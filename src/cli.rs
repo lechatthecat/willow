@@ -11,8 +11,11 @@ mod init;
 mod overview;
 mod package;
 mod protocol;
+mod request;
 mod rust;
 mod semantic_diff;
+
+use request::{Args, OutputFormat};
 
 #[derive(Debug)]
 enum CliCommand {
@@ -55,7 +58,7 @@ struct DebugCommand {
 }
 
 #[derive(Default)]
-struct CompilerFlags {
+struct CompilerFlags<'a> {
     debug: bool,
     locked: bool,
     offline: bool,
@@ -63,13 +66,12 @@ struct CompilerFlags {
     debug_info: bool,
     emit_hir: bool,
     emit_lir: bool,
-    runtime_lib: Option<PathBuf>,
+    runtime_lib: Option<&'a str>,
 }
 
-impl CompilerFlags {
-    fn parse(&mut self, args: &[String], index: &mut usize) -> Result<bool> {
-        let arg = &args[*index];
-        match arg.as_str() {
+impl<'a> CompilerFlags<'a> {
+    fn parse(&mut self, arg: &'a str, args: Args<'_, 'a>) -> Result<bool> {
+        match arg {
             "--debug" => self.debug = true,
             "--locked" => self.locked = true,
             "--offline" => self.offline = true,
@@ -82,18 +84,17 @@ impl CompilerFlags {
             "--emit-hir" => self.emit_hir = true,
             "--emit-lir" => self.emit_lir = true,
             "--runtime-lib" => {
-                *index += 1;
                 let path = args
-                    .get(*index)
+                    .next()
                     .ok_or_else(|| anyhow::anyhow!("missing value for `--runtime-lib`"))?;
-                self.runtime_lib = Some(PathBuf::from(path));
+                self.runtime_lib = Some(path);
             }
             _ => {
                 if let Some(path) = arg.strip_prefix("--runtime-lib=") {
                     if path.is_empty() {
                         anyhow::bail!("missing value for `--runtime-lib`");
                     }
-                    self.runtime_lib = Some(PathBuf::from(path));
+                    self.runtime_lib = Some(path);
                 } else {
                     return Ok(false);
                 }
@@ -119,7 +120,7 @@ impl CompilerFlags {
         } else {
             CompilerOptions::debug()
         };
-        options.target.runtime_lib = self.runtime_lib;
+        options.target.runtime_lib = self.runtime_lib.map(PathBuf::from);
         options.locked = self.locked;
         options.offline = self.offline;
         Ok(options)
@@ -127,55 +128,63 @@ impl CompilerFlags {
 }
 
 impl CliCommand {
-    fn parse(args: &[String]) -> Result<Self> {
-        let Some(command) = args.first() else {
-            anyhow::bail!("missing command or source file\n\n{}", usage());
-        };
-
+    fn parse(args: Args<'_, '_>) -> Result<Self> {
+        let command = args
+            .next()
+            .with_context(|| format!("missing command or source file\n\n{}", usage()))?;
         match command.as_str() {
             "--version" | "-V" | "version" => {
-                anyhow::ensure!(args.len() == 1, "version accepts no arguments");
+                anyhow::ensure!(args.next().is_none(), "version accepts no arguments");
                 Ok(Self::Version)
             }
-            "rust" | "doctor" => Ok(Self::Rust(rust::RustCommand::parse(command, &args[1..])?)),
-            "agent" => Ok(Self::Agent(agent::AgentCommand::parse(&args[1..])?)),
-            "init" => Ok(Self::Init(init::InitCommand::parse(&args[1..])?)),
-            "edit" => Ok(Self::Edit(edit::EditCommand::parse(&args[1..])?)),
-            "query" if args.get(1).is_some_and(|s| s == "rust-bridge") => {
-                Ok(Self::Rust(rust::RustCommand::parse(command, &args[1..])?))
+            "rust" | "doctor" => Ok(Self::Rust(rust::RustCommand::parse(command, args)?)),
+            "agent" => Ok(Self::Agent(agent::AgentCommand::parse(args)?)),
+            "init" => Ok(Self::Init(init::InitCommand::parse(args)?)),
+            "edit" => Ok(Self::Edit(edit::EditCommand::parse(args)?)),
+            "query" | "impact" => {
+                let first = args.next();
+                if command == "query" && first.is_some_and(|s| s == "rust-bridge") {
+                    return Ok(Self::Rust(rust::RustCommand::parse(
+                        command,
+                        &mut first.into_iter().chain(args),
+                    )?));
+                }
+                Ok(Self::Analysis(Box::new(analysis::AnalysisCommand::parse(
+                    command,
+                    &mut first.into_iter().chain(args),
+                )?)))
             }
-            "impact" | "query" => Ok(Self::Analysis(Box::new(analysis::AnalysisCommand::parse(
-                args,
-            )?))),
             "add" | "remove" | "update" | "deps" | "metadata" | "tidy" | "outdated" => Ok(
-                Self::Package(package::PackageCommand::parse(command, &args[1..])?),
+                Self::Package(package::PackageCommand::parse(command, args)?),
             ),
             "check" => {
-                let command = BuildCommand::parse(&args[1..])?;
+                let command = BuildCommand::parse(args)?;
                 anyhow::ensure!(
                     !command.emit_hir && !command.emit_lir && command.output.is_none(),
                     "check does not emit artifacts"
                 );
                 Ok(Self::Check(command))
             }
-            "build" => Ok(Self::Build(BuildCommand::parse(&args[1..])?)),
-            "run" => Ok(Self::Run(RunCommand::parse(&args[1..])?)),
-            "package" if args.get(1).is_some_and(|arg| arg == "verify") => {
-                let command = FetchCommand::parse_named(&args[2..], "package verify")?;
+            "build" => Ok(Self::Build(BuildCommand::parse(args)?)),
+            "run" => Ok(Self::Run(RunCommand::parse(args)?)),
+            "package" if args.next().is_some_and(|arg| arg == "verify") => {
+                let command = FetchCommand::parse_named(args, "package verify")?;
                 anyhow::ensure!(
                     !command.locked && !command.offline,
                     "package verify resolves independently of project.lock"
                 );
                 Ok(Self::Verify(command))
             }
-            "fetch" => Ok(Self::Fetch(FetchCommand::parse(&args[1..])?)),
-            "debug" => Ok(Self::Debug(DebugCommand::parse(&args[1..])?)),
-            source if source.ends_with(".wi") => Ok(Self::Build(BuildCommand::parse(args)?)),
+            "fetch" => Ok(Self::Fetch(FetchCommand::parse(args)?)),
+            "debug" => Ok(Self::Debug(DebugCommand::parse(args)?)),
+            source if source.ends_with(".wi") => Ok(Self::Build(BuildCommand::parse(
+                &mut std::iter::once(command).chain(args),
+            )?)),
             unknown => anyhow::bail!("unknown command `{unknown}`\n\n{}", usage()),
         }
     }
 
-    fn execute(self) -> Result<()> {
+    fn execute(self) -> Result<i32> {
         match self {
             Self::Version => {
                 println!(
@@ -203,7 +212,7 @@ impl CliCommand {
                 );
                 Ok(())
             }
-            Self::Rust(command) => command.execute(),
+            Self::Rust(command) => return command.execute(),
             Self::Package(command) => command.execute(),
             Self::Build(command) => command.execute(),
             Self::Check(command) => {
@@ -224,22 +233,20 @@ impl CliCommand {
                 }
                 Ok(())
             }
-            Self::Run(command) => command.execute(),
-            Self::Debug(command) => command.execute(),
+            Self::Run(command) => return command.execute(),
+            Self::Debug(command) => return command.execute(),
             Self::Fetch(command) => command.execute(),
             Self::Verify(command) => {
                 let report = willow_compiler::package::verify_package(&command.directory);
-                if command.format == "human" {
+                if command.format == OutputFormat::Human {
                     print!("{}", report.human());
                 } else {
                     println!("{}", serde_json::to_string(&report)?);
                 }
-                if !report.ok {
-                    std::process::exit(1);
-                }
-                Ok(())
+                return Ok(i32::from(!report.ok));
             }
-        }
+        }?;
+        Ok(0)
     }
 }
 
@@ -248,19 +255,18 @@ struct FetchCommand {
     directory: PathBuf,
     locked: bool,
     offline: bool,
-    format: String,
+    format: OutputFormat,
 }
 impl FetchCommand {
-    fn parse(args: &[String]) -> Result<Self> {
+    fn parse(args: Args<'_, '_>) -> Result<Self> {
         Self::parse_named(args, "fetch")
     }
-    fn parse_named(args: &[String], command: &str) -> Result<Self> {
+    fn parse_named(args: Args<'_, '_>, command: &str) -> Result<Self> {
         let mut directory = None;
         let mut locked = false;
         let mut offline = false;
-        let mut format = "human".to_string();
+        let mut format = "human";
         let mut format_seen = false;
-        let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
                 "--locked" => locked = true,
@@ -273,9 +279,9 @@ impl FetchCommand {
                     anyhow::ensure!(!format_seen, "duplicate --format");
                     format_seen = true;
                     format = if value == "--format" {
-                        args.next().context("missing --format value")?.clone()
+                        args.next().context("missing --format value")?.as_str()
                     } else {
-                        value[9..].into()
+                        &value[9..]
                     };
                 }
                 option if option.starts_with('-') => {
@@ -289,10 +295,8 @@ impl FetchCommand {
                 }
             }
         }
-        anyhow::ensure!(
-            matches!(format.as_str(), "human" | "json" | "ndjson"),
-            "invalid {command} format `{format}`"
-        );
+        let format = OutputFormat::parse(format)
+            .with_context(|| format!("invalid {command} format `{format}`"))?;
         Ok(Self {
             directory: directory.unwrap_or_else(|| PathBuf::from(".")),
             locked,
@@ -311,7 +315,7 @@ impl FetchCommand {
             willow_compiler::package::fetch_packages(&root, self.locked, self.offline)
         })();
         let graph = result?;
-        if self.format == "human" {
+        if self.format == OutputFormat::Human {
             println!("Fetched {} dependency packages", graph.packages.len() - 1);
         } else {
             let mut metadata = graph.metadata();
@@ -325,40 +329,31 @@ impl FetchCommand {
 }
 
 impl BuildCommand {
-    fn parse(args: &[String]) -> Result<Self> {
+    fn parse(args: Args<'_, '_>) -> Result<Self> {
         let mut flags = CompilerFlags::default();
         let mut input = None;
         let mut output = None;
-        let mut index = 0;
-
-        while index < args.len() {
-            if flags.parse(args, &mut index)? {
-                index += 1;
+        while let Some(arg) = args.next() {
+            if flags.parse(arg, args)? {
                 continue;
             }
-            match args[index].as_str() {
+            match arg.as_str() {
                 "-o" => {
-                    index += 1;
-                    output = Some(
-                        args.get(index)
-                            .ok_or_else(|| anyhow::anyhow!("missing value for `-o`"))?
-                            .clone(),
-                    );
+                    output = Some(args.next().context("missing value for `-o`")?);
                 }
                 option if option.starts_with('-') => {
                     anyhow::bail!("unknown build option `{option}`")
                 }
                 value => {
-                    if input.replace(value.to_string()).is_some() {
+                    if input.replace(value).is_some() {
                         anyhow::bail!("build accepts only one source file or project directory");
                     }
                 }
             }
-            index += 1;
         }
 
         let (source, project_dir) = match input {
-            Some(value) if value.ends_with(".wi") => (Some(value), None),
+            Some(value) if value.ends_with(".wi") => (Some(value.to_owned()), None),
             Some(value) => (None, Some(PathBuf::from(value))),
             None => (None, None),
         };
@@ -375,7 +370,7 @@ impl BuildCommand {
         Ok(Self {
             source,
             project_dir,
-            output,
+            output: output.cloned(),
             emit_hir,
             emit_lir,
             options: flags.finish()?,
@@ -450,37 +445,29 @@ impl BuildCommand {
 }
 
 impl RunCommand {
-    fn parse(args: &[String]) -> Result<Self> {
-        let separator = args.iter().position(|arg| arg == "--");
-        let (compiler_args, program_args) = match separator {
-            Some(index) => (&args[..index], args[index + 1..].to_vec()),
-            None => (args, vec![]),
-        };
+    fn parse(args: Args<'_, '_>) -> Result<Self> {
         let mut flags = CompilerFlags::default();
         let mut source = None;
-        let mut index = 0;
-        while index < compiler_args.len() {
-            if flags.parse(compiler_args, &mut index)? {
-                index += 1;
+        let mut compiler_args = (&mut *args).take_while(|arg| *arg != "--");
+        while let Some(arg) = compiler_args.next() {
+            if flags.parse(arg, &mut compiler_args)? {
                 continue;
             }
-            let arg = &compiler_args[index];
             if arg.starts_with('-') {
                 anyhow::bail!("unknown run option `{arg}`");
             }
-            if source.replace(arg.clone()).is_some() {
+            if source.replace(arg.as_str()).is_some() {
                 anyhow::bail!("run accepts only one source file or project directory");
             }
-            index += 1;
         }
         Ok(Self {
-            source: source.unwrap_or_else(|| ".".into()),
-            program_args,
+            source: source.unwrap_or(".").to_owned(),
+            program_args: args.cloned().collect(),
             options: flags.finish()?,
         })
     }
 
-    fn execute(self) -> Result<()> {
+    fn execute(self) -> Result<i32> {
         let temporary = RunDirectory::create()?;
         let output = temporary.0.join(if cfg!(windows) {
             "program.exe"
@@ -512,8 +499,7 @@ impl RunCommand {
             .args(&self.program_args)
             .status()
             .with_context(|| format!("failed to run {output}"))?;
-        drop(temporary);
-        std::process::exit(child_exit_code(status));
+        Ok(child_exit_code(status))
     }
 }
 
@@ -541,26 +527,22 @@ impl Drop for RunDirectory {
 }
 
 impl DebugCommand {
-    fn parse(args: &[String]) -> Result<Self> {
+    fn parse(args: Args<'_, '_>) -> Result<Self> {
         let mut flags = CompilerFlags::default();
         let mut source = None;
-        let mut index = 0;
-        while index < args.len() {
-            if flags.parse(args, &mut index)? {
-                index += 1;
+        while let Some(arg) = args.next() {
+            if flags.parse(arg, args)? {
                 continue;
             }
-            let arg = &args[index];
             if arg.starts_with('-') {
                 anyhow::bail!("unknown debug option `{arg}`");
             }
             if !arg.ends_with(".wi") {
                 anyhow::bail!("unexpected debug argument `{arg}`; expected a `.wi` source file");
             }
-            if source.replace(arg.clone()).is_some() {
+            if source.replace(arg.as_str()).is_some() {
                 anyhow::bail!("debug accepts exactly one source file");
             }
-            index += 1;
         }
         if flags.locked || flags.offline {
             anyhow::bail!("debug command does not accept --locked/--offline/--frozen");
@@ -569,12 +551,12 @@ impl DebugCommand {
             anyhow::bail!("debug command does not accept release-mode options");
         }
         Ok(Self {
-            source: source.ok_or_else(|| anyhow::anyhow!("no source file specified"))?,
+            source: source.context("no source file specified")?.to_owned(),
             options: flags.finish()?,
         })
     }
 
-    fn execute(self) -> Result<()> {
+    fn execute(self) -> Result<i32> {
         let output = temp_path(format!("willow_debug_{}", stem(&self.source)));
         compile(&self.source, &output, &self.options, None)?;
         eprintln!("note: interactive debugger not yet implemented");
@@ -582,7 +564,7 @@ impl DebugCommand {
         let status = Command::new(&output)
             .status()
             .with_context(|| format!("failed to run {output}"))?;
-        std::process::exit(child_exit_code(status));
+        Ok(child_exit_code(status))
     }
 }
 
@@ -599,73 +581,18 @@ fn child_exit_code(status: ExitStatus) -> i32 {
     status.code().unwrap_or(0)
 }
 
-pub(super) fn run(args: Vec<String>) -> Result<()> {
-    if args.first().is_some_and(|arg| arg == "verify-edit") {
-        let code = semantic_diff::run(&args[1..])?;
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-    if let Some(text) = help(&args) {
-        println!("{text}");
-        return Ok(());
-    }
-    if args.first().is_some_and(|arg| arg == "overview") {
-        let code = overview::run(&args[1..])?;
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-    if direct::requested(&args) {
-        let code = direct::run(&args)?;
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-    if protocol::requested(&args) {
-        let code = protocol::run(args)?;
-        if code != 0 {
-            std::process::exit(code);
-        }
-        return Ok(());
-    }
-    let machine_package = args.first().is_some_and(|s| {
-        matches!(
-            s.as_str(),
-            "add"
-                | "remove"
-                | "update"
-                | "deps"
-                | "metadata"
-                | "tidy"
-                | "outdated"
-                | "fetch"
-                | "package"
-                | "rust"
-                | "doctor"
-        ) || (s == "query" && args.get(1).is_some_and(|s| s == "rust-bridge"))
-    }) && args.iter().enumerate().any(|(i, arg)| {
-        matches!(arg.as_str(), "--format=json" | "--format=ndjson")
-            || (arg == "--format"
-                && args
-                    .get(i + 1)
-                    .is_some_and(|v| matches!(v.as_str(), "json" | "ndjson")))
-    });
-    let result = CliCommand::parse(&args).and_then(CliCommand::execute);
-    if machine_package && let Err(error) = &result {
-        let mut value = willow_compiler::package::package_error_json(error);
-        if let Some(command @ ("rust" | "doctor" | "query")) = args.first().map(String::as_str) {
-            value["kind"] = serde_json::json!(format!("{command}.error"));
-            if value["error"]["kind"] == "package_command_failed" {
-                value["error"]["kind"] = serde_json::json!(format!("{command}_command_failed"));
-            }
-        }
-        write_machine_output(&value)?;
-        std::process::exit(1);
-    }
+pub(super) fn run(args: Vec<String>) -> i32 {
+    use std::io::Write;
+    request::Request::parse(&args)
+        .execute()
+        .unwrap_or_else(|error| {
+            // Match the standard Result termination report, including anyhow causes.
+            let _ = writeln!(std::io::stderr().lock(), "Error: {error:?}");
+            1
+        })
+}
+
+fn human_result(result: Result<i32>) -> Result<i32> {
     if let Err(error) = &result
         && let Some(error) = error.downcast_ref::<willow_compiler::package::CommandError>()
         && matches!(
@@ -700,18 +627,9 @@ pub(super) fn write_machine_output(value: &serde_json::Value) -> Result<()> {
 /// `willow --help`, `willow help [command]` and `willow <command> ... --help`
 /// print usage (restricted to that command when it is known). Arguments after
 /// `--` belong to the program run by `willow run`.
-fn help(args: &[String]) -> Option<String> {
-    let own = args.split(|arg| arg == "--").next().unwrap_or_default();
-    let command = match own.first().map(String::as_str) {
-        Some("help") => own.get(1).map(String::as_str),
-        _ if own.iter().any(|arg| arg == "--help" || arg == "-h") => own
-            .first()
-            .map(String::as_str)
-            .filter(|c| !c.starts_with('-')),
-        _ => return None,
-    };
+fn help_text(command: Option<&str>) -> String {
     if command == Some("advanced") {
-        return Some(advanced_usage());
+        return advanced_usage();
     }
     let lines: Vec<_> = command
         .map(|c| format!("  willow {c} "))
@@ -722,11 +640,11 @@ fn help(args: &[String]) -> Option<String> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(if lines.is_empty() {
+    if lines.is_empty() {
         usage()
     } else {
         format!("Usage:\n{}", lines.join("\n"))
-    })
+    }
 }
 
 fn usage() -> String {
@@ -823,6 +741,13 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    fn help(args: &[String]) -> Option<String> {
+        match request::Request::parse(args) {
+            request::Request::Help(text) => Some(text),
+            _ => None,
+        }
     }
 
     #[cfg(unix)]
@@ -950,7 +875,7 @@ mod tests {
         ];
         for (case, expected) in cases {
             assert_eq!(
-                CliCommand::parse(&args(case)).is_ok(),
+                CliCommand::parse(&mut args(case).iter()).is_ok(),
                 *expected,
                 "case: {case:?}"
             );
@@ -960,7 +885,7 @@ mod tests {
     #[test]
     fn package_flags_and_fetch_parser() {
         for name in ["build", "run"] {
-            let command = CliCommand::parse(&args(&[name, "--frozen"])).unwrap();
+            let command = CliCommand::parse(&mut args(&[name, "--frozen"]).iter()).unwrap();
             let options = match command {
                 CliCommand::Build(c) => c.options,
                 CliCommand::Run(c) => c.options,
@@ -969,13 +894,14 @@ mod tests {
             assert!(options.locked && options.offline);
         }
         let CliCommand::Fetch(fetch) =
-            CliCommand::parse(&args(&["fetch", "dir", "--frozen", "--format=json"])).unwrap()
+            CliCommand::parse(&mut args(&["fetch", "dir", "--frozen", "--format=json"]).iter())
+                .unwrap()
         else {
             unreachable!()
         };
         assert!(fetch.locked && fetch.offline);
         assert_eq!(fetch.directory, PathBuf::from("dir"));
-        assert_eq!(fetch.format, "json");
+        assert_eq!(fetch.format, OutputFormat::Json);
         for input in [
             &["fetch", "--format"][..],
             &["fetch", "--format", "xml"],
@@ -983,7 +909,10 @@ mod tests {
             &["fetch", "--release"],
             &["debug", "main.wi", "--offline"],
         ] {
-            assert!(CliCommand::parse(&args(input)).is_err(), "{input:?}");
+            assert!(
+                CliCommand::parse(&mut args(input).iter()).is_err(),
+                "{input:?}"
+            );
         }
     }
 
@@ -999,14 +928,18 @@ mod tests {
             &["package", "verify", "--release"],
             &["package", "unknown"],
         ] {
-            assert!(CliCommand::parse(&args(input)).is_err(), "{input:?}");
+            assert!(
+                CliCommand::parse(&mut args(input).iter()).is_err(),
+                "{input:?}"
+            );
         }
     }
 
     #[test]
     fn run_command_preserves_arguments_after_separator() {
         let command =
-            CliCommand::parse(&args(&["run", "main.wi", "--", "a", "--release"])).unwrap();
+            CliCommand::parse(&mut args(&["run", "main.wi", "--", "a", "--release"]).iter())
+                .unwrap();
         let CliCommand::Run(command) = command else {
             panic!("expected run command");
         };
@@ -1016,13 +949,16 @@ mod tests {
 
     #[test]
     fn build_command_materializes_release_options() {
-        let command = CliCommand::parse(&args(&[
-            "build",
-            "main.wi",
-            "--release",
-            "--debug-info",
-            "--runtime-lib=rt.a",
-        ]))
+        let command = CliCommand::parse(
+            &mut args(&[
+                "build",
+                "main.wi",
+                "--release",
+                "--debug-info",
+                "--runtime-lib=rt.a",
+            ])
+            .iter(),
+        )
         .unwrap();
         let CliCommand::Build(command) = command else {
             panic!("expected build command");

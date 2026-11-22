@@ -9,46 +9,6 @@ use willow_compiler::diagnostics::{
 pub(super) const CHECK_COMMAND: &str = "willow check . --format ndjson --protocol-version 1";
 pub(super) const BUILD_COMMAND: &str = "willow build . --format ndjson --protocol-version 1";
 
-pub(super) fn requested(args: &[String]) -> bool {
-    if args.first().is_some_and(|s| s == "query") && args.get(1).is_some_and(|s| s == "rust-bridge")
-    {
-        return false;
-    }
-    // Existing package commands retain their own output contract.
-    if matches!(
-        args.first().map(String::as_str),
-        Some(
-            "agent"
-                | "init"
-                | "fetch"
-                | "package"
-                | "add"
-                | "remove"
-                | "update"
-                | "deps"
-                | "metadata"
-                | "tidy"
-                | "outdated"
-                | "rust"
-                | "doctor"
-        )
-    ) {
-        return false;
-    }
-    matches!(
-        args.first().map(String::as_str),
-        Some("impact" | "query" | "edit")
-    ) || args
-        .iter()
-        .take_while(|arg| arg.as_str() != "--")
-        .any(|arg| {
-            arg == "--format"
-                || arg.starts_with("--format=")
-                || arg == "--protocol-version"
-                || arg.starts_with("--protocol-version=")
-        })
-}
-
 pub(super) struct EventWriter<W> {
     writer: W,
     stream_id: String,
@@ -215,59 +175,12 @@ impl<W: Write> DiagnosticEmitter for EventWriter<W> {
     }
 }
 
-pub(super) fn options(args: Vec<String>) -> anyhow::Result<(Vec<String>, String, Option<String>)> {
-    let mut remaining = Vec::with_capacity(args.len());
-    let mut format = None;
-    let mut version = None;
-    let mut args = args.into_iter();
-    while let Some(arg) = args.next() {
-        if arg == "--" {
-            remaining.push(arg);
-            remaining.extend(args);
-            break;
-        }
-        let (target, value) = if arg == "--format" {
-            (
-                &mut format,
-                args.next()
-                    .ok_or_else(|| anyhow::anyhow!("missing --format value"))?,
-            )
-        } else if let Some(value) = arg.strip_prefix("--format=") {
-            (&mut format, value.to_owned())
-        } else if arg == "--protocol-version" {
-            (
-                &mut version,
-                args.next()
-                    .ok_or_else(|| anyhow::anyhow!("missing --protocol-version value"))?,
-            )
-        } else if let Some(value) = arg.strip_prefix("--protocol-version=") {
-            (&mut version, value.to_owned())
-        } else {
-            remaining.push(arg);
-            continue;
-        };
-        anyhow::ensure!(target.replace(value).is_none(), "duplicate protocol option");
-    }
-    let format = format.unwrap_or_else(|| "ndjson".into());
-    anyhow::ensure!(
-        matches!(format.as_str(), "human" | "ndjson"),
-        "unsupported output format"
-    );
-    anyhow::ensure!(
-        format != "human" || version.is_none(),
-        "protocol version requires ndjson"
-    );
-    Ok((remaining, format, version))
+pub(super) enum ArgumentError {
+    Invalid(anyhow::Error),
+    Version(String),
 }
 
-pub(super) fn run(args: Vec<String>) -> anyhow::Result<i32> {
-    let parsed = options(args);
-    if let Ok((args, format, _)) = &parsed
-        && format == "human"
-    {
-        CliCommand::parse(args)?.execute()?;
-        return Ok(0);
-    }
+pub(super) fn run(parsed: Result<CliCommand, ArgumentError>) -> anyhow::Result<i32> {
     let mut events = EventWriter::new(io::stdout().lock());
     events.event(
         "request.started",
@@ -276,79 +189,76 @@ pub(super) fn run(args: Vec<String>) -> anyhow::Result<i32> {
     )?;
     let mut location = None;
     let (code, exit_code, message) = match parsed {
-        Err(error) => ("WT1001", 2, error.to_string()),
-        Ok((_, _, Some(version))) if version != "1" => (
+        Err(ArgumentError::Invalid(error)) => ("WT1001", 2, error.to_string()),
+        Err(ArgumentError::Version(version)) => (
             "WT1002",
             2,
             format!("unsupported protocol version {version}"),
         ),
-        Ok((args, _, _)) => match CliCommand::parse(&args) {
-            Err(error) => ("WT1001", 2, error.to_string()),
-            Ok(CliCommand::Edit(command)) => match command.execute(&mut events) {
-                Ok(value) => {
-                    events.event("analysis.result", "WT0010", value)?;
-                    ("WT0000", 0, String::new())
-                }
-                Err(error) => {
-                    location = error
-                        .downcast_ref::<willow_compiler::ai::edit::Rejection>()
-                        .map(|rejection| rejection.location.clone());
-                    ("WT2002", 1, format!("{error:#}"))
-                }
-            },
-            Ok(CliCommand::Analysis(command)) => match command.execute(&mut events) {
-                Ok(value) => {
-                    let failed = value.get("success") == Some(&Value::Bool(false));
-                    events.event("analysis.result", "WT0010", value)?;
-                    if failed {
-                        (
-                            "WT2002",
-                            1,
-                            "analysis operation failed; see result reasons".into(),
-                        )
-                    } else {
-                        ("WT0000", 0, String::new())
-                    }
-                }
-                Err(error) => (
-                    if events.errors > 0 {
-                        "WT2001"
-                    } else {
-                        "WT2002"
-                    },
-                    1,
-                    format!("{error:#}"),
-                ),
-            },
-            Ok(command) => {
-                let operation = match command {
-                    CliCommand::Check(command) => Some((command, false)),
-                    CliCommand::Build(command) if !command.emit_hir && !command.emit_lir => {
-                        Some((command, true))
-                    }
-                    _ => None,
-                };
-                match operation {
-                    None => (
-                        "WT1001",
-                        2,
-                        "ndjson supports check/build without IR dumps".into(),
-                    ),
-                    Some((command, build)) => match command.execute_with(&mut events, build) {
-                        Ok(()) => ("WT0000", 0, String::new()),
-                        Err(error) => (
-                            if events.errors > 0 {
-                                "WT2001"
-                            } else {
-                                "WT2002"
-                            },
-                            1,
-                            format!("{error:#}"),
-                        ),
-                    },
-                }
+        Ok(CliCommand::Edit(command)) => match command.execute(&mut events) {
+            Ok(value) => {
+                events.event("analysis.result", "WT0010", value)?;
+                ("WT0000", 0, String::new())
+            }
+            Err(error) => {
+                location = error
+                    .downcast_ref::<willow_compiler::ai::edit::Rejection>()
+                    .map(|rejection| rejection.location.clone());
+                ("WT2002", 1, format!("{error:#}"))
             }
         },
+        Ok(CliCommand::Analysis(command)) => match command.execute(&mut events) {
+            Ok(value) => {
+                let failed = value.get("success") == Some(&Value::Bool(false));
+                events.event("analysis.result", "WT0010", value)?;
+                if failed {
+                    (
+                        "WT2002",
+                        1,
+                        "analysis operation failed; see result reasons".into(),
+                    )
+                } else {
+                    ("WT0000", 0, String::new())
+                }
+            }
+            Err(error) => (
+                if events.errors > 0 {
+                    "WT2001"
+                } else {
+                    "WT2002"
+                },
+                1,
+                format!("{error:#}"),
+            ),
+        },
+        Ok(command) => {
+            let operation = match command {
+                CliCommand::Check(command) => Some((command, false)),
+                CliCommand::Build(command) if !command.emit_hir && !command.emit_lir => {
+                    Some((command, true))
+                }
+                _ => None,
+            };
+            match operation {
+                None => (
+                    "WT1001",
+                    2,
+                    "ndjson supports check/build without IR dumps".into(),
+                ),
+                Some((command, build)) => match command.execute_with(&mut events, build) {
+                    Ok(()) => ("WT0000", 0, String::new()),
+                    Err(error) => (
+                        if events.errors > 0 {
+                            "WT2001"
+                        } else {
+                            "WT2002"
+                        },
+                        1,
+                        format!("{error:#}"),
+                    ),
+                },
+            }
+        }
     };
     let mut data = json!({"status": if exit_code == 0 { "ok" } else { "error" }, "exit_code": exit_code, "message": message});
     if let Some(location) = location {
@@ -623,6 +533,9 @@ mod tests {
             "--protocol-version=99",
         ]
         .map(str::to_owned);
-        assert!(!requested(&args));
+        assert!(matches!(
+            super::super::request::Request::parse(&args),
+            super::super::request::Request::Human(Ok(CliCommand::Run(_)))
+        ));
     }
 }

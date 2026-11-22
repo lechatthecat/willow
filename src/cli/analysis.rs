@@ -20,111 +20,121 @@ pub(super) struct AnalysisCommand {
     limits: Limits,
 }
 impl AnalysisCommand {
-    pub(super) fn parse(args: &[String]) -> Result<Self> {
-        let operation = args[0].as_str();
-        anyhow::ensure!(
-            matches!(operation, "impact" | "query"),
-            "unknown analysis command"
-        );
-        let args = &args[1..];
-        let mut result = Self {
-            operation: operation.into(),
-            requests: None,
-            build: BuildCommand::parse(&[])?,
-            file: None,
-            byte: None,
-            functions: vec![],
-            revision: None,
-            direction: Direction::Callers,
-            limits: Limits::default(),
-        };
-        let mut compiler_args = Vec::new();
+    pub(super) fn parse(operation: &str, args: Args<'_, '_>) -> Result<Self> {
+        let mut requests = None;
+        let mut file = None;
+        let mut byte = None;
+        let mut functions = Vec::new();
+        let mut revision = None;
+        let mut direction = Direction::Callers;
+        let mut limits = Limits::default();
         let mut seen = std::collections::HashSet::new();
-        let mut i = 0;
-        while i < args.len() {
-            let (key, inline) = args[i]
-                .split_once('=')
-                .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v)));
-            if matches!(
-                key,
-                "--requests"
-                    | "--file"
-                    | "--byte"
-                    | "--function"
-                    | "--revision"
-                    | "--direction"
-                    | "--max-nodes"
-                    | "--max-depth"
-            ) {
-                anyhow::ensure!(
-                    key == "--function" || seen.insert(key.to_string()),
-                    "duplicate {key}"
-                );
-                let value = if let Some(value) = inline {
-                    value
-                } else {
-                    i += 1;
-                    args.get(i).context("missing analysis option value")?
-                };
-                match key {
-                    "--requests" => result.requests = Some(value.into()),
-                    "--file" => result.file = Some(value.into()),
-                    "--byte" => result.byte = Some(value.parse()?),
-                    "--function" => result.functions.push(value.into()),
-                    "--revision" => result.revision = Some(value.into()),
-                    "--max-nodes" => result.limits.max_nodes = value.parse()?,
-                    "--max-depth" => result.limits.max_depth = value.parse()?,
-                    "--direction" => {
-                        result.direction = match value {
-                            "callers" => Direction::Callers,
-                            "callees" => Direction::Callees,
-                            _ => anyhow::bail!("direction must be callers or callees"),
+        // Analysis options have precedence even between a compiler flag and its value.
+        let mut analysis_error = None;
+        let mut next_compiler_arg = || -> Result<_> {
+            while let Some(arg) = args.next() {
+                let (key, inline) = super::request::split_option(arg);
+                if matches!(
+                    key,
+                    "--requests"
+                        | "--file"
+                        | "--byte"
+                        | "--function"
+                        | "--revision"
+                        | "--direction"
+                        | "--max-nodes"
+                        | "--max-depth"
+                ) {
+                    anyhow::ensure!(key == "--function" || seen.insert(key), "duplicate {key}");
+                    let value = if let Some(value) = inline {
+                        value
+                    } else {
+                        args.next().context("missing analysis option value")?
+                    };
+                    match key {
+                        "--requests" => requests = Some(value.into()),
+                        "--file" => file = Some(value.into()),
+                        "--byte" => byte = Some(value.parse()?),
+                        "--function" => functions.push(value.into()),
+                        "--revision" => revision = Some(value.into()),
+                        "--max-nodes" => limits.max_nodes = value.parse()?,
+                        "--max-depth" => limits.max_depth = value.parse()?,
+                        "--direction" => {
+                            direction = match value {
+                                "callers" => Direction::Callers,
+                                "callees" => Direction::Callees,
+                                _ => anyhow::bail!("direction must be callers or callees"),
+                            }
                         }
+                        _ => unreachable!(),
                     }
-                    _ => unreachable!(),
+                } else {
+                    return Ok(Some(arg));
                 }
-            } else {
-                compiler_args.push(args[i].clone());
             }
-            i += 1;
+            Ok(None)
+        };
+        let mut compiler_args = std::iter::from_fn(|| {
+            if analysis_error.is_some() {
+                return None;
+            }
+            next_compiler_arg().unwrap_or_else(|error| {
+                analysis_error = Some(error);
+                None
+            })
+        });
+        let build = BuildCommand::parse(&mut compiler_args);
+        compiler_args.for_each(drop);
+        if let Some(error) = analysis_error {
+            return Err(error);
         }
-        result.build = BuildCommand::parse(&compiler_args)?;
+        let build = build?;
         anyhow::ensure!(
-            !result.build.emit_hir && !result.build.emit_lir && result.build.output.is_none(),
+            !build.emit_hir && !build.emit_lir && build.output.is_none(),
             "analysis does not generate native/IR artifacts"
         );
-        anyhow::ensure!(result.limits.max_nodes > 0, "max-nodes must be positive");
+        anyhow::ensure!(limits.max_nodes > 0, "max-nodes must be positive");
         match operation {
             "impact" => {
                 anyhow::ensure!(
-                    result.byte.is_some() == result.file.is_some(),
+                    byte.is_some() == file.is_some(),
                     "--file and --byte must be specified together"
                 );
                 anyhow::ensure!(
-                    result.byte.is_some() || !result.functions.is_empty(),
+                    byte.is_some() || !functions.is_empty(),
                     "impact requires --file/--byte or --function"
                 );
                 anyhow::ensure!(
-                    result.functions.is_empty() || result.revision.is_some(),
+                    functions.is_empty() || revision.is_some(),
                     "--function requires --revision"
                 );
             }
             "query" => anyhow::ensure!(
-                result.requests.is_some()
-                    && result.file.is_none()
-                    && result.functions.is_empty()
-                    && result.byte.is_none()
-                    && result.revision.is_none()
+                requests.is_some()
+                    && file.is_none()
+                    && functions.is_empty()
+                    && byte.is_none()
+                    && revision.is_none()
                     && !seen.contains("--direction"),
                 "query requires --requests and source/compiler options only"
             ),
             _ => unreachable!(),
         }
         anyhow::ensure!(
-            operation == "query" || result.requests.is_none(),
+            operation == "query" || requests.is_none(),
             "--requests requires query"
         );
-        Ok(result)
+        Ok(Self {
+            operation: operation.into(),
+            requests,
+            build,
+            file,
+            byte,
+            functions,
+            revision,
+            direction,
+            limits,
+        })
     }
     pub(super) fn execute(self, emitter: &mut dyn DiagnosticEmitter) -> Result<Value> {
         let (entry, root) = if let Some(source) = self.build.source {

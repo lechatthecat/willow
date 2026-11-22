@@ -118,7 +118,31 @@ impl PackageImportError {
         }
     }
 }
+#[derive(Clone, Copy)]
+pub enum CommandErrorFamily {
+    Package,
+    Rust,
+    Doctor,
+    Query,
+}
+
+impl CommandErrorFamily {
+    pub fn render(self, error: &anyhow::Error) -> serde_json::Value {
+        let (kind, fallback) = match self {
+            Self::Package => ("package.error", "package_command_failed"),
+            Self::Rust => ("rust.error", "rust_command_failed"),
+            Self::Doctor => ("doctor.error", "doctor_command_failed"),
+            Self::Query => ("query.error", "query_command_failed"),
+        };
+        command_error_json(error, kind, fallback)
+    }
+}
+
 pub fn package_error_json(error: &anyhow::Error) -> Value {
+    CommandErrorFamily::Package.render(error)
+}
+
+fn command_error_json(error: &anyhow::Error, kind: &str, fallback_kind: &str) -> Value {
     let mut detail = error
         .chain()
         .find_map(|e| {
@@ -138,14 +162,14 @@ pub fn package_error_json(error: &anyhow::Error) -> Value {
             }
             None
         })
-        .unwrap_or(json!({"kind":"package_command_failed"}));
+        .unwrap_or_else(|| json!({"kind":fallback_kind}));
     // Invalid internal IDs are intentionally omitted even from human detail.
     detail["message"] = if detail["kind"] == "package_graph_invalid" {
         json!("invalid package graph")
     } else {
         json!(format!("{error:#}"))
     };
-    json!({"schema":1, "ok":false, "kind":"package.error", "error":detail})
+    json!({"schema":1, "ok":false, "kind":kind, "error":detail})
 }
 
 #[cfg(test)]

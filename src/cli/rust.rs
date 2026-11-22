@@ -1,4 +1,5 @@
 //! Rust command adapter. Cargo resolution and wrapper ownership stay in toolchain.
+use super::request::{Args, OutputFormat};
 use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
@@ -13,7 +14,7 @@ pub(super) struct RustCommand {
     operation: String,
     selector: Option<String>,
     directory: PathBuf,
-    format: String,
+    pub(super) format: OutputFormat,
     options: BridgeOptions,
     mutation: Option<Box<Mutation>>,
 }
@@ -41,12 +42,12 @@ fn has_native_sources(root: &std::path::Path) -> Result<bool> {
 }
 
 impl RustCommand {
-    pub(super) fn parse(command: &str, args: &[String]) -> Result<Self> {
-        let (operation, args) = if command == "doctor" {
-            ("doctor", args)
+    pub(super) fn parse(command: &str, args: Args<'_, '_>) -> Result<Self> {
+        let operation = if command == "doctor" {
+            "doctor"
         } else {
             let operation = args
-                .first()
+                .next()
                 .context("expected rust add, remove, update, tree, check or metadata")?;
             ensure!(
                 matches!(
@@ -55,7 +56,7 @@ impl RustCommand {
                 ),
                 "unknown rust command `{operation}`"
             );
-            (operation.as_str(), &args[1..])
+            operation.as_str()
         };
         let mut options = BridgeOptions::new(BuildMode::Debug)?;
         let mut directory = None;
@@ -64,11 +65,8 @@ impl RustCommand {
         let mut name = None;
         let mut spec = RustDependencySpec::default();
         let mut breaking = false;
-        let mut args = args.iter();
         while let Some(arg) = args.next() {
-            let (key, inline) = arg
-                .split_once('=')
-                .map_or((arg.as_str(), None), |(k, v)| (k, Some(v)));
+            let (key, inline) = super::request::split_option(arg);
             match key {
                 "--dry-run" if operation == "update" && inline.is_none() => {
                     ensure!(!options.read_only, "duplicate --dry-run");
@@ -106,14 +104,9 @@ impl RustCommand {
                     );
                     match key {
                         "--format" => {
-                            ensure!(
-                                matches!(value, "human" | "json" | "ndjson"),
-                                "invalid output format `{value}`"
-                            );
-                            ensure!(
-                                format.replace(value.to_owned()).is_none(),
-                                "duplicate --format"
-                            );
+                            let value = OutputFormat::parse(value)
+                                .with_context(|| format!("invalid output format `{value}`"))?;
+                            ensure!(format.replace(value).is_none(), "duplicate --format");
                         }
                         "--project-dir" => ensure!(
                             directory.replace(PathBuf::from(value)).is_none(),
@@ -147,7 +140,11 @@ impl RustCommand {
         if let Some(cache) = cache {
             options.cache_root = cache;
         }
-        let selector = name.clone();
+        let selector = if operation == "rust-bridge" {
+            name.take()
+        } else {
+            None
+        };
         let mutation = match operation {
             "add" => {
                 let mut name = name.context("rust add requires a dependency name")?;
@@ -171,7 +168,7 @@ impl RustCommand {
             operation: operation.into(),
             selector,
             directory: directory.unwrap_or_else(|| ".".into()),
-            format: format.unwrap_or_else(|| "human".into()),
+            format: format.unwrap_or_default(),
             options,
             mutation: mutation.map(Box::new),
         })
@@ -216,7 +213,7 @@ impl RustCommand {
         Ok(())
     }
 
-    pub(super) fn execute(mut self) -> Result<()> {
+    pub(super) fn execute(mut self) -> Result<i32> {
         let directory = std::fs::canonicalize(&self.directory)?;
         let (_, root) =
             project::find_project_manifest(&directory).context("no project.toml found")?;
@@ -261,14 +258,15 @@ impl RustCommand {
             .iter()
             .any(|symbol| symbol.native.is_some());
         if self.operation == "rust-bridge" {
-            return self.query_bridge(
+            self.query_bridge(
                 &project,
                 &root,
                 snapshot
                     .as_mut()
                     .context("query rust-bridge requires Willow sources")?,
                 enabled,
-            );
+            )?;
+            return Ok(0);
         }
         let mut value = if let Some(mutation) = self.mutation {
             let mut value = commands::mutate(&root, &self.options, *mutation)?;
@@ -351,7 +349,7 @@ impl RustCommand {
             value["rust_dependency_build_execution_notice"] = json!({"build_time_code_execution_possible":true,
                 "message":"Cargo builds may execute dependency build.rs scripts and procedural macros."});
         }
-        if self.format == "human" {
+        if self.format == OutputFormat::Human {
             if notice {
                 println!(
                     "note: Cargo builds may execute dependency build.rs scripts and procedural macros."
@@ -408,10 +406,7 @@ impl RustCommand {
         } else {
             super::write_machine_output(&value)?;
         }
-        if value["ok"] == false {
-            std::process::exit(1);
-        }
-        Ok(())
+        Ok(i32::from(value["ok"] == false))
     }
 }
 

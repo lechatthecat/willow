@@ -1,7 +1,13 @@
 use super::*;
 use willow_compiler::ai::verify::semantic_diff::contracts::{self, Policy};
 use willow_compiler::ai::verify::semantic_diff::{Options, SemanticDiff, resolve_base, verify};
-fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
+pub(super) struct VerifyEdit {
+    options: Options,
+    json: bool,
+    explain: bool,
+    policy: Option<Policy>,
+}
+pub(super) fn parse(args: Args<'_, '_>) -> Result<VerifyEdit> {
     let mut policy = Policy::default();
     let mut v2 = false;
     let mut policy_seen = false;
@@ -15,7 +21,6 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
     let mut json = false;
     let mut explain = false;
     let mut seen = std::collections::BTreeSet::new();
-    let mut args = args.iter();
     while let Some(key) = args.next() {
         anyhow::ensure!(seen.insert(key), "duplicate option: {key}");
         if key == "--write-contracts-lock" {
@@ -90,16 +95,22 @@ fn parse(args: &[String]) -> Result<(Options, bool, bool, Option<Policy>)> {
         policy.approval_evidence.is_some() == policy.approval_verifier.is_some(),
         "approval evidence and verifier must be supplied together"
     );
-    Ok((options, json, explain, v2.then_some(policy)))
+    Ok(VerifyEdit {
+        options,
+        json,
+        explain,
+        policy: v2.then_some(policy),
+    })
 }
-pub(super) fn run(args: &[String]) -> Result<i32> {
-    if args == ["--help"] || args == ["-h"] {
-        println!(
-            "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth] [--schema v3|v4] [--protected-base COMMIT] [--approval-evidence FILE --approval-verifier EXTERNAL_EXECUTABLE] [--write-contracts-lock]"
-        );
-        return Ok(0);
-    }
-    let (options, json, explain, policy) = match parse(args) {
+pub(super) const HELP: &str = "Usage: willow verify-edit --base REV [--root DIR] [--entry FILE] [--project] [--format json|text] [--explain] [--fail-on effect-growth] [--schema v3|v4] [--protected-base COMMIT] [--approval-evidence FILE --approval-verifier EXTERNAL_EXECUTABLE] [--write-contracts-lock]";
+
+pub(super) fn run(parsed: Result<VerifyEdit>) -> Result<i32> {
+    let VerifyEdit {
+        options,
+        json,
+        explain,
+        policy,
+    } = match parsed {
         Ok(value) => value,
         Err(error) => {
             eprintln!("verify-edit: {error:#}");
@@ -150,7 +161,7 @@ mod tests {
             "--base HEAD --unknown value",
         ] {
             let args: Vec<_> = input.split_whitespace().map(String::from).collect();
-            assert!(parse(&args).is_err(), "{input}");
+            assert!(parse(&mut args.iter()).is_err(), "{input}");
         }
     }
 }

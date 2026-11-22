@@ -1,3 +1,4 @@
+use super::request::Args;
 use anyhow::{Context, Result};
 use std::{
     io::{BufRead, IsTerminal, Write},
@@ -69,18 +70,19 @@ pub(super) enum AgentCommand {
     Sync { yes: bool },
 }
 impl AgentCommand {
-    pub(super) fn parse(args: &[String]) -> Result<Self> {
-        match args.first().map(String::as_str) {
+    pub(super) fn parse(args: Args<'_, '_>) -> Result<Self> {
+        match args.next().map(String::as_str) {
             Some("instructions") => {
-                let agent = Agent::parse(args.get(1).context("missing agent")?)?;
-                let format = match &args[2..] {
-                    [] => "human",
-                    [flag, value] if flag == "--format" => value,
-                    [flag] if flag.starts_with("--format=") => &flag[9..],
-                    _ => anyhow::bail!("expected --format human|json"),
+                let agent = Agent::parse(args.next().context("missing agent")?)?;
+                let format = match args.next().map(String::as_str) {
+                    None => "human",
+                    Some("--format") => args.next().context("expected --format human|json")?,
+                    Some(flag) => flag
+                        .strip_prefix("--format=")
+                        .context("expected --format human|json")?,
                 };
                 anyhow::ensure!(
-                    matches!(format, "human" | "json"),
+                    args.next().is_none() && matches!(format, "human" | "json"),
                     "expected --format human|json"
                 );
                 Ok(Self::Instructions {
@@ -89,13 +91,12 @@ impl AgentCommand {
                 })
             }
             Some("sync") => {
-                anyhow::ensure!(
-                    args.len() == 1 || (args.len() == 2 && args[1] == "--yes"),
-                    "expected agent sync [--yes]"
-                );
-                Ok(Self::Sync {
-                    yes: args.len() == 2,
-                })
+                let yes = match args.next().map(String::as_str) {
+                    Some("--yes") if args.next().is_none() => true,
+                    None => false,
+                    _ => anyhow::bail!("expected agent sync [--yes]"),
+                };
+                Ok(Self::Sync { yes })
             }
             _ => anyhow::bail!("expected agent instructions or sync"),
         }
@@ -235,8 +236,10 @@ mod tests {
                 .skip(1)
                 .map(str::to_owned)
                 .collect();
-            let (args, _, _) = super::super::protocol::options(args).unwrap();
-            super::super::CliCommand::parse(&args).unwrap();
+            assert!(matches!(
+                super::super::request::Request::parse(&args),
+                super::super::request::Request::Protocol(Ok(_))
+            ));
         }
     }
     #[test]

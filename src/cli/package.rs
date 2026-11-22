@@ -1,3 +1,4 @@
+use super::request::{Args, OutputFormat};
 use anyhow::{Context, Result, ensure};
 use std::path::PathBuf;
 use willow_compiler::{
@@ -12,7 +13,7 @@ use willow_compiler::{
 pub(super) struct PackageCommand {
     directory: PathBuf,
     dry_run: bool,
-    format: String,
+    pub(super) format: OutputFormat,
     operation: Operation,
 }
 #[derive(Debug)]
@@ -26,9 +27,12 @@ enum Operation {
 }
 
 impl PackageCommand {
-    pub(super) fn parse(command: &str, args: &[String]) -> Result<Self> {
-        let mut positional = Vec::new();
-        let mut format = "human".to_owned();
+    pub(super) fn parse(command: &str, args: Args<'_, '_>) -> Result<Self> {
+        // Two operands suffice for "deps why NAME". A third records overflow
+        // while allowing later option errors to retain their precedence.
+        let mut operands = [""; 3];
+        let mut count = 0;
+        let mut format = OutputFormat::Human;
         let mut format_seen = false;
         let mut git = None;
         let mut path = None;
@@ -37,23 +41,16 @@ impl PackageCommand {
         let mut dry_run = false;
         let mut breaking = false;
         let mut offline = false;
-        let mut args = args.iter();
         while let Some(arg) = args.next() {
-            let (option, inline) = arg
-                .split_once('=')
-                .map_or((arg.as_str(), None), |(a, b)| (a, Some(b)));
+            let (option, inline) = super::request::split_option(arg);
             match option {
                 "--format" => {
                     ensure!(!format_seen, "duplicate --format");
                     format_seen = true;
-                    format = inline
+                    let value = inline
                         .or_else(|| args.next().map(String::as_str))
-                        .context("missing --format value")?
-                        .to_owned();
-                    ensure!(
-                        matches!(format.as_str(), "human" | "json" | "ndjson"),
-                        "invalid package output format"
-                    );
+                        .context("missing --format value")?;
+                    format = OutputFormat::parse(value).context("invalid package output format")?;
                 }
                 "--dry-run"
                     if matches!(command, "add" | "remove" | "update") && inline.is_none() =>
@@ -94,16 +91,22 @@ impl PackageCommand {
                     );
                 }
                 _ if arg.starts_with('-') => anyhow::bail!("unknown {command} option `{arg}`"),
-                _ => positional.push(arg.clone()),
+                _ => {
+                    if let Some(slot) = operands.get_mut(count) {
+                        *slot = arg;
+                        count += 1;
+                    }
+                }
             }
         }
+        let positional = &operands[..count];
         let operation = match command {
             "metadata" => {
                 ensure!(
                     positional.len() <= 1,
                     "metadata accepts one project directory"
                 );
-                if let Some(path) = positional.pop() {
+                if let Some(path) = positional.first() {
                     ensure!(
                         directory.replace(PathBuf::from(path)).is_none(),
                         "duplicate project directory"
@@ -124,7 +127,7 @@ impl PackageCommand {
             }
             "add" => {
                 ensure!(positional.len() <= 1, "add accepts one alias or URL");
-                let mut alias = positional.pop();
+                let mut alias = positional.first().map(|s| (*s).to_owned());
                 if git.is_none() && path.is_none() {
                     let url = alias
                         .take()
@@ -159,7 +162,7 @@ impl PackageCommand {
                     "remove requires one dependency alias"
                 );
                 Operation::Mutate(PackageMutation::Remove {
-                    alias: positional.pop().unwrap(),
+                    alias: positional[0].to_owned(),
                 })
             }
             "update" => {
@@ -168,13 +171,13 @@ impl PackageCommand {
                     "update accepts at most one dependency alias"
                 );
                 Operation::Mutate(PackageMutation::Update {
-                    alias: positional.pop(),
+                    alias: positional.first().map(|s| (*s).to_owned()),
                     breaking,
                 })
             }
-            "deps" => match positional.as_slice() {
-                [tree] if tree == "tree" => Operation::Tree,
-                [why, target] if why == "why" => Operation::Why(target.clone()),
+            "deps" => match positional {
+                ["tree"] => Operation::Tree,
+                ["why", target] => Operation::Why((*target).to_owned()),
                 _ => anyhow::bail!("expected deps tree or deps why <alias|package-name>"),
             },
             _ => unreachable!(),
@@ -202,7 +205,7 @@ impl PackageCommand {
                 "no project.toml found",
             )
         })?;
-        if self.format != "human" {
+        if self.format != OutputFormat::Human {
             let value = match self.operation {
                 Operation::Tidy => serde_json::to_value(tidy_packages(&root)?)?,
                 Operation::Outdated { offline } => {
@@ -272,7 +275,10 @@ mod tests {
             ("deps", vec!["tree", "--dry-run"]),
         ] {
             let args: Vec<_> = args.into_iter().map(str::to_owned).collect();
-            assert!(PackageCommand::parse(cmd, &args).is_err(), "{cmd} {args:?}");
+            assert!(
+                PackageCommand::parse(cmd, &mut args.iter()).is_err(),
+                "{cmd} {args:?}"
+            );
         }
     }
 }

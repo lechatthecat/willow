@@ -1,3 +1,4 @@
+use super::request::{Args, OutputFormat};
 use anyhow::{Context, Result, ensure};
 use std::{collections::HashSet, path::PathBuf};
 use willow_compiler::{
@@ -9,35 +10,32 @@ use willow_compiler::{
     project,
 };
 
-struct Options {
+pub(super) struct Options {
     target: PathBuf,
     depth: Option<u8>,
-    format: String,
+    pub(super) format: OutputFormat,
     max_chars: usize,
     all: bool,
     absolute: bool,
     kind: Option<String>,
 }
 impl Options {
-    fn parse(args: &[String]) -> Result<Self> {
+    pub(super) fn parse(args: Args<'_, '_>) -> Result<Self> {
         let mut result = Self {
             target: ".".into(),
             depth: None,
-            format: "human".into(),
+            format: OutputFormat::Human,
             max_chars: 12000,
             all: false,
             absolute: false,
             kind: None,
         };
         let mut seen = HashSet::new();
-        let mut i = 0;
-        while i < args.len() {
-            let (key, inline) = args[i]
-                .split_once('=')
-                .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v)));
+        while let Some(arg) = args.next() {
+            let (key, inline) = super::request::split_option(arg);
             if !key.starts_with('-') {
                 ensure!(seen.insert("path"), "only one overview path is allowed");
-                result.target = args[i].clone().into();
+                result.target = arg.clone().into();
             } else {
                 ensure!(seen.insert(key), "duplicate option {key}");
                 match key {
@@ -53,8 +51,7 @@ impl Options {
                         let value = if let Some(v) = inline {
                             v
                         } else {
-                            i += 1;
-                            args.get(i).context("missing option value")?
+                            args.next().context("missing option value")?
                         };
                         match key {
                             "--depth" => {
@@ -62,11 +59,8 @@ impl Options {
                                 result.depth = Some(value.parse()?);
                             }
                             "--format" => {
-                                ensure!(
-                                    matches!(value, "human" | "json" | "ndjson"),
-                                    "format must be human, json or ndjson"
-                                );
-                                result.format = value.into();
+                                result.format = OutputFormat::parse(value)
+                                    .context("format must be human, json or ndjson")?;
                             }
                             "--max-chars" => {
                                 result.max_chars = value
@@ -83,7 +77,6 @@ impl Options {
                     _ => anyhow::bail!("unknown option {key}"),
                 }
             }
-            i += 1;
         }
         Ok(result)
     }
@@ -150,7 +143,7 @@ impl Options {
             target.display()
         );
         let code = i32::from(overview.status != "ok");
-        Ok((overview.render(&self.format, self.all)?, code))
+        Ok((overview.render(self.format.as_str(), self.all)?, code))
     }
 }
 #[derive(Default)]
@@ -169,21 +162,11 @@ impl willow_compiler::diagnostics::DiagnosticEmitter for ErrorCount {
         Ok(())
     }
 }
-pub(super) fn run(args: &[String]) -> Result<i32> {
-    let format = args
-        .iter()
-        .enumerate()
-        .find_map(|(i, a)| {
-            a.strip_prefix("--format=").or_else(|| {
-                if a == "--format" {
-                    args.get(i + 1).map(String::as_str)
-                } else {
-                    None
-                }
-            })
-        })
-        .unwrap_or("human");
-    let result = Options::parse(args)
+pub(super) fn run(parsed: Result<Options>, human_errors: bool) -> Result<i32> {
+    let human_errors = parsed.as_ref().map_or(human_errors, |options| {
+        options.format == OutputFormat::Human
+    });
+    let result = parsed
         .map_err(|e| (2, e))
         .and_then(|o| o.execute().map_err(|e| (1, e)));
     match result {
@@ -192,7 +175,7 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
             Ok(code)
         }
         Err((code, error)) => {
-            if format == "human" {
+            if human_errors {
                 eprintln!("{error:#}");
             } else {
                 println!(

@@ -17,8 +17,8 @@ pub(super) struct EditCommand {
     changes: ChangeFormat,
 }
 impl EditCommand {
-    pub(super) fn parse(args: &[String]) -> Result<Self> {
-        let operation = args.first().context(
+    pub(super) fn parse(args: Args<'_, '_>) -> Result<Self> {
+        let operation = args.next().context(
             "edit requires prepare, preview, verify, baseline, validate, apply or recover",
         )?;
         anyhow::ensure!(
@@ -40,7 +40,6 @@ impl EditCommand {
             manifest: None,
             changes: ChangeFormat::Full,
         };
-        let mut args = args[1..].iter();
         let mut seen = std::collections::HashSet::new();
         while let Some(key) = args.next() {
             anyhow::ensure!(seen.insert(key), "duplicate edit option");
@@ -181,7 +180,7 @@ mod tests {
     use super::*;
     fn parse(args: &str) -> Result<EditCommand> {
         let args: Vec<String> = args.split_whitespace().map(String::from).collect();
-        EditCommand::parse(&args)
+        EditCommand::parse(&mut args.iter())
     }
     #[test]
     fn changes_option_selects_preview_format() {
@@ -221,10 +220,11 @@ mod semantic_verify_tests {
     use super::*;
     fn parse(text: &str) -> Result<EditCommand> {
         EditCommand::parse(
-            &text
+            &mut text
                 .split_whitespace()
                 .map(String::from)
-                .collect::<Vec<_>>(),
+                .collect::<Vec<_>>()
+                .iter(),
         )
     }
     #[test]

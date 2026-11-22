@@ -3,23 +3,6 @@ use super::*;
 use serde_json::{Value, json};
 use willow_compiler::ai::direct::{DirectSession, RenameMode, SelectorFilter};
 
-pub(super) fn requested(args: &[String]) -> bool {
-    match args.first().map(String::as_str) {
-        Some("refs" | "references" | "symbol" | "type" | "effects" | "rename") => true,
-        Some("impact") => {
-            !args.get(1).is_some_and(|a| {
-                a.ends_with(".wi") || matches!(a.as_str(), "." | "..") || PathBuf::from(a).is_dir()
-            }) && !args.iter().any(|a| {
-                matches!(
-                    a.split('=').next(),
-                    Some("--function" | "--revision" | "--file" | "--byte" | "--protocol-version")
-                )
-            })
-        }
-        _ => false,
-    }
-}
-
 // Includes lexical symbols omitted from the overview's declaration-only list.
 const SYMBOL_KINDS: &[&str] = &[
     "module",
@@ -39,10 +22,10 @@ const SYMBOL_KINDS: &[&str] = &[
     "type-parameter",
 ];
 
-struct Options {
+pub(super) struct Options {
     command: String,
     selector: String,
-    format: String,
+    format: OutputFormat,
     source: Option<String>,
     project: Option<PathBuf>,
     filter: SelectorFilter,
@@ -57,102 +40,129 @@ struct Options {
     warnings: bool,
     max_chars: Option<usize>,
 }
-impl Options {
-    fn parse(args: &[String]) -> Result<Self> {
-        let mut result = Self {
-            command: args[0].clone(),
-            selector: String::new(),
-            format: "human".into(),
-            source: None,
-            project: None,
-            filter: SelectorFilter::default(),
-            all: false,
-            absolute: false,
-            explain: false,
-            show_id: false,
-            new_name: None,
-            dry_run: false,
-            diff: false,
-            verbose: false,
-            warnings: false,
-            max_chars: None,
-        };
-        let mut seen = std::collections::HashSet::new();
-        let mut i = 1;
-        while i < args.len() {
-            let (key, inline) = args[i]
-                .split_once('=')
-                .map_or((args[i].as_str(), None), |(k, v)| (k, Some(v)));
-            if !key.starts_with('-') {
-                if result.selector.is_empty() {
-                    result.selector = args[i].clone();
-                } else {
-                    anyhow::ensure!(
-                        result.command == "rename" && result.new_name.is_none(),
-                        "unexpected positional argument"
-                    );
-                    result.new_name = Some(args[i].clone());
-                }
+pub(super) struct Parser<'a> {
+    options: Options,
+    seen: std::collections::HashSet<&'a str>,
+    pending: Option<&'a str>,
+    valid_format: bool,
+}
+
+impl<'a> Parser<'a> {
+    pub(super) fn new(command: &str) -> Self {
+        Self {
+            options: Options {
+                command: command.to_owned(),
+                selector: String::new(),
+                format: OutputFormat::Human,
+                source: None,
+                project: None,
+                filter: SelectorFilter::default(),
+                all: false,
+                absolute: false,
+                explain: false,
+                show_id: false,
+                new_name: None,
+                dry_run: false,
+                diff: false,
+                verbose: false,
+                warnings: false,
+                max_chars: None,
+            },
+            seen: Default::default(),
+            pending: None,
+            valid_format: true,
+        }
+    }
+
+    pub(super) fn push(&mut self, arg: &'a str) -> Result<()> {
+        if let Some(key) = self.pending.take() {
+            return self.value(key, arg);
+        }
+        let result = &mut self.options;
+        let (key, inline) = super::request::split_option(arg);
+        if !key.starts_with('-') {
+            if result.selector.is_empty() {
+                result.selector = arg.to_owned();
             } else {
-                anyhow::ensure!(seen.insert(key), "duplicate option {key}");
-                match key {
-                    "--all" | "--absolute-paths" | "--explain" | "--show-id" | "--dry-run"
-                    | "--verbose" | "--diff" | "--warnings" => {
-                        anyhow::ensure!(inline.is_none(), "unexpected value for {key}");
-                        match key {
-                            "--all" => result.all = true,
-                            "--absolute-paths" => result.absolute = true,
-                            "--explain" => result.explain = true,
-                            "--diff" => result.diff = true,
-                            "--dry-run" => result.dry_run = true,
-                            "--verbose" => result.verbose = true,
-                            "--warnings" => result.warnings = true,
-                            _ => result.show_id = true,
-                        }
+                anyhow::ensure!(
+                    result.command == "rename" && result.new_name.is_none(),
+                    "unexpected positional argument"
+                );
+                result.new_name = Some(arg.to_owned());
+            }
+        } else {
+            anyhow::ensure!(self.seen.insert(key), "duplicate option {key}");
+            match key {
+                "--all" | "--absolute-paths" | "--explain" | "--show-id" | "--dry-run"
+                | "--verbose" | "--diff" | "--warnings" => {
+                    anyhow::ensure!(inline.is_none(), "unexpected value for {key}");
+                    match key {
+                        "--all" => result.all = true,
+                        "--absolute-paths" => result.absolute = true,
+                        "--explain" => result.explain = true,
+                        "--diff" => result.diff = true,
+                        "--dry-run" => result.dry_run = true,
+                        "--verbose" => result.verbose = true,
+                        "--warnings" => result.warnings = true,
+                        _ => result.show_id = true,
                     }
-                    "--format" | "--source" | "--project-dir" | "--kind" | "--module"
-                    | "--package" | "--max-chars" => {
-                        let value = if let Some(value) = inline {
-                            value
-                        } else {
-                            i += 1;
-                            args.get(i).context("missing option value")?
-                        };
-                        anyhow::ensure!(
-                            !value.is_empty() && !value.starts_with("--"),
-                            "missing option value for {key}"
-                        );
-                        match key {
-                            "--max-chars" => {
-                                result.max_chars = Some(
-                                    value
-                                        .parse()
-                                        .context("max-chars must be a nonnegative integer")?,
-                                )
-                            }
-                            "--format" => result.format = value.into(),
-                            "--source" => result.source = Some(value.into()),
-                            "--project-dir" => result.project = Some(value.into()),
-                            "--kind" => {
-                                anyhow::ensure!(
-                                    SYMBOL_KINDS.contains(&value),
-                                    "invalid --kind '{value}'. Valid symbol kinds: {}. \
+                }
+                "--format" | "--source" | "--project-dir" | "--kind" | "--module" | "--package"
+                | "--max-chars" => {
+                    if let Some(value) = inline {
+                        return self.value(key, value);
+                    }
+                    self.pending = Some(key);
+                }
+                _ => anyhow::bail!("unknown option {key}"),
+            }
+        }
+        Ok(())
+    }
+
+    fn value(&mut self, key: &str, value: &str) -> Result<()> {
+        let result = &mut self.options;
+        anyhow::ensure!(
+            !value.is_empty() && !value.starts_with("--"),
+            "missing option value for {key}"
+        );
+        match key {
+            "--max-chars" => {
+                result.max_chars = Some(
+                    value
+                        .parse()
+                        .context("max-chars must be a nonnegative integer")?,
+                )
+            }
+            "--format" => {
+                if let Some(format) = OutputFormat::parse(value) {
+                    result.format = format;
+                } else {
+                    self.valid_format = false;
+                }
+            }
+            "--source" => result.source = Some(value.into()),
+            "--project-dir" => result.project = Some(value.into()),
+            "--kind" => {
+                anyhow::ensure!(
+                    SYMBOL_KINDS.contains(&value),
+                    "invalid --kind '{value}'. Valid symbol kinds: {}. \
                                      --kind filters symbol kinds, not effect names; \
                                      the effects command currently has no effect filter. \
                                      Use willow effects SELECTOR without --kind to inspect effects.",
-                                    SYMBOL_KINDS.join(", ")
-                                );
-                                result.filter.kind = Some(value.into());
-                            }
-                            "--module" => result.filter.module = Some(value.into()),
-                            _ => result.filter.package = Some(value.into()),
-                        }
-                    }
-                    _ => anyhow::bail!("unknown option {key}"),
-                }
+                    SYMBOL_KINDS.join(", ")
+                );
+                result.filter.kind = Some(value.into());
             }
-            i += 1;
+            "--module" => result.filter.module = Some(value.into()),
+            _ => result.filter.package = Some(value.into()),
         }
+        Ok(())
+    }
+
+    pub(super) fn finish(self) -> Result<Options> {
+        anyhow::ensure!(self.pending.is_none(), "missing option value");
+        let result = self.options;
         anyhow::ensure!(!result.selector.is_empty(), "missing selector");
         anyhow::ensure!(
             result.command != "rename" || result.new_name.is_some(),
@@ -163,10 +173,7 @@ impl Options {
             "rename-only option"
         );
         anyhow::ensure!(!result.diff || result.dry_run, "--diff requires --dry-run");
-        anyhow::ensure!(
-            matches!(result.format.as_str(), "human" | "json" | "ndjson"),
-            "format must be human, json or ndjson"
-        );
+        anyhow::ensure!(self.valid_format, "format must be human, json or ndjson");
         anyhow::ensure!(
             result.source.is_none() || result.project.is_none(),
             "--source and --project-dir are mutually exclusive"
@@ -177,6 +184,17 @@ impl Options {
         );
         Ok(result)
     }
+}
+impl Options {
+    #[cfg(test)]
+    fn parse(args: &[String]) -> Result<Self> {
+        let mut parser = Parser::new(&args[0]);
+        for arg in &args[1..] {
+            parser.push(arg)?;
+        }
+        parser.finish()
+    }
+
     /// `warnings` counts checker warnings even when analysis or the query
     /// later fails, so every result can report the suppressed total.
     fn execute(&self, warnings: &mut usize) -> Result<Value> {
@@ -270,11 +288,13 @@ impl Options {
             );
         }
         let mut result = session.query(&self.command, &self.selector, &self.filter, self.all)?;
-        if matches!(self.command.as_str(), "effects" | "impact") && self.format == "human" {
+        if matches!(self.command.as_str(), "effects" | "impact")
+            && self.format == OutputFormat::Human
+        {
             session.display_function_targets(&mut result, self.absolute)?;
         }
         session.display_locations(&mut result, self.absolute)?;
-        if !(self.explain || self.command == "effects" && self.format == "human") {
+        if !(self.explain || self.command == "effects" && self.format == OutputFormat::Human) {
             concise(&mut result);
         }
         Ok(
@@ -1145,14 +1165,14 @@ fn render(value: &Value, options: &Options) -> Result<String> {
     let Some(limit) = options.max_chars else {
         return Ok(format!(
             "{}\n",
-            if options.format == "human" {
+            if options.format == OutputFormat::Human {
                 human(value, options)
             } else {
                 serde_json::to_string(value)?
             }
         ));
     };
-    let json = options.format != "human";
+    let json = options.format != OutputFormat::Human;
     let mut text = String::new();
     let mut boundaries = Vec::new();
     let mut chars = 0;
@@ -1174,19 +1194,7 @@ fn render(value: &Value, options: &Options) -> Result<String> {
     capped_prefix(&text, &boundaries, limit, json)
 }
 
-pub(super) fn run(args: &[String]) -> Result<i32> {
-    let parsed = Options::parse(args);
-    let format = args
-        .iter()
-        .enumerate()
-        .find_map(|(i, a)| {
-            a.strip_prefix("--format=").or_else(|| {
-                (a == "--format")
-                    .then(|| args.get(i + 1).map(String::as_str))
-                    .flatten()
-            })
-        })
-        .unwrap_or("human");
+pub(super) fn run(command: &str, parsed: Result<Options>, human_errors: bool) -> Result<i32> {
     let mut warnings = 0;
     let (mut value, code) = match &parsed {
         Ok(options) => match options.execute(&mut warnings) {
@@ -1205,7 +1213,7 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
             }
         },
         Err(error) => (
-            json!({"schema":1,"kind":args[0],"status":"invalid-arguments","message":format!("{error:#}")}),
+            json!({"schema":1,"kind":command,"status":"invalid-arguments","message":format!("{error:#}")}),
             2,
         ),
     };
@@ -1220,17 +1228,13 @@ pub(super) fn run(args: &[String]) -> Result<i32> {
                 return Ok(2);
             }
         }
-        if warnings > 0 && !options.warnings && options.format == "human" {
+        if warnings > 0 && !options.warnings && options.format == OutputFormat::Human {
             eprintln!(
                 "note: {} suppressed; rerun with --warnings to show them",
                 counted(warnings as u64, "checker warning")
             );
         }
-    } else if format == "human"
-        || args
-            .iter()
-            .any(|a| a == "--max-chars" || a.starts_with("--max-chars="))
-    {
+    } else if human_errors {
         eprintln!(
             "{}",
             value["message"].as_str().unwrap_or("invalid arguments")
@@ -1259,7 +1263,7 @@ mod tests {
                 "suggestions":["α猫","β犬"], "impact":{"nodes":[{"selector":"α猫"},{"selector":"β犬"}]}
             }});
             for format in ["human", "json", "ndjson"] {
-                options.format = format.into();
+                options.format = OutputFormat::parse(format).unwrap();
                 options.max_chars = None;
                 let baseline = render(&value, &options).unwrap();
                 let expected = if format == "human" {
