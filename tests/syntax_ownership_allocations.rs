@@ -86,3 +86,32 @@ fn syntax_ownership_allocation_scaling() {
         }
     }
 }
+
+#[test]
+fn deep_type_comparison_borrows_children_and_checks_function_results() {
+    use willow_compiler::parser::ast::Type;
+    for depth in [1, 8, 64, 512] {
+        let wrap = |leaf: Type| (0..depth).fold(leaf, |ty, _| Type::Array(Box::new(ty)));
+        let left = wrap(Type::I64);
+        let right = wrap(Type::I64);
+        let wrong = wrap(Type::Bool);
+        assert_eq!(measured(|| left == right), (true, 0));
+        assert_eq!(measured(|| left == wrong), (false, 0));
+
+        let callable = |params: Vec<Type>, result| Type::Fn(params, Box::new(result));
+        let f = callable(vec![Type::Bool, Type::I64], left);
+        let same = callable(vec![Type::Bool, Type::I64], right.clone());
+        let result = callable(vec![Type::Bool, Type::I64], wrong);
+        let arity = callable(vec![Type::Bool], right.clone());
+        let param = callable(vec![Type::Bool, Type::U64], right);
+        let (equal, allocations) = measured(|| f == same);
+        assert!(equal);
+        assert!(
+            allocations <= 1,
+            "{allocations} allocations at depth {depth}"
+        );
+        assert_ne!(f, result);
+        assert_ne!(f, arity);
+        assert_ne!(f, param);
+    }
+}

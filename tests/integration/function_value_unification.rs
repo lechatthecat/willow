@@ -20,6 +20,108 @@ async fn stage_task(s: SharedStage, x: i64) -> i64 { let f = s.run; await sleep(
 ";
 
 #[test]
+fn generated_temporaries_preserve_named_call_targets() {
+    let source = "
+fn __lir_value_2() -> i64 { return 7; }
+fn test(x: i64) -> i64 { return (x + x) + __lir_value_2(); }
+fn main() { println(test(3)); }";
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "13\n");
+
+    let source = "
+import std::collections::Array;
+fn __lir_value_2() -> i64 { return 7; }
+fn __async_return_0(n: i64) -> i64 { return n + 10; }
+fn eleven() -> i64 { return 11; }
+fn local(x: i64, __lir_value_2: fn() -> i64) -> i64 {
+    return (x + x) + __lir_value_2();
+}
+fn nested(flag: bool) -> i64 {
+    return __async_return_0(flag ? 1 : 2);
+}
+fn shadow(__async_return_0: fn() -> i64) -> i64 { return __async_return_0(); }
+fn store(a: Array<i64>, x: i64) { a[x - x] = x + __lir_value_2(); }
+fn loop_call(__for0_i: fn() -> i64) -> i64 {
+    let mut result = 0;
+    for i in 0..2 { result = result + __for0_i(); }
+    return result;
+}
+fn deferred(__defer0_print: fn() -> i64) {
+    defer println(1);
+    let __async_return_0 = eleven;
+    println(__defer0_print() + __async_return_0());
+}
+fn main() {
+    println(local(3, eleven));
+    println(nested(false));
+    println(shadow(eleven));
+    let a = [0];
+    store(a, 3);
+    println(a[0]);
+    println(loop_call(eleven));
+    deferred(eleven);
+}";
+    let (out, ok) = compile_and_run(source);
+    assert!(ok, "{out}");
+    assert_eq!(out, "17\n12\n11\n10\n22\n22\n1\n");
+}
+
+#[test]
+fn cfg_local_spellings_change_only_on_collision() {
+    let source = "
+fn probe(x:i64)->i64 { let __for0_unused = x + 1; return __for0_unused + x; }
+fn loop_before(x:i64)->i64 {
+    let mut sum = x;
+    for i in 0..2 { sum = sum + i; }
+    let __for0_i = sum + 1;
+    return __for0_i + sum;
+}
+fn loop_after(x:i64)->i64 {
+    let mut __for0_i = x;
+    for i in 0..2 { __for0_i = __for0_i + i; }
+    return __for0_i;
+}
+fn nested_defer(__defer0_print: i64) {
+    defer println(__defer0_print);
+    defer { defer println(8); }
+}
+fn main() { println(probe(3)); println(loop_before(3)); println(loop_after(3)); nested_defer(6); }";
+    let project = TestProject::new("cfg_local_spellings", &[("main.wi", source)]);
+    let output = project.emit_lir("main.wi");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lir = String::from_utf8(output.stdout).unwrap();
+    for (instruction, name, count) in [
+        ("Let {", "__for0_unused", 1),
+        ("Let {", "__for0_i", 2),
+        ("Let {", "__for0_i$", 2),
+        ("Let {", "__for0_end", 2),
+        ("Assign {", "__for0_i", 1),
+        ("Assign {", "__for0_i$", 2),
+    ] {
+        let field = format!("name: \"{name}\"");
+        let occurrences = lir
+            .lines()
+            .filter(|line| line.trim_start().starts_with(instruction) && line.contains(&field))
+            .count();
+        assert_eq!(occurrences, count, "{lir}");
+    }
+    let compiled = project.compile("main.wi");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let run = project.run();
+    assert!(run.status.success());
+    assert_eq!(run.stdout, b"7\n9\n4\n8\n6\n");
+}
+
+#[test]
 fn named_functions_and_lambdas_interchange_at_runtime() {
     let source = format!(
         "{DECLS}

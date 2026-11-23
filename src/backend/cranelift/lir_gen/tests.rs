@@ -1,6 +1,7 @@
 use super::*;
 use crate::backend::cranelift::symbols::{backend_symbol_component, class_member_symbol};
 use crate::backend::cranelift::type_index::TypeMap;
+use crate::ir::typed_ast::HirCallBinding;
 use crate::lexer::Lexer;
 use crate::parser::Parser;
 use willow_abi::runtime_symbols::names as rt;
@@ -1196,6 +1197,7 @@ fn may_allocate_preserves_twenty_wrapper_perspectives() {
         for allocating in [false, true] {
             let leaf = Box::new(node(if allocating {
                 HirExprKind::Call {
+                    binding: HirCallBinding::Function,
                     callee: "value".into(),
                     args: vec![],
                 }
@@ -1271,6 +1273,7 @@ fn may_allocate_preserves_twenty_wrapper_perspectives() {
             captures: vec![],
             body: vec![HirStmt::Return {
                 value: Some(node(HirExprKind::Call {
+                    binding: HirCallBinding::Function,
                     callee: "allocates".into(),
                     args: vec![],
                 })),
@@ -1327,6 +1330,7 @@ fn eligibility_wrapper(leaf: HirExpr, position: usize) -> HirExpr {
     match position {
         0 | 1 => eligibility_node(
             HirExprKind::Call {
+                binding: HirCallBinding::Function,
                 callee: "pair".into(),
                 args: if position == 0 {
                     vec![leaf, scalar()]
@@ -1532,12 +1536,12 @@ fn divergence_nested_if_and_match_use_a_one_megabyte_stack() {
                 let mut body = if diverges { vec![returns()] } else { vec![] };
                 for depth in 0..50_000 {
                     body = if depth % 2 == 0 {
-                        vec![HirStmt::If {
-                            cond: eligibility_node(HirExprKind::Bool(true), Type::Bool),
-                            then_branch: body,
-                            else_branch: Some(vec![returns()]),
+                        vec![HirStmt::conditional(
+                            eligibility_node(HirExprKind::Bool(true), Type::Bool),
+                            body,
+                            Some(vec![returns()]),
                             span,
-                        }]
+                        )]
                     } else {
                         vec![HirStmt::Expr(eligibility_node(
                             HirExprKind::Match {
@@ -7066,8 +7070,9 @@ fn d14_operand_position_panic_is_eligible() {
 #[test]
 fn d15_a_local_named_panic_is_not_the_builtin() {
     let span = crate::diagnostics::Span::dummy();
-    let call = HirExpr {
+    let call = |binding| HirExpr {
         kind: HirExprKind::Call {
+            binding,
             callee: "panic".to_string().into(),
             args: Vec::new(),
         },
@@ -7077,9 +7082,17 @@ fn d15_a_local_named_panic_is_not_the_builtin() {
     let tables = empty_tables();
     let local = Type::Fn(Vec::new(), Box::new(Type::Never));
     tables.with_ctx(|ctx| {
-        assert!(supported_panic(&call, ctx, &HashMap::new()));
+        assert!(supported_panic(
+            &call(HirCallBinding::Function),
+            ctx,
+            &HashMap::new()
+        ));
         let names: HashMap<&str, Cow<'_, Type>> = HashMap::from([("panic", Cow::Borrowed(&local))]);
-        assert!(!supported_panic(&call, ctx, &names));
+        assert!(!supported_panic(
+            &call(HirCallBinding::Local { may_change: false }),
+            ctx,
+            &names
+        ));
     });
 }
 
@@ -7340,6 +7353,7 @@ fn d26_arm_divergence_is_decided_by_the_tail_statement() {
     };
     let never = HirExpr {
         kind: HirExprKind::Call {
+            binding: HirCallBinding::Function,
             callee: "panic".to_string().into(),
             args: Vec::new(),
         },
@@ -7460,12 +7474,12 @@ fn d31_an_if_ends_an_arm_only_when_both_branches_leave() {
         }]
     };
     let guard = |else_branch: Option<Vec<HirStmt>>| {
-        vec![HirStmt::If {
-            cond: cond.clone(),
-            then_branch: returns(),
+        vec![HirStmt::conditional(
+            cond.clone(),
+            returns(),
             else_branch,
             span,
-        }]
+        )]
     };
     assert!(body_diverges(&guard(Some(returns()))));
     // no `else`: the falling-through path is still a path

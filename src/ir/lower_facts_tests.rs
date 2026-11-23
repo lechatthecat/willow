@@ -623,7 +623,11 @@ fn composite_receivers_build_only_their_final_types() {
                     }
                     if receiver == "captured(left)" {
                         let callback = ctx.lookup("callback").unwrap().ty.clone();
-                        ctx.bind_cell("captured".to_owned(), callback, true);
+                        ctx.bind_with_storage(
+                            "captured".to_owned(),
+                            callback,
+                            BindingStorage::Cell,
+                        );
                     }
                     let receivers: Vec<_> = AstWalk::new(AstEvent::Block(&f.body))
                         .filter_map(|event| match event {

@@ -21,6 +21,7 @@
 //! rather than silently dropping work, so later slices can extend coverage
 //! incrementally without changing behavior.
 
+pub(super) mod defer_stability;
 mod expressions;
 mod normalization;
 pub use normalization::NormalizedTypes;
@@ -52,8 +53,9 @@ use crate::semantic::type_checker::LambdaCapture;
 use crate::semantic::type_checker::types::await_output_type;
 
 use super::typed_ast::{
-    HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard,
-    HirMatchArm, HirParam, HirPattern, HirProgram, HirSelectCase, HirSelectCaseKind, HirStmt,
+    HirCallBinding, HirCapture, HirClass, HirDeferBody, HirDeferId, HirExpr, HirExprKind,
+    HirFunction, HirGuard, HirMatchArm, HirParam, HirPattern, HirProgram, HirSelectCase,
+    HirSelectCaseKind, HirStmt,
 };
 use crate::semantic::intrinsics::{BuiltinMethod, Intrinsic};
 
@@ -896,7 +898,7 @@ fn lower_function(
     let mut params = Vec::with_capacity(f.params.len());
     for p in &f.params {
         let ty = ctx.normalize(&p.ty);
-        let name = ctx.bind(p.name.clone(), ty.clone());
+        let name = ctx.bind_param(p, ty.clone());
         params.push(HirParam {
             name,
             ty: ty.into(),
@@ -905,6 +907,8 @@ fn lower_function(
         });
     }
     let return_type = ctx.normalize(&f.return_type);
+    // Contract expressions are outside the statement body resolved below.
+    ctx.deferred_callees.skipped = true;
     let requires = f
         .requires
         .iter()
@@ -923,7 +927,10 @@ fn lower_function(
         ctx.pop_scope();
         clauses
     };
-    let body = lower_block(&f.body, &mut ctx)?;
+    ctx.deferred_callees.skipped = false;
+    let mut body = lower_block(&f.body, &mut ctx, true)?;
+    ctx.deferred_callees
+        .resolve(&mut body, Some(&ctx.scopes), ctx.tables.symbols);
     Ok(HirFunction {
         requires,
         ensures,
@@ -971,7 +978,7 @@ fn lower_method(
     }
     for p in &m.params {
         let ty = ctx.normalize(&p.ty);
-        let name = ctx.bind(p.name.clone(), ty.clone());
+        let name = ctx.bind_param(p, ty.clone());
         params.push(HirParam {
             name,
             ty: ty.into(),
@@ -980,7 +987,9 @@ fn lower_method(
         });
     }
     let return_type = ctx.normalize(&m.return_type);
-    let body = lower_block(&m.body, &mut ctx)?;
+    let mut body = lower_block(&m.body, &mut ctx, true)?;
+    ctx.deferred_callees
+        .resolve(&mut body, Some(&ctx.scopes), ctx.tables.symbols);
     Ok(HirFunction {
         requires: Vec::new(),
         ensures: Vec::new(),
@@ -1016,7 +1025,7 @@ fn lower_constructor(
     });
     for p in &ctor.params {
         let ty = ctx.normalize(&p.ty);
-        let name = ctx.bind(p.name.clone(), ty.clone());
+        let name = ctx.bind_param(p, ty.clone());
         params.push(HirParam {
             name,
             ty: ty.into(),
@@ -1024,7 +1033,9 @@ fn lower_constructor(
             span: p.span,
         });
     }
-    let body = lower_block(&ctor.body, &mut ctx)?;
+    let mut body = lower_block(&ctor.body, &mut ctx, true)?;
+    ctx.deferred_callees
+        .resolve(&mut body, Some(&ctx.scopes), ctx.tables.symbols);
     Ok(HirFunction {
         requires: Vec::new(),
         ensures: Vec::new(),
@@ -1041,7 +1052,7 @@ fn lower_constructor(
 /// the HIR.
 #[derive(Clone)]
 struct Binding {
-    cell: bool,
+    storage: BindingStorage,
     ty: Type,
     /// The HIR name. This is the source name for the first binding of that
     /// name in a function, and `name$n` for every later one. LIR has a single flat namespace
@@ -1050,6 +1061,23 @@ struct Binding {
     /// `let` over a parameter, a `match` arm binding over an outer `let` —
     /// must not arrive there under one name.
     hir_name: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BindingStorage {
+    Stable,
+    MayChange,
+    Cell,
+}
+
+impl BindingStorage {
+    fn local(may_change: bool) -> Self {
+        if may_change {
+            Self::MayChange
+        } else {
+            Self::Stable
+        }
+    }
 }
 
 // A compiler-private, fixed one-element array is the GC-managed cell.
@@ -1071,7 +1099,7 @@ fn cell_index(span: Span) -> HirExpr {
 }
 
 fn binding_read(binding: &Binding, ty: crate::semantic::ids::SemanticType, span: Span) -> HirExpr {
-    let kind = if binding.cell {
+    let kind = if binding.storage == BindingStorage::Cell {
         HirExprKind::Index {
             array: Box::new(cell_storage(binding, span)),
             index: Box::new(cell_index(span)),
@@ -1095,6 +1123,7 @@ struct LowerCtx<'a, 'unit> {
     /// function, not only across the scopes currently open.
     binds_seen: HashMap<String, usize>,
     next_defer_id: u32,
+    deferred_callees: defer_stability::Callees,
     current_class: Option<String>,
     /// The receiver class an interface default's copy lowers the opaque
     /// `Self` its shared check typed the body with as.
@@ -1118,6 +1147,7 @@ impl<'a, 'unit> LowerCtx<'a, 'unit> {
             namespace_scope_base: 1,
             binds_seen: HashMap::new(),
             next_defer_id: 0,
+            deferred_callees: Default::default(),
             current_class: None,
             receiver: None,
             fn_returns,
@@ -1164,10 +1194,17 @@ impl<'a, 'unit> LowerCtx<'a, 'unit> {
     /// it. Callers MUST build their HIR node from the returned name — it is the
     /// source name only when nothing else in this function has claimed it.
     fn bind(&mut self, name: String, ty: Type) -> String {
-        self.bind_cell(name, ty, false)
+        self.bind_with_storage(name, ty, BindingStorage::Stable)
     }
 
-    fn bind_cell(&mut self, name: String, ty: Type, cell: bool) -> String {
+    fn bind_param(&mut self, param: &crate::parser::ast::Param, ty: Type) -> String {
+        // A read-only reference can still observe a write through another
+        // alias to its backing field or array element.
+        let borrowed = !matches!(param.mode, crate::parser::ast::ParamMode::Value);
+        self.bind_with_storage(param.name.clone(), ty, BindingStorage::local(borrowed))
+    }
+
+    fn bind_with_storage(&mut self, name: String, ty: Type, storage: BindingStorage) -> String {
         let seen = self.binds_seen.entry(name.clone()).or_insert(0);
         *seen += 1;
         // A nested local function value and a free function also share the
@@ -1187,7 +1224,7 @@ impl<'a, 'unit> LowerCtx<'a, 'unit> {
         self.scopes.insert(
             name,
             Binding {
-                cell,
+                storage,
                 ty,
                 hir_name: hir_name.clone(),
             },
@@ -1254,7 +1291,13 @@ fn retype_array_literal(value: &mut HirExpr, target: &Type) {
     lower_try_propagate_expr,
     lower_value_args
 )]
-fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagnostic> {
+fn lower_block(
+    block: &Block,
+    ctx: &mut LowerCtx,
+    reachable: bool,
+) -> Result<Vec<HirStmt>, Diagnostic> {
+    let enclosing_skipped = ctx.deferred_callees.skipped;
+    ctx.deferred_callees.skipped |= !reachable;
     ctx.push_scope();
     let mut out = Vec::with_capacity(block.stmts.len());
     for stmt in &block.stmts {
@@ -1378,6 +1421,7 @@ fn lower_block(block: &Block, ctx: &mut LowerCtx) -> Result<Vec<HirStmt>, Diagno
         out.push(lower_stmt(stmt, ctx)?);
     }
     ctx.pop_scope();
+    ctx.deferred_callees.skipped = enclosing_skipped;
     Ok(out)
 }
 
@@ -1428,7 +1472,12 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             // checker never accepted and no consumer can reason from.
             retype_array_literal(&mut value, &binding_ty);
             let cell = ctx.tables.cell_declaration(&l.span);
-            let name = ctx.bind_cell(l.name.clone(), binding_ty.clone(), cell);
+            let storage = if cell {
+                BindingStorage::Cell
+            } else {
+                BindingStorage::local(l.mutable)
+            };
+            let name = ctx.bind_with_storage(l.name.clone(), binding_ty.clone(), storage);
             let storage_ty = if cell {
                 Type::Array(Box::new(binding_ty))
             } else {
@@ -1453,7 +1502,10 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::Assign(a) => {
             let value = lower_expr(&a.value, ctx)?;
-            if let Some(binding) = ctx.lookup(&a.name).filter(|b| b.cell) {
+            if let Some(binding) = ctx
+                .lookup(&a.name)
+                .filter(|b| b.storage == BindingStorage::Cell)
+            {
                 return Ok(HirStmt::IndexAssign {
                     array: cell_storage(binding, a.span),
                     index: cell_index(a.span),
@@ -1469,20 +1521,31 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::If(i) => {
             let cond = lower_expr(&i.cond, ctx)?;
-            let then_branch = lower_block(&i.then_block, ctx)?;
+            let then_branch = lower_block(
+                &i.then_block,
+                ctx,
+                defer_stability::branch_reachable(&cond, true),
+            )?;
             let else_branch = match &i.else_block {
-                Some(b) => Some(lower_block(b, ctx)?),
+                Some(b) => Some(lower_block(
+                    b,
+                    ctx,
+                    defer_stability::branch_reachable(&cond, false),
+                )?),
                 None => None,
             };
-            Ok(HirStmt::If {
-                cond,
-                then_branch,
-                else_branch,
-                span: i.span,
-            })
+            let branch = HirStmt::conditional(cond, then_branch, else_branch, i.span);
+            ctx.deferred_callees.skipped |= branch.transfers_control();
+            Ok(branch)
         }
-        Stmt::Break(span) => Ok(HirStmt::Break { span: *span }),
-        Stmt::Continue(span) => Ok(HirStmt::Continue { span: *span }),
+        Stmt::Break(span) => {
+            ctx.deferred_callees.skipped = true;
+            Ok(HirStmt::Break { span: *span })
+        }
+        Stmt::Continue(span) => {
+            ctx.deferred_callees.skipped = true;
+            Ok(HirStmt::Continue { span: *span })
+        }
         // Every source form of `defer` has a HIR shape. The
         // body is lowered where it was written, so a deferred `match
         // recover()` sees the same bindings the registering scope did; a block
@@ -1495,8 +1558,9 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 .expect("too many defer sites");
             let body = match &d.body {
                 DeferBody::Expr(expr) => HirDeferBody::Expr(lower_expr(expr, ctx)?),
-                DeferBody::Block(block) => HirDeferBody::Block(lower_block(block, ctx)?),
+                DeferBody::Block(block) => HirDeferBody::Block(lower_block(block, ctx, true)?),
             };
+            ctx.deferred_callees.register(&body);
             Ok(HirStmt::Defer {
                 id,
                 body,
@@ -1524,17 +1588,24 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 _ => Err(unsupported(l.span, "lock target type")),
             };
             ctx.push_scope();
-            let binding = ctx.bind(l.binding.clone(), value_type(&target)?.to_source());
+            let binding = ctx.bind_with_storage(
+                l.binding.clone(),
+                value_type(&target)?.to_source(),
+                BindingStorage::local(l.mutable),
+            );
             for member in &mut additional {
-                member.binding = ctx.bind(
+                member.binding = ctx.bind_with_storage(
                     member.binding.clone(),
                     value_type(&member.target)?.to_source(),
+                    BindingStorage::local(member.mutable),
                 );
             }
+            let enclosing_skipped = ctx.deferred_callees.skipped;
             let mut body = Vec::with_capacity(l.body.stmts.len());
             for stmt in &l.body.stmts {
                 body.push(lower_stmt(stmt, ctx)?);
             }
+            ctx.deferred_callees.skipped = enclosing_skipped;
             ctx.pop_scope();
             Ok(HirStmt::Lock {
                 additional,
@@ -1548,7 +1619,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
         }
         Stmt::While(w) => {
             let cond = lower_expr(&w.cond, ctx)?;
-            let body = lower_block(&w.body, ctx)?;
+            let body = lower_block(&w.body, ctx, defer_stability::branch_reachable(&cond, true))?;
             Ok(HirStmt::While {
                 cond,
                 body,
@@ -1560,12 +1631,17 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
                 Some(e) => Some(lower_expr(e, ctx)?),
                 None => None,
             };
+            ctx.deferred_callees.skipped = true;
             Ok(HirStmt::Return {
                 value,
                 span: r.span,
             })
         }
-        Stmt::Expr(e) => Ok(HirStmt::Expr(lower_expr(&e.expr, ctx)?)),
+        Stmt::Expr(e) => {
+            let expr = lower_expr(&e.expr, ctx)?;
+            ctx.deferred_callees.skipped |= expr.ty == Type::Never;
+            Ok(HirStmt::Expr(expr))
+        }
         Stmt::FieldAssign(s) => {
             let object = lower_expr(&s.object, ctx)?;
             let value = lower_expr(&s.value, ctx)?;
@@ -1655,7 +1731,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             };
             ctx.push_scope();
             let name = ctx.bind(s.name.clone(), (element_ty).to_source());
-            let body = lower_block(&s.body, ctx)?;
+            let body = lower_block(&s.body, ctx, true)?;
             ctx.pop_scope();
             Ok(HirStmt::For {
                 name,
@@ -1847,6 +1923,7 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
                 .expect("integer contract expression");
             let op = willow_abi::integer_overflow::encode(op, layout.bits, layout.signed);
             node.kind = HirExprKind::Call {
+                binding: HirCallBinding::Function,
                 callee: "$contract_i64".into(),
                 args: vec![int(op), lhs, rhs],
             };

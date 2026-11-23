@@ -858,3 +858,32 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "42\n99\n0\n");
 }
+
+#[test]
+fn nested_calls_keep_outer_values_and_captured_places_in_order() {
+    assert_reference_args(
+        r#"
+        class Box {
+            pub value: i64;
+            pub init(self, a: &mut i64, b: i64) { a = a + b; self.value = a; }
+            pub fn add(self, a: &mut i64, b: i64) -> i64 {
+                a = a + b; return self.value + a;
+            }
+            pub static fn twice(a: &mut i64, b: i64) -> i64 { a = a + b; return 2 * a; }
+        }
+        fn combine(prefix: i64, slot: &mut i64, v: i64) -> i64 {
+            slot = slot + v; return prefix + slot;
+        }
+        fn exercise(flag: bool) {
+            let a = [1, 2, 3];
+            let mut x = 4;
+            let result = combine(100, &a[0],
+                new Box(&x, flag ? 6 : 0).add(&a[1], Box::twice(&a[2], flag ? 7 : 0)));
+            println(result); println(a[0]); println(a[1]); println(a[2]); println(x);
+        }
+        fn main() { exercise(true); }
+        "#,
+        "133\n33\n22\n10\n10\n",
+        &["combine", "exercise"],
+    );
+}

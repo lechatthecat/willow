@@ -44,9 +44,86 @@ pub struct HirResolution {
     pub namespaces: std::collections::HashMap<TypeId, String>,
 }
 
+/// Ordered generic parameters. Cloned declaration snapshots share the immutable
+/// names and the lookup index, which is built only on a named lookup.
+#[derive(Clone, Default)]
+pub struct HirTypeParameters(ParameterNames);
+
+#[derive(Clone, Default)]
+enum ParameterNames {
+    #[default]
+    Empty,
+    One(TypeId),
+    Many(std::sync::Arc<IndexedNames>),
+}
+
+struct IndexedNames {
+    ordered: Box<[TypeId]>,
+    indices: std::sync::OnceLock<std::collections::HashMap<TypeId, usize>>,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static BINDING_INDEX_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl FromIterator<TypeId> for HirTypeParameters {
+    fn from_iter<I: IntoIterator<Item = TypeId>>(iter: I) -> Self {
+        let mut names = iter.into_iter();
+        let Some(first) = names.next() else {
+            return Self::default();
+        };
+        let Some(second) = names.next() else {
+            return Self(ParameterNames::One(first));
+        };
+        Self(ParameterNames::Many(std::sync::Arc::new(IndexedNames {
+            ordered: [first, second].into_iter().chain(names).collect(),
+            indices: Default::default(),
+        })))
+    }
+}
+
+impl std::fmt::Debug for HirTypeParameters {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(self.as_slice(), f)
+    }
+}
+
+impl PartialEq for HirTypeParameters {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_slice() == other.as_slice()
+    }
+}
+
+impl HirTypeParameters {
+    pub fn as_slice(&self) -> &[TypeId] {
+        match &self.0 {
+            ParameterNames::Empty => &[],
+            ParameterNames::One(id) => std::slice::from_ref(id),
+            ParameterNames::Many(params) => &params.ordered,
+        }
+    }
+
+    pub(crate) fn position(&self, name: &TypeId) -> Option<usize> {
+        let params = match &self.0 {
+            ParameterNames::Empty => return None,
+            ParameterNames::One(only) => return (name == only).then_some(0),
+            ParameterNames::Many(params) => params,
+        };
+        let indices = params.indices.get_or_init(|| {
+            let index: std::collections::HashMap<_, _> =
+                params.ordered.iter().copied().zip(0..).collect();
+            #[cfg(test)]
+            BINDING_INDEX_ENTRIES.set(BINDING_INDEX_ENTRIES.get() + index.len());
+            index
+        });
+        indices.get(name).copied()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct HirEnumInfo {
-    pub type_params: Vec<TypeId>,
+    pub type_params: HirTypeParameters,
     pub variants: Vec<HirEnumVariant>,
 }
 
@@ -71,7 +148,7 @@ pub struct HirClassInfo {
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct HirInterfaceInfo {
-    pub type_params: Vec<TypeId>,
+    pub type_params: HirTypeParameters,
     pub extends: Vec<TypeId>,
     pub methods: std::collections::HashMap<String, HirSignature>,
 }
@@ -90,36 +167,56 @@ impl HirResolution {
     /// Representation-preserving class upcasts and declared interface
     /// conversions. Lowering uses declarations rather than backend layouts.
     pub(crate) fn can_coerce(&self, source: &Type, target: &Type) -> bool {
-        if source == target {
-            return true;
-        }
-        // The two callable kinds share one representation, at any depth (a
-        // function value, or an `Option`/`FrozenArray`/... of them); the
-        // checker already enforced which direction and which variance is
-        // allowed, so lowering only needs the shapes to agree.
-        if source.same_modulo_callable_kind(target) {
-            return true;
-        }
-        let mut pending = vec![source.clone()];
-        let mut seen = std::collections::HashSet::new();
-        while let Some(current) = pending.pop() {
-            if current == *target {
-                return true;
+        self.can_coerce_matching(source, |ty, relax| {
+            if relax {
+                ty.same_modulo_callable_kind(target)
+            } else {
+                ty == target
             }
-            if !seen.insert(current.clone()) {
+        })
+    }
+
+    /// Ancestors are nominal. Actual arguments affect the match, while the
+    /// declaration alone determines which edges to visit next.
+    pub(crate) fn can_coerce_matching(
+        &self,
+        source: &Type,
+        matches: impl Fn(&Type, bool) -> bool,
+    ) -> bool {
+        if matches(source, true) {
+            return true;
+        }
+        let (Type::Named(root) | Type::Generic(root, _)) = source else {
+            return false;
+        };
+        let mut pending = vec![*root];
+        let mut seen = std::collections::HashSet::new();
+        while let Some(id) = pending.pop() {
+            if !seen.insert(id) {
                 continue;
             }
-            let identity = match &current {
-                Type::Named(id) | Type::Generic(id, _) => *id,
-                _ => continue,
-            };
-            if let Some(class) = self.classes.get(&identity) {
+            if let Some(class) = self.classes.get(&id) {
                 if let Some(base) = class.base {
-                    pending.push(Type::Named(base));
+                    if matches(&Type::Named(base), false) {
+                        return true;
+                    }
+                    pending.push(base);
                 }
-                pending.extend(class.implements.iter().cloned());
-            } else if let Some(interface) = self.interfaces.get(&identity) {
-                pending.extend(interface.extends.iter().map(|parent| Type::Named(*parent)));
+                for ty in &class.implements {
+                    if matches(ty, false) {
+                        return true;
+                    }
+                    if let Type::Named(id) | Type::Generic(id, _) = ty {
+                        pending.push(*id);
+                    }
+                }
+            } else if let Some(interface) = self.interfaces.get(&id) {
+                for &parent in &interface.extends {
+                    if matches(&Type::Named(parent), false) {
+                        return true;
+                    }
+                    pending.push(parent);
+                }
             }
         }
         false
@@ -224,6 +321,8 @@ pub enum HirStmt {
     },
     /// `if cond { .. } else { .. }` — `cond` is always `Bool`.
     If {
+        /// All reachable arms transfer control out of the enclosing statement list.
+        exits: bool,
         cond: HirExpr,
         then_branch: Vec<HirStmt>,
         else_branch: Option<Vec<HirStmt>>,
@@ -426,6 +525,11 @@ pub struct HirExprWalk<'a> {
     pending: Vec<(&'a HirExpr, bool)>,
     include_lambdas: bool,
 }
+#[cfg(test)]
+std::thread_local! {
+    pub(crate) static POSTORDER_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl<'a> Iterator for HirExprWalk<'a> {
     type Item = &'a HirExpr;
     fn next(&mut self) -> Option<Self::Item> {
@@ -434,6 +538,8 @@ impl<'a> Iterator for HirExprWalk<'a> {
                 continue;
             }
             if visited {
+                #[cfg(test)]
+                POSTORDER_VISITS.set(POSTORDER_VISITS.get() + 1);
                 return Some(expr);
             }
             self.pending.push((expr, true));
@@ -456,6 +562,51 @@ fn nested_exprs(body: &[HirStmt]) -> Vec<&HirExpr> {
 }
 
 impl HirStmt {
+    pub(crate) fn conditional(
+        cond: HirExpr,
+        then_branch: Vec<HirStmt>,
+        else_branch: Option<Vec<HirStmt>>,
+        span: Span,
+    ) -> Self {
+        // Child conditionals already summarize their arms. Inspect only this
+        // list's immediate statements, even for deeply nested conditionals.
+        fn arm_exits(body: &[HirStmt]) -> bool {
+            for stmt in body {
+                match stmt {
+                    // A cleanup may recover and resume after this scope.
+                    HirStmt::Defer { .. } => return false,
+                    HirStmt::Expr(e) if e.ty == Type::Never => return false,
+                    _ if stmt.transfers_control() => return true,
+                    _ => {}
+                }
+            }
+            false
+        }
+
+        let exits = match cond.kind {
+            HirExprKind::Bool(true) => arm_exits(&then_branch),
+            HirExprKind::Bool(false) => else_branch.as_deref().is_some_and(arm_exits),
+            _ => else_branch.as_deref().is_some_and(arm_exits) && arm_exits(&then_branch),
+        };
+        Self::If {
+            cond,
+            then_branch,
+            else_branch,
+            span,
+            exits,
+        }
+    }
+
+    pub(crate) fn transfers_control(&self) -> bool {
+        matches!(
+            self,
+            Self::Return { .. }
+                | Self::Break { .. }
+                | Self::Continue { .. }
+                | Self::If { exits: true, .. }
+        )
+    }
+
     /// Every expression this statement holds directly, including those inside
     /// its nested statement bodies. Exhaustive for the same reason as
     /// [`HirExpr::children`].
@@ -535,6 +686,20 @@ impl HirStmt {
     }
 }
 
+/// Lexical resolution of a named call. A deferred call can retain a stable
+/// binding directly. A local that may change before cleanup is read at registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HirCallBinding {
+    Function,
+    Local { may_change: bool },
+}
+
+impl HirCallBinding {
+    pub(crate) fn is_local(self) -> bool {
+        matches!(self, Self::Local { .. })
+    }
+}
+
 /// The expression forms covered by slice 1.
 #[derive(Debug, Clone, PartialEq)]
 pub enum HirExprKind {
@@ -558,9 +723,10 @@ pub enum HirExprKind {
         op: UnaryOp,
         operand: Box<HirExpr>,
     },
-    /// A free-function call; `ty` is the callee's return type.
+    /// A named call. Lexical resolution distinguishes a local callable from a function.
     Call {
         callee: FunctionId,
+        binding: HirCallBinding,
         args: Vec<HirExpr>,
     },
     /// Call a computed callable value (including a mutable capture cell load).
@@ -793,3 +959,6 @@ pub enum HirPattern {
 
 #[path = "typed_ast/ownership.rs"]
 mod ownership;
+pub(crate) use ownership::{
+    ChildrenMut, NodeRef as HirNodeRef, Siblings, visit_expr_children_mut, visit_stmt_children_mut,
+};

@@ -1289,6 +1289,7 @@ pub(crate) fn scalar_replace_objects(
 mod tests {
     use super::*;
     use crate::diagnostics::Span;
+    use crate::ir::typed_ast::HirCallBinding;
 
     fn lowered(source: &str) -> super::super::lowered::SourceProgram {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
@@ -1833,6 +1834,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
     fn folds_constant_exponent_but_preserves_dynamic_base() {
         let base = HirExpr {
             kind: HirExprKind::Call {
+                binding: HirCallBinding::Function,
                 callee: "effect".into(),
                 args: vec![],
             },
@@ -1991,6 +1993,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
         };
         let call = HirExpr {
             kind: HirExprKind::Call {
+                binding: HirCallBinding::Function,
                 callee: "effect".into(),
                 args: vec![],
             },
@@ -2193,6 +2196,7 @@ fn calling(n: i64) -> i64 { let mut i = 0; while i < n { i = effect(i); } return
         ] {
             let call = HirExpr {
                 kind: HirExprKind::Call {
+                    binding: HirCallBinding::Function,
                     callee: "mutate".into(),
                     args,
                 },

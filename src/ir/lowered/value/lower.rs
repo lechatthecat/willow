@@ -1,24 +1,60 @@
 use super::LirPlace;
 use super::*;
+use crate::ir::lowered::{
+    HirCallBinding, LoweringDeclarations, ParameterType, ProjectedParameter, ResolvedSignature,
+    match_bound_parameter,
+};
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
+use std::borrow::Cow;
 
-#[derive(Default)]
-struct Callables {
-    signatures: HashMap<FunctionId, (Vec<Type>, Type)>,
-    async_outputs: HashMap<FunctionId, Type>,
-    resolution: crate::ir::typed_ast::HirResolution,
+#[derive(Clone, Copy)]
+enum CallParameters<'a> {
+    Source(&'a [crate::ir::typed_ast::HirParam]),
+    Declaration(&'a [Type]),
 }
-impl std::ops::Deref for Callables {
-    type Target = HashMap<FunctionId, (Vec<Type>, Type)>;
-    fn deref(&self) -> &Self::Target {
-        &self.signatures
+
+impl<'a> CallParameters<'a> {
+    fn iter(self) -> impl ExactSizeIterator<Item = &'a Type> {
+        let len = match self {
+            Self::Source(params) => params.len(),
+            Self::Declaration(types) => types.len(),
+        };
+        (0..len).map(move |i| match self {
+            Self::Source(params) => &params[i].ty,
+            Self::Declaration(types) => &types[i],
+        })
     }
 }
 
-fn class_fields(class: &TypeId, callables: &Callables) -> Option<Vec<(String, Type)>> {
-    super::super::class_fields(&callables.resolution, class)
+struct CallSignature<'a> {
+    params: CallParameters<'a>,
+    output: &'a Type,
+    is_async: bool,
 }
 
+impl CallSignature<'_> {
+    fn returns(&self, ty: &Type) -> bool {
+        if self.is_async {
+            matches!(ty, Type::Generic(id, args) if *id == TypeId::local("Task")
+                && args.as_slice() == std::slice::from_ref(self.output))
+        } else {
+            self.output == ty
+        }
+    }
+}
+
+struct Callables<'s, 'r> {
+    signatures: HashMap<FunctionId, CallSignature<'s>>,
+    resolution: &'r LoweringDeclarations<'r>,
+}
+impl<'r> Callables<'_, 'r> {
+    fn new(resolution: &'r LoweringDeclarations<'r>) -> Self {
+        Self {
+            resolution,
+            signatures: HashMap::new(),
+        }
+    }
+}
 fn static_field(class: &TypeId, field: &str, callables: &Callables) -> bool {
     let mut next = Some(*class);
     let mut seen = std::collections::HashSet::new();
@@ -37,37 +73,31 @@ fn static_field(class: &TypeId, field: &str, callables: &Callables) -> bool {
     false
 }
 
-fn static_call(
+fn static_call<'a>(
     class: &TypeId,
     method: &str,
     args: &[HirExpr],
     result: &Type,
-    callables: &Callables,
+    callables: &'a Callables,
+    plan: &mut ScalarPlan<'a>,
 ) -> bool {
     if let Some(namespace) = callables.resolution.namespaces.get(class)
         && let Some(signature) = crate::semantic::intrinsics::namespace_builtin(namespace, method)
     {
         return signature.ret == *result
-            && signature.params.len() == args.len()
-            && signature
-                .params
-                .iter()
-                .zip(args)
-                .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution));
+            && plan.parameters(Cow::Owned(signature.params), args, callables.resolution);
     }
-    if let Some(signature) = super::super::static_signature(&callables.resolution, class, method) {
-        return signature.is_static
-            && (if signature.is_async {
-                Type::Generic(TypeId::local("Task"), vec![signature.return_type.clone()])
-            } else {
-                signature.return_type.clone()
-            }) == *result
-            && signature.params.len() == args.len()
-            && signature
-                .params
-                .iter()
-                .zip(args)
-                .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution));
+    if let Some(signature) = super::super::static_signature(callables.resolution, class, method) {
+        if !signature.declaration.is_static || signature.declaration.params.len() != args.len() {
+            return false;
+        }
+        let output_matches = if signature.declaration.is_async {
+            matches!(result, Type::Generic(id, args) if *id == TypeId::local("Task")
+                && args.as_slice() == std::slice::from_ref(signature.return_type().as_ref()))
+        } else {
+            signature.return_type().as_ref() == result
+        };
+        return output_matches && plan.method_parameters(&signature, args, callables.resolution);
     }
     if callables.resolution.classes.contains_key(class)
         || callables.resolution.enums.contains_key(class)
@@ -75,7 +105,8 @@ fn static_call(
         return false;
     }
     let class_name = class.to_string();
-    match (Builtin::from_name(&class_name), method, args) {
+    let builtin = Builtin::from_name(&class_name);
+    let valid = match (builtin, method, args) {
         (
             Some(Builtin::Map | Builtin::Channel | Builtin::CancellationToken | Builtin::TaskScope),
             "new",
@@ -96,7 +127,7 @@ fn static_call(
             ) || matches!(class_name.as_str(), "CellI64" | "CellBool") =>
         {
             use crate::semantic::builtin_types;
-            matches!(result, Type::Generic(name, payloads) if name == class && matches!(payloads.as_slice(), [ty] if argument_coercible(ty, arg, &callables.resolution)))
+            matches!(result, Type::Generic(name, payloads) if name == class && matches!(payloads.as_slice(), [ty] if argument_coercible(ty, arg, callables.resolution)))
                 || builtin_types::resolve(result)
                     .filter(|resolved| {
                         !matches!(
@@ -108,7 +139,7 @@ fn static_call(
                         resolved
                             .args
                             .first()
-                            .is_some_and(|ty| argument_coercible(ty, arg, &callables.resolution))
+                            .is_some_and(|ty| argument_coercible(ty, arg, callables.resolution))
                     })
                 || matches!(
                     (id, &arg.ty),
@@ -122,67 +153,100 @@ fn static_call(
         (None, "new", []) if matches!(class_name.as_str(), "CancelToken" | "CancelSource") => true,
         // Only these builtin constructor and argument shapes have flat lowering.
         _ => false,
+    };
+    if valid
+        && method == "new"
+        && matches!(
+            builtin,
+            Some(
+                Builtin::Mutex | Builtin::RwLock | Builtin::BlockingCell | Builtin::BlockingRwCell
+            )
+        )
+        && let Type::Generic(_, params) = result
+    {
+        for (arg, target) in args.iter().zip(params) {
+            if !exits_before_conversion(arg, plan.builtin_panic)
+                && arg.ty != *target
+                && !matches!(arg.kind, HirExprKind::ReferenceArg { .. })
+            {
+                plan.coercions
+                    .get_or_insert_with(HashMap::new)
+                    .insert(std::ptr::from_ref(arg), Parameter::ResultArgument);
+            }
+        }
     }
+    valid
 }
 
-fn enum_payloads(
+fn enum_variant_supported(
     class: &TypeId,
     variant: &str,
     ty: &Type,
+    args: &[HirExpr],
     callables: &Callables,
-) -> Option<Vec<Type>> {
-    let info = callables.resolution.enums.get(class)?;
-    let args = match ty {
+) -> bool {
+    let Some((info, variant)) = callables.resolution.enum_variant(class, variant, None) else {
+        return false;
+    };
+    let type_args = match ty {
         Type::Generic(name, args) if name == class => args.as_slice(),
         Type::Named(name) if name == class => &[],
-        // Only an instance of this enum supplies substitutions for its payload.
-        _ => return None,
+        _ => return false,
     };
-    if info.type_params.len() != args.len() {
-        return None;
+    if type_args.len() != info.type_params.as_slice().len() {
+        return false;
     }
-    let substitutions = info
-        .type_params
-        .iter()
-        .copied()
-        .zip(args.iter().cloned())
-        .collect();
-    let variant = info
-        .variants
-        .iter()
-        .find(|candidate| candidate.name == variant)?;
-    let mut payloads: Vec<_> = variant
-        .payloads
-        .iter()
-        .map(|payload| crate::semantic::symbols::substitute_type(payload, &substitutions))
-        .collect();
-    if payloads == [Type::Void] {
-        payloads.clear();
+    if matches!(variant.payloads.as_slice(), [] | [Type::Void]) {
+        return args.is_empty();
     }
-    Some(payloads)
+    // Resolve names only when a payload mentions one. The index belongs to
+    // the declaration; each construction borrows its own actual arguments.
+    if let [Type::Named(id)] = variant.payloads.as_slice()
+        && info
+            .type_params
+            .position(id)
+            .is_some_and(|i| matches!(type_args[i], Type::Void))
+    {
+        return args.is_empty();
+    }
+    variant.payloads.len() == args.len()
+        && variant.payloads.iter().zip(args).all(|(param, arg)| {
+            let matches = |ty: &Type, relax| {
+                match_bound_parameter(param, ty, relax, &info.type_params, type_args, |_, _| None)
+            };
+            if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
+                matches(&arg.ty, false)
+            } else {
+                matches!(arg.ty, Type::Never)
+                    || callables.resolution.can_coerce_matching(&arg.ty, matches)
+            }
+        })
 }
 
-fn constructor_supported(class: &TypeId, args: &[HirExpr], callables: &Callables) -> bool {
+fn constructor_supported<'a>(
+    class: &TypeId,
+    args: &[HirExpr],
+    callables: &'a Callables,
+    plan: &mut ScalarPlan<'a>,
+) -> bool {
     let Some(info) = callables.resolution.classes.get(class) else {
         return false;
     };
     if let Some(signature) = &info.constructor {
-        signature.params.len() == args.len()
-            && signature
-                .params
-                .iter()
-                .zip(args)
-                .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))
-    } else {
-        class_fields(class, callables).is_some_and(|fields| fields.len() == args.len())
+        return plan.parameters(Cow::Borrowed(&signature.params), args, callables.resolution);
     }
+    callables
+        .resolution
+        .fields_rev(class)
+        .is_some_and(|fields| fields.len() == args.len())
 }
 
-fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>> {
-    super::super::format_segments(args)
-}
-
-fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
+fn builtin_call(
+    callee: &FunctionId,
+    args: &[HirExpr],
+    result: &Type,
+    check_format: impl FnOnce() -> bool,
+) -> bool {
     let name = callee.unqualified_name();
     let name = name.as_deref().unwrap_or("");
     if !callee.is_free_named(name) {
@@ -196,16 +260,17 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
         return matches!(args, [a, b] if a.ty == Type::Bool && b.ty == Type::I64)
             && *result == Type::Void;
     }
+    if name == "format" || (name == "panic" && args.len() > 1) {
+        if (name == "format" && *result != Type::String)
+            || (name == "panic" && *result != Type::Never)
+        {
+            return false;
+        }
+        return check_format();
+    }
     if name == "panic" {
         return *result == Type::Never
-            && match args {
-                [] => true,
-                [arg] => arg.ty == Type::String,
-                [_, _, ..] => format_segments(args).is_some(),
-            };
-    }
-    if name == "format" {
-        return *result == Type::String && format_segments(args).is_some();
+            && (args.is_empty() || matches!(args, [arg] if arg.ty == Type::String));
     }
     if name == "recover" {
         return args.is_empty();
@@ -232,111 +297,38 @@ fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
         }
 }
 
-fn instance_method(receiver: &Type, method: &str, args: &[HirExpr], callables: &Callables) -> bool {
-    super::super::method_signature(&callables.resolution, receiver, method).is_some_and(
-        |signature| {
-            // Interface dispatch keeps its hidden receiver even for the
-            // supported declaration spelling without an explicit `self`.
-            (!signature.is_static || matches!(receiver, Type::Named(name) | Type::Generic(name, _) if callables.resolution.interfaces.contains_key(name)))
-                && signature.params.len() == args.len()
-                && signature
-                    .params
-                    .iter()
-                    .zip(args)
-                    .all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))
-        },
-    )
-}
-
-fn argument_types(
-    node: &HirExpr,
-    names: &HashMap<String, LirLocalId>,
-    locals: &[LirLocal],
-    callables: &Callables,
-) -> Option<Vec<Type>> {
-    match &node.kind {
-        HirExprKind::Invoke { callee, .. } => match &callee.ty {
-            Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
-            // Only callable types supply parameter types.
-            _ => None,
-        },
-        HirExprKind::Call { callee, .. } => {
-            if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
-                match &locals[local.0 as usize].ty {
-                    Type::Fn(params, _) | Type::Closure(params, _) => Some(params.clone()),
-                    // A local shadows the declaration even when it has no callable signature.
-                    _ => None,
-                }
-            } else {
-                callables.get(callee).map(|(params, _)| params.clone())
-            }
-        }
-        HirExprKind::New { class, .. } => callables
-            .resolution
-            .classes
-            .get(class)?
-            .constructor
-            .as_ref()
-            .map(|signature| signature.params.clone()),
-        HirExprKind::MethodCall {
-            object,
-            method,
-            super_class,
-            ..
-        } => {
-            let dispatch = super_class.map(Type::Named);
-            super::super::method_signature(
-                &callables.resolution,
-                dispatch.as_ref().unwrap_or(&object.ty),
-                method,
-            )
-            .map(|signature| signature.params)
-        }
-        HirExprKind::StaticCall { class, method, .. } => {
-            if let Some(namespace) = callables.resolution.namespaces.get(class)
-                && let Some(signature) =
-                    crate::semantic::intrinsics::namespace_builtin(namespace, method)
-            {
-                return Some(signature.params);
-            }
-            if let Some(signature) =
-                super::super::static_signature(&callables.resolution, class, method)
-            {
-                return Some(signature.params);
-            }
-            if method == "new"
-                && matches!(
-                    Builtin::from_name(class.name().as_ref()),
-                    Some(
-                        Builtin::Mutex
-                            | Builtin::RwLock
-                            | Builtin::BlockingCell
-                            | Builtin::BlockingRwCell
-                    )
-                )
-                && let Type::Generic(_, params) = &node.ty
-            {
-                return Some(params.clone());
-            }
-            None
-        }
-        ir_variants!(
-            HirExprKind;
-            Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Print, Array, Index, Ternary,
-            FieldAccess, ObjectLiteral, StaticField, ReferenceArg, Range, Await, TryPropagate,
-            Lambda, Match, Select
-        ) => None,
-    }
+fn instance_method<'e>(
+    receiver: &'e Type,
+    super_class: Option<TypeId>,
+    method: &str,
+    args: &[HirExpr],
+    callables: &'e Callables,
+    plan: &mut ScalarPlan<'e>,
+) -> bool {
+    let resolution = callables.resolution;
+    let signature = match super_class {
+        Some(class) => super::super::lookup_method_signature(resolution, class, None, method),
+        None => super::super::method_signature(resolution, receiver, method),
+    };
+    signature.is_some_and(|signature| {
+        // Interface methods retain their receiver with either declaration spelling.
+        (!signature.declaration.is_static
+            || signature
+                .interface
+                .as_ref()
+                .is_some_and(|i| resolution.interfaces.contains_key(&i.class)))
+            && plan.method_parameters(&signature, args, resolution)
+    })
 }
 
 /// The one type both sides of a class/interface `==` or `!=` are compared
 /// at: the supertype side's, so the subtype side is coerced to
 /// it first. Reference identity is then the object word on either side.
-fn identity_operand_type(
-    lhs: &HirExpr,
-    rhs: &HirExpr,
+fn identity_operand_type<'e>(
+    lhs: &'e HirExpr,
+    rhs: &'e HirExpr,
     resolution: &crate::ir::typed_ast::HirResolution,
-) -> Option<Type> {
+) -> Option<&'e Type> {
     let identity = |ty: &Type| {
         matches!(ty, Type::Named(id) | Type::Generic(id, _)
             if resolution.classes.contains_key(id) || resolution.interfaces.contains_key(id))
@@ -345,9 +337,9 @@ fn identity_operand_type(
         return None;
     }
     if resolution.can_coerce(&rhs.ty, &lhs.ty) {
-        Some(lhs.ty.clone())
+        Some(&lhs.ty)
     } else if resolution.can_coerce(&lhs.ty, &rhs.ty) {
-        Some(rhs.ty.clone())
+        Some(&rhs.ty)
     } else {
         None
     }
@@ -365,43 +357,217 @@ fn argument_coercible(
     }
 }
 
-fn scalar(
-    expr: &HirExpr,
+// Store preflight can check several operands before lowering any of them.
+// Remember the side, so those operands can later be lowered in place.
+#[derive(Clone, Copy)]
+enum IdentitySide {
+    Left,
+    Right,
+}
+
+enum Parameter<'a> {
+    Declared(Cow<'a, Type>),
+    Projected(ProjectedParameter<'a>),
+    // Generic cell and lock constructors take their parameter from the HIR result.
+    ResultArgument,
+}
+
+#[derive(Default)]
+struct ScalarPlan<'a> {
+    snapshots: bool,
+    // Postorder validation identifies the builtin after local and declared
+    // callables have had their chance to resolve the name.
+    builtin_panic: Option<FunctionId>,
+    // A named function already carries its ID in HIR. Only local calls need a slot.
+    local_callees: HashMap<FunctionId, LirLocalId>,
+    identities: Option<HashMap<*const HirExpr, IdentitySide>>,
+    coercions: Option<HashMap<*const HirExpr, Parameter<'a>>>,
+    formats: Option<HashMap<*const HirExpr, crate::interpolate::CheckedTemplate<'a>>>,
+}
+
+// These are the scalar evaluator's two explicit exits. Other calls returning
+// Never still use the ordinary call instruction and its existing continuation.
+fn exits_before_conversion(arg: &HirExpr, builtin_panic: Option<FunctionId>) -> bool {
+    matches!(arg.ty, Type::Never)
+        && match &arg.kind {
+            HirExprKind::Var(_) => true,
+            HirExprKind::Call {
+                callee,
+                binding: HirCallBinding::Function,
+                ..
+            } => Some(*callee) == builtin_panic,
+            _ => false,
+        }
+}
+
+impl<'a> ScalarPlan<'a> {
+    fn local_callee(
+        &mut self,
+        callee: FunctionId,
+        names: &HashMap<String, LirLocalId>,
+    ) -> Option<LirLocalId> {
+        use std::collections::hash_map::Entry;
+        match self.local_callees.entry(callee) {
+            Entry::Occupied(slot) => Some(*slot.get()),
+            Entry::Vacant(slot) => {
+                let id = *names.get(callee.name().as_ref())?;
+                Some(*slot.insert(id))
+            }
+        }
+    }
+
+    fn method_parameters(
+        &mut self,
+        signature: &ResolvedSignature<'a, 'a>,
+        args: &[HirExpr],
+        resolution: &crate::ir::typed_ast::HirResolution,
+    ) -> bool {
+        let builtin_panic = self.builtin_panic;
+        signature.check_conversions(
+            args,
+            |arg| exits_before_conversion(arg, builtin_panic),
+            |_, target, arg| {
+                let parameter = match target {
+                    ParameterType::Declared(ty) => {
+                        if !argument_coercible(ty, arg, resolution) {
+                            return false;
+                        }
+                        Parameter::Declared(Cow::Borrowed(ty))
+                    }
+                    ParameterType::Projected(p) => {
+                        if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
+                            return false;
+                        }
+                        if !matches!(arg.ty, Type::Never) && !p.accepts_value(&arg.ty, resolution) {
+                            return false;
+                        }
+                        Parameter::Projected(p)
+                    }
+                };
+                self.coercions
+                    .get_or_insert_with(HashMap::new)
+                    .insert(std::ptr::from_ref(arg), parameter);
+                true
+            },
+        )
+    }
+
+    fn parameters(
+        &mut self,
+        params: Cow<'a, [Type]>,
+        args: &[HirExpr],
+        resolution: &crate::ir::typed_ast::HirResolution,
+    ) -> bool {
+        match params {
+            Cow::Borrowed(params) => {
+                self.check_parameters(params.iter().map(Cow::Borrowed), args, resolution)
+            }
+            Cow::Owned(params) => {
+                self.check_parameters(params.into_iter().map(Cow::Owned), args, resolution)
+            }
+        }
+    }
+
+    fn check_parameters(
+        &mut self,
+        params: impl ExactSizeIterator<Item = Cow<'a, Type>>,
+        args: &[HirExpr],
+        resolution: &crate::ir::typed_ast::HirResolution,
+    ) -> bool {
+        params.len() == args.len()
+            && params.zip(args).all(|(target, arg)| {
+                if exits_before_conversion(arg, self.builtin_panic) || *target == arg.ty {
+                    return true;
+                }
+                if !argument_coercible(&target, arg, resolution) {
+                    return false;
+                }
+                self.coercions
+                    .get_or_insert_with(HashMap::new)
+                    .insert(std::ptr::from_ref(arg), Parameter::Declared(target));
+                true
+            })
+    }
+}
+
+fn scalar<'e>(
+    expr: &'e HirExpr,
     names: &HashMap<String, LirLocalId>,
     locals: &[LirLocal],
-    callables: &Callables,
+    callables: &'e Callables,
     is_async: bool,
+    plan: &mut ScalarPlan<'e>,
 ) -> bool {
+    plan.snapshots = false;
     expr.walk_postorder(false).all(|node| match &node.kind {
         HirExprKind::Int(_) | HirExprKind::Float(_) | HirExprKind::Bool(_) | HirExprKind::Str(_) | HirExprKind::FnRef(_) => true,
         HirExprKind::ReferenceArg { place } => matches!(place.kind, HirExprKind::Var(_) | HirExprKind::FieldAccess { .. } | HirExprKind::Index { .. }),
-        HirExprKind::New { class, args } => constructor_supported(class, args, callables),
-        HirExprKind::ObjectLiteral { class, fields } => class_fields(class, callables).is_some_and(|declared| {
-            let names: std::collections::HashSet<_> = fields.iter().map(|(name, _)| name).collect();
-            declared.len() == fields.len() && names.len() == fields.len() && declared.iter().all(|(name, _)| names.contains(name))
-        }),
-        HirExprKind::StaticField { class, field } => enum_payloads(class, field, &node.ty, callables).is_some_and(|payloads| payloads.is_empty())
+        HirExprKind::New { class, args } => {
+            plan.snapshots = true;
+            constructor_supported(class, args, callables, plan)
+        }
+        HirExprKind::ObjectLiteral { class, fields } => super::super::object_literal_supported(callables.resolution, class, fields),
+        HirExprKind::StaticField { class, field } => enum_variant_supported(class, field, &node.ty, &[], callables)
             || static_field(class, field, callables),
-        HirExprKind::StaticCall { class, method, args } => enum_payloads(class, method, &node.ty, callables).is_some_and(|payloads| payloads.len() == args.len() && payloads.iter().zip(args).all(|(target, value)| argument_coercible(target, value, &callables.resolution))) || static_call(class, method, args, &node.ty, callables),
+        HirExprKind::StaticCall { class, method, args } => {
+            plan.snapshots = true;
+            enum_variant_supported(class, method, &node.ty, args, callables)
+                || static_call(class, method, args, &node.ty, callables, plan)
+        }
         HirExprKind::Await { inner } => crate::semantic::builtin_types::unary_arg(&inner.ty, crate::semantic::builtin_types::BuiltinTypeId::Future) == Some(&node.ty)
-            || (!is_async && node.ty == Type::Void && matches!(&inner.kind, HirExprKind::Call { callee, args } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && builtin_call(callee, args, &inner.ty))),
+            || (!is_async && node.ty == Type::Void && matches!(&inner.kind, HirExprKind::Call { callee, args, binding: HirCallBinding::Function } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && builtin_call(callee, args, &inner.ty, || false))),
         HirExprKind::Array { .. } => matches!(node.ty, Type::Array(_)),
         HirExprKind::Index { .. } | HirExprKind::FieldAccess { .. } | HirExprKind::Range { .. } => true,
         HirExprKind::Unary { .. } => matches!(node.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool),
         HirExprKind::Var(name) => names.contains_key(name),
         HirExprKind::Lambda { captures, .. } => captures.iter().all(|capture| names.contains_key(&capture.source)),
         HirExprKind::Print { value, .. } => matches!(value.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String | Type::Never),
-        HirExprKind::MethodCall { object, method, args, super_class, builtin } => match builtin { Some(id) => !(is_async && id.is_suspension_point()), None => instance_method(super_class.map(Type::Named).as_ref().unwrap_or(&object.ty), method, args, callables) },
-        HirExprKind::Invoke { callee, args, .. } => matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result) if **result == node.ty && params.len() == args.len() && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution))),
-        HirExprKind::Call { callee, args } => if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
-            matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result) if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. })) && **result == node.ty && params.len() == args.len() && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, &callables.resolution)))
-        } else { callables.get(callee).is_some_and(|(params, result)| *result == node.ty
-                && params.len() == args.len() && params.iter().zip(args).all(|(param, arg)| argument_coercible(param, arg, &callables.resolution)))
-                || builtin_call(callee, args, &node.ty) },
+        HirExprKind::MethodCall { object, method, args, super_class, builtin } => {
+            plan.snapshots = true;
+            match builtin {
+                Some(id) => !(is_async && id.is_suspension_point()),
+                None => instance_method(&object.ty, *super_class, method, args, callables, plan),
+            }
+        }
+        HirExprKind::Invoke { callee, args, .. } => {
+            plan.snapshots = true;
+            matches!(&callee.ty, Type::Fn(params, result) | Type::Closure(params, result)
+                if **result == node.ty && params.len() == args.len()
+                    && !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+                    && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, callables.resolution)))
+        }
+        HirExprKind::Call { callee, binding, args } => {
+            plan.snapshots = true;
+            if binding.is_local() {
+                let Some(local) = plan.local_callee(*callee, names) else { return false };
+                matches!(&locals[local.0 as usize].ty, Type::Fn(params, result) | Type::Closure(params, result)
+                    if !args.iter().any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
+                        && **result == node.ty && params.len() == args.len()
+                        && params.iter().zip(args).all(|(ty, arg)| argument_coercible(ty, arg, callables.resolution)))
+            } else if let Some(sig) = callables.signatures.get(callee) {
+                sig.returns(&node.ty) && plan.check_parameters(sig.params.iter().map(Cow::Borrowed), args, callables.resolution)
+            } else {
+                let valid = builtin_call(callee, args, &node.ty, || {
+                    super::super::check_format(args, |_| {}).is_some_and(|template| {
+                        plan.formats.get_or_insert_with(HashMap::new).insert(std::ptr::from_ref(node), template);
+                        true
+                    })
+                });
+                if valid && matches!(node.ty, Type::Never) && callee.is_free_named("panic") {
+                    plan.builtin_panic = Some(*callee);
+                }
+                valid
+            }
+        }
         HirExprKind::Binary { op, lhs, rhs } => !matches!(op, BinOp::And | BinOp::Or)
             && (matches!(lhs.ty, Type::I8 | Type::I16 | Type::I32 | Type::U16 | Type::U32 | Type::U64 | Type::Char | Type::U8 | Type::I64 | Type::F64 | Type::Bool | Type::String)
-                || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, &callables.resolution).is_some())
-                || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(&lhs.ty, Type::Named(name) | Type::Generic(name, _) if callables.resolution.enums.get(name).is_some_and(|info| info.variants.iter().all(|variant| variant.payloads.is_empty()))))),
+                || (matches!(op, BinOp::Eq | BinOp::Ne) && identity_operand_type(lhs, rhs, callables.resolution).inspect(|&target| {
+                    if lhs.ty != rhs.ty {
+                        let side = if std::ptr::eq(target, &lhs.ty) { IdentitySide::Left } else { IdentitySide::Right };
+                        plan.identities.get_or_insert_with(HashMap::new).insert(std::ptr::from_ref(node), side);
+                    }
+                }).is_some())
+                || (matches!(op, BinOp::Eq | BinOp::Ne) && matches!(&lhs.ty, Type::Named(name) | Type::Generic(name, _) if callables.resolution.enum_is_payload_free(name)))),
         HirExprKind::Ternary { .. } | HirExprKind::TryPropagate { .. } | HirExprKind::Match { .. } | HirExprKind::Select { .. } => false,
     })
 }
@@ -415,7 +581,7 @@ fn append_format(
     values: &mut HashMap<*const HirExpr, LirOperand>,
     emitted: &mut Vec<SourceInst>,
     locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
+    names: &HashMap<String, LirLocalId>,
 ) {
     let key = std::ptr::from_ref(node);
     let result = if let Some(previous) = values.get(&key) {
@@ -438,12 +604,34 @@ fn append_format(
     values.insert(key, result);
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static EMITTED_COMPUTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static EMITTED_LITERAL_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static RESERVED_LOCALS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn push_compute(emitted: &mut Vec<SourceInst>, local: LirLocalId, value: LirRvalue, span: Span) {
+    #[cfg(test)]
+    {
+        EMITTED_COMPUTES.set(EMITTED_COMPUTES.get() + 1);
+        if let LirRvalue::StringLiteral(text) = &value {
+            EMITTED_LITERAL_BYTES.set(EMITTED_LITERAL_BYTES.get() + text.len());
+        }
+    }
+    emitted.push(SourceInst::Compute { local, value, span });
+}
+
 fn reserve(
     ty: Type,
     locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
+    names: &HashMap<String, LirLocalId>,
 ) -> LirLocalId {
+    #[cfg(test)]
+    RESERVED_LOCALS.set(RESERVED_LOCALS.get() + 1);
     let local = LirLocalId(locals.len() as u32);
+    // Scalar results reference each other by ID. Their numeric names are unique
+    // within this pass and only need to avoid names present at entry.
     let mut name = format!("__lir_value_{}", local.0);
     while names.contains_key(&name) {
         name.push('_');
@@ -451,13 +639,12 @@ fn reserve(
     locals.push(LirLocal {
         storage_kind: super::super::LirStorageKind::Value,
         id: local,
-        name: name.clone(),
+        name,
         ty,
         source_span: None,
         synthetic: true,
         parameter: false,
     });
-    names.insert(name, local);
     local
 }
 
@@ -467,10 +654,10 @@ fn emit(
     span: Span,
     emitted: &mut Vec<SourceInst>,
     locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
+    names: &HashMap<String, LirLocalId>,
 ) -> LirLocalId {
     let local = reserve(ty, locals, names);
-    emitted.push(SourceInst::Compute { local, value, span });
+    push_compute(emitted, local, value, span);
     local
 }
 
@@ -479,86 +666,58 @@ pub(in crate::ir::lowered) fn lower_blocks(
     locals: &mut Vec<LirLocal>,
     is_async: bool,
 ) {
-    lower_blocks_with(blocks, locals, &Callables::default(), is_async);
+    let hir = Default::default();
+    let resolution = LoweringDeclarations::new(&hir);
+    lower_blocks_with(blocks, locals, &Callables::new(&resolution), is_async);
 }
 
-pub(in crate::ir::lowered) fn lower_calls(
+pub(in crate::ir::lowered) fn lower_calls<'r>(
     functions: &mut [super::super::SourceFunction],
     lambdas: &mut [super::super::SourceLambda],
-    resolution: &crate::ir::typed_ast::HirResolution,
+    resolution: &'r LoweringDeclarations<'r>,
 ) {
-    let mut callables = Callables {
-        signatures: HashMap::new(),
-        async_outputs: HashMap::new(),
-        resolution: resolution.clone(),
-    };
-    for (name, signature) in &resolution.functions {
-        if name.is_free_named(name.unqualified_name().as_deref().unwrap_or(""))
-            && (matches!(
-                name.unqualified_name().as_deref().unwrap_or(""),
-                "panic" | "recover" | "format"
-            ) || crate::semantic::intrinsics::builtin_call_runtime_name(
-                name.unqualified_name().as_deref().unwrap_or(""),
-            )
-            .is_some())
+    let mut callables = Callables::new(resolution);
+    // Bodies and local tables can be lowered while the immutable source headers
+    // lend their types to calls (including calls made from lifted/deferred bodies).
+    let mut pending = Vec::with_capacity(functions.len() + lambdas.len());
+    for f in functions {
+        callables.signatures.insert(
+            f.name,
+            CallSignature {
+                params: CallParameters::Source(&f.params),
+                output: &f.return_type,
+                is_async: f.is_async,
+            },
+        );
+        pending.push((&mut f.blocks, &mut f.locals, f.is_async));
+    }
+    for lambda in lambdas {
+        let f = &mut lambda.function;
+        pending.push((&mut f.blocks, &mut f.locals, f.is_async));
+    }
+    for (name, sig) in &resolution.functions {
+        let std::collections::hash_map::Entry::Vacant(slot) = callables.signatures.entry(*name)
+        else {
+            continue;
+        };
+        let spelling = name.unqualified_name();
+        let spelling = spelling.as_deref().unwrap_or("");
+        if name.is_free_named(spelling)
+            && (matches!(spelling, "panic" | "recover" | "format")
+                || crate::semantic::intrinsics::builtin_call_runtime_name(spelling).is_some())
         {
             continue;
         }
-        let result = if signature.is_async {
-            callables
-                .async_outputs
-                .insert(*name, signature.return_type.clone());
-            Type::Generic(TypeId::local("Task"), vec![signature.return_type.clone()])
-        } else {
-            signature.return_type.clone()
-        };
-        callables
-            .signatures
-            .insert(*name, (signature.params.clone(), result));
+        slot.insert(CallSignature {
+            params: CallParameters::Declaration(&sig.params),
+            output: &sig.return_type,
+            is_async: sig.is_async,
+        });
     }
-    for f in functions.iter() {
-        let result = if f.is_async {
-            callables
-                .async_outputs
-                .insert(f.name, f.return_type.clone());
-            Type::Generic(TypeId::local("Task"), vec![f.return_type.clone()])
-        } else {
-            f.return_type.clone()
-        };
-        callables.signatures.insert(
-            f.name,
-            (
-                f.params.iter().map(|param| param.ty.clone()).collect(),
-                result,
-            ),
-        );
-    }
-    let mut method_effects = HashMap::new();
-    // Index descendants once, then resolve only virtual effects actually queried.
-    let mut children: HashMap<TypeId, Vec<TypeId>> = HashMap::new();
-    for (&class, info) in &resolution.classes {
-        if let Some(base) = info.base {
-            children.entry(base).or_default().push(class);
-        }
-        for implemented in &info.implements {
-            if let Type::Named(interface) | Type::Generic(interface, _) = implemented {
-                children.entry(*interface).or_default().push(class);
-            }
-        }
-    }
-    for (&interface, info) in &resolution.interfaces {
-        for &base in &info.extends {
-            children.entry(base).or_default().push(interface);
-        }
-    }
-    let mut dispatch_effects = HashMap::new();
-    let mut pending: Vec<_> = functions
-        .iter_mut()
-        .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
-        .collect();
-    while let Some(f) = pending.pop() {
-        lower_blocks_with(&mut f.blocks, &mut f.locals, &callables, f.is_async);
-        for block in &mut f.blocks {
+    let mut dispatch = super::super::dispatch::DispatchEffects::default();
+    while let Some((blocks, locals, is_async)) = pending.pop() {
+        lower_blocks_with(blocks, locals, &callables, is_async);
+        for block in blocks {
             for inst in &mut block.instrs {
                 if let SourceInst::Compute {
                     value:
@@ -575,17 +734,11 @@ pub(in crate::ir::lowered) fn lower_calls(
                 {
                     let receiver = super_class.map(Type::Named);
                     let receiver = receiver.as_ref().unwrap_or(receiver_ty);
-                    *is_async = super::super::method_is_async(
-                        resolution,
-                        receiver,
-                        method,
-                        &mut method_effects,
-                    ) || (super_class.is_none()
-                        && matches!(result, Type::Generic(name, _) if crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::Task))
-                        && matches!(receiver, Type::Named(class) | Type::Generic(class, _)
-                        if super::super::dispatch_may_start_task(
-                            resolution, &children, *class, method.as_str(), &mut dispatch_effects, &mut method_effects,
-                        )));
+                    *is_async = super::super::method_is_async(resolution, receiver, method)
+                        || (super_class.is_none()
+                            && matches!(result, Type::Generic(name, _) if crate::semantic::builtin_types::resolve_name(name) == Some(crate::semantic::builtin_types::BuiltinTypeId::Task))
+                            && matches!(receiver, Type::Named(class) | Type::Generic(class, _)
+                            if dispatch.may_start_task(resolution, *class, method)));
                 }
                 if let SourceInst::Compute {
                     value:
@@ -608,68 +761,47 @@ pub(in crate::ir::lowered) fn lower_calls(
                                     resolution,
                                     &Type::Named(*class),
                                     method,
-                                    &mut method_effects,
                                 )
                             },
                             |signature| signature.is_async,
                         );
                 }
                 if let SourceInst::Defer { body, .. } = inst {
-                    pending.push(&mut body.function);
+                    let f = &mut body.function;
+                    pending.push((&mut f.blocks, &mut f.locals, f.is_async));
                 }
             }
         }
     }
 }
 
-fn operand(
-    expr: &mut HirExpr,
-    emitted: &mut Vec<SourceInst>,
-    locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
-    callables: &Callables,
-    is_async: bool,
-    snapshot: bool,
-) -> LirOperand {
-    lower(expr, emitted, locals, names, callables, is_async);
-    let value = LirOperand::from_flat_expr(expr, |name| Some(names[name]))
-        .unwrap_or_else(|| unreachable!("validated expression became a flat operand"));
-    if snapshot && expr.ty != Type::Never && matches!(value, LirOperand::Local(_)) {
-        LirOperand::Local(emit(
-            LirRvalue::Use(value),
-            expr.ty.clone(),
-            expr.span,
-            emitted,
-            locals,
-            names,
-        ))
-    } else {
-        value
-    }
-}
-
 fn lower_store(
-    inst: &mut SourceInst,
+    inst: &SourceInst,
     emitted: &mut Vec<SourceInst>,
     locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
+    names: &HashMap<String, LirLocalId>,
     callables: &Callables,
     is_async: bool,
 ) -> bool {
-    let valid = match &*inst {
-        SourceInst::FieldAssign { object, value, .. } => [object, value]
-            .iter()
-            .all(|expr| scalar(expr, names, locals, callables, is_async)),
+    let mut plan = ScalarPlan::default();
+    // Each store operand carries its own snapshot policy into emission.
+    let mut snapshots = [false; 3];
+    let mut flags = snapshots.iter_mut();
+    let mut valid_operand = |expr| {
+        let valid = scalar(expr, names, locals, callables, is_async, &mut plan);
+        *flags.next().expect("a store has at most three operands") = plan.snapshots;
+        valid
+    };
+    let valid = match inst {
+        SourceInst::FieldAssign { object, value, .. } => {
+            [object, value].into_iter().all(&mut valid_operand)
+        }
         SourceInst::IndexAssign {
             array,
             index,
             value,
-        } => [array, index, value]
-            .iter()
-            .all(|expr| scalar(expr, names, locals, callables, is_async)),
-        SourceInst::StaticFieldAssign { value, .. } => {
-            scalar(value, names, locals, callables, is_async)
-        }
+        } => [array, index, value].into_iter().all(&mut valid_operand),
+        SourceInst::StaticFieldAssign { value, .. } => valid_operand(value),
         ir_variants!(
             SourceInst;
             Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
@@ -680,89 +812,106 @@ fn lower_store(
     if !valid {
         return false;
     }
-    let (value, span) = match inst {
-        SourceInst::FieldAssign {
-            object,
-            field,
-            value,
-        } => {
-            let object_ty = object.ty.clone();
-            let receiver = operand(object, emitted, locals, names, callables, is_async, true);
-            if object.ty == Type::Never {
-                return true;
-            }
-            let stored = operand(value, emitted, locals, names, callables, is_async, false);
-            if value.ty == Type::Never {
-                return true;
-            }
-            (
-                LirRvalue::FieldStore {
-                    object: receiver,
-                    object_ty,
-                    field: field.clone(),
-                    value: stored,
-                },
-                object.span,
-            )
+    let mut flags = snapshots.into_iter();
+    let mut operand = |expr, snapshot: bool| -> Result<LirOperand, LirLocalId> {
+        plan.snapshots = flags.next().expect("each store operand was validated");
+        let value = if scalar::needs_lowering(expr) {
+            LirOperand::Local(scalar::lower_validated(
+                expr, emitted, locals, names, callables, is_async, &mut plan,
+            )?)
+        } else {
+            LirOperand::from_flat_expr(expr, |name| Some(names[name]))
+                .expect("validated store operand is flat")
+        };
+        if expr.ty == Type::Never
+            && let LirOperand::Local(id) = value
+        {
+            return Err(id);
         }
-        SourceInst::IndexAssign {
-            array,
-            index,
-            value,
-        } => {
-            let Type::Array(element) = &array.ty else {
-                return false;
-            };
-            let element = (**element).clone();
-            let receiver = operand(array, emitted, locals, names, callables, is_async, true);
-            if array.ty == Type::Never {
-                return true;
-            }
-            let index_value = operand(index, emitted, locals, names, callables, is_async, true);
-            if index.ty == Type::Never {
-                return true;
-            }
-            let stored = operand(value, emitted, locals, names, callables, is_async, false);
-            if value.ty == Type::Never {
-                return true;
-            }
-            (
-                LirRvalue::ArrayStore {
-                    array: receiver,
-                    index: index_value,
-                    value: stored,
-                    element,
-                },
-                array.span,
-            )
-        }
-        SourceInst::StaticFieldAssign {
-            class,
-            field,
-            value,
-        } => {
-            let stored = operand(value, emitted, locals, names, callables, is_async, false);
-            if value.ty == Type::Never {
-                return true;
-            }
-            (
-                LirRvalue::StaticStore {
-                    class: *class,
-                    field: field.clone(),
-                    value: stored,
-                },
-                value.span,
-            )
-        }
-        ir_variants!(
-            SourceInst;
-            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
-            Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
-            SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
-        ) => unreachable!(),
+        Ok(if snapshot && matches!(value, LirOperand::Local(_)) {
+            LirOperand::Local(emit(
+                LirRvalue::Use(value),
+                expr.ty.clone(),
+                expr.span,
+                emitted,
+                locals,
+                names,
+            ))
+        } else {
+            value
+        })
     };
-    emit(value, Type::Void, span, emitted, locals, names);
-    true
+    let result = (|| -> Result<_, LirLocalId> {
+        Ok(Some(match inst {
+            SourceInst::FieldAssign {
+                object,
+                field,
+                value,
+            } => {
+                let receiver = operand(object, true)?;
+                let stored = operand(value, false)?;
+                (
+                    LirRvalue::FieldStore {
+                        object: receiver,
+                        object_ty: object.ty.clone(),
+                        field: field.clone(),
+                        value: stored,
+                    },
+                    object.span,
+                )
+            }
+            SourceInst::IndexAssign {
+                array,
+                index,
+                value,
+            } => {
+                let Type::Array(element) = &array.ty else {
+                    return Ok(None);
+                };
+                let receiver = operand(array, true)?;
+                let index_value = operand(index, true)?;
+                let stored = operand(value, false)?;
+                (
+                    LirRvalue::ArrayStore {
+                        array: receiver,
+                        index: index_value,
+                        value: stored,
+                        element: (**element).clone(),
+                    },
+                    array.span,
+                )
+            }
+            SourceInst::StaticFieldAssign {
+                class,
+                field,
+                value,
+            } => {
+                let stored = operand(value, false)?;
+                (
+                    LirRvalue::StaticStore {
+                        class: *class,
+                        field: field.clone(),
+                        value: stored,
+                    },
+                    value.span,
+                )
+            }
+            ir_variants!(
+                SourceInst;
+                Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+                Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
+                SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
+            ) => unreachable!(),
+        }))
+    })();
+    match result {
+        Ok(Some((value, span))) => {
+            emit(value, Type::Void, span, emitted, locals, names);
+            true
+        }
+        Err(_) => true,
+        Ok(None) => false,
+    }
 }
 
 fn lower_blocks_with(
@@ -771,21 +920,14 @@ fn lower_blocks_with(
     callables: &Callables,
     is_async: bool,
 ) {
-    let mut names = locals
+    let names = locals
         .iter()
         .map(|local| (local.name.clone(), local.id))
         .collect();
     for block in blocks {
         let mut emitted = Vec::new();
         for mut inst in std::mem::take(&mut block.instrs) {
-            if lower_store(
-                &mut inst,
-                &mut emitted,
-                locals,
-                &mut names,
-                callables,
-                is_async,
-            ) {
+            if lower_store(&inst, &mut emitted, locals, &names, callables, is_async) {
                 continue;
             }
             match &mut inst {
@@ -794,10 +936,10 @@ fn lower_blocks_with(
                     {
                         value.ty = ty.clone();
                     }
-                    lower(value, &mut emitted, locals, &mut names, callables, is_async)
+                    lower(value, &mut emitted, locals, &names, callables, is_async)
                 }
                 SourceInst::Assign { value, .. } | SourceInst::Expr(value) => {
-                    lower(value, &mut emitted, locals, &mut names, callables, is_async)
+                    lower(value, &mut emitted, locals, &names, callables, is_async)
                 }
                 ir_variants!(
                     SourceInst;
@@ -836,7 +978,7 @@ fn lower_blocks_with(
         }
         match &mut block.terminator {
             SourceTerminator::Branch { cond, .. } | SourceTerminator::Return(Some(cond)) => {
-                lower(cond, &mut emitted, locals, &mut names, callables, is_async);
+                lower(cond, &mut emitted, locals, &names, callables, is_async);
                 if cond.ty == Type::Never {
                     block.terminator = SourceTerminator::Return(None);
                 }
@@ -853,6 +995,146 @@ fn lower_blocks_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scalar_signature_setup_borrows_overlapping_and_declaration_only_types() {
+        use crate::ir::lowered::SourceFunction;
+        use crate::ir::typed_ast::{HirParam, HirResolution, HirSignature};
+        use crate::parser::ast::REBUILT_TYPE_NODES;
+
+        for count in [1, 8, 32] {
+            for depth in [0, 8, 32] {
+                let ty = (0..depth).fold(Type::I64, |ty, _| Type::Array(Box::new(ty)));
+                for source_headers in [false, true] {
+                    for is_async in [false, true] {
+                        let mut hir = HirResolution::default();
+                        let mut functions = Vec::new();
+                        for i in 0..count {
+                            let name = FunctionId::free(format!("f{i}"));
+                            hir.functions.insert(
+                                name,
+                                HirSignature {
+                                    params: vec![ty.clone()],
+                                    param_modes: vec![],
+                                    return_type: ty.clone(),
+                                    is_async,
+                                    is_static: false,
+                                },
+                            );
+                            if source_headers {
+                                functions.push(SourceFunction {
+                                    name,
+                                    is_async,
+                                    params: vec![HirParam {
+                                        name: "x".into(),
+                                        ty: ty.clone(),
+                                        by_reference: false,
+                                        span: Span::dummy(),
+                                    }],
+                                    return_type: ty.clone(),
+                                    locals: vec![],
+                                    blocks: vec![],
+                                    async_frame: Default::default(),
+                                    captures: vec![],
+                                });
+                            }
+                        }
+                        let view = LoweringDeclarations::new(&hir);
+                        REBUILT_TYPE_NODES.set(0);
+                        lower_calls(&mut functions, &mut [], &view);
+                        let rebuilt = REBUILT_TYPE_NODES.get();
+                        assert_eq!(rebuilt, 0);
+                        println!(
+                            "functions={count} depth={depth} overlap={source_headers} async={is_async} setup_rebuilt={rebuilt}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_signatures_emit_winning_parameters_and_async_outputs() {
+        use crate::ir::lowered::{lower_function, tests::checked_hir};
+        let mut hir = checked_hir(
+            "
+            fn local_sync(x: i64) -> i64 {return x;}
+            async fn local_async(x: i64) -> i64 {return x;}
+            fn imported_sync(x: i64) -> i64 {return x;}
+            async fn imported_async(x: i64) -> i64 {return x;}
+            fn probe() { local_sync(1); local_async(2); imported_sync(3); imported_async(4); }
+        ",
+        );
+        // Give the shadowed declarations different types and async flags.
+        for name in ["local_sync", "local_async"] {
+            let sig = hir
+                .resolution
+                .functions
+                .get_mut(&FunctionId::free(name))
+                .unwrap();
+            sig.params = vec![Type::Bool];
+            sig.return_type = Type::Bool;
+            sig.is_async = !sig.is_async;
+        }
+        let view = LoweringDeclarations::new(&hir.resolution);
+        let mut functions: Vec<_> = hir
+            .functions
+            .iter()
+            .filter(|f| {
+                !f.name.is_free_named("imported_sync") && !f.name.is_free_named("imported_async")
+            })
+            .map(|f| lower_function(f, None, &view))
+            .collect();
+        lower_calls(&mut functions, &mut [], &view);
+        let probe = functions
+            .iter()
+            .find(|f| f.name.is_free_named("probe"))
+            .unwrap();
+        let calls: Vec<_> = probe
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter_map(|inst| {
+                let SourceInst::Compute { value, .. } = inst else {
+                    return None;
+                };
+                let (id, params, ty, is_async) = match value {
+                    LirRvalue::DirectCall {
+                        callee,
+                        params,
+                        result,
+                        ..
+                    } => (callee, params, result, false),
+                    LirRvalue::StartTask {
+                        callee,
+                        params,
+                        output,
+                        ..
+                    } => (callee, params, output, true),
+                    _ => return None,
+                };
+                assert_eq!(params.as_slice(), &[Type::I64]);
+                assert_eq!(*ty, Type::I64);
+                Some((id.to_string(), is_async))
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            [
+                ("local_sync", false),
+                ("local_async", true),
+                ("imported_sync", false),
+                ("imported_async", true)
+            ]
+            .map(|(name, a)| (name.to_owned(), a))
+        );
+    }
+
+    fn builtin_call(callee: &FunctionId, args: &[HirExpr], result: &Type) -> bool {
+        super::builtin_call(callee, args, result, || {
+            crate::ir::lowered::check_format(args, |_| {}).is_some()
+        })
+    }
 
     fn check_scheduler_builtin_results(callee: &str, args: &[HirExpr]) {
         for (result, expected) in [
@@ -1074,6 +1356,118 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn object_literal_fields_match_once_in_any_order() {
+        use crate::ir::lowered::object_literal_supported;
+        use crate::ir::typed_ast::{HirClassInfo, HirResolution};
+
+        let class = TypeId::local("Pair");
+        let mut resolution = HirResolution::default();
+        resolution.classes.insert(
+            class,
+            HirClassInfo {
+                fields: vec![("left".into(), Type::I64), ("right".into(), Type::I64)],
+                ..HirClassInfo::default()
+            },
+        );
+        let resolution = LoweringDeclarations::new(&resolution);
+        let field = |name: &str| {
+            (
+                name.to_owned(),
+                HirExpr {
+                    kind: HirExprKind::Int(1),
+                    ty: Type::I64,
+                    span: Span::dummy(),
+                },
+            )
+        };
+        assert!(object_literal_supported(
+            &resolution,
+            &class,
+            &[field("right"), field("left")]
+        ));
+        for fields in [
+            vec![field("left")],
+            vec![field("left"), field("left")],
+            vec![field("right"), field("extra")],
+        ] {
+            assert!(!object_literal_supported(&resolution, &class, &fields));
+        }
+    }
+
+    #[test]
+    fn inherited_field_validation_borrows_names_and_types() {
+        use crate::ir::lowered::object_literal_supported;
+        use crate::ir::typed_ast::HirClassInfo;
+        use crate::parser::ast::REBUILT_TYPE_NODES;
+
+        let base = TypeId::local("Base");
+        let child = TypeId::local("Child");
+        let field = |name: &str| {
+            (
+                name.to_owned(),
+                HirExpr {
+                    kind: HirExprKind::Int(1),
+                    ty: Type::I64,
+                    span: Span::dummy(),
+                },
+            )
+        };
+        let fields = [field("own"), field("inherited")];
+        let args = [fields[0].1.clone(), fields[1].1.clone()];
+        for depth in [0, 8, 64] {
+            let ty = (0..depth).fold(Type::I64, |ty, _| Type::Array(Box::new(ty)));
+            let mut hir = crate::ir::typed_ast::HirResolution::default();
+            hir.classes.insert(
+                base,
+                HirClassInfo {
+                    fields: vec![("inherited".into(), ty.clone())],
+                    ..Default::default()
+                },
+            );
+            hir.classes.insert(
+                child,
+                HirClassInfo {
+                    base: Some(base),
+                    fields: vec![("inherited".into(), Type::Bool), ("own".into(), ty)],
+                    ..Default::default()
+                },
+            );
+            let resolution = LoweringDeclarations::new(&hir);
+            let callables = Callables::new(&resolution);
+            REBUILT_TYPE_NODES.set(0);
+            assert!(object_literal_supported(
+                callables.resolution,
+                &child,
+                &fields
+            ));
+            assert!(constructor_supported(
+                &child,
+                &args,
+                &callables,
+                &mut ScalarPlan::default()
+            ));
+            assert!(!constructor_supported(
+                &child,
+                &args[..1],
+                &callables,
+                &mut ScalarPlan::default()
+            ));
+            let mut ordered: Vec<_> = resolution.fields_rev(&child).unwrap().collect();
+            ordered.reverse();
+            assert_eq!(ordered.len(), 2);
+            assert!(std::ptr::eq(
+                ordered[0],
+                &callables.resolution.classes[&base].fields[0]
+            ));
+            assert!(std::ptr::eq(
+                ordered[1],
+                &callables.resolution.classes[&child].fields[1]
+            ));
+            assert_eq!(REBUILT_TYPE_NODES.get(), 0, "field type depth {depth}");
         }
     }
 

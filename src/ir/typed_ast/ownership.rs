@@ -21,9 +21,17 @@ fn stmt_slots(len: usize) -> Vec<HirStmt> {
     (0..len).map(|_| empty_stmt()).collect()
 }
 
-enum NodeRef<'a> {
+pub(crate) enum NodeRef<'a> {
     Expr(&'a HirExpr),
     Stmt(&'a HirStmt),
+}
+impl<'a> NodeRef<'a> {
+    pub(crate) fn children(&self) -> Vec<Self> {
+        match self {
+            Self::Expr(expr) => expr_children(expr),
+            Self::Stmt(stmt) => stmt_children(stmt),
+        }
+    }
 }
 enum NodeMut<'a> {
     Expr(&'a mut HirExpr),
@@ -127,7 +135,12 @@ fn shallow_expr(source: &HirExpr) -> HirExpr {
             callee: Box::new(empty_expr()),
             args: expr_slots(args.len()),
         },
-        HirExprKind::Call { callee, args } => HirExprKind::Call {
+        HirExprKind::Call {
+            callee,
+            binding,
+            args,
+        } => HirExprKind::Call {
+            binding: *binding,
             callee: *callee,
             args: expr_slots(args.len()),
         },
@@ -303,11 +316,13 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             span: *span,
         },
         HirStmt::If {
+            exits,
             cond: _,
             then_branch,
             else_branch,
             span,
         } => HirStmt::If {
+            exits: *exits,
             cond: empty_expr(),
             then_branch: stmt_slots(then_branch.len()),
             else_branch: else_branch.as_ref().map(|body| stmt_slots(body.len())),
@@ -412,9 +427,74 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
     }
 }
 
+/// Mutable child edges of HIR nodes. Ownership walks flatten statement lists,
+/// while analyses that care about cleanup boundaries can enter them as scopes.
+pub(crate) enum Siblings<'a> {
+    Exprs(&'a mut [HirExpr]),
+    Fields(&'a mut [(String, HirExpr)]),
+    Guards(&'a mut [HirGuard]),
+    Locks(&'a mut [HirLockTarget]),
+    Arms(&'a mut [HirMatchArm]),
+    Cases(&'a mut [HirSelectCase]),
+}
+
+pub(crate) trait ChildrenMut<'a> {
+    fn expr(&mut self, child: &'a mut HirExpr);
+    fn siblings(&mut self, siblings: Siblings<'a>);
+    fn arm(&mut self, arm: &'a mut HirMatchArm) {
+        self.siblings(Siblings::Guards(&mut arm.guard));
+        self.block(&mut arm.body);
+    }
+    fn case(&mut self, case: &'a mut HirSelectCase) {
+        match &mut case.kind {
+            HirSelectCaseKind::Recv { channel, .. } => self.expr(channel),
+            HirSelectCaseKind::Send { channel, value } => {
+                self.expr(channel);
+                self.expr(value);
+            }
+            HirSelectCaseKind::Timeout { millis } => self.expr(millis),
+            HirSelectCaseKind::Join { task, .. } => self.expr(task),
+            HirSelectCaseKind::Default => {}
+        }
+        self.block(&mut case.body);
+    }
+    fn block(&mut self, children: &'a mut [HirStmt]);
+}
+
+impl<'a> ChildrenMut<'a> for Vec<NodeMut<'a>> {
+    fn expr(&mut self, child: &'a mut HirExpr) {
+        self.push(NodeMut::Expr(child));
+    }
+    fn siblings(&mut self, siblings: Siblings<'a>) {
+        match siblings {
+            Siblings::Exprs(items) => self.extend(items.iter_mut().map(NodeMut::Expr)),
+            Siblings::Fields(items) => self.extend(items.iter_mut().map(|(_, e)| NodeMut::Expr(e))),
+            Siblings::Guards(items) => {
+                self.extend(items.iter_mut().map(|g| NodeMut::Expr(g.expr_mut())))
+            }
+            Siblings::Locks(items) => {
+                self.extend(items.iter_mut().map(|l| NodeMut::Expr(&mut l.target)))
+            }
+            Siblings::Arms(items) => items.iter_mut().for_each(|arm| self.arm(arm)),
+            Siblings::Cases(items) => items.iter_mut().for_each(|case| self.case(case)),
+        }
+    }
+    fn block(&mut self, children: &'a mut [HirStmt]) {
+        self.extend(children.iter_mut().map(NodeMut::Stmt));
+    }
+}
+
 fn expr_children_mut(source: &mut HirExpr) -> Vec<NodeMut<'_>> {
     let mut out = Vec::new();
-    match &mut source.kind {
+    visit_expr_children_mut(&mut source.kind, &mut out);
+    out
+}
+
+pub(crate) fn visit_expr_children_mut<'a>(
+    source: &'a mut HirExprKind,
+    out: &mut impl ChildrenMut<'a>,
+) {
+    match source {
         HirExprKind::Int(..)
         | HirExprKind::Float(..)
         | HirExprKind::Bool(..)
@@ -422,99 +502,79 @@ fn expr_children_mut(source: &mut HirExpr) -> Vec<NodeMut<'_>> {
         | HirExprKind::Var(..)
         | HirExprKind::FnRef(..) => {}
         HirExprKind::Binary { lhs, rhs, .. } => {
-            out.push(NodeMut::Expr(lhs));
-            out.push(NodeMut::Expr(rhs));
+            out.expr(lhs);
+            out.expr(rhs);
         }
         HirExprKind::Unary { operand, .. } => {
-            out.push(NodeMut::Expr(operand));
+            out.expr(operand);
         }
         HirExprKind::Invoke { callee, args, .. } => {
-            out.push(NodeMut::Expr(callee));
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.expr(callee);
+            out.siblings(Siblings::Exprs(args));
         }
         HirExprKind::Call { args, .. } => {
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.siblings(Siblings::Exprs(args));
         }
         HirExprKind::Print { value, .. } => {
-            out.push(NodeMut::Expr(value));
+            out.expr(value);
         }
         HirExprKind::Array { elements } => {
-            out.extend(elements.iter_mut().map(NodeMut::Expr));
+            out.siblings(Siblings::Exprs(elements));
         }
         HirExprKind::Index { array, index } => {
-            out.push(NodeMut::Expr(array));
-            out.push(NodeMut::Expr(index));
+            out.expr(array);
+            out.expr(index);
         }
         HirExprKind::Ternary {
             condition,
             then_expr,
             else_expr,
         } => {
-            out.push(NodeMut::Expr(condition));
-            out.push(NodeMut::Expr(then_expr));
-            out.push(NodeMut::Expr(else_expr));
+            out.expr(condition);
+            out.expr(then_expr);
+            out.expr(else_expr);
         }
         HirExprKind::New { args, .. } => {
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.siblings(Siblings::Exprs(args));
         }
         HirExprKind::FieldAccess { object, .. } => {
-            out.push(NodeMut::Expr(object));
+            out.expr(object);
         }
         HirExprKind::MethodCall { object, args, .. } => {
-            out.push(NodeMut::Expr(object));
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.expr(object);
+            out.siblings(Siblings::Exprs(args));
         }
         HirExprKind::ObjectLiteral { fields, .. } => {
-            out.extend(fields.iter_mut().map(|(_, e)| NodeMut::Expr(e)));
+            out.siblings(Siblings::Fields(fields));
         }
         HirExprKind::StaticField { .. } => {}
         HirExprKind::StaticCall { args, .. } => {
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.siblings(Siblings::Exprs(args));
         }
         HirExprKind::ReferenceArg { place } => {
-            out.push(NodeMut::Expr(place));
+            out.expr(place);
         }
         HirExprKind::Range { start, end } => {
-            out.push(NodeMut::Expr(start));
-            out.push(NodeMut::Expr(end));
+            out.expr(start);
+            out.expr(end);
         }
         HirExprKind::Await { inner } => {
-            out.push(NodeMut::Expr(inner));
+            out.expr(inner);
         }
         HirExprKind::TryPropagate { inner } => {
-            out.push(NodeMut::Expr(inner));
+            out.expr(inner);
         }
         HirExprKind::Lambda { body, .. } => {
-            out.extend(body.iter_mut().map(NodeMut::Stmt));
+            out.block(body);
         }
         HirExprKind::Match { scrutinee, arms } => {
-            out.push(NodeMut::Expr(scrutinee));
-            for arm in arms {
-                out.extend(
-                    arm.guard
-                        .iter_mut()
-                        .map(|step| NodeMut::Expr(step.expr_mut())),
-                );
-                out.extend(arm.body.iter_mut().map(NodeMut::Stmt));
-            }
+            out.expr(scrutinee);
+            out.siblings(Siblings::Arms(arms));
         }
         HirExprKind::Select { cases } => {
-            for case in cases {
-                match &mut case.kind {
-                    HirSelectCaseKind::Recv { channel, .. } => out.push(NodeMut::Expr(channel)),
-                    HirSelectCaseKind::Send { channel, value } => {
-                        out.push(NodeMut::Expr(channel));
-                        out.push(NodeMut::Expr(value));
-                    }
-                    HirSelectCaseKind::Timeout { millis } => out.push(NodeMut::Expr(millis)),
-                    HirSelectCaseKind::Join { task, .. } => out.push(NodeMut::Expr(task)),
-                    HirSelectCaseKind::Default => {}
-                }
-                out.extend(case.body.iter_mut().map(NodeMut::Stmt));
-            }
+            out.siblings(Siblings::Cases(cases));
         }
     }
-    out
 }
 
 fn expr_children(source: &HirExpr) -> Vec<NodeRef<'_>> {
@@ -620,13 +680,18 @@ fn expr_children(source: &HirExpr) -> Vec<NodeRef<'_>> {
 
 fn stmt_children_mut(source: &mut HirStmt) -> Vec<NodeMut<'_>> {
     let mut out = Vec::new();
+    visit_stmt_children_mut(source, &mut out);
+    out
+}
+
+pub(crate) fn visit_stmt_children_mut<'a>(source: &'a mut HirStmt, out: &mut impl ChildrenMut<'a>) {
     match source {
-        HirStmt::Expr(expr) => out.push(NodeMut::Expr(expr)),
+        HirStmt::Expr(expr) => out.expr(expr),
         HirStmt::Let { value, .. } => {
-            out.push(NodeMut::Expr(value));
+            out.expr(value);
         }
         HirStmt::Assign { value, .. } => {
-            out.push(NodeMut::Expr(value));
+            out.expr(value);
         }
         HirStmt::If {
             cond,
@@ -634,24 +699,26 @@ fn stmt_children_mut(source: &mut HirStmt) -> Vec<NodeMut<'_>> {
             else_branch,
             ..
         } => {
-            out.push(NodeMut::Expr(cond));
-            out.extend(then_branch.iter_mut().map(NodeMut::Stmt));
+            out.expr(cond);
+            out.block(then_branch);
             if let Some(body) = else_branch {
-                out.extend(body.iter_mut().map(NodeMut::Stmt));
+                out.block(body);
             }
         }
         HirStmt::While { cond, body, .. } => {
-            out.push(NodeMut::Expr(cond));
-            out.extend(body.iter_mut().map(NodeMut::Stmt));
+            out.expr(cond);
+            out.block(body);
         }
         HirStmt::Return { value, .. } => {
-            out.extend(value.iter_mut().map(NodeMut::Expr));
+            if let Some(value) = value {
+                out.expr(value);
+            }
         }
         HirStmt::Break { .. } => {}
         HirStmt::Continue { .. } => {}
         HirStmt::Defer { body, .. } => match body {
-            HirDeferBody::Expr(e) => out.push(NodeMut::Expr(e)),
-            HirDeferBody::Block(body) => out.extend(body.iter_mut().map(NodeMut::Stmt)),
+            HirDeferBody::Expr(e) => out.expr(e),
+            HirDeferBody::Block(body) => out.block(body),
         },
         HirStmt::Lock {
             target,
@@ -659,21 +726,17 @@ fn stmt_children_mut(source: &mut HirStmt) -> Vec<NodeMut<'_>> {
             body,
             ..
         } => {
-            out.push(NodeMut::Expr(target));
-            out.extend(
-                additional
-                    .iter_mut()
-                    .map(|member| NodeMut::Expr(&mut member.target)),
-            );
-            out.extend(body.iter_mut().map(NodeMut::Stmt));
+            out.expr(target);
+            out.siblings(Siblings::Locks(additional));
+            out.block(body);
         }
         HirStmt::For { iterable, body, .. } => {
-            out.push(NodeMut::Expr(iterable));
-            out.extend(body.iter_mut().map(NodeMut::Stmt));
+            out.expr(iterable);
+            out.block(body);
         }
         HirStmt::FieldAssign { object, value, .. } => {
-            out.push(NodeMut::Expr(object));
-            out.push(NodeMut::Expr(value));
+            out.expr(object);
+            out.expr(value);
         }
         HirStmt::IndexAssign {
             array,
@@ -681,18 +744,17 @@ fn stmt_children_mut(source: &mut HirStmt) -> Vec<NodeMut<'_>> {
             value,
             ..
         } => {
-            out.push(NodeMut::Expr(array));
-            out.push(NodeMut::Expr(index));
-            out.push(NodeMut::Expr(value));
+            out.expr(array);
+            out.expr(index);
+            out.expr(value);
         }
         HirStmt::StaticFieldAssign { value, .. } => {
-            out.push(NodeMut::Expr(value));
+            out.expr(value);
         }
         HirStmt::SuperInit { args, .. } => {
-            out.extend(args.iter_mut().map(NodeMut::Expr));
+            out.siblings(Siblings::Exprs(args));
         }
     }
-    out
 }
 
 fn stmt_children(source: &HirStmt) -> Vec<NodeRef<'_>> {
@@ -854,6 +916,7 @@ mod tests {
                 operand: Box::new(child),
             },
             3 => HirExprKind::Call {
+                binding: HirCallBinding::Function,
                 callee: "f".into(),
                 args: vec![leaf(), child],
             },
@@ -1080,12 +1143,7 @@ mod tests {
                     span: Span::dummy(),
                 };
                 for _ in 0..50_000 {
-                    stmt = HirStmt::If {
-                        cond: leaf(),
-                        then_branch: vec![stmt],
-                        else_branch: None,
-                        span: Span::dummy(),
-                    };
+                    stmt = HirStmt::conditional(leaf(), vec![stmt], None, Span::dummy());
                 }
                 let copied = stmt.clone();
                 assert_eq!(stmt.child_exprs().len(), 50_001);

@@ -2,7 +2,7 @@
 //! Production eligibility operates on lowered LIR in `validation`.
 
 use super::*;
-use crate::ir::typed_ast::HirGuard;
+use crate::ir::typed_ast::{HirCallBinding, HirGuard};
 
 /// Does this expression suspend the running task where it stands? `await`,
 /// `select`, and a channel `send`/`recv` all return control to the scheduler.
@@ -11,7 +11,7 @@ fn lir_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.unqualified_name().as_deref().unwrap_or(""), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, binding: HirCallBinding::Function, .. } if matches!(callee.unqualified_name().as_deref().unwrap_or(""), "sleep" | "yield")) =>
         {
             false
         }
@@ -136,7 +136,12 @@ fn lir_await_site<'e>(
     let HirExprKind::Await { inner } = &expr.kind else {
         return None;
     };
-    let HirExprKind::Call { callee, args } = &inner.kind else {
+    let HirExprKind::Call {
+        callee,
+        binding: HirCallBinding::Function,
+        args,
+    } = &inner.kind
+    else {
         return None;
     };
     if !cooperative_leaves.contains(&callee.clone()) {
@@ -152,7 +157,12 @@ fn lir_builtin_await(expr: &HirExpr) -> Option<LirAwaitSite<'_>> {
     let HirExprKind::Await { inner } = &expr.kind else {
         return None;
     };
-    let HirExprKind::Call { callee, args } = &inner.kind else {
+    let HirExprKind::Call {
+        callee,
+        binding: HirCallBinding::Function,
+        args,
+    } = &inner.kind
+    else {
         return None;
     };
     if expr.ty != Type::Void
@@ -480,15 +490,17 @@ pub(super) fn supported_panic<'e>(
     ctx: &LirTypeCtx<'_>,
     names: &HashMap<&'e str, Cow<'e, Type>>,
 ) -> bool {
-    let HirExprKind::Call { callee, args } = &e.kind else {
+    let HirExprKind::Call {
+        callee,
+        binding: HirCallBinding::Function,
+        args,
+    } = &e.kind
+    else {
         return false;
     };
     // A local binding of the same name is an ordinary indirect call, not the
     // builtin, and it wins here exactly as it does in `supported_expr`.
-    if !callee.is_free_named("panic")
-        || e.ty != Type::Never
-        || names.contains_key(callee.unqualified_name().as_deref().unwrap_or(""))
-    {
+    if !callee.is_free_named("panic") || e.ty != Type::Never {
         return false;
     }
     // The three accepted message shapes: none (emission substitutes a
@@ -1295,12 +1307,15 @@ fn supported_expr_node<'n>(
                     ctx.supported_type(ty) && ctx.storable(ty, &arg.ty) && child_supported(arg)
                 })
         }
-        HirExprKind::Call { callee, args } => {
-            // HIR spells direct and indirect calls with the same node, and a
-            // local fn-typed binding shadows a free function.
-            // The local wins here because this must resolve to what the type checker
-            // checked the call against.
-            if let Some(local) = names.get(callee.unqualified_name().as_deref().unwrap_or("")) {
+        HirExprKind::Call {
+            callee,
+            binding,
+            args,
+        } => {
+            if binding.is_local() {
+                let Some(local) = names.get(callee.name().as_ref()) else {
+                    return false;
+                };
                 // Either callable value: a `closure` is called through the code
                 // pointer in its word 0, with the object itself as the hidden
                 // leading argument, so the only difference from a `fn` is in

@@ -1,15 +1,44 @@
 use super::*;
+use crate::ir::lowered::MethodOperands;
+use crate::ir::typed_ast::HirCapture;
 use crate::semantic::intrinsics::BuiltinMethod;
+use std::borrow::Cow;
+
+#[cfg(test)]
+std::thread_local! {
+    static PEAK_MATERIALIZED_TARGET_NODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 pub(super) fn lower(
     expr: &mut HirExpr,
     emitted: &mut Vec<SourceInst>,
     locals: &mut Vec<LirLocal>,
-    names: &mut HashMap<String, LirLocalId>,
+    names: &HashMap<String, LirLocalId>,
     callables: &Callables,
     is_async: bool,
 ) {
-    if !matches!(
+    if !needs_lowering(expr) {
+        return;
+    }
+    let mut plan = ScalarPlan::default();
+    let valid = scalar(expr, names, locals, callables, is_async, &mut plan);
+    if !valid {
+        return;
+    }
+    let result = lower_validated(expr, emitted, locals, names, callables, is_async, &mut plan);
+    drop(plan);
+    let local = match result {
+        Ok(local) => local,
+        Err(local) => {
+            expr.ty = Type::Never;
+            local
+        }
+    };
+    expr.kind = HirExprKind::Var(locals[local.0 as usize].name.clone());
+}
+
+pub(super) fn needs_lowering(expr: &HirExpr) -> bool {
+    matches!(
         expr.kind,
         HirExprKind::Unary { .. }
             | HirExprKind::Binary { .. }
@@ -29,65 +58,86 @@ pub(super) fn lower(
             | HirExprKind::FnRef(_)
             | HirExprKind::Lambda { .. }
             | HirExprKind::MethodCall { .. }
-    ) || !scalar(expr, names, locals, callables, is_async)
-    {
-        return;
-    }
-    let snapshots = expr.walk_postorder(false).any(|node| {
-        matches!(
-            node.kind,
-            HirExprKind::Call { .. }
-                | HirExprKind::Invoke { .. }
-                | HirExprKind::MethodCall { .. }
-                | HirExprKind::New { .. }
-                | HirExprKind::StaticCall { .. }
-        )
-    });
+    )
+}
 
+pub(super) fn lower_validated<'d>(
+    expr: &'d HirExpr,
+    emitted: &mut Vec<SourceInst>,
+    locals: &mut Vec<LirLocal>,
+    names: &HashMap<String, LirLocalId>,
+    callables: &'d Callables,
+    is_async: bool,
+    plan: &mut ScalarPlan<'d>,
+) -> Result<LirLocalId, LirLocalId> {
     let mut context = ScalarLowering {
         emitted,
         locals,
         names,
         callables,
         is_async,
-        snapshots,
+        snapshots: plan.snapshots,
+        plan,
         values: HashMap::new(),
         reference_sites: HashMap::new(),
-        work: vec![Work::Enter(&*expr)],
+        work: vec![Work::Enter(expr)],
     };
     while let Some(action) = context.work.pop() {
-        if let Some(kind) = context.step(action) {
-            expr.kind = kind;
-            expr.ty = Type::Never;
-            return;
+        if let Some(stop) = context.step(action) {
+            return Err(stop);
         }
     }
-    let LirOperand::Local(result) = context.values[&std::ptr::from_ref(&*expr)] else {
-        unreachable!()
+    let LirOperand::Local(result) = context.values[&std::ptr::from_ref(expr)] else {
+        unreachable!("a completed scalar root is stored in a result local")
     };
-    expr.kind = HirExprKind::Var(context.locals[result.0 as usize].name.clone());
+    Ok(result)
 }
 
 enum Work<'a> {
     Enter(&'a HirExpr),
     Coerce {
         child: &'a HirExpr,
-        target: Type,
+        target: Cow<'a, Type>,
     },
-    Finish(&'a HirExpr),
-    AwaitBuiltin(&'a HirExpr),
-    Reference(&'a HirExpr),
-    PrepareMethod(&'a HirExpr),
+    CoerceProjected {
+        child: &'a HirExpr,
+        target: ProjectedParameter<'a>,
+    },
+    CoerceSnapshot {
+        child: &'a HirExpr,
+        snapshot: LirLocalId,
+        index: usize,
+    },
+    Finish(&'a HirExpr, Finish<'a>),
+    AwaitBuiltin {
+        node: &'a HirExpr,
+        call_span: &'a Span,
+        callee: FunctionId,
+        args: &'a [HirExpr],
+    },
+    CaptureField {
+        object: &'a HirExpr,
+        local: LirLocalId,
+    },
+    CaptureElement {
+        array: &'a HirExpr,
+        index: &'a HirExpr,
+        owner: LirLocalId,
+        slot: LirLocalId,
+        span: &'a Span,
+    },
+    PrepareMethod(&'a HirExpr, MethodOperands<'a>),
     FieldStore {
-        object: LirOperand,
-        object_ty: Type,
-        field: String,
+        object: LirLocalId,
+        object_ty: &'a Type,
+        field: &'a str,
         child: &'a HirExpr,
     },
     EnumStore {
-        node: &'a HirExpr,
+        local: LirLocalId,
+        enum_ty: &'a Type,
         class: TypeId,
-        variant: String,
+        variant: &'a str,
         index: usize,
         child: &'a HirExpr,
     },
@@ -95,9 +145,10 @@ enum Work<'a> {
         node: &'a HirExpr,
         message: Option<&'a HirExpr>,
     },
-    FormatLiteral {
+    FormatNext {
         node: &'a HirExpr,
-        text: String,
+        template: crate::interpolate::CheckedTemplate<'a>,
+        operands: &'a [HirExpr],
     },
     FormatValue {
         node: &'a HirExpr,
@@ -105,55 +156,117 @@ enum Work<'a> {
         format: Option<crate::interpolate::F64Format>,
     },
     ArrayStore {
-        array: LirOperand,
+        array: LirLocalId,
         index: usize,
-        element: Type,
+        element: &'a Type,
         child: &'a HirExpr,
     },
 }
 
-fn arguments<'a>(args: &'a [HirExpr], targets: Option<&[Type]>) -> Vec<Work<'a>> {
-    let mut work = Vec::new();
-    for (index, child) in args.iter().enumerate().rev() {
-        if let Some(target) = targets.and_then(|types| types.get(index))
-            && *target != child.ty
+enum Finish<'a> {
+    Await(&'a HirExpr),
+    StaticCall {
+        class: TypeId,
+        method: &'a str,
+        args: &'a [HirExpr],
+    },
+    New {
+        class: TypeId,
+        args: &'a [HirExpr],
+    },
+    Index {
+        array: &'a HirExpr,
+        index: &'a HirExpr,
+    },
+    Field {
+        object: &'a HirExpr,
+        field: &'a str,
+    },
+    Range {
+        start: &'a HirExpr,
+        end: &'a HirExpr,
+    },
+    Print {
+        value: &'a HirExpr,
+        newline: bool,
+    },
+    Method(MethodOperands<'a>, Option<BuiltinMethod>),
+    LocalCall {
+        name: FunctionId,
+        snapshot: LirLocalId,
+        args: &'a [HirExpr],
+    },
+    Invoke {
+        params: &'a [Type],
+        name: FunctionId,
+        callee: &'a HirExpr,
+        args: &'a [HirExpr],
+    },
+    Call {
+        callee: FunctionId,
+        args: &'a [HirExpr],
+    },
+    Unary {
+        op: &'a UnaryOp,
+        operand: &'a HirExpr,
+    },
+    Binary {
+        op: &'a BinOp,
+        lhs: &'a HirExpr,
+        rhs: &'a HirExpr,
+    },
+}
+
+fn push_typed_arguments<'e, 'p>(
+    work: &mut Vec<Work<'e>>,
+    args: &'e [HirExpr],
+    params: &'p [Type],
+    builtin_panic: Option<FunctionId>,
+    coercion: impl Fn(&'e HirExpr, usize, &'p Type) -> Work<'e>,
+) {
+    let paired = args.len().min(params.len());
+    work.extend(args[paired..].iter().rev().map(Work::Enter));
+    for (index, (child, target)) in args.iter().zip(params).enumerate().rev() {
+        if !exits_before_conversion(child, builtin_panic)
+            && child.ty != *target
             && !matches!(child.kind, HirExprKind::ReferenceArg { .. })
         {
-            work.push(Work::Coerce {
-                child,
-                target: target.clone(),
-            });
+            work.push(coercion(child, index, target));
         }
         work.push(Work::Enter(child));
     }
-    work
+}
+
+fn callable_params(ty: &Type) -> &[Type] {
+    let (Type::Fn(params, _) | Type::Closure(params, _)) = ty else {
+        unreachable!("a validated indirect call has a function or closure signature")
+    };
+    params
 }
 
 /// Per-expression state shared by the iterative scalar lowering actions.
-struct ScalarLowering<'a, 'e> {
+struct ScalarLowering<'a, 'e, 'r> {
     emitted: &'a mut Vec<SourceInst>,
     locals: &'a mut Vec<LirLocal>,
-    names: &'a mut HashMap<String, LirLocalId>,
-    callables: &'a Callables,
+    names: &'a HashMap<String, LirLocalId>,
+    callables: &'e Callables<'e, 'r>,
     is_async: bool,
     snapshots: bool,
+    plan: &'a mut ScalarPlan<'e>,
     values: HashMap<*const HirExpr, LirOperand>,
     reference_sites: HashMap<*const HirExpr, (FunctionId, usize)>,
     work: Vec<Work<'e>>,
 }
 
-impl<'e> ScalarLowering<'_, 'e> {
+impl<'e> ScalarLowering<'_, 'e, '_> {
     fn emit(&mut self, value: LirRvalue, ty: Type, span: Span) -> LirLocalId {
         emit(value, ty, span, self.emitted, self.locals, self.names)
     }
 
-    fn finish_await(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Await { inner } = &node.kind else {
-            unreachable!()
-        };
+    fn finish_await(&mut self, node: &HirExpr, inner: &HirExpr) -> LirOperand {
         LirOperand::Local(self.emit(
             LirRvalue::AwaitFuture {
-                future: self.values[&std::ptr::from_ref(&**inner)].clone(),
+                future: self.values[&std::ptr::from_ref(inner)].clone(),
                 result: node.ty.clone(),
             },
             node.ty.clone(),
@@ -161,20 +274,18 @@ impl<'e> ScalarLowering<'_, 'e> {
         ))
     }
 
-    fn finish_static_call(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::StaticCall {
-            class,
-            method,
-            args,
-        } = &node.kind
-        else {
-            unreachable!()
-        };
+    fn finish_static_call(
+        &mut self,
+        node: &HirExpr,
+        class: TypeId,
+        method: &str,
+        args: &[HirExpr],
+    ) -> LirOperand {
         LirOperand::Local(
             self.emit(
                 LirRvalue::StaticCall {
-                    class: *class,
-                    method: method.clone(),
+                    class,
+                    method: method.to_owned(),
                     is_async: false,
                     args: args
                         .iter()
@@ -196,16 +307,12 @@ impl<'e> ScalarLowering<'_, 'e> {
         )
     }
 
-    fn finish_new(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::New { class, args } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_new(&mut self, node: &HirExpr, class: TypeId, args: &[HirExpr]) -> LirOperand {
         let object = self.values[&std::ptr::from_ref(node)].clone();
         self.emit(
             LirRvalue::ConstructorCall {
                 object: object.clone(),
-                class: *class,
+                class,
                 args: args
                     .iter()
                     .map(|arg| self.values[&std::ptr::from_ref(arg)].clone())
@@ -225,14 +332,11 @@ impl<'e> ScalarLowering<'_, 'e> {
         object
     }
 
-    fn finish_index(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Index { array, index } = &node.kind else {
-            unreachable!()
-        };
+    fn finish_index(&mut self, node: &HirExpr, array: &HirExpr, index: &HirExpr) -> LirOperand {
         LirOperand::Local(self.emit(
             LirRvalue::Index {
-                array: self.values[&std::ptr::from_ref(&**array)].clone(),
-                index: self.values[&std::ptr::from_ref(&**index)].clone(),
+                array: self.values[&std::ptr::from_ref(array)].clone(),
+                index: self.values[&std::ptr::from_ref(index)].clone(),
                 element: node.ty.clone(),
             },
             node.ty.clone(),
@@ -240,15 +344,12 @@ impl<'e> ScalarLowering<'_, 'e> {
         ))
     }
 
-    fn finish_field_access(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::FieldAccess { object, field } = &node.kind else {
-            unreachable!()
-        };
+    fn finish_field_access(&mut self, node: &HirExpr, object: &HirExpr, field: &str) -> LirOperand {
         LirOperand::Local(self.emit(
             LirRvalue::FieldLoad {
-                object: self.values[&std::ptr::from_ref(&**object)].clone(),
+                object: self.values[&std::ptr::from_ref(object)].clone(),
                 object_ty: object.ty.clone(),
-                field: field.clone(),
+                field: field.to_owned(),
                 result: node.ty.clone(),
             },
             node.ty.clone(),
@@ -256,94 +357,37 @@ impl<'e> ScalarLowering<'_, 'e> {
         ))
     }
 
-    fn finish_static_field(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::StaticField { class, field } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_static_field(&mut self, node: &HirExpr, class: &TypeId, field: &str) -> LirOperand {
         let value = if self.callables.resolution.enums.contains_key(class) {
             LirRvalue::EnumAlloc {
                 class: *class,
-                variant: field.clone(),
+                variant: field.to_owned(),
                 enum_ty: node.ty.clone(),
             }
         } else {
             LirRvalue::StaticField {
                 class: *class,
-                field: field.clone(),
+                field: field.to_owned(),
                 result: node.ty.clone(),
             }
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_range(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Range { start, end } = &node.kind else {
-            unreachable!()
-        };
+    fn finish_range(&mut self, node: &HirExpr, start: &HirExpr, end: &HirExpr) -> LirOperand {
         LirOperand::Local(self.emit(
             LirRvalue::Range {
-                start: self.values[&std::ptr::from_ref(&**start)].clone(),
-                end: self.values[&std::ptr::from_ref(&**end)].clone(),
+                start: self.values[&std::ptr::from_ref(start)].clone(),
+                end: self.values[&std::ptr::from_ref(end)].clone(),
             },
             node.ty.clone(),
             node.span,
         ))
     }
 
-    fn finish_int(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Int(value) = &node.kind else {
-            unreachable!()
-        };
-        LirOperand::integer(*value, &node.ty)
-    }
-
-    fn finish_float(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Float(value) = &node.kind else {
-            unreachable!()
-        };
-        LirOperand::Float(*value)
-    }
-
-    fn finish_bool(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Bool(value) = &node.kind else {
-            unreachable!()
-        };
-        LirOperand::Bool(*value)
-    }
-
-    fn finish_str(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Str(value) = &node.kind else {
-            unreachable!()
-        };
-        LirOperand::Local(self.emit(
-            LirRvalue::StringLiteral(value.clone()),
-            node.ty.clone(),
-            node.span,
-        ))
-    }
-
-    fn finish_fn_ref(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::FnRef(function) = &node.kind else {
-            unreachable!()
-        };
-        LirOperand::Local(self.emit(
-            LirRvalue::FunctionRef {
-                function: *function,
-                ty: node.ty.clone(),
-            },
-            node.ty.clone(),
-            node.span,
-        ))
-    }
-
-    fn finish_lambda(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Lambda { id, captures, .. } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_lambda(&mut self, node: &HirExpr, id: ExprId, captures: &[HirCapture]) -> LirOperand {
         let value = LirRvalue::Closure {
-            id: *id,
+            id,
             captures: captures
                 .iter()
                 .map(|capture| LirOperand::Local(self.names[&capture.source]))
@@ -353,24 +397,16 @@ impl<'e> ScalarLowering<'_, 'e> {
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_print(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Print { value, newline } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_print(&mut self, node: &HirExpr, value: &HirExpr, newline: bool) -> LirOperand {
         let value = LirRvalue::Print {
-            value: self.values[&std::ptr::from_ref(&**value)].clone(),
+            value: self.values[&std::ptr::from_ref(value)].clone(),
             ty: value.ty.clone(),
-            newline: *newline,
+            newline,
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_var(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Var(name) = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_var(&mut self, node: &HirExpr, name: &str) -> LirOperand {
         let source = LirOperand::Local(self.names[name]);
         if self.snapshots {
             LirOperand::Local(self.emit(LirRvalue::Use(source), node.ty.clone(), node.span))
@@ -379,24 +415,20 @@ impl<'e> ScalarLowering<'_, 'e> {
         }
     }
 
-    fn finish_method_call(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::MethodCall {
-            object,
-            method,
-            args,
-            super_class,
-            builtin,
-        } = &node.kind
-        else {
-            unreachable!()
-        };
-
-        let receiver = self.values[&std::ptr::from_ref(&**object)].clone();
-        let operands = args
+    fn finish_method_call(
+        &mut self,
+        node: &HirExpr,
+        call: MethodOperands<'_>,
+        builtin: Option<BuiltinMethod>,
+    ) -> LirOperand {
+        let receiver = self.values[&std::ptr::from_ref(call.object)].clone();
+        let operands = call
+            .args
             .iter()
             .map(|arg| self.values[&std::ptr::from_ref(arg)].clone())
             .collect();
-        let arg_types = args
+        let arg_types = call
+            .args
             .iter()
             .map(|arg| {
                 self.values[&std::ptr::from_ref(arg)]
@@ -406,100 +438,85 @@ impl<'e> ScalarLowering<'_, 'e> {
             .collect();
         let value = match builtin {
             Some(BuiltinMethod::Intrinsic(id)) => LirRvalue::IntrinsicCall {
-                intrinsic: *id,
-                method: method.clone(),
+                intrinsic: id,
+                method: call.method.clone(),
                 receiver,
-                receiver_ty: object.ty.clone(),
+                receiver_ty: call.object.ty.clone(),
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
             },
             Some(BuiltinMethod::Adt(id)) => LirRvalue::EnumMethod {
                 receiver,
-                receiver_ty: object.ty.clone(),
-                method: *id,
+                receiver_ty: call.object.ty.clone(),
+                method: id,
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
             },
             None => LirRvalue::MethodCall {
                 receiver,
-                receiver_ty: object.ty.clone(),
-                method: method.to_string(),
+                receiver_ty: call.object.ty.clone(),
+                method: call.method.to_string(),
                 // Filled in the common final call walk below.
                 is_async: false,
                 args: operands,
                 arg_types,
                 result: node.ty.clone(),
-                super_class: *super_class,
+                super_class: call.super_class,
             },
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_invoke(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Invoke { name, callee, args } = &node.kind else {
-            unreachable!()
-        };
-
-        let (Type::Fn(params, result) | Type::Closure(params, result)) = &callee.ty else {
-            unreachable!()
-        };
+    fn finish_invoke(
+        &mut self,
+        node: &HirExpr,
+        name: FunctionId,
+        callee: LirOperand,
+        args: &[HirExpr],
+        params: Vec<Type>,
+    ) -> LirOperand {
         let value = LirRvalue::IndirectCall {
-            callee: self.values[&std::ptr::from_ref(&**callee)].clone(),
-            name: *name,
+            callee,
+            name,
             args: args
                 .iter()
                 .map(|arg| self.values[&std::ptr::from_ref(arg)].clone())
                 .collect(),
-            params: params.clone(),
-            result: (**result).clone(),
+            params,
+            result: node.ty.clone(),
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_call(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Call { callee, args } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_call(&mut self, node: &HirExpr, callee: FunctionId, args: &[HirExpr]) -> LirOperand {
         let operands = args
             .iter()
             .map(|arg| self.values[&std::ptr::from_ref(arg)].clone())
             .collect();
-        let value = if let Some(callable) = self.values.get(&std::ptr::from_ref(node)) {
-            let ty = callable.ty(self.locals).expect("callable local");
-            let (Type::Fn(params, result) | Type::Closure(params, result)) = &ty else {
-                unreachable!()
-            };
-            LirRvalue::IndirectCall {
-                callee: callable.clone(),
-                name: *callee,
-                args: operands,
-                params: params.clone(),
-                result: (**result).clone(),
-            }
-        } else if let Some((params, result)) = self.callables.get(callee) {
-            if let Some(output) = self.callables.async_outputs.get(callee) {
+        let value = if let Some(signature) = self.callables.signatures.get(&callee) {
+            let params = signature.params.iter().cloned().collect();
+            if signature.is_async {
                 LirRvalue::StartTask {
-                    callee: *callee,
+                    callee,
                     args: operands,
-                    params: params.clone(),
-                    output: output.clone(),
+                    params,
+                    output: signature.output.clone(),
                 }
             } else {
                 LirRvalue::DirectCall {
-                    callee: *callee,
+                    callee,
                     args: operands,
-                    params: params.clone(),
-                    result: result.clone(),
+                    params,
+                    result: signature.output.clone(),
                 }
             }
         } else if callee.is_free_named("recover") {
             LirRvalue::Recover
         } else {
             LirRvalue::BuiltinCall {
-                callee: *callee,
+                callee,
                 args: operands,
                 params: args.iter().map(|arg| arg.ty.clone()).collect(),
                 result: node.ty.clone(),
@@ -508,29 +525,27 @@ impl<'e> ScalarLowering<'_, 'e> {
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_unary(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Unary { op, operand } = &node.kind else {
-            unreachable!()
-        };
-
+    fn finish_unary(&mut self, node: &HirExpr, op: &UnaryOp, operand: &HirExpr) -> LirOperand {
         let value = LirRvalue::Unary {
             op: op.clone(),
-            operand: self.values[&std::ptr::from_ref(&**operand)].clone(),
+            operand: self.values[&std::ptr::from_ref(operand)].clone(),
             ty: node.ty.clone(),
         };
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish_binary(&mut self, node: &HirExpr) -> LirOperand {
-        let HirExprKind::Binary { op, lhs, rhs } = &node.kind else {
-            unreachable!()
-        };
-
-        let lhs_value = self.values[&std::ptr::from_ref(&**lhs)].clone();
+    fn finish_binary(
+        &mut self,
+        node: &HirExpr,
+        op: &BinOp,
+        lhs: &HirExpr,
+        rhs: &HirExpr,
+    ) -> LirOperand {
+        let lhs_value = self.values[&std::ptr::from_ref(lhs)].clone();
         let value = LirRvalue::Binary {
             op: op.clone(),
             lhs: lhs_value.clone(),
-            rhs: self.values[&std::ptr::from_ref(&**rhs)].clone(),
+            rhs: self.values[&std::ptr::from_ref(rhs)].clone(),
             // A mixed class/interface identity comparison coerced
             // its subtype side on entry, so the left operand already
             // carries the shared type.
@@ -543,78 +558,86 @@ impl<'e> ScalarLowering<'_, 'e> {
         LirOperand::Local(self.emit(value, node.ty.clone(), node.span))
     }
 
-    fn finish(&mut self, node: &HirExpr) {
-        let operand = match &node.kind {
-            HirExprKind::Await { .. } => self.finish_await(node),
-            HirExprKind::StaticCall { .. } => self.finish_static_call(node),
-            HirExprKind::New { .. } => self.finish_new(node),
-            HirExprKind::Index { .. } => self.finish_index(node),
-            HirExprKind::FieldAccess { .. } => self.finish_field_access(node),
-            HirExprKind::StaticField { .. } => self.finish_static_field(node),
-            HirExprKind::Range { .. } => self.finish_range(node),
-            HirExprKind::Int(_) => self.finish_int(node),
-            HirExprKind::Float(_) => self.finish_float(node),
-            HirExprKind::Bool(_) => self.finish_bool(node),
-            HirExprKind::Str(_) => self.finish_str(node),
-            HirExprKind::FnRef(_) => self.finish_fn_ref(node),
-            HirExprKind::Lambda { .. } => self.finish_lambda(node),
-            HirExprKind::Print { .. } => self.finish_print(node),
-            HirExprKind::Var(_) => self.finish_var(node),
-            HirExprKind::MethodCall { .. } => self.finish_method_call(node),
-            HirExprKind::Invoke { .. } => self.finish_invoke(node),
-            HirExprKind::Call { .. } => self.finish_call(node),
-            HirExprKind::Unary { .. } => self.finish_unary(node),
-            HirExprKind::Binary { .. } => self.finish_binary(node),
-            ir_variants!(
-                HirExprKind;
-                Array, Ternary, ObjectLiteral, ReferenceArg, TryPropagate, Match, Select
-            ) => unreachable!("scalar tree was validated"),
+    fn finish(&mut self, node: &HirExpr, action: Finish<'e>) {
+        let operand = match action {
+            Finish::Await(inner) => self.finish_await(node, inner),
+            Finish::StaticCall {
+                class,
+                method,
+                args,
+            } => self.finish_static_call(node, class, method, args),
+            Finish::New { class, args } => self.finish_new(node, class, args),
+            Finish::Index { array, index } => self.finish_index(node, array, index),
+            Finish::Field { object, field } => self.finish_field_access(node, object, field),
+            Finish::Range { start, end } => self.finish_range(node, start, end),
+            Finish::Print { value, newline } => self.finish_print(node, value, newline),
+            Finish::Method(call, builtin) => self.finish_method_call(node, call, builtin),
+            Finish::Invoke {
+                name,
+                callee,
+                args,
+                params,
+            } => self.finish_invoke(
+                node,
+                name,
+                self.values[&std::ptr::from_ref(callee)].clone(),
+                args,
+                params.to_vec(),
+            ),
+            Finish::LocalCall {
+                name,
+                snapshot,
+                args,
+            } => {
+                let params = callable_params(&self.locals[snapshot.0 as usize].ty).to_vec();
+                self.finish_invoke(node, name, LirOperand::Local(snapshot), args, params)
+            }
+            Finish::Call { callee, args } => self.finish_call(node, callee, args),
+            Finish::Unary { op, operand } => self.finish_unary(node, op, operand),
+            Finish::Binary { op, lhs, rhs } => self.finish_binary(node, op, lhs, rhs),
         };
         self.values.insert(std::ptr::from_ref(node), operand);
     }
 
-    fn enter_await(&mut self, node: &'e HirExpr, targets: Option<&[Type]>) -> bool {
-        let HirExprKind::Await { inner } = &node.kind else {
-            unreachable!()
-        };
-
-        let HirExprKind::Call { args, .. } = &inner.kind else {
-            unreachable!()
-        };
-        self.work.push(Work::AwaitBuiltin(node));
-        self.work.extend(arguments(args, targets));
-        true
-    }
-
-    fn enter_reference_arg(&mut self, node: &'e HirExpr) -> bool {
-        let HirExprKind::ReferenceArg { place } = &node.kind else {
-            unreachable!()
-        };
-
+    fn enter_reference_arg(&mut self, node: &'e HirExpr, place: &'e HirExpr) {
         let captured = match &place.kind {
             HirExprKind::Var(name) => LirPlace::Local(self.names[name]),
-            HirExprKind::FieldAccess { object, field } => LirPlace::Field {
-                object: reserve(object.ty.clone(), self.locals, self.names),
-                object_ty: object.ty.clone(),
-                field: field.clone(),
-                ty: place.ty.clone(),
-            },
-            HirExprKind::Index { .. } => {
+            HirExprKind::FieldAccess { object, field } => {
+                let local = reserve(object.ty.clone(), self.locals, self.names);
+                self.work.push(Work::CaptureField { object, local });
+                self.work.push(Work::Enter(object));
+                LirPlace::Field {
+                    object: local,
+                    object_ty: object.ty.clone(),
+                    field: field.clone(),
+                    ty: place.ty.clone(),
+                }
+            }
+            HirExprKind::Index { array, index } => {
                 let owner = reserve(Type::Void, self.locals, self.names);
                 self.locals[owner.0 as usize].storage_kind =
                     super::super::super::LirStorageKind::GcOwner;
+                let slot = reserve(Type::I64, self.locals, self.names);
+                self.work.push(Work::CaptureElement {
+                    array,
+                    index,
+                    owner,
+                    slot,
+                    span: &place.span,
+                });
+                self.work.push(Work::Enter(index));
+                self.work.push(Work::Enter(array));
                 LirPlace::ArrayElement {
                     owner,
-                    index: reserve(Type::I64, self.locals, self.names),
+                    index: slot,
                     element: place.ty.clone(),
                 }
             }
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
-                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
-                Await, TryPropagate, Lambda, Match, Select
-            ) => unreachable!("validated reference place"),
+            ir_variants!(HirExprKind; Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
+                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select) =>
+            {
+                unreachable!("a validated reference place is a variable, field or array element")
+            }
         };
         let argument = LirOperand::Reference {
             place: captured,
@@ -633,168 +656,110 @@ impl<'e> ScalarLowering<'_, 'e> {
             );
         }
         self.values.insert(std::ptr::from_ref(node), argument);
-        self.work.push(Work::Reference(node));
-        match &place.kind {
-            HirExprKind::Var(_) => {}
-            HirExprKind::FieldAccess { object, .. } => self.work.push(Work::Enter(object)),
-            HirExprKind::Index { array, index } => {
-                self.work.push(Work::Enter(index));
-                self.work.push(Work::Enter(array));
-            }
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, FnRef, Binary, Unary, Call, Invoke, Print, Array, Ternary,
-                New, MethodCall, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range,
-                Await, TryPropagate, Lambda, Match, Select
-            ) => unreachable!("validated reference place"),
-        }
-        true
     }
 
-    fn enter_method_call(&mut self, node: &'e HirExpr, targets: Option<&[Type]>) -> bool {
-        let HirExprKind::MethodCall { object, args, .. } = &node.kind else {
-            unreachable!()
-        };
-
-        self.work.push(Work::Finish(node));
-        self.work.extend(arguments(args, targets));
-        self.work.push(Work::PrepareMethod(node));
-        self.work.push(Work::Enter(object));
-        true
-    }
-
-    fn enter_enum(&mut self, node: &'e HirExpr) -> bool {
-        let HirExprKind::StaticCall {
-            class,
-            method,
-            args,
-        } = &node.kind
-        else {
-            unreachable!()
-        };
-
-        let object = LirOperand::Local(self.emit(
+    fn enter_enum(
+        &mut self,
+        node: &'e HirExpr,
+        class: TypeId,
+        method: &'e str,
+        args: &'e [HirExpr],
+    ) {
+        let local = self.emit(
             LirRvalue::EnumAlloc {
-                class: *class,
-                variant: method.clone(),
+                class,
+                variant: method.to_owned(),
                 enum_ty: node.ty.clone(),
             },
             node.ty.clone(),
             node.span,
-        ));
-        self.values.insert(std::ptr::from_ref(node), object);
+        );
+        self.values
+            .insert(std::ptr::from_ref(node), LirOperand::Local(local));
         for (index, child) in args.iter().enumerate().rev() {
             self.work.push(Work::EnumStore {
-                node,
-                class: *class,
-                variant: method.clone(),
+                enum_ty: &node.ty,
+                local,
+                class,
+                variant: method,
                 index,
                 child,
             });
             self.work.push(Work::Enter(child));
         }
-        true
     }
 
-    fn enter_new(&mut self, node: &'e HirExpr, targets: Option<&[Type]>) -> bool {
-        let HirExprKind::New { class, args } = &node.kind else {
-            unreachable!()
-        };
-
-        let object = LirOperand::Local(self.emit(
+    fn enter_new(&mut self, node: &'e HirExpr, class: &TypeId, args: &'e [HirExpr]) {
+        let object = self.emit(
             LirRvalue::ObjectAlloc { class: *class },
             node.ty.clone(),
             node.span,
-        ));
-        self.values.insert(std::ptr::from_ref(node), object.clone());
+        );
+        self.values
+            .insert(std::ptr::from_ref(node), LirOperand::Local(object));
         if self.callables.resolution.classes[class]
             .constructor
-            .is_some()
+            .is_none()
         {
+            let fields = self
+                .callables
+                .resolution
+                .fields_rev(class)
+                .expect("scalar preflight resolved the memberwise field layout");
+            for ((field, _), child) in fields.zip(args.iter().rev()) {
+                self.work.push(Work::FieldStore {
+                    object,
+                    object_ty: &node.ty,
+                    field,
+                    child,
+                });
+                self.work.push(Work::Enter(child));
+            }
+        } else {
             if args
                 .iter()
                 .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
             {
                 self.emit(LirRvalue::BeginReferenceCall, Type::Void, node.span);
             }
-            self.work.push(Work::Finish(node));
-            self.work.extend(arguments(args, targets));
-        } else {
-            let fields = class_fields(class, self.callables).expect("validated class");
-            for ((field, _), child) in fields.into_iter().zip(args).rev() {
-                self.work.push(Work::FieldStore {
-                    object: object.clone(),
-                    object_ty: node.ty.clone(),
-                    field,
-                    child,
-                });
-                self.work.push(Work::Enter(child));
-            }
+            self.work.push(Work::Finish(
+                node,
+                Finish::New {
+                    class: *class,
+                    args,
+                },
+            ));
+            self.push_validated_arguments(node, args);
         }
-        true
     }
 
-    fn enter_object_literal(&mut self, node: &'e HirExpr) -> bool {
-        let HirExprKind::ObjectLiteral { class, fields } = &node.kind else {
-            unreachable!()
-        };
-
-        let object = LirOperand::Local(self.emit(
-            LirRvalue::ObjectAlloc { class: *class },
-            node.ty.clone(),
-            node.span,
-        ));
-        self.values.insert(std::ptr::from_ref(node), object.clone());
+    fn enter_object_literal(
+        &mut self,
+        node: &'e HirExpr,
+        class: TypeId,
+        fields: &'e [(String, HirExpr)],
+    ) {
+        let object = self.emit(LirRvalue::ObjectAlloc { class }, node.ty.clone(), node.span);
+        self.values
+            .insert(std::ptr::from_ref(node), LirOperand::Local(object));
         for (field, child) in fields.iter().rev() {
             self.work.push(Work::FieldStore {
-                object: object.clone(),
-                object_ty: node.ty.clone(),
-                field: field.clone(),
+                object,
+                object_ty: &node.ty,
+                field,
                 child,
             });
             self.work.push(Work::Enter(child));
         }
-        true
     }
 
-    fn enter_special(&mut self, node: &'e HirExpr, targets: Option<&[Type]>) -> bool {
-        match &node.kind {
-            HirExprKind::Await { inner }
-                if !self.is_async
-                    && matches!(&inner.kind, HirExprKind::Call { callee, .. } if (callee.is_free_named("sleep") || callee.is_free_named("yield")) && !self.names.contains_key(callee.unqualified_name().as_deref().unwrap_or("")) && !self.callables.contains_key(callee)) =>
-            {
-                self.enter_await(node, targets)
-            }
-            HirExprKind::ReferenceArg { .. } => self.enter_reference_arg(node),
-            HirExprKind::MethodCall { builtin: None, .. } => self.enter_method_call(node, targets),
-            HirExprKind::StaticCall { class, .. }
-                if self.callables.resolution.enums.contains_key(class) =>
-            {
-                self.enter_enum(node)
-            }
-            HirExprKind::New { .. } => self.enter_new(node, targets),
-            HirExprKind::ObjectLiteral { .. } => self.enter_object_literal(node),
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
-                Index, Ternary, FieldAccess, MethodCall, StaticField, StaticCall, Range, Await,
-                TryPropagate, Lambda, Match, Select
-            ) => false,
-        }
-    }
-
-    fn prepare_references(&mut self, node: &HirExpr) {
-        let args = match &node.kind {
-            HirExprKind::Call { args, .. }
-            | HirExprKind::New { args, .. }
-            | HirExprKind::StaticCall { args, .. }
-            | HirExprKind::MethodCall {
-                builtin: None,
-                args,
-                ..
-            } => args,
-            _ => return,
-        };
+    fn prepare_references(
+        &mut self,
+        node: &HirExpr,
+        args: &[HirExpr],
+        begin: bool,
+        callee: impl FnOnce() -> Option<FunctionId>,
+    ) {
         let mut sites = args
             .iter()
             .enumerate()
@@ -803,182 +768,403 @@ impl<'e> ScalarLowering<'_, 'e> {
         if sites.peek().is_none() {
             return;
         }
-        let callee = match &node.kind {
-            HirExprKind::Call { callee, .. } => *callee,
-            HirExprKind::MethodCall {
-                object,
-                method,
-                super_class,
-                ..
-            } => {
-                let (Type::Named(owner) | Type::Generic(owner, _)) = &object.ty else {
-                    return;
-                };
-                FunctionId::method(super_class.unwrap_or(*owner), method)
-            }
-            HirExprKind::New { class, .. } => FunctionId::method(*class, "init"),
-            HirExprKind::StaticCall { class, method, .. } => FunctionId::method(*class, method),
-            _ => unreachable!(),
-        };
+        let Some(callee) = callee() else { return };
         for (index, arg) in sites {
             self.reference_sites
                 .insert(std::ptr::from_ref(arg), (callee, index));
         }
-        if !matches!(
-            node.kind,
-            HirExprKind::MethodCall { .. } | HirExprKind::New { .. }
-        ) {
+        if begin {
             self.emit(LirRvalue::BeginReferenceCall, Type::Void, node.span);
         }
     }
 
-    fn enter_call(&mut self, node: &'e HirExpr, targets: Option<&[Type]>) -> bool {
-        let HirExprKind::Call { callee, args } = &node.kind else {
-            return false;
-        };
-
-        if let Some(source) = self
-            .names
-            .get(callee.unqualified_name().as_deref().unwrap_or(""))
-            .copied()
-        {
+    fn enter_call(
+        &mut self,
+        node: &'e HirExpr,
+        callee: FunctionId,
+        is_local: bool,
+        args: &'e [HirExpr],
+    ) {
+        self.prepare_references(node, args, true, || Some(callee));
+        if is_local {
+            let source = self.plan.local_callees[&callee];
             let ty = self.locals[source.0 as usize].ty.clone();
             let snapshot = self.emit(LirRvalue::Use(LirOperand::Local(source)), ty, node.span);
-            self.values
-                .insert(std::ptr::from_ref(node), LirOperand::Local(snapshot));
-            self.work.push(Work::Finish(node));
-            self.work.extend(arguments(args, targets));
-            return true;
+            self.work.push(Work::Finish(
+                node,
+                Finish::LocalCall {
+                    name: callee,
+                    snapshot,
+                    args,
+                },
+            ));
+            let params = callable_params(&self.locals[snapshot.0 as usize].ty);
+            push_typed_arguments(
+                &mut self.work,
+                args,
+                params,
+                self.plan.builtin_panic,
+                |child, index, _| Work::CoerceSnapshot {
+                    child,
+                    snapshot,
+                    index,
+                },
+            );
+            return;
         }
-        let panic = callee.is_free_named("panic") && !self.callables.contains_key(callee);
+        let panic = Some(callee) == self.plan.builtin_panic;
         if panic {
             let message = if args.len() == 1 { args.first() } else { None };
             self.work.push(Work::Raise { node, message });
             if args.is_empty() {
-                self.work.push(Work::FormatLiteral {
-                    node,
-                    text: "explicit panic".into(),
-                });
-                return true;
+                self.format_literal(node, "explicit panic".to_owned());
+                return;
             }
             if let Some(message) = message {
                 self.work.push(Work::Enter(message));
-                return true;
+                return;
             }
         }
-        if (callee.is_free_named("format") || panic) && !self.callables.contains_key(callee) {
-            let segments = format_segments(args).expect("validated format");
-            let mut actions = Vec::new();
-            let mut operands = args[1..].iter();
-            if segments.is_empty() {
-                actions.push(Work::FormatLiteral {
-                    node,
-                    text: String::new(),
-                });
-            }
-            for segment in segments {
-                match segment {
-                    crate::interpolate::Segment::Literal(text) => {
-                        actions.push(Work::FormatLiteral { node, text })
-                    }
-                    segment => {
-                        let child = operands.next().expect("validated placeholder");
-                        let format = match segment {
-                            crate::interpolate::Segment::F64(format) => Some(format),
-                            _ => None,
-                        };
-                        actions.push(Work::Enter(child));
-                        actions.push(Work::FormatValue {
-                            node,
-                            child,
-                            format,
-                        });
-                    }
-                }
-            }
-            self.work.extend(actions.into_iter().rev());
-            return true;
+        if (callee.is_free_named("format") || panic)
+            && !self.callables.signatures.contains_key(&callee)
+        {
+            let template = self
+                .plan
+                .formats
+                .as_mut()
+                .and_then(|formats| formats.remove(&std::ptr::from_ref(node)))
+                .expect("scalar preflight checked the format template");
+            self.next_format_piece(node, template, &args[1..]);
+            return;
         }
 
-        false
+        self.work
+            .push(Work::Finish(node, Finish::Call { callee, args }));
+        self.push_validated_arguments(node, args);
     }
 
-    fn enter(&mut self, node: &'e HirExpr) -> Option<HirExprKind> {
-        // A CFG expression with only divergent branches leaves a
-        // Never local in its unreachable merge block, not a value.
-        if node.ty == Type::Never && matches!(node.kind, HirExprKind::Var(_)) {
-            return Some(node.kind.clone());
+    fn next_format_piece(
+        &mut self,
+        node: &'e HirExpr,
+        mut template: crate::interpolate::CheckedTemplate<'e>,
+        operands: &'e [HirExpr],
+    ) {
+        let (literal, operand) = template.render_piece();
+        if !literal.is_empty() || operands.is_empty() {
+            self.format_literal(node, literal);
         }
-        // A checked builtin consumes value operands in receiver-first order.
-        // Only declared methods need a prepared receiver and parameter coercions.
-        if let HirExprKind::MethodCall {
-            builtin: Some(_),
-            object,
-            args,
-            ..
-        } = &node.kind
-        {
-            self.work.push(Work::Finish(node));
-            self.work.extend(args.iter().rev().map(Work::Enter));
-            self.work.push(Work::Enter(object));
-            return None;
-        }
-        let targets = argument_types(node, self.names, self.locals, self.callables);
-        self.prepare_references(node);
-        if self.enter_special(node, targets.as_deref()) {
-            return None;
-        }
-        if self.enter_call(node, targets.as_deref()) {
-            return None;
-        }
-        if let HirExprKind::Array { elements } = &node.kind {
-            let Type::Array(element) = &node.ty else {
-                unreachable!()
+        if let Some(operand) = operand {
+            let format = match operand {
+                crate::interpolate::SourceFormat::Display => None,
+                crate::interpolate::SourceFormat::Precision(format) => Some(format),
             };
-            let array = LirOperand::Local(self.emit(
-                LirRvalue::ArrayAlloc {
-                    length: elements.len(),
-                    element: (**element).clone(),
-                },
-                node.ty.clone(),
-                node.span,
-            ));
-            self.values.insert(std::ptr::from_ref(node), array.clone());
-            for (index, child) in elements.iter().enumerate().rev() {
-                self.work.push(Work::ArrayStore {
-                    array: array.clone(),
-                    index,
-                    element: (**element).clone(),
-                    child,
+            let (child, rest) = operands
+                .split_first()
+                .expect("a checked placeholder has an operand");
+            if !template.as_str().is_empty() {
+                self.work.push(Work::FormatNext {
+                    node,
+                    template,
+                    operands: rest,
                 });
-                self.work.push(Work::Enter(child));
             }
-            return None;
+            self.work.push(Work::FormatValue {
+                node,
+                child,
+                format,
+            });
+            self.work.push(Work::Enter(child));
         }
-        self.work.push(Work::Finish(node));
-        if let HirExprKind::Invoke { callee, args, .. } = &node.kind {
-            self.work.extend(arguments(args, targets.as_deref()));
-            self.work.push(Work::Enter(callee));
-        } else if let HirExprKind::Call { args, .. } | HirExprKind::StaticCall { args, .. } =
-            &node.kind
-        {
-            self.work.extend(arguments(args, targets.as_deref()));
-        } else if let HirExprKind::Binary { lhs, rhs, .. } = &node.kind
-            && lhs.ty != rhs.ty
-            && let Some(target) = identity_operand_type(lhs, rhs, &self.callables.resolution)
-        {
-            for child in [&**rhs, &**lhs] {
-                if child.ty != target {
-                    self.work.push(Work::Coerce {
+    }
+
+    fn enter_array(&mut self, node: &'e HirExpr, elements: &'e [HirExpr]) {
+        let Type::Array(element) = &node.ty else {
+            unreachable!("a validated array literal has array type")
+        };
+        let array = self.emit(
+            LirRvalue::ArrayAlloc {
+                length: elements.len(),
+                element: (**element).clone(),
+            },
+            node.ty.clone(),
+            node.span,
+        );
+        self.values
+            .insert(std::ptr::from_ref(node), LirOperand::Local(array));
+        for (index, child) in elements.iter().enumerate().rev() {
+            self.work.push(Work::ArrayStore {
+                array,
+                index,
+                element,
+                child,
+            });
+            self.work.push(Work::Enter(child));
+        }
+    }
+
+    fn push_validated_arguments(&mut self, node: &'e HirExpr, args: &'e [HirExpr]) {
+        let Some(coercions) = self.plan.coercions.as_mut() else {
+            self.work.extend(args.iter().rev().map(Work::Enter));
+            return;
+        };
+        for (index, child) in args.iter().enumerate().rev() {
+            if let Some(parameter) = coercions.remove(&std::ptr::from_ref(child)) {
+                self.work.push(match parameter {
+                    Parameter::Declared(target) => Work::Coerce { child, target },
+                    Parameter::ResultArgument => Work::Coerce {
                         child,
-                        target: target.clone(),
-                    });
-                }
-                self.work.push(Work::Enter(child));
+                        target: Cow::Borrowed(&node.ty.child_parts().0[index]),
+                    },
+                    Parameter::Projected(target) => Work::CoerceProjected { child, target },
+                });
             }
-        } else if !matches!(node.kind, HirExprKind::Lambda { .. }) {
-            self.work
-                .extend(node.children().into_iter().rev().map(Work::Enter));
+            self.work.push(Work::Enter(child));
+        }
+    }
+
+    fn enter_method(
+        &mut self,
+        node: &'e HirExpr,
+        call: MethodOperands<'e>,
+        builtin: Option<BuiltinMethod>,
+    ) {
+        self.work
+            .push(Work::Finish(node, Finish::Method(call, builtin)));
+        if builtin.is_some() {
+            self.work.extend(call.args.iter().rev().map(Work::Enter));
+        } else {
+            self.prepare_references(node, call.args, false, || {
+                let (Type::Named(owner) | Type::Generic(owner, _)) = &call.object.ty else {
+                    return None;
+                };
+                Some(FunctionId::method(
+                    call.super_class.unwrap_or(*owner),
+                    call.method,
+                ))
+            });
+            self.push_validated_arguments(node, call.args);
+            self.work.push(Work::PrepareMethod(node, call));
+        }
+        self.work.push(Work::Enter(call.object));
+    }
+
+    fn enter_await(&mut self, node: &'e HirExpr, inner: &'e HirExpr) {
+        if !self.is_async
+            && let HirExprKind::Call {
+                callee,
+                args,
+                binding: HirCallBinding::Function,
+            } = &inner.kind
+            && (callee.is_free_named("sleep") || callee.is_free_named("yield"))
+            && !self.callables.signatures.contains_key(callee)
+        {
+            self.work.push(Work::AwaitBuiltin {
+                node,
+                call_span: &inner.span,
+                callee: *callee,
+                args,
+            });
+            self.work.extend(args.iter().rev().map(Work::Enter));
+        } else {
+            self.work.push(Work::Finish(node, Finish::Await(inner)));
+            self.work.push(Work::Enter(inner));
+        }
+    }
+
+    fn enter_binary(
+        &mut self,
+        node: &'e HirExpr,
+        op: &'e BinOp,
+        lhs: &'e HirExpr,
+        rhs: &'e HirExpr,
+    ) {
+        self.work
+            .push(Work::Finish(node, Finish::Binary { op, lhs, rhs }));
+        let target = self
+            .plan
+            .identities
+            .as_mut()
+            .and_then(|targets| targets.remove(&std::ptr::from_ref(node)));
+        if matches!(target, Some(IdentitySide::Left)) {
+            self.work.push(Work::Coerce {
+                child: rhs,
+                target: Cow::Borrowed(&lhs.ty),
+            });
+        }
+        self.work.push(Work::Enter(rhs));
+        if matches!(target, Some(IdentitySide::Right)) {
+            self.work.push(Work::Coerce {
+                child: lhs,
+                target: Cow::Borrowed(&rhs.ty),
+            });
+        }
+        self.work.push(Work::Enter(lhs));
+    }
+
+    fn enter(&mut self, node: &'e HirExpr) -> Option<LirLocalId> {
+        match &node.kind {
+            HirExprKind::Call {
+                callee,
+                binding,
+                args,
+            } => self.enter_call(node, *callee, binding.is_local(), args),
+            HirExprKind::New { class, args } => {
+                self.prepare_references(node, args, false, || {
+                    Some(FunctionId::method(*class, "init"))
+                });
+                self.enter_new(node, class, args);
+            }
+            HirExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => {
+                self.prepare_references(node, args, true, || {
+                    Some(FunctionId::method(*class, method))
+                });
+                if self.callables.resolution.enums.contains_key(class) {
+                    self.enter_enum(node, *class, method, args);
+                } else {
+                    self.work.push(Work::Finish(
+                        node,
+                        Finish::StaticCall {
+                            class: *class,
+                            method,
+                            args,
+                        },
+                    ));
+                    self.push_validated_arguments(node, args);
+                }
+            }
+            HirExprKind::Invoke { name, callee, args } => {
+                let params = callable_params(&callee.ty);
+                self.work.push(Work::Finish(
+                    node,
+                    Finish::Invoke {
+                        params,
+                        name: *name,
+                        callee,
+                        args,
+                    },
+                ));
+                push_typed_arguments(
+                    &mut self.work,
+                    args,
+                    params,
+                    self.plan.builtin_panic,
+                    |child, _, ty| Work::Coerce {
+                        child,
+                        target: Cow::Borrowed(ty),
+                    },
+                );
+                self.work.push(Work::Enter(callee));
+            }
+            HirExprKind::MethodCall {
+                object,
+                method,
+                args,
+                super_class,
+                builtin,
+            } => self.enter_method(
+                node,
+                MethodOperands {
+                    object,
+                    method,
+                    args,
+                    super_class: *super_class,
+                },
+                *builtin,
+            ),
+            HirExprKind::Await { inner } => self.enter_await(node, inner),
+            HirExprKind::ReferenceArg { place } => self.enter_reference_arg(node, place),
+            HirExprKind::Array { elements } => self.enter_array(node, elements),
+            HirExprKind::ObjectLiteral { class, fields } => {
+                self.enter_object_literal(node, *class, fields)
+            }
+            HirExprKind::Unary { op, operand } => {
+                self.work
+                    .push(Work::Finish(node, Finish::Unary { op, operand }));
+                self.work.push(Work::Enter(operand));
+            }
+            HirExprKind::Binary { op, lhs, rhs } => self.enter_binary(node, op, lhs, rhs),
+            HirExprKind::Print { value, newline } => {
+                self.work.push(Work::Finish(
+                    node,
+                    Finish::Print {
+                        value,
+                        newline: *newline,
+                    },
+                ));
+                self.work.push(Work::Enter(value));
+            }
+            HirExprKind::Index { array, index } => {
+                self.work
+                    .push(Work::Finish(node, Finish::Index { array, index }));
+                self.work.push(Work::Enter(index));
+                self.work.push(Work::Enter(array));
+            }
+            HirExprKind::FieldAccess { object, field } => {
+                self.work
+                    .push(Work::Finish(node, Finish::Field { object, field }));
+                self.work.push(Work::Enter(object));
+            }
+            HirExprKind::Range { start, end } => {
+                self.work
+                    .push(Work::Finish(node, Finish::Range { start, end }));
+                self.work.push(Work::Enter(end));
+                self.work.push(Work::Enter(start));
+            }
+            // Leaves have no pending children. Their result is ready immediately.
+            HirExprKind::Int(value) => {
+                self.values
+                    .insert(node, LirOperand::integer(*value, &node.ty));
+            }
+            HirExprKind::Float(value) => {
+                self.values.insert(node, LirOperand::Float(*value));
+            }
+            HirExprKind::Bool(value) => {
+                self.values.insert(node, LirOperand::Bool(*value));
+            }
+            HirExprKind::Var(name) => {
+                if node.ty == Type::Never {
+                    return Some(self.names[name]);
+                }
+                let operand = self.finish_var(node, name);
+                self.values.insert(node, operand);
+            }
+            HirExprKind::Str(value) => {
+                let local = self.emit(
+                    LirRvalue::StringLiteral(value.clone()),
+                    node.ty.clone(),
+                    node.span,
+                );
+                self.values.insert(node, LirOperand::Local(local));
+            }
+            HirExprKind::FnRef(function) => {
+                let local = self.emit(
+                    LirRvalue::FunctionRef {
+                        function: *function,
+                        ty: node.ty.clone(),
+                    },
+                    node.ty.clone(),
+                    node.span,
+                );
+                self.values.insert(node, LirOperand::Local(local));
+            }
+            HirExprKind::Lambda { id, captures, .. } => {
+                let operand = self.finish_lambda(node, *id, captures);
+                self.values.insert(node, operand);
+            }
+            HirExprKind::StaticField { class, field } => {
+                let operand = self.finish_static_field(node, class, field);
+                self.values.insert(node, operand);
+            }
+            HirExprKind::Ternary { .. }
+            | HirExprKind::TryPropagate { .. }
+            | HirExprKind::Match { .. }
+            | HirExprKind::Select { .. } => {
+                unreachable!("scalar validation excludes control-flow expressions")
+            }
         }
         None
     }
@@ -999,17 +1185,17 @@ impl<'e> ScalarLowering<'_, 'e> {
             .insert(std::ptr::from_ref(child), LirOperand::Local(local));
     }
 
-    fn await_builtin(&mut self, node: &'e HirExpr) {
-        let HirExprKind::Await { inner } = &node.kind else {
-            unreachable!()
-        };
-        let HirExprKind::Call { callee, args } = &inner.kind else {
-            unreachable!()
-        };
+    fn await_builtin(
+        &mut self,
+        node: &'e HirExpr,
+        call_span: Span,
+        callee: FunctionId,
+        args: &[HirExpr],
+    ) {
         let future_type = Type::Generic(TypeId::local("Future"), vec![Type::Void]);
         let future = self.emit(
             LirRvalue::BuiltinCall {
-                callee: *callee,
+                callee,
                 args: args
                     .iter()
                     .map(|arg| self.values[&std::ptr::from_ref(arg)].clone())
@@ -1018,7 +1204,7 @@ impl<'e> ScalarLowering<'_, 'e> {
                 result: future_type.clone(),
             },
             future_type,
-            inner.span,
+            call_span,
         );
         let result = self.emit(
             LirRvalue::AwaitFuture {
@@ -1032,84 +1218,46 @@ impl<'e> ScalarLowering<'_, 'e> {
             .insert(std::ptr::from_ref(node), LirOperand::Local(result));
     }
 
-    fn reference(&mut self, node: &'e HirExpr) {
-        let HirExprKind::ReferenceArg { place } = &node.kind else {
-            unreachable!()
-        };
-        let LirOperand::Reference {
-            place: captured, ..
-        } = self.values[&std::ptr::from_ref(node)].clone()
-        else {
-            unreachable!()
-        };
-        match (&place.kind, captured) {
-            (HirExprKind::Var(_), LirPlace::Local(_)) => {}
-            (HirExprKind::FieldAccess { object, .. }, LirPlace::Field { object: local, .. }) => {
-                self.emitted.push(SourceInst::Compute {
-                    local,
-                    value: LirRvalue::Use(self.values[&std::ptr::from_ref(&**object)].clone()),
-                    span: object.span,
-                });
-            }
-            (
-                HirExprKind::Index { array, index },
-                LirPlace::ArrayElement {
-                    owner,
-                    index: local,
-                    ..
-                },
-            ) => {
-                let index_value = self.values[&std::ptr::from_ref(&**index)].clone();
-                self.emitted.push(SourceInst::Compute {
-                    local,
-                    value: LirRvalue::Use(index_value.clone()),
-                    span: index.span,
-                });
-                self.emitted.push(SourceInst::Compute {
-                    local: owner,
-                    value: LirRvalue::CaptureArrayOwner {
-                        array: self.values[&std::ptr::from_ref(&**array)].clone(),
-                        index: LirOperand::Local(local),
-                    },
-                    span: place.span,
-                });
-            }
-            // A reserved place must pair the source form with the matching storage.
-            (
-                ir_variants!(
-                    HirExprKind;
-                    Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
-                    Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
-                    StaticCall, ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
-                ),
-                _,
-            ) => unreachable!("reserved reference place"),
-        }
+    fn capture_element(
+        &mut self,
+        array: &HirExpr,
+        index: &HirExpr,
+        owner: LirLocalId,
+        slot: LirLocalId,
+        span: Span,
+    ) {
+        push_compute(
+            self.emitted,
+            slot,
+            LirRvalue::Use(self.values[&std::ptr::from_ref(index)].clone()),
+            index.span,
+        );
+        push_compute(
+            self.emitted,
+            owner,
+            LirRvalue::CaptureArrayOwner {
+                array: self.values[&std::ptr::from_ref(array)].clone(),
+                index: LirOperand::Local(slot),
+            },
+            span,
+        );
     }
 
-    fn prepare_method(&mut self, node: &'e HirExpr) {
-        let HirExprKind::MethodCall {
-            object,
-            method,
-            args,
-            ..
-        } = &node.kind
-        else {
-            unreachable!()
-        };
-        let receiver = self.values[&std::ptr::from_ref(&**object)].clone();
+    fn prepare_method(&mut self, node: &'e HirExpr, call: MethodOperands<'e>) {
+        let receiver = self.values[&std::ptr::from_ref(call.object)].clone();
         let local = self.emit(
             LirRvalue::PrepareMethod {
                 receiver,
-                receiver_ty: object.ty.clone(),
-                method: method.to_string(),
+                receiver_ty: call.object.ty.clone(),
+                method: call.method.to_string(),
             },
-            object.ty.clone(),
+            call.object.ty.clone(),
             node.span,
         );
         self.values
-            .insert(std::ptr::from_ref(&**object), LirOperand::Local(local));
-        if args
+            .insert(std::ptr::from_ref(call.object), LirOperand::Local(local));
+        if call
+            .args
             .iter()
             .any(|arg| matches!(arg.kind, HirExprKind::ReferenceArg { .. }))
         {
@@ -1119,16 +1267,16 @@ impl<'e> ScalarLowering<'_, 'e> {
 
     fn field_store(
         &mut self,
-        object: LirOperand,
-        object_ty: Type,
-        field: String,
+        object: LirLocalId,
+        object_ty: &Type,
+        field: &str,
         child: &'e HirExpr,
     ) {
         self.emit(
             LirRvalue::FieldStore {
-                object,
-                object_ty,
-                field,
+                object: LirOperand::Local(object),
+                object_ty: object_ty.clone(),
+                field: field.to_owned(),
                 value: self.values[&std::ptr::from_ref(child)].clone(),
             },
             Type::Void,
@@ -1138,41 +1286,37 @@ impl<'e> ScalarLowering<'_, 'e> {
 
     fn enum_store(
         &mut self,
-        node: &'e HirExpr,
+        local: LirLocalId,
+        enum_ty: &Type,
         class: TypeId,
-        variant: String,
+        variant: &str,
         index: usize,
         child: &'e HirExpr,
     ) {
-        let object = self.values[&std::ptr::from_ref(node)].clone();
-        let LirOperand::Local(local) = object else {
-            unreachable!()
-        };
-        self.emitted.push(SourceInst::Compute {
+        push_compute(
+            self.emitted,
             local,
-            value: LirRvalue::EnumPayloadStore {
-                object,
+            LirRvalue::EnumPayloadStore {
+                object: LirOperand::Local(local),
                 class,
-                variant,
+                variant: variant.to_owned(),
                 index,
                 value: self.values[&std::ptr::from_ref(child)].clone(),
                 source: child.ty.clone(),
-                enum_ty: node.ty.clone(),
+                enum_ty: enum_ty.clone(),
             },
-            span: child.span,
-        });
+            child.span,
+        );
     }
 
-    fn raise(&mut self, node: &'e HirExpr, message: Option<&'e HirExpr>) -> Option<HirExprKind> {
+    fn raise(&mut self, node: &'e HirExpr, message: Option<&'e HirExpr>) -> Option<LirLocalId> {
         let message = message
             .map(|child| self.values[&std::ptr::from_ref(child)].clone())
             .unwrap_or_else(|| self.values[&std::ptr::from_ref(node)].clone());
         let result = self.emit(LirRvalue::Panic { message }, Type::Never, node.span);
         // No enclosing operand, coercion, store, or later argument can
         // execute after this raise. Preserve only the evaluated prefix.
-        Some(HirExprKind::Var(
-            self.locals[result.0 as usize].name.clone(),
-        ))
+        Some(result)
     }
 
     fn format_literal(&mut self, node: &'e HirExpr, text: String) {
@@ -1213,13 +1357,13 @@ impl<'e> ScalarLowering<'_, 'e> {
         );
     }
 
-    fn array_store(&mut self, array: LirOperand, index: usize, element: Type, child: &'e HirExpr) {
+    fn array_store(&mut self, array: LirLocalId, index: usize, element: &Type, child: &'e HirExpr) {
         self.emit(
             LirRvalue::ArrayStore {
-                array,
+                array: LirOperand::Local(array),
                 index: LirOperand::Int(index as i64),
                 value: self.values[&std::ptr::from_ref(child)].clone(),
-                element,
+                element: element.clone(),
             },
             Type::Void,
             child.span,
@@ -1228,23 +1372,56 @@ impl<'e> ScalarLowering<'_, 'e> {
 
     // A divergent action returns the replacement root and stops the worklist.
     // Ordinary actions leave the root untouched until all operands are ready.
-    fn step(&mut self, action: Work<'e>) -> Option<HirExprKind> {
+    fn step(&mut self, action: Work<'e>) -> Option<LirLocalId> {
         match action {
             Work::Coerce { child, target } => {
+                self.coerce(child, target.into_owned());
+            }
+            Work::CoerceProjected { child, target } => {
+                let ty = target.bindings.specialize(target.param);
+                #[cfg(test)]
+                {
+                    let nodes = tests::type_nodes(&ty);
+                    PEAK_MATERIALIZED_TARGET_NODES
+                        .set(PEAK_MATERIALIZED_TARGET_NODES.get().max(nodes));
+                }
+                self.coerce(child, ty);
+            }
+            Work::CoerceSnapshot {
+                child,
+                snapshot,
+                index,
+            } => {
+                let target = callable_params(&self.locals[snapshot.0 as usize].ty)[index].clone();
                 self.coerce(child, target);
-                None
             }
-            Work::AwaitBuiltin(node) => {
-                self.await_builtin(node);
-                None
+            Work::AwaitBuiltin {
+                node,
+                call_span,
+                callee,
+                args,
+            } => {
+                self.await_builtin(node, *call_span, callee, args);
             }
-            Work::Reference(node) => {
-                self.reference(node);
-                None
+            Work::CaptureField { object, local } => {
+                push_compute(
+                    self.emitted,
+                    local,
+                    LirRvalue::Use(self.values[&std::ptr::from_ref(object)].clone()),
+                    object.span,
+                );
             }
-            Work::PrepareMethod(node) => {
-                self.prepare_method(node);
-                None
+            Work::CaptureElement {
+                array,
+                index,
+                owner,
+                slot,
+                span,
+            } => {
+                self.capture_element(array, index, owner, slot, *span);
+            }
+            Work::PrepareMethod(node, call) => {
+                self.prepare_method(node, call);
             }
             Work::FieldStore {
                 object,
@@ -1253,22 +1430,24 @@ impl<'e> ScalarLowering<'_, 'e> {
                 child,
             } => {
                 self.field_store(object, object_ty, field, child);
-                None
             }
             Work::EnumStore {
-                node,
+                local,
+                enum_ty,
                 class,
                 variant,
                 index,
                 child,
             } => {
-                self.enum_store(node, class, variant, index, child);
-                None
+                self.enum_store(local, enum_ty, class, variant, index, child);
             }
-            Work::Raise { node, message } => self.raise(node, message),
-            Work::FormatLiteral { node, text } => {
-                self.format_literal(node, text);
-                None
+            Work::Raise { node, message } => return self.raise(node, message),
+            Work::FormatNext {
+                node,
+                template,
+                operands,
+            } => {
+                self.next_format_piece(node, template, operands);
             }
             Work::FormatValue {
                 node,
@@ -1276,7 +1455,6 @@ impl<'e> ScalarLowering<'_, 'e> {
                 format,
             } => {
                 self.format_value(node, child, format);
-                None
             }
             Work::ArrayStore {
                 array,
@@ -1285,13 +1463,15 @@ impl<'e> ScalarLowering<'_, 'e> {
                 child,
             } => {
                 self.array_store(array, index, element, child);
-                None
             }
-            Work::Finish(node) => {
-                self.finish(node);
-                None
+            Work::Finish(node, action) => {
+                self.finish(node, action);
             }
-            Work::Enter(node) => self.enter(node),
+            Work::Enter(node) => return self.enter(node),
         }
+        None
     }
 }
+
+#[cfg(test)]
+mod tests;

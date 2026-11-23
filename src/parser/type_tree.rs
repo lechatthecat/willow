@@ -115,9 +115,9 @@ impl<N> Type<N> {
     /// Whether two types are equal once callable kinds are ignored.
     pub fn same_modulo_callable_kind(&self, other: &Self) -> bool
     where
-        N: Clone + PartialEq,
+        N: PartialEq,
     {
-        self.with_callable_kind(false) == other.with_callable_kind(false)
+        self.equal_tree(other, Comparison::CallableStorage, |_, _| None)
     }
     /// Rebuild every generic application bottom-up; `rewrite` receives the
     /// already rewritten arguments.
@@ -150,9 +150,9 @@ impl<N> Type<N> {
                         values.push(value);
                         continue;
                     }
-                    let children = ty.children();
-                    work.push(Work::Build(ty, children.len()));
-                    work.extend(children.into_iter().rev().map(Work::Enter));
+                    let (args, tail) = ty.child_parts();
+                    work.push(Work::Build(ty, args.len() + usize::from(tail.is_some())));
+                    work.extend(args.iter().chain(tail).rev().map(Work::Enter));
                 }
                 Work::Build(ty, count) => {
                     #[cfg(test)]
@@ -216,10 +216,6 @@ impl<N> Type<N> {
         }
     }
 
-    fn children(&self) -> Vec<&Self> {
-        let (args, tail) = self.child_parts();
-        args.iter().chain(tail).collect()
-    }
     fn take_children(&mut self, pending: &mut Vec<Self>) {
         match self {
             Self::Array(element) | Self::FixedArray(element, _) => {
@@ -248,28 +244,65 @@ impl<N> Drop for Type<N> {
         }
     }
 }
+#[derive(Clone, Copy, PartialEq)]
+enum Comparison {
+    Exact,
+    CallableStorage,
+    ArrayStorage,
+}
+
 impl<N: PartialEq> Type<N> {
     /// Runtime array slots have the same representation regardless of their
     /// checked length constraint, and function values regardless of their
     /// callable kind. Nominal identities and all other shapes stay exact.
     pub(crate) fn same_array_storage_type(&self, other: &Self) -> bool {
-        self.equal_tree(other, true)
+        self.equal_tree(other, Comparison::ArrayStorage, |_, _| None)
     }
-    fn equal_tree(&self, other: &Self, erase_array_length: bool) -> bool {
-        let mut pending = vec![(self, other)];
-        while let Some((left, right)) = pending.pop() {
-            if erase_array_length
+    /// Compare a declaration with a concrete type without building the substituted tree.
+    pub(crate) fn equals_with_bindings(
+        &self,
+        other: &Self,
+        bound_name: impl FnMut(&N, &Self) -> Option<bool>,
+    ) -> bool {
+        self.equal_tree(other, Comparison::Exact, bound_name)
+    }
+    pub(crate) fn callable_storage_with_bindings(
+        &self,
+        other: &Self,
+        bound_name: impl FnMut(&N, &Self) -> Option<bool>,
+    ) -> bool {
+        self.equal_tree(other, Comparison::CallableStorage, bound_name)
+    }
+
+    fn equal_tree(
+        &self,
+        other: &Self,
+        comparison: Comparison,
+        mut bound_name: impl FnMut(&N, &Self) -> Option<bool>,
+    ) -> bool {
+        let mut pending = Vec::new();
+        let mut current = Some((self, other));
+        while let Some((left, right)) = current.take().or_else(|| pending.pop()) {
+            if let Self::Named(name) = left
+                && let Some(equal) = bound_name(name, right)
+            {
+                if !equal {
+                    return false;
+                }
+                continue;
+            }
+            if comparison == Comparison::ArrayStorage
                 && let (
                     Self::Array(a) | Self::FixedArray(a, _),
                     Self::Array(b) | Self::FixedArray(b, _),
                 ) = (left, right)
             {
-                pending.push((a, b));
+                current = Some((a.as_ref(), b.as_ref()));
                 continue;
             }
             // Both function-value kinds share one representation; only the
             // checker distinguishes them.
-            let same_callable_storage = erase_array_length
+            let same_callable_storage = comparison != Comparison::Exact
                 && matches!(left, Self::Fn(..) | Self::Closure(..))
                 && matches!(right, Self::Fn(..) | Self::Closure(..));
             if !same_callable_storage
@@ -286,19 +319,22 @@ impl<N: PartialEq> Type<N> {
                 }
                 _ => {}
             }
-            let a = left.children();
-            let b = right.children();
+            let (a, left_tail) = left.child_parts();
+            let (b, right_tail) = right.child_parts();
             if a.len() != b.len() {
                 return false;
             }
-            pending.extend(a.into_iter().zip(b));
+            // Matching node kinds have the same tail shape. Consume it in place
+            // so a chain of arrays or function results needs no worklist slots.
+            current = left_tail.zip(right_tail);
+            pending.extend(a.iter().zip(b));
         }
         true
     }
 }
 impl<N: PartialEq> PartialEq for Type<N> {
     fn eq(&self, other: &Self) -> bool {
-        self.equal_tree(other, false)
+        self.equal_tree(other, Comparison::Exact, |_, _| None)
     }
 }
 impl<N: Eq> Eq for Type<N> {}
@@ -314,9 +350,9 @@ impl<N: Hash> Hash for Type<N> {
                 Self::FixedArray(_, n) => n.hash(state),
                 _ => {}
             }
-            let children = ty.children();
-            children.len().hash(state);
-            pending.extend(children.into_iter().rev());
+            let (args, tail) = ty.child_parts();
+            (args.len() + usize::from(tail.is_some())).hash(state);
+            pending.extend(args.iter().chain(tail).rev());
         }
     }
 }
@@ -350,7 +386,8 @@ impl<N: serde::Serialize> serde::Serialize for Type<N> {
         let mut pending = vec![self];
         while let Some(ty) = pending.pop() {
             nodes.push(ty);
-            pending.extend(ty.children());
+            let (args, tail) = ty.child_parts();
+            pending.extend(args.iter().chain(tail));
         }
         #[cfg(test)]
         super::SERIALIZED_TYPE_NODES.with(|count| count.set(count.get() + nodes.len()));
@@ -528,6 +565,24 @@ impl<N: std::fmt::Debug> std::fmt::Debug for Type<N> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn bound_array_comparison_reaches_the_substituted_leaf() {
+        use super::Type;
+        for depth in [1, 8, 64, 512] {
+            let wrap = |leaf: Type<u8>| (0..depth).fold(leaf, |ty, _| Type::Array(Box::new(ty)));
+            let declaration = wrap(Type::Named(0));
+            let actual = wrap(Type::I64);
+            let mut visits = 0;
+            let exact = declaration.equals_with_bindings(&actual, |name, ty| {
+                visits += 1;
+                (*name == 0).then_some(matches!(ty, Type::I64))
+            });
+            assert!(exact, "binding mismatch at depth {depth}");
+            assert_eq!(visits, 1);
+            assert!(!declaration.equals_with_bindings(&actual, |_, _| Some(false)));
+        }
+    }
+
     #[test]
     fn fixed_array_type_tree_scaling_and_identity() {
         use super::Type;

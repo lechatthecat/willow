@@ -725,6 +725,109 @@ fn main() { let f = new C(10).counter(); println(f(true)); println(f(false)); }
 }
 
 #[test]
+fn defer_local_call_keeps_registration_value_after_reassignment() {
+    assert_program_output(
+        "fn first() { println(1); } fn second() { println(2); }
+         fn main() { let mut f = first; defer f(); f = second; }",
+        "1\n",
+    );
+}
+
+#[test]
+fn defer_local_call_captures_before_an_argument_rebinds_it() {
+    assert_program_output(
+        r#"
+fn first(n: i64) { println(10 + n); }
+fn second(n: i64) { println(20 + n); }
+fn replace(f: &mut fn(i64) -> void) -> i64 { f = second; return 9; }
+fn main() {
+    let mut f: fn(i64) -> void = first;
+    defer f(replace(&f));
+    f(0);
+}
+"#,
+        "20\n19\n",
+    );
+}
+
+#[test]
+fn deferred_callable_survives_a_later_cleanup_rebinding_it_during_unwind() {
+    assert_output_under_gc_stress(
+        r#"
+fn make(label: String) -> fn() -> void {
+    return || { gc_collect(); println(label); };
+}
+fn main() {
+    let mut f = make("registered " + "value");
+    defer { println(recover().is_some()); }
+    defer f();
+    defer { f = make("replacement"); gc_collect(); }
+    panic("unwind");
+}
+"#,
+        "registered value\ntrue\n",
+    );
+}
+
+#[test]
+fn deferred_read_only_callable_reference_freezes_aliased_storage() {
+    assert_output_under_gc_stress(
+        r#"
+fn first() { println(1); }
+fn second() { println(2); }
+class Holder { pub f: fn() -> void; }
+fn set(h: Holder, f: fn() -> void) { h.f = f; }
+fn work(view: & fn() -> void, owner: Holder) {
+    defer view();
+    owner.f = second;
+    gc_collect();
+    view();
+}
+fn main() { let h = new Holder(first); set(h, first); work(&h.f, h); }
+"#,
+        "2\n1\n",
+    );
+}
+
+#[test]
+fn defer_local_call_keeps_capture_storage_across_later_name_collisions() {
+    assert_program_output(
+        r#"
+fn first(n: i64) { println(n); }
+fn second(n: i64) { println(100 + n); }
+async fn main() {
+    let mut f = first;
+    defer f(1);
+    let __defer0_callee = second;
+    let __defer0_arg0 = 2;
+    f = second;
+    __defer0_callee(__defer0_arg0);
+    await sleep(1);
+}
+"#,
+        "102\n1\n",
+    );
+}
+
+#[test]
+fn defer_local_call_roots_registered_closure() {
+    assert_output_under_gc_stress(
+        r#"
+fn make(label: String) -> fn() -> void { return || { println(label); }; }
+fn main() {
+    let mut f = make("old" + " value");
+    defer { f(); }
+    defer f();
+    f = make("new" + " value");
+    gc_collect();
+    gc_minor_collect();
+}
+"#,
+        "old value\nnew value\n",
+    );
+}
+
+#[test]
 fn mutable_capture_defer_invoke_arguments_at_registration() {
     assert_program_output(
         r#"

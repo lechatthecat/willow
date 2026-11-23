@@ -255,7 +255,7 @@ fn format_expr(e: &HirExpr) -> String {
             format_expr(callee),
             args.iter().map(format_expr).collect::<Vec<_>>().join(", ")
         ),
-        HirExprKind::Call { callee, args } => {
+        HirExprKind::Call { callee, args, .. } => {
             let args = args
                 .iter()
                 .map(|expr| format_expr(expr))

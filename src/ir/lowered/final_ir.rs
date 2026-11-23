@@ -332,9 +332,38 @@ fn empty_function() -> LirFunction {
     }
 }
 
+// CFG construction uses a terminal '$' for generated storage. Keep it in
+// the published name only if this graph also contains the source spelling.
+fn finish_local_name(
+    name: &mut String,
+    local: LirLocalId,
+    collisions: &std::collections::HashSet<LirLocalId>,
+) {
+    if name.ends_with('$') && !collisions.contains(&local) {
+        name.pop();
+    }
+}
+
+// Cleanup storage is rebound by name. A binding declared after registration
+// can affect the parent's final spelling while remaining absent in the region.
+fn captured_name_collisions(
+    locals: &[LirLocal],
+    captures: &[LirLocalId],
+    collisions: &std::collections::HashSet<LirLocalId>,
+) -> Vec<String> {
+    if collisions.is_empty() {
+        return Vec::new();
+    }
+    captures
+        .iter()
+        .filter(|id| collisions.contains(id))
+        .map(|id| locals[id.0 as usize].name.clone())
+        .collect()
+}
+
 fn operand(
     expression: &crate::ir::typed_ast::HirExpr,
-    names: &std::collections::HashMap<String, LirLocalId>,
+    names: &std::collections::HashMap<&str, LirLocalId>,
     instructions: &mut Vec<LirInst>,
 ) -> Option<LirOperand> {
     use crate::ir::typed_ast::HirExprKind as E;
@@ -387,6 +416,33 @@ fn operand(
     value
 }
 
+fn finish_terminator(
+    terminator: super::SourceTerminator,
+    names: &std::collections::HashMap<&str, LirLocalId>,
+    instrs: &mut Vec<LirInst>,
+) -> Terminator {
+    use super::SourceTerminator as T;
+    match terminator {
+        T::Jump(target) => Terminator::Jump(target),
+        T::Branch {
+            cond,
+            then_block,
+            else_block,
+        } => Terminator::Branch {
+            cond: operand(&cond, names, instrs).unwrap_or(LirOperand::Bool(false)),
+            then_block,
+            else_block,
+        },
+        T::Suspend { operation, resume } => Terminator::Suspend { operation, resume },
+        T::Return(value) => Terminator::Return(
+            value
+                .as_ref()
+                .and_then(|value| operand(value, names, instrs)),
+        ),
+        T::CleanupReturn => Terminator::CleanupReturn,
+    }
+}
+
 pub(super) fn finish_program(source: super::SourceProgram) -> LirProgram {
     LirProgram {
         functions: source.functions.into_iter().map(finish_function).collect(),
@@ -405,10 +461,10 @@ pub(super) fn finish_program(source: super::SourceProgram) -> LirProgram {
 /// Convert cleanup regions in postorder without consuming native stack depth.
 pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
     enum Work {
-        Enter(usize, super::SourceFunction),
+        Enter(usize, super::SourceFunction, Vec<String>),
         Finish(usize, LirFunction, Vec<(usize, usize, usize)>),
     }
-    let mut pending = vec![Work::Enter(0, source)];
+    let mut pending = vec![Work::Enter(0, source, Vec::new())];
     let mut finished = std::collections::HashMap::new();
     let mut next_id = 1;
     while let Some(work) = pending.pop() {
@@ -424,13 +480,24 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                 }
                 finished.insert(id, function);
             }
-            Work::Enter(id, source) => {
-                use super::{SourceInst as I, SourceTerminator as T};
-                let names = source
+            Work::Enter(id, mut source, inherited_collisions) => {
+                use super::SourceInst as I;
+                let names: std::collections::HashMap<_, _> = source
                     .locals
                     .iter()
-                    .map(|local| (local.name.clone(), local.id))
+                    .map(|local| (local.name.as_str(), local.id))
                     .collect();
+                let mut collisions: std::collections::HashSet<_> = source
+                    .locals
+                    .iter()
+                    .filter_map(|local| {
+                        let base = local.name.strip_suffix('$')?;
+                        names.contains_key(base).then_some(local.id)
+                    })
+                    .collect();
+                for name in inherited_collisions {
+                    collisions.insert(names[name.as_str()]);
+                }
                 let mut blocks = Vec::new();
                 let mut children = Vec::new();
                 let mut child_work = Vec::new();
@@ -443,7 +510,7 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                             }
                             I::Let {
                                 local,
-                                name,
+                                mut name,
                                 mutable,
                                 span,
                                 ty,
@@ -452,6 +519,7 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                 let Some(value) = operand(&value, &names, &mut instrs) else {
                                     continue;
                                 };
+                                finish_local_name(&mut name, local, &collisions);
                                 LirInst::Let {
                                     local,
                                     name,
@@ -461,10 +529,15 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                     value,
                                 }
                             }
-                            I::Assign { local, name, value } => {
+                            I::Assign {
+                                local,
+                                mut name,
+                                value,
+                            } => {
                                 let Some(value) = operand(&value, &names, &mut instrs) else {
                                     continue;
                                 };
+                                finish_local_name(&mut name, local, &collisions);
                                 LirInst::Assign { local, name, value }
                             }
                             I::Expr(value) => {
@@ -489,7 +562,12 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                 let child = next_id;
                                 next_id += 1;
                                 children.push((blocks.len(), instrs.len(), child));
-                                child_work.push(Work::Enter(child, *body.function));
+                                let inherited = captured_name_collisions(
+                                    &source.locals,
+                                    &body.captures,
+                                    &collisions,
+                                );
+                                child_work.push(Work::Enter(child, *body.function, inherited));
                                 LirInst::Defer {
                                     id,
                                     body: LirDeferBody {
@@ -555,34 +633,16 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                         };
                         instrs.push(instruction);
                     }
-                    let terminator = match block.terminator {
-                        T::Jump(target) => Terminator::Jump(target),
-                        T::Branch {
-                            cond,
-                            then_block,
-                            else_block,
-                        } => Terminator::Branch {
-                            cond: operand(&cond, &names, &mut instrs)
-                                .unwrap_or(LirOperand::Bool(false)),
-                            then_block,
-                            else_block,
-                        },
-                        T::Suspend { operation, resume } => {
-                            Terminator::Suspend { operation, resume }
-                        }
-                        T::Return(value) => Terminator::Return(
-                            value
-                                .as_ref()
-                                .and_then(|value| operand(value, &names, &mut instrs)),
-                        ),
-                        T::CleanupReturn => Terminator::CleanupReturn,
-                    };
+                    let terminator = finish_terminator(block.terminator, &names, &mut instrs);
                     blocks.push(LirBlock {
                         id: block.id,
                         instrs,
                         terminator,
                         recovery: block.recovery,
                     });
+                }
+                for local in &mut source.locals {
+                    finish_local_name(&mut local.name, local.id, &collisions);
                 }
                 let function = LirFunction {
                     name: source.name,

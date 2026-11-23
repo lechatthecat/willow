@@ -27,11 +27,12 @@ use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
 use crate::semantic::intrinsics::{AdtMethod, BuiltinMethod, Intrinsic};
 use crate::semantic::type_checker::types::{await_output_type, awaitable_task_type};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use super::typed_ast::{
-    HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction, HirGuard, HirParam,
-    HirPattern, HirProgram, HirStmt,
+    HirCallBinding, HirCapture, HirDeferBody, HirDeferId, HirExpr, HirExprKind, HirFunction,
+    HirGuard, HirParam, HirPattern, HirProgram, HirStmt,
 };
 
 pub mod async_liveness;
@@ -39,11 +40,24 @@ pub mod cleanup;
 mod lifetime;
 mod liveness;
 pub(crate) use liveness::normal_successors;
+mod declarations;
+mod defer_captures;
+mod dispatch;
+use declarations::LoweringDeclarations;
 mod nested_cfg;
 pub mod value;
 pub use value::{LirOperand, LirPlace, LirRvalue};
 
 use async_liveness::LirAsyncFrameLayout;
+
+/// Borrowed instance-call operands shared by receiver preparation and call emission.
+#[derive(Clone, Copy)]
+struct MethodOperands<'a> {
+    object: &'a HirExpr,
+    method: &'a crate::parser::ast::MethodSpelling,
+    args: &'a [HirExpr],
+    super_class: Option<TypeId>,
+}
 
 /// A whole program in lowered IR.
 #[derive(Debug, Clone, PartialEq)]
@@ -704,20 +718,20 @@ pub(crate) fn lower_source_program_with(
     program: &HirProgram,
     overflow_checks: bool,
 ) -> SourceProgram {
-    let resolution = std::rc::Rc::new(program.resolution.clone());
+    let resolution = LoweringDeclarations::new(&program.resolution);
     let mut functions = Vec::with_capacity(program.functions.len());
     let mut lambdas = Vec::new();
     for f in &program.functions {
-        functions.push(lower_function(f, None, resolution.clone()));
+        functions.push(lower_function(f, None, &resolution));
         collect_lambdas(&f.body, &mut lambdas, &resolution);
     }
     for c in &program.classes {
         for m in &c.methods {
-            functions.push(lower_function(m, Some(&c.name), resolution.clone()));
+            functions.push(lower_function(m, Some(&c.name), &resolution));
             collect_lambdas(&m.body, &mut lambdas, &resolution);
         }
     }
-    value::lower_calls(&mut functions, &mut lambdas, &program.resolution);
+    value::lower_calls(&mut functions, &mut lambdas, &resolution);
     // Calls through a value that can only be one named function become
     // direct calls before leaf inlining selects its call sites.
     let direct = synchronous_function_indices(&functions);
@@ -795,10 +809,10 @@ pub(in crate::ir) fn synchronous_function_indices(
 /// [`HirExpr::children`], whose `Lambda` case yields the body's expressions, so
 /// a lambda nested inside another lambda is reached the same way as one nested
 /// in a call argument.
-fn collect_lambdas(
+fn collect_lambdas<'r>(
     body: &[HirStmt],
     out: &mut Vec<SourceLambda>,
-    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+    resolution: &'r LoweringDeclarations<'r>,
 ) {
     for stmt in body {
         for expr in stmt.child_exprs() {
@@ -807,20 +821,20 @@ fn collect_lambdas(
     }
 }
 
-fn collect_lambdas_in_expr(
+fn collect_lambdas_in_expr<'r>(
     expr: &HirExpr,
     out: &mut Vec<SourceLambda>,
-    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+    resolution: &'r LoweringDeclarations<'r>,
 ) {
     for expr in expr.walk_postorder(true) {
         collect_lambda(expr, out, resolution);
     }
 }
 
-fn collect_lambda(
+fn collect_lambda<'r>(
     expr: &HirExpr,
     out: &mut Vec<SourceLambda>,
-    resolution: &std::rc::Rc<super::typed_ast::HirResolution>,
+    resolution: &'r LoweringDeclarations<'r>,
 ) {
     if let HirExprKind::Lambda {
         id,
@@ -835,8 +849,7 @@ fn collect_lambda(
         let (Type::Fn(_, ret) | Type::Closure(_, ret)) = &expr.ty else {
             return;
         };
-        let mut b = Builder::new_lambda(params, captures);
-        b.resolution = resolution.clone();
+        let mut b = Builder::new_lambda(params, captures, resolution);
         b.return_type = (**ret).clone();
         // A lifted lambda owns a function scope just like a named function.
         // Lowering only its statements would leave top-level defer sites
@@ -920,79 +933,101 @@ pub(crate) fn reference_place_name(place: &HirExpr) -> String {
     out
 }
 
-fn format_segments(args: &[HirExpr]) -> Option<Vec<crate::interpolate::Segment>> {
-    use crate::interpolate::Segment;
+fn format_template(args: &[HirExpr]) -> Option<&str> {
     let HirExprKind::Str(spec) = &args.first()?.kind else {
         return None;
     };
-    let segments = crate::interpolate::parse_spec(spec).ok()?;
+    Some(spec)
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static LIVE_FORMAT_DESCRIPTOR_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PEAK_FORMAT_DESCRIPTOR_CAPACITY: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn check_format(
+    args: &[HirExpr],
+    mut record: impl FnMut(crate::interpolate::SourceSegment),
+) -> Option<crate::interpolate::CheckedTemplate<'_>> {
+    use crate::interpolate::SourceSegment as Segment;
+    let template = format_template(args)?;
     let mut operands = args[1..].iter();
-    for segment in &segments {
-        match segment {
-            Segment::Literal(_) => {}
-            Segment::Display => {
-                if !matches!(
-                    operands.next()?.ty,
+    let mut valid = true;
+    let parsed = crate::interpolate::visit_ranges(template, |segment| {
+        valid &= match segment {
+            Segment::Literal(_) => true,
+            Segment::Display => operands.next().is_some_and(|arg| {
+                matches!(
+                    arg.ty,
                     Type::I8
                         | Type::I16
                         | Type::I32
+                        | Type::I64
+                        | Type::U8
                         | Type::U16
                         | Type::U32
                         | Type::U64
                         | Type::Char
-                        | Type::U8
-                        | Type::I64
                         | Type::F64
                         | Type::Bool
                         | Type::String
-                ) {
-                    return None;
-                }
-            }
-            Segment::F64(_) => {
-                if operands.next()?.ty != Type::F64 {
-                    return None;
-                }
-            }
+                )
+            }),
+            Segment::F64(_) => operands.next().is_some_and(|arg| arg.ty == Type::F64),
+        };
+        if valid {
+            record(segment);
         }
-    }
-    operands.next().is_none().then_some(segments)
+    });
+    parsed.ok().filter(|_| valid && operands.next().is_none())
 }
 
-fn class_fields(
-    resolution: &super::typed_ast::HirResolution,
+// The descriptors belong to this call. Scheduling can borrow their ranges
+// while pushing work; the template slices in that work borrow the HIR.
+fn with_format_segments<'e>(
+    args: &'e [HirExpr],
+    schedule: impl FnOnce(&'e str, &[crate::interpolate::SourceSegment]),
+) -> bool {
+    let mut segments = Vec::new();
+    let template = check_format(args, |segment| segments.push(segment));
+    #[cfg(test)]
+    {
+        let live = LIVE_FORMAT_DESCRIPTOR_CAPACITY.get() + segments.capacity();
+        LIVE_FORMAT_DESCRIPTOR_CAPACITY.set(live);
+        PEAK_FORMAT_DESCRIPTOR_CAPACITY.set(PEAK_FORMAT_DESCRIPTOR_CAPACITY.get().max(live));
+    }
+    if let Some(spec) = template {
+        schedule(spec.as_str(), &segments);
+    }
+    #[cfg(test)]
+    LIVE_FORMAT_DESCRIPTOR_CAPACITY
+        .set(LIVE_FORMAT_DESCRIPTOR_CAPACITY.get() - segments.capacity());
+    template.is_some()
+}
+
+fn object_literal_supported(
+    resolution: &LoweringDeclarations<'_>,
     class: &TypeId,
-) -> Option<Vec<(String, Type)>> {
-    let mut chain = Vec::new();
-    let mut next = Some(*class);
-    let mut seen = std::collections::HashSet::new();
-    while let Some(class) = next {
-        if !seen.insert(class) {
-            return None;
+    fields: &[(String, HirExpr)],
+) -> bool {
+    resolution.fields_rev(class).is_some_and(|mut declared| {
+        if declared.len() != fields.len() {
+            return false;
         }
-        let info = resolution.classes.get(&class)?;
-        chain.push(info);
-        next = info.base;
-    }
-    let mut fields = Vec::new();
-    let mut names = std::collections::HashSet::new();
-    for info in chain.into_iter().rev() {
-        for (name, ty) in &info.fields {
-            if names.insert(name.clone()) {
-                fields.push((name.clone(), ty.clone()));
-            }
-        }
-    }
-    Some(fields)
+        let names: std::collections::HashSet<_> = fields.iter().map(|(name, _)| name).collect();
+        names.len() == fields.len() && declared.all(|(name, _)| names.contains(name))
+    })
 }
 
-fn arguments_compatible(
+fn arguments_compatible<'a>(
     resolution: &super::typed_ast::HirResolution,
-    params: &[Type],
+    params: impl IntoIterator<Item = &'a Type, IntoIter: ExactSizeIterator>,
     args: &[HirExpr],
 ) -> bool {
+    let params = params.into_iter();
     params.len() == args.len()
-        && params.iter().zip(args).all(|(target, argument)| {
+        && params.zip(args).all(|(target, argument)| {
             if matches!(argument.kind, HirExprKind::ReferenceArg { .. }) {
                 *target == argument.ty
             } else {
@@ -1001,182 +1036,339 @@ fn arguments_compatible(
         })
 }
 
-fn static_signature(
-    resolution: &super::typed_ast::HirResolution,
+/// Class and module signatures can borrow the declaration. Interface dispatch
+/// may specialize Self and type parameters for the receiver.
+struct ResolvedSignature<'a, 'r> {
+    declaration: &'a super::typed_ast::HirSignature,
+    interface: Option<InterfaceReceiver<'a, 'r>>,
+}
+
+struct InterfaceReceiver<'a, 'r> {
+    class: TypeId,
+    type_params: &'a super::typed_ast::HirTypeParameters,
+    args: Option<&'r [Type]>,
+}
+
+#[derive(Clone, Copy)]
+struct InterfaceBindings<'a> {
+    class: TypeId,
+    args: Option<&'a [Type]>,
+    type_params: &'a super::typed_ast::HirTypeParameters,
+    self_id: TypeId,
+}
+
+impl<'a, 'r> InterfaceReceiver<'a, 'r> {
+    fn bindings<'b>(&self) -> InterfaceBindings<'b>
+    where
+        'a: 'b,
+        'r: 'b,
+    {
+        InterfaceBindings {
+            class: self.class,
+            args: self.args,
+            type_params: self.type_params,
+            self_id: TypeId::local("Self"),
+        }
+    }
+}
+
+impl InterfaceBindings<'_> {
+    fn matches(&self, param: &Type, actual: &Type) -> bool {
+        self.compare(param, actual, false)
+    }
+
+    fn compare(&self, param: &Type, actual: &Type, ignore_callable_kind: bool) -> bool {
+        match_bound_parameter(
+            param,
+            actual,
+            ignore_callable_kind,
+            self.type_params,
+            self.args.unwrap_or_default(),
+            |id, ty| {
+                if *id != self.self_id {
+                    return None;
+                }
+                Some(match (self.args, ty) {
+                    (None, Type::Named(id)) => self.class == *id,
+                    (Some(args), Type::Generic(id, actual)) => {
+                        self.class == *id
+                            && args.len() == actual.len()
+                            && args.iter().zip(actual).all(|(a, b)| {
+                                if ignore_callable_kind {
+                                    a.same_modulo_callable_kind(b)
+                                } else {
+                                    a == b
+                                }
+                            })
+                    }
+                    _ => false,
+                })
+            },
+        )
+    }
+
+    fn specialize(&self, param: &Type) -> Type {
+        #[cfg(test)]
+        INTERFACE_SPECIALIZATIONS.set(INTERFACE_SPECIALIZATIONS.get() + 1);
+        param.substitute_names(|id| {
+            if let Some(i) = self.type_params.position(id) {
+                Some(self.args.unwrap_or_default()[i].clone())
+            } else if *id == self.self_id {
+                Some(match self.args {
+                    Some(args) => Type::Generic(self.class, args.to_vec()),
+                    None => Type::Named(self.class),
+                })
+            } else {
+                None
+            }
+        })
+    }
+}
+
+fn match_bound_parameter(
+    param: &Type,
+    actual: &Type,
+    ignore_callable_kind: bool,
+    names: &super::typed_ast::HirTypeParameters,
+    args: &[Type],
+    match_self: impl Fn(&TypeId, &Type) -> Option<bool>,
+) -> bool {
+    let bound = |id: &TypeId, ty: &Type| match names.position(id) {
+        Some(i) if ignore_callable_kind => Some(args[i].same_modulo_callable_kind(ty)),
+        Some(i) => Some(args[i] == *ty),
+        None => match_self(id, ty),
+    };
+    if ignore_callable_kind {
+        param.callable_storage_with_bindings(actual, bound)
+    } else {
+        param.equals_with_bindings(actual, bound)
+    }
+}
+
+/// A conversion may use an interface parameter whose concrete shape depends
+/// on the receiver. Both parts borrow immutable declaration or HIR data.
+#[derive(Clone, Copy)]
+struct ProjectedParameter<'e> {
+    param: &'e Type,
+    bindings: InterfaceBindings<'e>,
+}
+
+impl ProjectedParameter<'_> {
+    // Reference arguments require an exact match. The caller has already
+    // handled them; here only a value can use callable storage or an upcast.
+    fn accepts_value(&self, source: &Type, resolution: &super::typed_ast::HirResolution) -> bool {
+        resolution.can_coerce_matching(source, |ty, relax| {
+            self.bindings.compare(self.param, ty, relax)
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ParameterType<'e> {
+    Declared(&'e Type),
+    Projected(ProjectedParameter<'e>),
+}
+
+impl<'e> ResolvedSignature<'e, 'e> {
+    fn check_conversions(
+        &self,
+        args: &[HirExpr],
+        exits_before_conversion: impl Fn(&HirExpr) -> bool,
+        mut check: impl FnMut(usize, ParameterType<'e>, &HirExpr) -> bool,
+    ) -> bool {
+        let params = &self.declaration.params;
+        if args.len() != params.len() {
+            return false;
+        }
+        let mut bindings = None;
+        for (index, (param, arg)) in params.iter().zip(args).enumerate() {
+            if exits_before_conversion(arg) {
+                continue;
+            }
+            let target = if let Some(interface) = &self.interface {
+                let bindings = *bindings.get_or_insert_with(|| interface.bindings());
+                if bindings.matches(param, &arg.ty) {
+                    continue;
+                }
+                ParameterType::Projected(ProjectedParameter { param, bindings })
+            } else {
+                if param == &arg.ty {
+                    continue;
+                }
+                ParameterType::Declared(param)
+            };
+            if !check(index, target, arg) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+impl<'a> ResolvedSignature<'a, '_> {
+    fn return_type(&self) -> Cow<'a, Type> {
+        let result = &self.declaration.return_type;
+        match &self.interface {
+            Some(interface) => Cow::Owned(interface.bindings().specialize(result)),
+            None => Cow::Borrowed(result),
+        }
+    }
+}
+
+fn static_signature<'a>(
+    resolution: &'a LoweringDeclarations<'a>,
     class: &TypeId,
     method: &str,
-) -> Option<super::typed_ast::HirSignature> {
+) -> Option<ResolvedSignature<'a, 'static>> {
     resolution
         .modules
         .get(class)
         .and_then(|functions| functions.get(method))
-        .cloned()
-        .or_else(|| method_signature(resolution, &Type::Named(*class), method))
+        .map(|declaration| ResolvedSignature {
+            declaration,
+            interface: None,
+        })
+        .or_else(|| lookup_method_signature(resolution, *class, None, method))
 }
 
 #[cfg(test)]
 std::thread_local! {
+    static INTERFACE_SPECIALIZATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CLASS_FIELD_ENUMERATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(crate) static DECLARED_METHOD_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static METHOD_EFFECT_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static DISPATCH_EFFECT_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Resolve declaration effects once per (class, method), sharing inherited
-/// answers across call sites. Generic arguments cannot change this effect.
-fn method_is_async(
-    resolution: &super::typed_ast::HirResolution,
-    receiver: &Type,
-    method: &str,
-    cache: &mut std::collections::HashMap<FunctionId, bool>,
-) -> bool {
+fn method_is_async(resolution: &LoweringDeclarations<'_>, receiver: &Type, method: &str) -> bool {
     let (Type::Named(class) | Type::Generic(class, _)) = receiver else {
         return false;
     };
-    let mut class = *class;
-    let mut path = Vec::new();
-    let mut result = false;
-    // Valid inheritance is acyclic. Bound malformed input as well.
-    for _ in 0..=resolution.classes.len() {
-        #[cfg(test)]
-        METHOD_EFFECT_PROBES.with(|count| count.set(count.get() + 1));
-        let key = FunctionId::method(class, method);
-        if let Some(&cached) = cache.get(&key) {
-            result = cached;
-            break;
-        }
-        path.push(key);
-        if let Some(interface) = resolution.interfaces.get(&class) {
-            result = interface
-                .methods
-                .get(method)
-                .is_some_and(|sig| sig.is_async);
-            break;
-        }
-        let Some(info) = resolution.classes.get(&class) else {
-            break;
-        };
-        if let Some(signature) = info.methods.get(method) {
-            result = signature.is_async;
-            break;
-        }
-        let Some(base) = info.base else { break };
-        class = base;
-    }
-    for key in path {
-        cache.insert(key, result);
-    }
-    result
+    resolution
+        .declared_method(*class, method)
+        .is_some_and(|decl| decl.signature.is_async)
 }
 
-/// Query descendant effects lazily. Memoize each visited (type, method) pair,
-/// including negative answers, so overlapping virtual-call queries share work.
-fn dispatch_may_start_task(
-    resolution: &super::typed_ast::HirResolution,
-    children: &std::collections::HashMap<TypeId, Vec<TypeId>>,
-    class: TypeId,
+fn method_signature<'a, 'r>(
+    resolution: &LoweringDeclarations<'a>,
+    receiver: &'r Type,
     method: &str,
-    cache: &mut std::collections::HashMap<FunctionId, bool>,
-    declarations: &mut std::collections::HashMap<FunctionId, bool>,
-) -> bool {
-    let key = FunctionId::method(class, method);
-    if let Some(&result) = cache.get(&key) {
-        return result;
-    }
-    let mut work = vec![(class, false)];
-    let mut active = std::collections::HashSet::new();
-    while let Some((class, exiting)) = work.pop() {
-        let key = FunctionId::method(class, method);
-        if cache.contains_key(&key) {
-            continue;
-        }
-        if exiting {
-            let result = children.get(&class).is_some_and(|children| {
-                children.iter().any(|&child| {
-                    cache
-                        .get(&FunctionId::method(child, method))
-                        .copied()
-                        .unwrap_or(false)
-                })
-            });
-            cache.insert(key, result);
-            active.remove(&class);
-            continue;
-        }
-        #[cfg(test)]
-        DISPATCH_EFFECT_VISITS.with(|count| count.set(count.get() + 1));
-        // Interface implementers may inherit their async body from a class
-        // outside this descendant walk. Reuse exact declaration resolution.
-        if resolution.open_dispatch_types.contains(&class)
-            || method_is_async(resolution, &Type::Named(class), method, declarations)
-        {
-            cache.insert(key, true);
-            continue;
-        }
-        // Invalid cyclic declarations are rejected earlier; remain bounded here.
-        if !active.insert(class) {
-            continue;
-        }
-        work.push((class, true));
-        if let Some(children) = children.get(&class) {
-            work.extend(children.iter().map(|&child| (child, false)));
-        }
-    }
-    cache
-        .get(&FunctionId::method(class, method))
-        .copied()
-        .unwrap_or(false)
+) -> Option<ResolvedSignature<'a, 'r>> {
+    let (class, args) = match receiver {
+        Type::Named(class) => (*class, None),
+        Type::Generic(class, args) => (*class, Some(args.as_slice())),
+        _ => return None,
+    };
+    lookup_method_signature(resolution, class, args, method)
 }
 
-fn method_signature(
-    resolution: &super::typed_ast::HirResolution,
-    receiver: &Type,
+fn lookup_method_signature<'a, 'r>(
+    resolution: &LoweringDeclarations<'a>,
+    receiver_class: TypeId,
+    args: Option<&'r [Type]>,
     method: &str,
-) -> Option<super::typed_ast::HirSignature> {
+) -> Option<ResolvedSignature<'a, 'r>> {
     #[cfg(test)]
     DECLARED_METHOD_LOOKUPS.set(DECLARED_METHOD_LOOKUPS.get() + 1);
-    let (Type::Named(class) | Type::Generic(class, _)) = receiver else {
-        return None;
-    };
-    let mut next = Some(*class);
-    let mut seen = std::collections::HashSet::new();
-    while let Some(class) = next {
-        if !seen.insert(class) {
-            return None;
-        }
-        if let Some(interface) = resolution.interfaces.get(&class) {
-            let mut signature = interface.methods.get(method)?.clone();
-            let mut substitutions =
-                std::collections::HashMap::from([(TypeId::local("Self"), receiver.clone())]);
-            if let Type::Generic(_, args) = receiver {
-                if interface.type_params.len() != args.len() {
-                    return None;
-                }
-                substitutions.extend(
-                    interface
-                        .type_params
-                        .iter()
-                        .copied()
-                        .zip(args.iter().cloned()),
-                );
-            } else if !interface.type_params.is_empty() {
+    let method = resolution.declared_method(receiver_class, method)?;
+    let interface = match method.interface_params {
+        Some(type_params) => {
+            if type_params.as_slice().len() != args.unwrap_or_default().len() {
                 return None;
             }
-            signature.params = signature
-                .params
-                .iter()
-                .map(|ty| crate::semantic::symbols::substitute_type(ty, &substitutions))
-                .collect();
-            signature.return_type =
-                crate::semantic::symbols::substitute_type(&signature.return_type, &substitutions);
-            return Some(signature);
+            Some(InterfaceReceiver {
+                class: receiver_class,
+                type_params,
+                args,
+            })
         }
-        let info = resolution.classes.get(&class)?;
-        if let Some(signature) = info.methods.get(method) {
-            return Some(signature.clone());
-        }
-        next = info.base;
+        None => None,
+    };
+    Some(ResolvedSignature {
+        declaration: method.signature,
+        interface,
+    })
+}
+
+/// A missing arm yields the condition's boolean value on that edge (&& or ||).
+struct ConditionalOperands<'a> {
+    condition: &'a HirExpr,
+    then_expr: Option<&'a HirExpr>,
+    else_expr: Option<&'a HirExpr>,
+}
+
+impl<'a> ConditionalOperands<'a> {
+    fn from_kind(kind: &'a HirExprKind) -> Option<Self> {
+        use crate::parser::ast::BinOp;
+        let (condition, then_expr, else_expr) = match kind {
+            HirExprKind::Ternary {
+                condition,
+                then_expr,
+                else_expr,
+            } => (
+                condition.as_ref(),
+                Some(then_expr.as_ref()),
+                Some(else_expr.as_ref()),
+            ),
+            HirExprKind::Binary {
+                op: BinOp::And,
+                lhs,
+                rhs,
+            } => (lhs.as_ref(), Some(rhs.as_ref()), None),
+            HirExprKind::Binary {
+                op: BinOp::Or,
+                lhs,
+                rhs,
+            } => (lhs.as_ref(), None, Some(rhs.as_ref())),
+            _ => return None,
+        };
+        Some(Self {
+            condition,
+            then_expr,
+            else_expr,
+        })
     }
-    None
+
+    fn literal_condition(&self) -> Option<bool> {
+        match self.condition.kind {
+            HirExprKind::Bool(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn operand(&self, truth: bool) -> Option<&'a HirExpr> {
+        if truth {
+            self.then_expr
+        } else {
+            self.else_expr
+        }
+    }
+}
+
+struct ConstantIfBranches<'a> {
+    taken: Option<&'a [HirStmt]>,
+    skipped: &'a [HirStmt],
+}
+
+/// Both CFG construction and lexical capture analysis elide the same statement arm.
+fn constant_if_branches<'a>(
+    cond: &HirExpr,
+    then_branch: &'a [HirStmt],
+    else_branch: Option<&'a [HirStmt]>,
+) -> Option<ConstantIfBranches<'a>> {
+    match cond.kind {
+        HirExprKind::Bool(true) => Some(ConstantIfBranches {
+            taken: Some(then_branch),
+            skipped: else_branch.unwrap_or_default(),
+        }),
+        HirExprKind::Bool(false) => Some(ConstantIfBranches {
+            taken: else_branch,
+            skipped: then_branch,
+        }),
+        _ => None,
+    }
+}
+
+fn while_body_is_reachable(cond: &HirExpr) -> bool {
+    !matches!(cond.kind, HirExprKind::Bool(false))
 }
 
 /// Whether running `body` can END a panic rather than just clean up after one:
@@ -1194,7 +1386,7 @@ pub(crate) fn defer_body_contains_recover(body: &HirDeferBody) -> bool {
 
 fn expr_has_recover(expr: &HirExpr) -> bool {
     expr.walk_postorder(false)
-        .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, .. } if callee.is_free_named("recover")))
+        .any(|expr| matches!(&expr.kind, HirExprKind::Call { callee, binding: HirCallBinding::Function, .. } if callee.is_free_named("recover")))
 }
 
 fn block_has_recover(stmts: &[HirStmt]) -> bool {
@@ -1204,14 +1396,74 @@ fn block_has_recover(stmts: &[HirStmt]) -> bool {
         .any(expr_has_recover)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static CAPTURE_DISCOVERY_STORAGE: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+    static CAPTURE_DISCOVERY_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn cleanup_captures(
+    inputs: &[LirLocalId],
+    blocks: &[SourceBlock],
+    locals: &[LirLocal],
+) -> Vec<LirLocalId> {
+    if inputs.is_empty() {
+        return Vec::new();
+    }
+    // Region-local IDs in the input prefix map directly to the caller's ordered IDs.
+    let names = locals[..inputs.len()]
+        .iter()
+        .map(|local| {
+            #[cfg(test)]
+            CAPTURE_DISCOVERY_VISITS.set(CAPTURE_DISCOVERY_VISITS.get() + 1);
+            (local.name.as_str(), local.id)
+        })
+        .collect::<HashMap<_, _>>();
+    let mut seen = vec![0; inputs.len().div_ceil(64)];
+    #[cfg(test)]
+    CAPTURE_DISCOVERY_STORAGE.set((names.len(), seen.len()));
+
+    let mut mark = |id: LirLocalId| {
+        if (id.0 as usize) < inputs.len() && !liveness::contains(&seen, id) {
+            liveness::insert(&mut seen, id);
+            true
+        } else {
+            false
+        }
+    };
+    let mut remaining = inputs.len();
+    for block in blocks {
+        for inst in &block.instrs {
+            #[cfg(test)]
+            CAPTURE_DISCOVERY_VISITS.set(CAPTURE_DISCOVERY_VISITS.get() + 1);
+            async_liveness::visit_instruction_locals(inst, &names, |_, id| {
+                remaining -= usize::from(mark(id));
+            });
+            if remaining == 0 {
+                return inputs.to_vec();
+            }
+        }
+        #[cfg(test)]
+        CAPTURE_DISCOVERY_VISITS.set(CAPTURE_DISCOVERY_VISITS.get() + 1);
+        async_liveness::visit_terminator_uses(&block.terminator, &names, |id| {
+            remaining -= usize::from(mark(id));
+        });
+        if remaining == 0 {
+            return inputs.to_vec();
+        }
+    }
+    liveness::ones(&seen)
+        .map(|id| inputs[id.0 as usize])
+        .collect()
+}
+
 /// Lower one function's statement tree into a block graph.
-fn lower_function(
+fn lower_function<'r>(
     f: &HirFunction,
     class: Option<&TypeId>,
-    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
+    resolution: &'r LoweringDeclarations<'r>,
 ) -> SourceFunction {
-    let mut b = Builder::new(&f.params, f.is_async);
-    b.resolution = resolution;
+    let mut b = Builder::new(&f.params, f.is_async, resolution);
     b.return_type = f.return_type.clone();
     for clause in &f.requires {
         b.lower_stmt(&contract_check(clause.clone(), false));
@@ -1287,9 +1539,9 @@ struct LocalOptions {
 
 /// Block-graph builder: appends instructions to a current block and seals
 /// blocks with terminators as control flow branches and rejoins.
-struct Builder {
+struct Builder<'r> {
     return_type: Type,
-    resolution: std::rc::Rc<super::typed_ast::HirResolution>,
+    resolution: &'r LoweringDeclarations<'r>,
     blocks: Vec<(Vec<SourceInst>, Option<SourceTerminator>)>,
     /// Per-block [`SourceBlock::recovery`], filled in by `lower_scope` once it
     /// knows the scope's resume block.
@@ -1308,6 +1560,9 @@ struct Builder {
     is_async: bool,
     suspend_counter: usize,
     locals: Vec<LirLocal>,
+    /// Free names of descendant sites in the lexical cleanup currently being lowered.
+    nested_defer_access: defer_captures::NestedAccess,
+    cleanup_name: Option<FunctionId>,
     /// The currently open lexical scopes, outermost first.
     scope_starts: Vec<LirScopeMark>,
     scope_roots: Vec<LirLocalId>,
@@ -1337,7 +1592,7 @@ fn expr_suspends_here(expr: &HirExpr) -> bool {
     match &expr.kind {
         HirExprKind::Await { inner }
             if builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                && !matches!(&inner.kind, HirExprKind::Call { callee, .. } if matches!(callee.name().as_ref(), "sleep" | "yield")) =>
+                && !matches!(&inner.kind, HirExprKind::Call { callee, binding: HirCallBinding::Function, .. } if matches!(callee.name().as_ref(), "sleep" | "yield")) =>
         {
             false
         }
@@ -1566,7 +1821,6 @@ fn instruction_executes_call(inst: &SourceInst) -> bool {
 #[willow_continuations::methods(
     lower_assign_operands,
     lower_condition,
-    lower_conditional_branches,
     lower_conditional_suspend,
     lower_for,
     lower_lock,
@@ -1586,11 +1840,11 @@ fn instruction_executes_call(inst: &SourceInst) -> bool {
     lower_suspending_operand,
     lower_value_into
 )]
-impl Builder {
-    fn new(params: &[HirParam], is_async: bool) -> Self {
+impl<'r> Builder<'r> {
+    fn new(params: &[HirParam], is_async: bool, resolution: &'r LoweringDeclarations<'r>) -> Self {
         let mut builder = Self {
             return_type: Type::Void,
-            resolution: Default::default(),
+            resolution,
             blocks: vec![(Vec::new(), None)],
             block_recovery: vec![Vec::new()],
             current: 0,
@@ -1603,6 +1857,8 @@ impl Builder {
             is_async,
             suspend_counter: 0,
             locals: Vec::new(),
+            nested_defer_access: None,
+            cleanup_name: None,
             scope_starts: Vec::new(),
             scope_roots: Vec::new(),
             local_by_name: std::collections::HashMap::new(),
@@ -1631,8 +1887,12 @@ impl Builder {
     /// and they are `parameter` locals for the same reason a parameter is: the
     /// backend gives them their value at entry, so nothing in the body may
     /// clear or re-slot them on a scope exit.
-    fn new_lambda(params: &[HirParam], captures: &[HirCapture]) -> Self {
-        let mut builder = Self::new(&[], false);
+    fn new_lambda(
+        params: &[HirParam],
+        captures: &[HirCapture],
+        resolution: &'r LoweringDeclarations<'r>,
+    ) -> Self {
+        let mut builder = Self::new(&[], false, resolution);
         for capture in captures {
             builder.declare_local(
                 capture.name.clone(),
@@ -1658,15 +1918,39 @@ impl Builder {
         builder
     }
 
-    fn lower_defer_region(&mut self, stmts: &[HirStmt], recovery_capable: bool) -> SourceDeferBody {
-        let mut region = Self::new(&[], false);
-        region.resolution = self.resolution.clone();
-        region.locals = self.locals.clone();
-        region
+    fn lower_defer_region(
+        &mut self,
+        stmts: &[HirStmt],
+        recovery_capable: bool,
+        inputs: &[LirLocalId],
+        nested_access: defer_captures::NestedAccess,
+    ) -> SourceDeferBody {
+        let mut region = Self::new(&[], false, self.resolution);
+        let name = self.cleanup_name.unwrap_or_else(|| {
+            if let Some(receiver) = self.local_by_name.get("self")
+                && let Type::Named(owner) = self.locals[receiver.0 as usize].ty
+            {
+                FunctionId::method(owner, "$defer")
+            } else {
+                FunctionId::free("$defer")
+            }
+        });
+        region.cleanup_name = Some(name);
+        region.nested_defer_access = nested_access;
+        region.locals = inputs
+            .iter()
+            .map(|id| self.locals[id.0 as usize].clone())
+            .collect();
+        region.local_by_name = region
             .locals
             .iter_mut()
-            .for_each(|local| local.parameter = true);
-        region.local_by_name = self.local_by_name.clone();
+            .enumerate()
+            .map(|(index, local)| {
+                local.id = LirLocalId(index as u32);
+                local.parameter = true;
+                (local.name.clone(), local.id)
+            })
+            .collect();
         region.suspend_counter = self.suspend_counter;
         region.for_counter = self.for_counter;
         region.lower_scope(stmts);
@@ -1676,41 +1960,7 @@ impl Builder {
             }
         }
         let (blocks, locals) = region.finish();
-        let names = locals
-            .iter()
-            .map(|local| (local.name.as_str(), local.id))
-            .collect();
-        let mut referenced = std::collections::HashSet::new();
-        for block in &blocks {
-            for inst in &block.instrs {
-                let mut writes = std::collections::HashSet::new();
-                async_liveness::instruction_use_def(inst, &names, &mut referenced, &mut writes);
-                referenced.extend(writes);
-            }
-            async_liveness::terminator_uses(
-                &block.terminator,
-                &names,
-                &mut referenced,
-                &std::collections::HashSet::new(),
-            );
-        }
-        let mut captures: Vec<_> = referenced
-            .into_iter()
-            .filter(|local| (local.0 as usize) < self.locals.len())
-            .collect();
-        captures.sort_by_key(|local| local.0);
-        let name = self
-            .locals
-            .iter()
-            .find(|local| local.name == "self")
-            .and_then(|local| {
-                if let Type::Named(owner) = &local.ty {
-                    Some(FunctionId::method(*owner, "$defer"))
-                } else {
-                    None
-                }
-            })
-            .unwrap_or_else(|| FunctionId::free("$defer"));
+        let captures = cleanup_captures(inputs, &blocks, &locals);
         SourceDeferBody {
             function: Box::new(SourceFunction {
                 name,
@@ -1820,10 +2070,12 @@ impl Builder {
         )
     }
 
+    // A terminal '$' is private to CFG storage. Source shadow suffixes end in a
+    // number. Final LIR chooses the printable spelling once all locals exist.
     fn synthetic_name(&mut self, role: &str) -> String {
         let n = self.suspend_counter;
         self.suspend_counter += 1;
-        format!("__async_{role}_{n}")
+        format!("__async_{role}_{n}$")
     }
 
     fn local_expr(&self, local: LirLocalId, span: Span) -> HirExpr {
@@ -1838,38 +2090,75 @@ impl Builder {
     /// Freeze the operands whose defer semantics are registration-time. Block
     /// and match bodies deliberately remain trees and read lexical locals when
     /// cleanup actually runs.
-    fn capture_defer_expr(&mut self, id: LirDeferId, expr: &HirExpr) -> HirExpr {
-        let capture = |this: &mut Self, role: &str, value: &HirExpr| {
-            let name = format!("__defer{}_{}", id.0, role);
-            let local = this.push_synth_let(&name, false, value.clone());
-            this.local_expr(local, value.span)
+    fn capture_defer_expr(
+        &mut self,
+        id: LirDeferId,
+        expr: &HirExpr,
+    ) -> (HirExpr, Option<Vec<LirLocalId>>) {
+        let capture =
+            |this: &mut Self, role: &str, value: HirExpr, inputs: &mut Vec<LirLocalId>| {
+                let mut name = format!("__defer{}_{}$", id.0, role);
+                // Each cleanup region restarts its site IDs but inherits its
+                // parent's locals. Distinguish a new capture of the same role.
+                if this.local_by_name.contains_key(&name) {
+                    use std::fmt::Write;
+                    write!(name, "{}$", this.locals.len()).expect("writing to a String");
+                }
+                let span = value.span;
+                let local = this.push_synth_let(&name, false, value);
+                inputs.push(local);
+                this.local_expr(local, span)
+            };
+        let capture_args = |this: &mut Self, args: &[HirExpr], inputs: &mut Vec<LirLocalId>| {
+            args.iter()
+                .enumerate()
+                .map(|(index, arg)| capture(this, &format!("arg{index}"), arg.clone(), inputs))
+                .collect()
         };
-        let mut out = expr.clone();
-        out.kind = match &expr.kind {
-            HirExprKind::Invoke { name, callee, args } => {
-                // Freeze the callable before evaluating arguments: an argument
-                // may replace the cell that supplied it. Cleanup only reads
-                // these registration-time snapshots, including their GC roots.
-                let callee = Box::new(capture(self, "callee", callee));
-                let args = args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
-                    .collect();
+        let invoke =
+            |this: &mut Self, name, callee, args: &[HirExpr], inputs: &mut Vec<LirLocalId>| {
+                // An argument may replace the callable. Read it before the first
+                // argument and keep that value in the cleanup region's captures.
+                let callee = Box::new(capture(this, "callee", callee, inputs));
                 HirExprKind::Invoke {
-                    name: *name,
+                    name,
                     callee,
+                    args: capture_args(this, args, inputs),
+                }
+            };
+        let mut inputs = Vec::new();
+        let kind = match &expr.kind {
+            HirExprKind::Invoke { name, callee, args } => {
+                invoke(self, *name, (**callee).clone(), args, &mut inputs)
+            }
+            HirExprKind::Call {
+                callee,
+                binding: HirCallBinding::Local { may_change: true },
+                args,
+            } => {
+                let slot = self.local_by_name[callee.name().as_ref()];
+                invoke(
+                    self,
+                    *callee,
+                    self.local_expr(slot, expr.span),
                     args,
+                    &mut inputs,
+                )
+            }
+            HirExprKind::Call {
+                callee,
+                binding,
+                args,
+            } => {
+                if binding.is_local() {
+                    inputs.push(self.local_by_name[callee.name().as_ref()]);
+                }
+                HirExprKind::Call {
+                    callee: *callee,
+                    binding: *binding,
+                    args: capture_args(self, args, &mut inputs),
                 }
             }
-            HirExprKind::Call { callee, args } => HirExprKind::Call {
-                callee: *callee,
-                args: args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
-                    .collect(),
-            },
             HirExprKind::MethodCall {
                 object,
                 method,
@@ -1878,17 +2167,13 @@ impl Builder {
                 builtin,
             } => HirExprKind::MethodCall {
                 builtin: *builtin,
-                super_class: *super_class,
-                object: Box::new(capture(self, "self", object)),
+                object: Box::new(capture(self, "self", (**object).clone(), &mut inputs)),
                 method: method.clone(),
-                args: args
-                    .iter()
-                    .enumerate()
-                    .map(|(index, arg)| capture(self, &format!("arg{index}"), arg))
-                    .collect(),
+                args: capture_args(self, args, &mut inputs),
+                super_class: *super_class,
             },
             HirExprKind::Print { value, newline } => HirExprKind::Print {
-                value: Box::new(capture(self, "print", value)),
+                value: Box::new(capture(self, "print", (**value).clone(), &mut inputs)),
                 newline: *newline,
             },
             ir_variants!(
@@ -1896,9 +2181,16 @@ impl Builder {
                 Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Array, Index, Ternary, New,
                 FieldAccess, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range, Await,
                 TryPropagate, Lambda, Match, Select
-            ) => return expr.clone(),
+            ) => return (expr.clone(), None),
         };
-        out
+        (
+            HirExpr {
+                kind,
+                ty: expr.ty.clone(),
+                span: expr.span,
+            },
+            Some(inputs),
+        )
     }
 
     /// Lower root expression control flow or a scheduler suspension.
@@ -1944,7 +2236,7 @@ impl Builder {
             HirExprKind::Await { inner }
                 if awaitable_task_type(&inner.ty).is_none()
                     && builtin_types::unary_arg(&inner.ty, B::Future).is_some()
-                    && !matches!(&inner.kind, HirExprKind::Call { callee, args }
+                    && !matches!(&inner.kind, HirExprKind::Call { callee, binding: HirCallBinding::Function, args }
                         if (callee.is_free_named("sleep") && args.len() == 1)
                             || (callee.is_free_named("yield") && args.is_empty())) =>
             {
@@ -1954,7 +2246,12 @@ impl Builder {
                 // Only the runtime builtins return `Future<void>`; a user async
                 // fn named `sleep`/`yield` returns a `Task` and is awaited as one.
                 let builtin = builtin_types::unary_arg(&inner.ty, B::Future).is_some();
-                if let HirExprKind::Call { callee, args } = &inner.kind {
+                if let HirExprKind::Call {
+                    callee,
+                    binding: HirCallBinding::Function,
+                    args,
+                } = &inner.kind
+                {
                     match (callee.name().as_ref(), args.as_slice()) {
                         ("sleep", [millis]) if builtin && value.ty == Type::Void => {
                             let millis = self.lower_operand_before_suspend(millis)?;
@@ -2770,75 +3067,49 @@ impl Builder {
     }
 
     fn lower_conditional_suspend(&mut self, value: &HirExpr) -> Option<HirExpr> {
-        let (condition, then_expr, else_expr) = match &value.kind {
-            HirExprKind::Ternary {
-                condition,
-                then_expr,
-                else_expr,
-            } => (&**condition, &**then_expr, &**else_expr),
-            HirExprKind::Binary { op, lhs, rhs }
-                if matches!(
-                    op,
-                    crate::parser::ast::BinOp::And | crate::parser::ast::BinOp::Or
-                ) =>
-            {
-                let constant = HirExpr {
-                    kind: HirExprKind::Bool(matches!(op, crate::parser::ast::BinOp::Or)),
-                    ty: Type::Bool,
-                    span: value.span,
-                };
-                if matches!(op, crate::parser::ast::BinOp::And) {
-                    return self.lower_conditional_branches(value, lhs, rhs, &constant);
-                }
-                return self.lower_conditional_branches(value, lhs, &constant, rhs);
-            }
-            ir_variants!(
-                HirExprKind;
-                Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Call, Invoke, Print, Array,
-                Index, New, FieldAccess, MethodCall, ObjectLiteral, StaticField, StaticCall,
-                ReferenceArg, Range, Await, TryPropagate, Lambda, Match, Select
-            ) => return None,
-        };
-        self.lower_conditional_branches(value, condition, then_expr, else_expr)
-    }
-
-    fn lower_conditional_branches(
-        &mut self,
-        whole: &HirExpr,
-        condition: &HirExpr,
-        then_expr: &HirExpr,
-        else_expr: &HirExpr,
-    ) -> Option<HirExpr> {
-        let condition = self.lower_condition(condition);
+        let branches = ConditionalOperands::from_kind(&value.kind)?;
+        let selected = self.cleanup_name.and_then(|_| branches.literal_condition());
+        let condition = self.lower_condition(branches.condition);
         let result_name = self.synthetic_name("conditional");
         let result = self.declare_local(
             result_name,
-            whole.ty.clone(),
+            value.ty.clone(),
             None,
             LocalOptions {
                 synthetic: true,
                 parameter: false,
             },
         );
-        let then_block = self.new_block();
-        let else_block = self.new_block();
+        let first = self.new_block();
+        let (first_truth, other) = if let Some(truth) = selected {
+            self.terminate(SourceTerminator::Jump(first));
+            (truth, None)
+        } else {
+            let otherwise = self.new_block();
+            self.terminate(SourceTerminator::Branch {
+                cond: condition,
+                then_block: first,
+                else_block: otherwise,
+            });
+            (true, Some((false, otherwise)))
+        };
         let merge = self.new_block();
-        self.terminate(SourceTerminator::Branch {
-            cond: condition,
-            then_block,
-            else_block,
-        });
-
-        self.switch_to(then_block);
-        self.lower_value_into(result, then_expr);
-        self.terminate(SourceTerminator::Jump(merge));
-
-        self.switch_to(else_block);
-        self.lower_value_into(result, else_expr);
-        self.terminate(SourceTerminator::Jump(merge));
-
+        for (truth, block) in std::iter::once((first_truth, first)).chain(other) {
+            self.switch_to(block);
+            if let Some(operand) = branches.operand(truth) {
+                self.lower_value_into(result, operand);
+            } else {
+                let constant = HirExpr {
+                    kind: HirExprKind::Bool(truth),
+                    ty: Type::Bool,
+                    span: value.span,
+                };
+                self.lower_value_into(result, &constant);
+            }
+            self.terminate(SourceTerminator::Jump(merge));
+        }
         self.switch_to(merge);
-        Some(self.local_expr(result, whole.span))
+        Some(self.local_expr(result, value.span))
     }
 
     fn lower_value_into(&mut self, destination: LirLocalId, value: &HirExpr) {
@@ -3013,23 +3284,31 @@ impl Builder {
         else {
             return false;
         };
-        let Some(info) = self.resolution.classes.get(&base).cloned() else {
+        let resolution = self.resolution;
+        let Some(info) = resolution.classes.get(&base) else {
             return false;
         };
-        let explicit = info.constructor.is_some();
-        let mut fields = Vec::new();
-        let params = if let Some(signature) = &info.constructor {
-            signature.params.clone()
+        let fields = if let Some(signature) = &info.constructor {
+            if !arguments_compatible(resolution, &signature.params, args) {
+                return false;
+            }
+            Vec::new()
         } else {
-            let Some(inherited) = class_fields(&self.resolution, &base) else {
+            let Some(fields) = resolution.fields_rev(&base) else {
                 return false;
             };
-            fields = inherited;
-            fields.iter().map(|(_, ty)| ty.clone()).collect()
+            if fields.len() != args.len() {
+                return false;
+            }
+            // Argument lowering can itself resolve another layout. Keep only
+            // the borrowed declarations while evaluating in source order.
+            let mut fields: Vec<_> = fields.collect();
+            fields.reverse();
+            if !arguments_compatible(resolution, fields.iter().map(|(_, ty)| ty), args) {
+                return false;
+            }
+            fields
         };
-        if !arguments_compatible(&self.resolution, &params, args) {
-            return false;
-        }
         let name = self.synthetic_name("base_receiver");
         let base_ty = Type::Named(base);
         let base_local = self.declare_local(
@@ -3062,7 +3341,11 @@ impl Builder {
                 "reference_call",
             );
         }
-        for (index, (arg, target)) in args.iter().zip(&params).enumerate() {
+        for (index, arg) in args.iter().enumerate() {
+            let target = match &info.constructor {
+                Some(signature) => &signature.params[index],
+                None => &fields[index].1,
+            };
             if matches!(arg.kind, HirExprKind::ReferenceArg { .. }) {
                 let Some(reference) =
                     self.lower_reference_argument(arg, FunctionId::method(base, "init"), index)
@@ -3096,7 +3379,7 @@ impl Builder {
                 },
                 span: arg.span,
             });
-            if explicit {
+            if info.constructor.is_some() {
                 operands.push(LirOperand::Local(coerced));
             } else {
                 let name = self.synthetic_name("base_store");
@@ -3121,7 +3404,7 @@ impl Builder {
                 });
             }
         }
-        if explicit {
+        if let Some(signature) = &info.constructor {
             let name = self.synthetic_name("base_init");
             let local = self.declare_local(
                 name,
@@ -3138,7 +3421,7 @@ impl Builder {
                     object: LirOperand::Local(base_local),
                     class: base,
                     args: operands,
-                    arg_types: params,
+                    arg_types: signature.params.clone(),
                 },
                 span,
             });
@@ -3619,9 +3902,17 @@ impl Builder {
         // Only a scope that can actually swallow a panic continues at its
         // resume block; a scope whose defers merely run cleanup lets the panic
         // through, so it adds no edge.
-        let recovers = stmts.iter().any(
-            |stmt| matches!(stmt, HirStmt::Defer { body, .. } if defer_body_contains_recover(body)),
-        );
+        let recovers = stmts.iter().any(|stmt| match stmt {
+            HirStmt::Defer { id, body, .. } => self
+                .nested_defer_access
+                .as_ref()
+                .and_then(|sites| sites.get(id))
+                .map_or_else(
+                    || defer_body_contains_recover(body),
+                    |access| access.recovers,
+                ),
+            _ => false,
+        });
         self.push(SourceInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
@@ -4021,14 +4312,44 @@ impl Builder {
                     .and_then(|scope| scope.get(hir_id))
                     .copied()
                     .expect("defer outside its LIR scope");
-                let recovery_capable = defer_body_contains_recover(body);
-                let stmts = match body {
+                let expression;
+                let (stmts, frozen) = match body {
                     HirDeferBody::Expr(expr) => {
-                        vec![HirStmt::Expr(self.capture_defer_expr(id, expr))]
+                        let (call, inputs) = self.capture_defer_expr(id, expr);
+                        expression = HirStmt::Expr(call);
+                        (std::slice::from_ref(&expression), inputs)
                     }
-                    HirDeferBody::Block(stmts) => stmts.clone(),
+                    HirDeferBody::Block(stmts) => (stmts.as_slice(), None),
                 };
-                let body = self.lower_defer_region(&stmts, recovery_capable);
+                let plan = self
+                    .nested_defer_access
+                    .as_ref()
+                    .and_then(|sites| sites.get(hir_id));
+                let mut nested = self.nested_defer_access.clone();
+                let (inputs, recovery_capable) = if let Some(inputs) = frozen {
+                    (
+                        inputs,
+                        plan.map_or_else(|| defer_body_contains_recover(body), |p| p.recovers),
+                    )
+                } else {
+                    let root;
+                    let access = if let Some(access) = plan {
+                        access
+                    } else {
+                        let mut sites = HashMap::new();
+                        root = defer_captures::analyze(body, &mut sites);
+                        nested = (!sites.is_empty()).then(|| std::rc::Rc::new(sites));
+                        &root
+                    };
+                    let mut inputs: Vec<_> = access
+                        .names
+                        .iter()
+                        .filter_map(|name| self.local_by_name.get(name.as_ref()).copied())
+                        .collect();
+                    inputs.sort_unstable_by_key(|id| id.0);
+                    (inputs, access.recovers)
+                };
+                let body = self.lower_defer_region(stmts, recovery_capable, &inputs, nested);
                 self.push(SourceInst::Defer {
                     id,
                     body,
@@ -4049,11 +4370,11 @@ impl Builder {
                 else_branch,
                 ..
             } => {
-                if let HirExprKind::Bool(value) = cond.kind {
-                    if value {
-                        self.lower_scope(then_branch);
-                    } else if let Some(else_branch) = else_branch {
-                        self.lower_scope(else_branch);
+                if let Some(branches) =
+                    constant_if_branches(cond, then_branch, else_branch.as_deref())
+                {
+                    if let Some(taken) = branches.taken {
+                        self.lower_scope(taken);
                     }
                     return;
                 }
@@ -4084,6 +4405,16 @@ impl Builder {
             }
             HirStmt::While { cond, body, .. } => {
                 let header = self.new_block();
+                self.terminate(SourceTerminator::Jump(header));
+                self.switch_to(header);
+                if self.cleanup_name.is_some() && !while_body_is_reachable(cond) {
+                    // Keep the reachable header and exit from CFG pruning. The skipped
+                    // body can mention bindings this cleanup does not import.
+                    let exit = self.new_block();
+                    self.terminate(SourceTerminator::Jump(exit));
+                    self.switch_to(exit);
+                    return;
+                }
                 let body_block = self.new_block();
                 let backedge = if self.is_async {
                     self.new_block()
@@ -4091,9 +4422,6 @@ impl Builder {
                     header
                 };
                 let exit = self.new_block();
-
-                self.terminate(SourceTerminator::Jump(header));
-                self.switch_to(header);
                 let cond = self.lower_condition(cond);
                 self.terminate(SourceTerminator::Branch {
                     cond,
@@ -4323,7 +4651,7 @@ impl Builder {
     ) {
         let n = self.for_counter;
         self.for_counter += 1;
-        let i_name = format!("__for{n}_i");
+        let i_name = format!("__for{n}_i$");
         // The whole `for` construct is a scope of its own.
         // The desugaring hoists the iterable into a synthetic `let` that lives
         // as long as the loop does; nothing in the source scope holds it, so
@@ -4380,7 +4708,7 @@ impl Builder {
         match (literal_bounds, &iterable.ty) {
             // for x in start..end  →  i = start; while i < end { x = i; .. }
             (Some((start, end)), _) => {
-                let bound_name = format!("__for{n}_end");
+                let bound_name = format!("__for{n}_end$");
                 self.push_synth_let(&i_name, true, (**start).clone());
                 self.push_synth_let(&bound_name, false, (**end).clone());
                 bound_expr = HirExpr {
@@ -4400,7 +4728,7 @@ impl Builder {
                     // The guard above admits FrozenArray as the other representation.
                     _ => builtin_types::unary_arg(ty, B::FrozenArray).unwrap(),
                 };
-                let arr_name = format!("__for{n}_arr");
+                let arr_name = format!("__for{n}_arr$");
                 let arr_var = HirExpr {
                     kind: HirExprKind::Var(arr_name.clone()),
                     ty: iterable.ty.clone(),
@@ -4463,8 +4791,8 @@ impl Builder {
                     && B::from_name(g.name().as_ref()) == Some(B::Range)
                     && args.first() == Some(&Type::I64) =>
             {
-                let range_name = format!("__for{n}_range");
-                let bound_name = format!("__for{n}_end");
+                let range_name = format!("__for{n}_range$");
+                let bound_name = format!("__for{n}_end$");
                 let range_local = self.push_synth_let(&range_name, false, iterable.clone());
                 self.scope_roots.push(range_local);
                 let bound = |field: &str| HirExpr {
@@ -5012,6 +5340,7 @@ fn contract_check(clause: HirExpr, post: bool) -> HirStmt {
     let span = clause.span;
     HirStmt::Expr(HirExpr {
         kind: HirExprKind::Call {
+            binding: HirCallBinding::Function,
             callee: "$contract_check".into(),
             args: vec![
                 clause,
@@ -5027,7 +5356,7 @@ fn contract_check(clause: HirExpr, post: bool) -> HirStmt {
     })
 }
 
-impl Builder {
+impl Builder<'_> {
     /// Share the postcondition CFG across all normal returns. Neither clause
     /// trees nor their arithmetic are copied per exit.
     fn contract_epilogue(&mut self, f: &HirFunction) {

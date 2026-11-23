@@ -259,7 +259,9 @@ fn deep_expression_cfg_lowering_uses_a_one_megabyte_stack() {
                     span,
                 };
             }
-            let mut builder = Builder::new(&[], false);
+            let hir = Default::default();
+            let resolution = LoweringDeclarations::new(&hir);
+            let mut builder = Builder::new(&[], false, &resolution);
             let lowered = builder
                 .lower_nested_cfg(&expr)
                 .expect("nested control flow");
@@ -294,6 +296,7 @@ fn deep_hir_predicates_use_a_one_megabyte_stack() {
                 let mut expr = HirExpr {
                     kind: if has_call {
                         HirExprKind::Call {
+                            binding: HirCallBinding::Function,
                             callee: "recover".into(),
                             args: Vec::new(),
                         }
@@ -315,7 +318,12 @@ fn deep_hir_predicates_use_a_one_megabyte_stack() {
                 assert_eq!(expr_has_recover(&expr), has_call);
                 assert_eq!(expression_executes_call(&expr), has_call);
                 let mut lambdas = Vec::new();
-                collect_lambdas_in_expr(&expr, &mut lambdas, &Default::default());
+                let declarations = Default::default();
+                collect_lambdas_in_expr(
+                    &expr,
+                    &mut lambdas,
+                    &LoweringDeclarations::new(&declarations),
+                );
                 assert!(lambdas.is_empty());
                 drop(expr);
             }
@@ -380,6 +388,10 @@ fn lir(src: &str) -> SourceProgram {
 }
 
 fn lir_checked(src: &str) -> SourceProgram {
+    lower_source_program(&checked_hir(src))
+}
+
+pub(super) fn checked_hir(src: &str) -> HirProgram {
     let source = format!("import std::collections::Array; {src}");
     let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
     assert!(errors.is_empty(), "{errors:?}");
@@ -397,7 +409,7 @@ fn lir_checked(src: &str) -> SourceProgram {
     let facts = crate::ir::lower::SemanticFacts::from_checker(&checker);
     let (hir, errors) = crate::ir::lower::lower_program_with(&program, &facts);
     assert!(errors.is_empty(), "{errors:?}");
-    lower_source_program(&hir)
+    hir
 }
 
 fn func<'a>(p: &'a SourceProgram, name: &str) -> &'a SourceFunction {
@@ -574,6 +586,928 @@ fn defer_cleanup_region_owns_cfg_and_captures_only_outer_reads_or_writes() {
                     .iter()
                     .all(|id| !cleanup.function.locals[id.0 as usize].parameter)
             );
+        }
+    }
+}
+
+#[test]
+fn deferred_callable_uses_the_binding_resolved_at_registration() {
+    for count in [1, 8, 32] {
+        let source = format!(
+            "fn first(n: i64) {{}} fn second(n: i64) {{}} fn probe(stable: fn(i64) -> void, variable: &mut fn(i64) -> void) {{
+                let f = first; {}
+                if true {{ let mut f = first; defer f(1); f = second; }}
+                defer stable(2); defer variable(3); variable = second;
+            }}",
+            "defer f(0);".repeat(count)
+        );
+        let program = lir_checked(&source);
+        let outer = func(&program, "probe");
+        let callees: Vec<_> = outer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| {
+                let SourceInst::Defer { body, .. } = inst else {
+                    return None;
+                };
+                let [callee, argument] = body.captures.as_slice() else {
+                    panic!("one callee and one frozen argument");
+                };
+                assert!(outer.locals[argument.0 as usize].synthetic);
+                Some(&outer.locals[callee.0 as usize])
+            })
+            .collect();
+        assert_eq!(callees.len(), count + 3);
+        assert!(
+            callees[..count]
+                .iter()
+                .all(|local| !local.synthetic && local.name == "f")
+        );
+        assert!(callees[count].synthetic);
+        assert_eq!(callees[count + 1].name, "stable");
+        assert!(callees[count + 2].synthetic);
+        assert_eq!(
+            outer
+                .locals
+                .iter()
+                .filter(|l| l.synthetic && l.name.contains("_callee"))
+                .count(),
+            2
+        );
+    }
+}
+
+#[test]
+fn deferred_callable_stability_ends_at_its_lexical_cleanup() {
+    for count in [1, 8, 32] {
+        let source = format!(
+            "fn one() {{}} fn two() {{}} fn probe(view: & fn()->void) {{
+                let mut f = one;
+                if true {{ {} }}
+                {} f = two; {}
+                defer view();
+            }}",
+            "defer f();".repeat(count),
+            "defer f();".repeat(count),
+            "defer f();".repeat(count)
+        );
+        let program = lir_checked(&source);
+        let outer = func(&program, "probe");
+        let slots: Vec<_> = outer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| match inst {
+                SourceInst::Defer { body, .. } => {
+                    let [callee] = body.captures.as_slice() else {
+                        panic!("one callee input")
+                    };
+                    Some(&outer.locals[callee.0 as usize])
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(slots.len(), 3 * count + 1);
+        assert!(slots[..count].iter().all(|slot| slot.name == "f"));
+        assert!(slots[count..2 * count].iter().all(|slot| slot.synthetic));
+        assert!(
+            slots[2 * count..3 * count]
+                .iter()
+                .all(|slot| slot.name == "f")
+        );
+        assert_eq!(slots.last().unwrap().name, "view");
+    }
+}
+
+#[test]
+fn skipped_writes_and_read_only_borrows_keep_a_deferred_callable_in_its_slot() {
+    let source = "fn first() {} fn second() {} fn inspect(g: & fn()->void) { g(); }
+        fn replace(g: &mut fn()->void)->bool { g = second; return true; }
+        fn probe(flag: bool) {
+            let mut f: fn()->void = first;
+            defer f();
+            inspect(&f);
+            if false { f = second; }
+            while false { replace(&f); }
+            let a = false && replace(&f);
+            let b = true || replace(&f);
+            let c = flag ? true : (false ? replace(&f) : true);
+        }";
+    let program = lir_checked(source);
+    let outer = func(&program, "probe");
+    let capture = outer
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .find_map(|inst| match inst {
+            SourceInst::Defer { body, .. } => Some(&body.captures),
+            _ => None,
+        })
+        .expect("cleanup registration");
+    assert_eq!(capture.len(), 1);
+    assert_eq!(outer.locals[capture[0].0 as usize].name, "f");
+}
+
+#[test]
+fn deferred_callable_stability_scan_shares_writes_across_registrations() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    for mutable in [false, true] {
+        for registrations in [1, 8, 32] {
+            for assignments in [1, 8, 32] {
+                let source = format!(
+                    "fn one() {{}} fn probe() {{
+                    let {} f = one; let mut x = 0; {} {} }}",
+                    if mutable { "mut" } else { "" },
+                    "defer f();".repeat(registrations),
+                    "x = x + 1;".repeat(assignments)
+                );
+                SCAN_COUNTS.set(Default::default());
+                let _ = checked_hir(&source);
+                let counts = SCAN_COUNTS.get();
+                println!(
+                    "mutable={mutable} registrations={registrations} assignments={assignments} {counts:?}"
+                );
+                if mutable {
+                    assert_eq!(counts.watched_slots, 1);
+                    assert_eq!(counts.work_items, 4 * assignments + 2 * registrations + 1);
+                    assert_eq!(counts.reachability_checks, assignments + registrations + 2);
+                    assert!(counts.peak_pending <= 4);
+                } else {
+                    assert_eq!(counts, Default::default());
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn deferred_callable_stability_streams_wide_calls_and_arrays() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    for width in [2, 16, 128, 512] {
+        let args = vec!["1"; width].join(",");
+        let parameters = (0..width)
+            .map(|i| format!("p{i}: i64"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for tail in [format!("consume({args});"), format!("let xs = [{args}];")] {
+            let source = format!(
+                "fn one() {{}} fn consume({parameters}) {{}} fn probe() {{
+                let mut f = one; defer f(); {tail} }}"
+            );
+            let _ = checked_hir(&source);
+            let counts = SCAN_COUNTS.get();
+            println!("width={width} array={} {counts:?}", tail.starts_with("let"));
+            assert_eq!(counts.watched_slots, 1);
+            assert!(counts.work_items >= width);
+            assert!(counts.peak_pending <= 3);
+        }
+    }
+}
+
+#[test]
+fn deferred_callable_stability_uses_each_reference_arguments_declared_mode() {
+    let program = lir_checked(
+        "fn one() {} fn two() {}
+        fn inspect(read: & fn()->void, middle: i64, write: &mut fn()->void) { write = two; }
+        fn probe() { let mut left: fn()->void = one; let mut right: fn()->void = one;
+            defer left(); defer right(); inspect(&left, 1, &right); }",
+    );
+    let outer = func(&program, "probe");
+    let captures = outer
+        .blocks
+        .iter()
+        .flat_map(|b| &b.instrs)
+        .filter_map(|i| match i {
+            SourceInst::Defer { body, .. } => {
+                let [slot] = body.captures.as_slice() else {
+                    panic!("expected a single callee input")
+                };
+                Some(&outer.locals[slot.0 as usize])
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(captures.len(), 2);
+    assert_eq!(captures[0].name, "left");
+    assert!(captures[1].synthetic);
+}
+
+#[test]
+fn deferred_callable_stability_borrows_the_parameter_index_only_for_watched_aliases() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    for width in [1, 8, 64, 256] {
+        let parameters = (0..width)
+            .map(|i| format!("p{i}: &mut fn()->void"))
+            .collect::<Vec<_>>()
+            .join(",");
+        for borrowed in [false, true] {
+            let target = if borrowed { "view" } else { "f" };
+            let source = format!(
+                "fn one() {{}} fn probe(view: & fn()->void, {parameters}) {{
+                let mut f = one; defer {target}(); p0 = one; }}"
+            );
+            let program = lir_checked(&source);
+            let counts = SCAN_COUNTS.get();
+            let outer = func(&program, "probe");
+            let capture = outer
+                .blocks
+                .iter()
+                .flat_map(|b| &b.instrs)
+                .find_map(|i| match i {
+                    SourceInst::Defer { body, .. } => Some(body.captures.as_slice()),
+                    _ => None,
+                })
+                .unwrap();
+            let [id] = capture else {
+                panic!("expected one captured callee")
+            };
+            assert_eq!(outer.locals[id.0 as usize].synthetic, borrowed);
+            println!("ref_params={} borrowed={borrowed} {counts:?}", width + 1);
+            assert_eq!(counts.watched_slots, 1);
+            assert_eq!(counts.borrowed_parameter_index, borrowed);
+            assert_eq!(counts.alias_lookups, if borrowed { 2 } else { 0 });
+        }
+    }
+}
+
+#[test]
+fn deferred_callable_stability_counts_scope_reachability_before_a_final_registration() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    for prefix in [0, 1, 8, 64, 256] {
+        let source = format!(
+            "fn one() {{}} fn probe() {{ let mut f = one; {} defer f(); }}",
+            "1;".repeat(prefix)
+        );
+        let _ = checked_hir(&source);
+        let counts = SCAN_COUNTS.get();
+        println!("prefix={prefix} {counts:?}");
+        assert_eq!(counts.reachability_checks, prefix + 2);
+        assert_eq!(counts.work_items, 3);
+    }
+}
+
+#[test]
+fn skipped_deferred_calls_do_not_extend_the_stability_scan_into_initializers() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    let mut total_operands = 0;
+    for width in [1, 8, 64, 512] {
+        let values = vec!["7"; width].join(",");
+        for reassigned in [false, true] {
+            let write = if reassigned { "f = two;" } else { "" };
+            let program = lir_checked(&format!(
+                "fn one() {{}} fn two() {{}} fn probe() {{
+                 let mut f = one; let xs = [{values}]; defer f();
+                 if false {{ defer f(); }} {write} }}"
+            ));
+            let counts = SCAN_COUNTS.get();
+            let outer = func(&program, "probe");
+            let [id] = only_cleanup(outer).captures.as_slice() else {
+                panic!("expected one callee")
+            };
+            assert_eq!(outer.locals[id.0 as usize].synthetic, reassigned);
+            println!("width={width} reassigned={reassigned} {counts:?}");
+            total_operands += counts.integer_operands;
+        }
+    }
+    assert_eq!(total_operands, 0);
+}
+
+#[test]
+fn deferred_callable_stability_counts_only_reachable_registrations() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    // The diverging match arm allows a registration inside a boolean operand.
+    let operand = "match flag { true => { defer f(); return; }, false => true }";
+    let cases = [
+        ("false branch", "if false { defer f(); }".into(), 0),
+        ("true alternate", "if true {} else { defer f(); }".into(), 0),
+        ("false loop", "while false { defer f(); }".into(), 0),
+        ("return", "return; defer f();".into(), 0),
+        (
+            "return in taken branch",
+            "if true { return; } defer f();".into(),
+            0,
+        ),
+        (
+            "return in both branches",
+            "if flag { return; } else { return; } defer f();".into(),
+            0,
+        ),
+        ("never", r#"panic("stop"); defer f();"#.into(), 0),
+        ("break", "while flag { break; defer f(); }".into(), 0),
+        ("continue", "while flag { continue; defer f(); }".into(), 0),
+        ("and", format!("let result = NEVER && ({operand});"), 0),
+        ("or", format!("let result = true || ({operand});"), 0),
+        (
+            "ternary",
+            format!("let result = false ? ({operand}) : true;"),
+            0,
+        ),
+        (
+            "nested",
+            format!("if false {{ let result = flag && ({operand}); defer f(); }}"),
+            0,
+        ),
+        ("live branch", "if flag { defer f(); }".into(), 1),
+        (
+            "live alternate",
+            "if false {} else { defer f(); }".into(),
+            1,
+        ),
+        ("live loop", "while flag { defer f(); break; }".into(), 1),
+        (
+            "dynamic and",
+            format!("let result = flag && ({operand});"),
+            1,
+        ),
+        (
+            "dynamic or",
+            format!("let result = flag || ({operand});"),
+            1,
+        ),
+        (
+            "dynamic ternary",
+            format!("let result = flag ? ({operand}) : ({operand});"),
+            2,
+        ),
+        (
+            "scope restoration",
+            "if flag { return; } defer f();".into(),
+            1,
+        ),
+    ];
+    for (label, tail, extra_sites) in cases {
+        for outer_registration in [false, true] {
+            SCAN_COUNTS.set(Default::default());
+            let first = if outer_registration { "defer f();" } else { "" };
+            let _ = checked_hir(&format!(
+                "const NEVER: bool = false; fn one() {{}}
+                fn probe(flag: bool) {{ let mut f = one; let xs = [7,7,7,7]; {first} {tail} }}"
+            ));
+            let counts = SCAN_COUNTS.get();
+            assert_eq!(
+                counts.resolved_sites,
+                usize::from(outer_registration) + extra_sites,
+                "{label}"
+            );
+            assert_eq!(counts.integer_operands, 0, "{label}");
+            if !outer_registration && extra_sites == 0 {
+                assert_eq!(counts, Default::default(), "{label}");
+            }
+        }
+    }
+}
+
+#[test]
+fn guaranteed_branch_exits_avoid_deferred_callee_snapshots() {
+    use crate::ir::lower::defer_stability::SCAN_COUNTS;
+
+    for count in [1, 8, 32] {
+        for (label, branch, falls_through) in [
+            ("literal", "if true { return; }", false),
+            ("alternate", "if false {} else { return; }", false),
+            ("both", "if flag { return; } else { return; }", false),
+            (
+                "nested",
+                "if flag { if true { return; } } else { return; }",
+                false,
+            ),
+            ("dynamic", "if flag { return; }", true),
+            ("nested dynamic", "if true { if flag { return; } }", true),
+            (
+                "recover",
+                r#"if true { defer match recover() { Some(_) => {}, None => {} } panic("boom"); }"#,
+                true,
+            ),
+        ] {
+            let source = format!(
+                "fn one() {{}} fn two() {{}} fn probe(flag: bool) {{
+                let mut f = one; {} {branch} f = two; }}",
+                "defer f();".repeat(count)
+            );
+            let program = lir_checked(&source);
+            let resolved = SCAN_COUNTS.get().resolved_sites;
+            let outer = func(&program, "probe");
+            let snapshots = outer
+                .locals
+                .iter()
+                .filter(|l| l.synthetic && l.name.contains("_callee"))
+                .count();
+            println!("{label} registrations={count} snapshots={snapshots} resolved={resolved}");
+            assert_eq!(resolved, count, "{label}");
+            assert_eq!(snapshots, if falls_through { count } else { 0 }, "{label}");
+        }
+    }
+}
+
+#[test]
+fn mixed_defer_registrations_keep_cleanup_slots_linear() {
+    for count in [1, 8, 32] {
+        let source = format!(
+            "fn first() {{}} fn second() {{}} fn probe() {{ let mut f = first; {} {} f = second; }}",
+            "defer f();".repeat(count),
+            "defer first();".repeat(count)
+        );
+        let program = lir_checked(&source);
+        let sites: Vec<_> = func(&program, "probe")
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| match inst {
+                SourceInst::Defer { body, .. } => Some(body),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(sites.len(), 2 * count);
+        let (indirect, direct) = sites.split_at(count);
+        let total: usize = sites.iter().map(|body| body.function.locals.len()).sum();
+        println!("sites_per_group={count} cleanup_slots={total}");
+        assert!(indirect.iter().all(|body| body.captures.len() == 1));
+        assert!(direct.iter().all(|body| body.captures.is_empty()));
+        assert_eq!(total, 4 * count);
+    }
+}
+
+#[test]
+fn mixed_defer_blocks_inherit_lexical_reads_and_writes_across_snapshots() {
+    for count in [1, 8, 32] {
+        let source = format!(
+            "fn first() {{}} fn second() {{}} fn probe() {{ let mut dst = 0; let mut f = first; {}
+             let src = 7; {} {} f = second; }}",
+            "defer f();".repeat(count),
+            "defer f();".repeat(count),
+            "defer { dst = src; }".repeat(count),
+        );
+        let program = lir_checked(&source);
+        let outer = func(&program, "probe");
+        let sites = outer
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| {
+                if let SourceInst::Defer { body, .. } = inst {
+                    Some(body)
+                } else {
+                    None
+                }
+            });
+        let mut block_count = 0;
+        let mut total = 0;
+        for body in sites.skip(2 * count) {
+            block_count += 1;
+            total += body.function.locals.len();
+            let names: Vec<_> = body
+                .captures
+                .iter()
+                .map(|id| outer.locals[id.0 as usize].name.as_str())
+                .collect();
+            assert_eq!(names, ["dst", "src"]);
+            assert!(
+                body.function
+                    .locals
+                    .iter()
+                    .all(|local| !local.synthetic || !local.parameter)
+            );
+        }
+        assert_eq!(block_count, count);
+        assert_eq!(total, 2 * count);
+    }
+}
+
+#[test]
+fn lexical_cleanup_imports_only_referenced_parent_slots() {
+    fn sites(function: &SourceFunction) -> impl Iterator<Item = &SourceDeferBody> {
+        function
+            .blocks
+            .iter()
+            .flat_map(|block| &block.instrs)
+            .filter_map(|inst| {
+                if let SourceInst::Defer { body, .. } = inst {
+                    Some(body)
+                } else {
+                    None
+                }
+            })
+    }
+    for unrelated in [1, 8, 32] {
+        let padding: String = (0..unrelated)
+            .map(|i| format!("let unused{i} = {i};"))
+            .collect();
+        for count in [1, 8, 32] {
+            let source = format!(
+                "fn probe() {{ {padding} let mut dst = 0; {} {} }}",
+                "defer { dst = 1; }".repeat(count),
+                "defer { defer { dst = 2; } }".repeat(count)
+            );
+            defer_captures::VISITED_NODES.set(0);
+            let program = lir_checked(&source);
+            let visits = defer_captures::VISITED_NODES.get();
+            assert_eq!(visits, 5 * count);
+            let parent = func(&program, "probe");
+            let dst = parent.locals.iter().find(|l| l.name == "dst").unwrap().id;
+            assert_eq!(dst.0 as usize, unrelated);
+            let mut total = 0;
+            for (i, body) in sites(parent).enumerate() {
+                assert_eq!(body.captures, [dst]);
+                total += body.function.locals.len();
+                if i >= count {
+                    let inner = sites(&body.function).next().unwrap();
+                    assert_eq!(inner.captures, [LirLocalId(0)]);
+                    assert_eq!(body.function.locals[0].name, "dst");
+                    total += inner.function.locals.len();
+                }
+            }
+            println!(
+                "unrelated={unrelated} block_pairs={count} all_region_slots={total} analyzed_nodes={visits}"
+            );
+            assert_eq!(total, 3 * count);
+        }
+    }
+}
+
+fn only_cleanup(parent: &SourceFunction) -> &SourceDeferBody {
+    let mut sites = parent
+        .blocks
+        .iter()
+        .flat_map(|block| &block.instrs)
+        .filter_map(|inst| match inst {
+            SourceInst::Defer { body, .. } => Some(body),
+            _ => None,
+        });
+    let site = sites.next().expect("one cleanup registration");
+    assert!(sites.next().is_none());
+    site
+}
+
+#[test]
+fn capture_free_cleanup_skips_local_and_cfg_discovery() {
+    for width in [1, 8, 32] {
+        let locals: String = (0..width).map(|i| format!("let mut v{i} = 0;")).collect();
+        for assignments in [1, 8, 32] {
+            let writes: String = (0..assignments)
+                .map(|i| format!("v{} = {i};", i % width))
+                .collect();
+            let source = format!("fn probe() {{ defer {{ {locals} {writes} println(v0); }} }}");
+            CAPTURE_DISCOVERY_VISITS.set(0);
+            let program = lir_checked(&source);
+            let site = only_cleanup(func(&program, "probe"));
+            let slots = site.function.locals.len();
+            let instructions: usize = site.function.blocks.iter().map(|b| b.instrs.len()).sum();
+            assert!(site.captures.is_empty());
+            assert!(slots >= width && instructions >= assignments);
+            let count = CAPTURE_DISCOVERY_VISITS.get();
+            println!(
+                "locals={width} assignments={assignments} slots={slots} instructions={instructions} discovery_visits={count}"
+            );
+            assert_eq!(count, 0);
+        }
+    }
+}
+
+#[test]
+fn one_cleanup_input_bounds_discovery_storage() {
+    for locals in [1, 16, 128] {
+        let declarations: String = (0..locals).map(|i| format!("let mut v{i} = 0;")).collect();
+        for assignments in [1, 16, 128] {
+            let writes: String = (0..assignments)
+                .map(|i| format!("v{} = {i};", i % locals))
+                .collect();
+            // The only parent access comes last, so the private reads and writes are examined.
+            let source = format!(
+                "fn probe() {{ let mut dst = 0; defer {{ {declarations} {writes} dst = v0; }} }}"
+            );
+            CAPTURE_DISCOVERY_STORAGE.set((usize::MAX, usize::MAX));
+            let program = lir_checked(&source);
+            let site = only_cleanup(func(&program, "probe"));
+            assert_eq!(site.captures, [LirLocalId(0)]);
+            assert!(site.function.locals.len() > locals);
+            let storage = CAPTURE_DISCOVERY_STORAGE.get();
+            println!("locals={locals} assignments={assignments} discovery_storage={storage:?}");
+            assert_eq!(storage, (1, 1), "one name and one bitmap word");
+        }
+    }
+}
+
+#[test]
+fn sparse_cleanup_captures_preserve_ordered_parent_ids() {
+    for width in [8, 32, 128] {
+        let locals: String = (0..width)
+            .map(|i| format!("let pad{i} = 0; let mut v{i} = 0;"))
+            .collect();
+        let live = [1, width / 2, width - 1];
+        let writes: String = live.iter().rev().map(|i| format!("v{i} = 2;")).collect();
+        let hir = checked_hir(&format!("fn probe() {{ {locals} defer {{ {writes} }} }}"));
+        let f = hir
+            .functions
+            .iter()
+            .find(|f| f.name.is_free_named("probe"))
+            .unwrap();
+        let (defer, declarations) = f.body.split_last().unwrap();
+        let HirStmt::Defer {
+            body: HirDeferBody::Block(stmts),
+            ..
+        } = defer
+        else {
+            panic!("expected a deferred block")
+        };
+        // Supply an explicit wide input table to the region builder. The body
+        // only references three. This checks post-lowering filtering independently
+        // of which inputs the lexical analysis requests.
+        let resolution = LoweringDeclarations::new(&hir.resolution);
+        let mut builder = Builder::new(&f.params, false, &resolution);
+        builder.lower_stmts(declarations);
+        let inputs: Vec<_> = (0..width)
+            .map(|i| builder.local_by_name[&format!("v{i}")])
+            .collect();
+        CAPTURE_DISCOVERY_VISITS.set(0);
+        let site = builder.lower_defer_region(stmts, false, &inputs, None);
+        assert!(CAPTURE_DISCOVERY_VISITS.get() > 0);
+        let imports: Vec<_> = site
+            .function
+            .locals
+            .iter()
+            .filter(|local| local.parameter)
+            .collect();
+        assert_eq!(imports.len(), width);
+        for (index, local) in imports.into_iter().enumerate() {
+            assert_eq!(local.id, LirLocalId(index as u32));
+            assert_eq!(local.name, format!("v{index}"));
+        }
+        assert_eq!(site.captures, live.map(|i| LirLocalId((2 * i + 1) as u32)));
+    }
+}
+
+#[test]
+fn false_while_adds_no_cleanup_slots_at_any_depth() {
+    for width in [0, 1, 8, 32] {
+        let locals: String = (0..width).map(|i| format!("let mut v{i} = {i};")).collect();
+        let skipped: String = (0..width)
+            .map(|i| format!("v{i} = dst; dst = v{i};"))
+            .collect();
+        for depth in [1, 8, 32] {
+            let source = format!(
+                "fn probe() {{ {locals} let mut dst = 0; {} while false {{ {skipped} }} dst = 7; {} }}",
+                "defer {".repeat(depth),
+                "}".repeat(depth)
+            );
+            defer_captures::VISITED_NODES.set(0);
+            let program = lir_checked(&source);
+            assert_eq!(defer_captures::VISITED_NODES.get(), depth + 2);
+            let mut parent = func(&program, "probe");
+            for level in 0..depth {
+                let site = only_cleanup(parent);
+                let id = LirLocalId(if level == 0 { width } else { 0 });
+                assert_eq!(site.captures, [id]);
+                assert_eq!(parent.locals[id.0 as usize].name, "dst");
+                assert_eq!(site.function.locals.len(), 1);
+                assert_eq!(site.function.locals[0].name, "dst");
+                parent = &site.function;
+            }
+        }
+    }
+}
+
+#[test]
+fn reachable_cleanup_loops_keep_condition_and_body_captures() {
+    for (condition, expected) in [("true", vec![1, 2]), ("flag", vec![0, 1, 2])] {
+        let program = lir_checked(&format!(
+            "fn probe(flag: bool, src: i64) {{ let mut dst = 0; defer {{ defer {{
+                while {condition} {{ dst = src; }}
+            }} }} }}"
+        ));
+        let outer = only_cleanup(func(&program, "probe"));
+        assert_eq!(
+            outer.captures,
+            expected.iter().copied().map(LirLocalId).collect::<Vec<_>>()
+        );
+        let inner = only_cleanup(&outer.function);
+        assert_eq!(
+            inner.captures,
+            (0..expected.len() as u32)
+                .map(LirLocalId)
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
+#[test]
+fn nested_cleanup_summaries_share_identifier_bytes() {
+    for bytes in [8, 128, 1024] {
+        let name = "x".repeat(bytes);
+        for depth in [1, 8, 32] {
+            for repeated in [false, true] {
+                // A local call uses the function identity and a value read uses the HIR spelling.
+                let mut block = format!("{name}();");
+                for _ in 0..depth {
+                    let read = if repeated {
+                        format!("let own = {name};")
+                    } else {
+                        String::new()
+                    };
+                    block = format!("defer {{ {read} {block} }}");
+                }
+                let hir = checked_hir(&format!(
+                    "fn empty() {{}} fn probe() {{ let padding = 0; let {name} = empty; {block} }}"
+                ));
+                let probe = hir
+                    .functions
+                    .iter()
+                    .find(|f| f.name.is_free_named("probe"))
+                    .unwrap();
+                let HirStmt::Defer { body, .. } = probe.body.last().unwrap() else {
+                    panic!("expected outer defer")
+                };
+                let mut sites = HashMap::new();
+                let root = defer_captures::analyze(body, &mut sites);
+                assert_eq!(sites.len() + 1, depth);
+                let mut allocations = HashMap::new();
+                for access in sites.values().chain(std::iter::once(&root)) {
+                    assert_eq!(access.names.len(), 1);
+                    for spelling in &access.names {
+                        assert_eq!(&**spelling, name);
+                        allocations.insert(spelling.as_ptr(), spelling.len());
+                    }
+                }
+                assert_eq!(allocations.values().sum::<usize>(), bytes);
+                let program = lower_source_program(&hir);
+                let mut parent = func(&program, "probe");
+                for level in 0..depth {
+                    let site = only_cleanup(parent);
+                    let id = LirLocalId(u32::from(level == 0));
+                    assert_eq!(site.captures, [id]);
+                    assert_eq!(parent.locals[id.0 as usize].name, name);
+                    parent = &site.function;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn nested_cleanup_imports_follow_the_lowered_if_branch() {
+    for width in [1, 8, 32] {
+        let pad: String = (0..width).map(|i| format!("let mut v{i} = {i};")).collect();
+        let accesses: String = (0..width)
+            .map(|i| format!("v{i} = dst; dst = v{i};"))
+            .collect();
+        for depth in [1, 8, 32] {
+            for condition in ["true", "false", "flag"] {
+                let branch = match condition {
+                    "true" => format!("if true {{ dst = 7; }} else {{ {accesses} }}"),
+                    "false" => format!("if false {{ {accesses} }} dst = 7;"),
+                    _ => format!("if flag {{ dst = 7; }} else {{ {accesses} }}"),
+                };
+                let source = format!(
+                    "fn probe(flag: bool) {{ {pad} let mut dst = 0; {} {branch} {} }}",
+                    "defer {".repeat(depth),
+                    "}".repeat(depth)
+                );
+                let program = lir_checked(&source);
+                let mut parent = func(&program, "probe");
+                let all = condition == "flag";
+                for level in 0..depth {
+                    let body = parent
+                        .blocks
+                        .iter()
+                        .flat_map(|block| &block.instrs)
+                        .find_map(|inst| match inst {
+                            SourceInst::Defer { body, .. } => Some(body),
+                            _ => None,
+                        })
+                        .expect("nested cleanup");
+                    let expected: Vec<_> = if all {
+                        (0..width + 2).map(LirLocalId).collect()
+                    } else if level == 0 {
+                        vec![LirLocalId(width + 1)]
+                    } else {
+                        vec![LirLocalId(0)]
+                    };
+                    assert_eq!(body.captures, expected);
+                    let (imports, private) = body.function.locals.split_at(expected.len());
+                    for (local, id) in imports.iter().zip(&expected) {
+                        assert!(local.parameter);
+                        assert_eq!(local.name, parent.locals[id.0 as usize].name);
+                    }
+                    // Only the innermost dynamic branch reserves a condition temporary.
+                    if all && level + 1 == depth {
+                        assert_eq!(private.len(), 1);
+                        assert!(private[0].synthetic && !private[0].parameter);
+                        assert_eq!(private[0].ty, Type::Bool);
+                    } else {
+                        assert!(private.is_empty());
+                    }
+                    parent = &body.function;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn cleanup_conditional_operands_import_only_reachable_bindings() {
+    for width in [1u32, 8, 32] {
+        let declarations: String = (0..width).map(|i| format!("let v{i} = {i};")).collect();
+        let sum = (0..width)
+            .map(|i| format!("v{i}"))
+            .collect::<Vec<_>>()
+            .join(" + ");
+        let rhs = format!("({sum} > 0)");
+        let dst = width + 2;
+        for (expr, reads_flag, reads_live, reads_rhs) in [
+            (format!("true ? true : {rhs}"), false, false, false),
+            (format!("false ? {rhs} : true"), false, false, false),
+            (format!("false && {rhs}"), false, false, false),
+            (format!("true || {rhs}"), false, false, false),
+            (format!("true && {rhs}"), false, false, true),
+            (format!("false || {rhs}"), false, false, true),
+            (format!("flag ? live : {rhs}"), true, true, true),
+            (format!("flag && {rhs}"), true, false, true),
+            (format!("flag || {rhs}"), true, false, true),
+            (format!("flag ? (true || {rhs}) : live"), true, true, false),
+        ] {
+            let parent_ids: Vec<_> = (0..=dst)
+                .filter(|id| match *id {
+                    0 => reads_flag,
+                    1 => reads_live,
+                    n if n == dst => true,
+                    _ => reads_rhs,
+                })
+                .map(LirLocalId)
+                .collect();
+            for depth in [1, 8, 32] {
+                let source = format!(
+                    "fn probe(flag: bool, live: bool) {{ {declarations} let mut dst = false; {} dst = {expr}; {} }}",
+                    "defer {".repeat(depth),
+                    "}".repeat(depth)
+                );
+                let program = lir_checked(&source);
+                let mut parent = func(&program, "probe");
+                let local_ids: Vec<_> = (0..parent_ids.len() as u32).map(LirLocalId).collect();
+                for level in 0..depth {
+                    let site = only_cleanup(parent);
+                    let expected = if level == 0 { &parent_ids } else { &local_ids };
+                    assert_eq!(&site.captures, expected, "{expr} at level {level}");
+                    let imports: Vec<_> = site
+                        .function
+                        .locals
+                        .iter()
+                        .filter(|l| l.parameter)
+                        .collect();
+                    assert_eq!(imports.len(), expected.len(), "{expr} at level {level}");
+                    for ((import, id), index) in imports.iter().zip(expected).zip(&local_ids) {
+                        assert_eq!(import.id, *index);
+                        assert_eq!(import.name, parent.locals[id.0 as usize].name);
+                    }
+                    parent = &site.function;
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn skipped_cleanup_expression_operands_preserve_syntactic_recovery() {
+    for expr in [
+        "true ? false : (unused && recover().is_some())",
+        "false ? (unused && recover().is_some()) : false",
+        "false && (unused || recover().is_some())",
+        "true || (unused && recover().is_some())",
+    ] {
+        let program = lir_checked(&format!(
+            "fn probe(unused: bool) {{ defer {{ defer {{ println({expr}); }} }} }}"
+        ));
+        let mut parent = func(&program, "probe");
+        for _ in 0..2 {
+            let site = only_cleanup(parent);
+            assert!(site.recovery_capable, "{expr}");
+            assert!(site.captures.is_empty());
+            assert!(site.function.locals.iter().all(|local| !local.parameter));
+            parent = &site.function;
+        }
+    }
+}
+
+#[test]
+fn skipped_cleanup_branch_preserves_syntactic_recovery() {
+    for control in ["if false", "while false"] {
+        let program = lir_checked(&format!(
+            "fn probe() {{ let unused = 9; defer {{ defer {{
+                {control} {{ defer {{ let panic_info = recover(); println(unused); }} }}
+            }} }} }}"
+        ));
+        let mut parent = func(&program, "probe");
+        for _ in 0..2 {
+            let body = only_cleanup(parent);
+            assert!(body.recovery_capable);
+            assert!(body.captures.is_empty());
+            assert!(body.function.locals.is_empty());
+            parent = &body.function;
         }
     }
 }
@@ -756,8 +1690,8 @@ fn l10_range_for_desugar() {
             _ => None,
         })
         .collect();
-    assert!(names.contains(&"__for0_i"), "{names:?}");
-    assert!(names.contains(&"__for0_end"), "{names:?}");
+    assert!(names.contains(&"__for0_i$"), "{names:?}");
+    assert!(names.contains(&"__for0_end$"), "{names:?}");
 }
 
 // 11. the range-for body rebinds the loop variable and increments
@@ -787,7 +1721,7 @@ fn l11_range_for_body_binding_and_increment() {
     let inc = &f.blocks[inc.0];
     assert!(matches!(
         inc.instrs.last(),
-        Some(SourceInst::Assign { name, .. }) if name == "__for0_i"
+        Some(SourceInst::Assign { name, .. }) if name == "__for0_i$"
     ));
     assert!(matches!(inc.terminator, SourceTerminator::Jump(h) if h == header));
 }
@@ -807,10 +1741,10 @@ fn l12_array_for_desugar() {
             _ => None,
         })
         .collect();
-    assert!(names.contains(&"__for0_arr"), "{names:?}");
-    assert!(names.contains(&"__for0_i"), "{names:?}");
+    assert!(names.contains(&"__for0_arr$"), "{names:?}");
+    assert!(names.contains(&"__for0_i$"), "{names:?}");
     // The length is NOT hoisted into a `let`.
-    assert!(!names.contains(&"__for0_len"), "{names:?}");
+    assert!(!names.contains(&"__for0_len$"), "{names:?}");
     let SourceTerminator::Jump(header) = f.blocks[0].terminator else {
         unreachable!()
     };
@@ -864,8 +1798,8 @@ fn l13_nested_for_unique_induction_vars() {
             _ => None,
         })
         .collect();
-    assert!(all_lets.iter().any(|n| n == "__for0_i"), "{all_lets:?}");
-    assert!(all_lets.iter().any(|n| n == "__for1_i"), "{all_lets:?}");
+    assert!(all_lets.iter().any(|n| n == "__for0_i$"), "{all_lets:?}");
+    assert!(all_lets.iter().any(|n| n == "__for1_i$"), "{all_lets:?}");
 }
 
 // 14. a return inside an if leaves both paths terminated
@@ -1684,4 +2618,410 @@ fn f(which: i64) -> i64 {
                 SourceInst::MatchTest { .. } | SourceInst::MatchBind { .. }
             ))
     );
+}
+
+const READ_METHOD: &str = "pub fn read(self) -> i64 { return 7; }";
+
+fn method_hierarchy(depth: usize, methods: &str) -> String {
+    let mut classes = format!("open class C0 {{ {methods} }} ");
+    for i in 1..=depth {
+        classes.push_str(&format!("open class C{i} extends C{} {{}} ", i - 1));
+    }
+    classes
+}
+
+#[test]
+fn inherited_method_cache_shares_ancestry_across_lowering_paths() {
+    use super::declarations::METHOD_ANCESTRY_PROBES;
+    for depth in [1, 8, 32] {
+        let classes = method_hierarchy(depth, READ_METHOD);
+        for count in [1, 8, 32] {
+            let scalar = vec!["x.read()"; count].join(",");
+            let nested = vec!["(flag ? x : x).read()"; count].join(",");
+            let hir = checked_hir(&format!(
+                "{classes} fn scalar(x: C{depth}) -> Array<i64> {{ return [{scalar}]; }}
+                 fn nested(x: C{depth}, flag: bool) -> Array<i64> {{ return [{nested}]; }}"
+            ));
+            for (scalar, nested) in [(true, false), (false, true), (true, true)] {
+                let mut program = hir.clone();
+                program.functions.retain(|f| {
+                    (scalar && f.name.is_free_named("scalar"))
+                        || (nested && f.name.is_free_named("nested"))
+                });
+                METHOD_ANCESTRY_PROBES.set(0);
+                let lowered = lower_source_program(&program);
+                let visits = METHOD_ANCESTRY_PROBES.get();
+                assert_eq!(visits, depth + 1);
+                assert_eq!(
+                    lowered.functions.len(),
+                    1 + usize::from(scalar) + usize::from(nested)
+                );
+                for f in lowered.functions {
+                    let calls = f.blocks.iter().flat_map(|b| &b.instrs).filter(|i| matches!(
+                        i, SourceInst::Compute { value: LirRvalue::MethodCall { method, .. }, .. } if method == "read"
+                    )).count();
+                    assert_eq!(
+                        calls,
+                        if f.name.is_free_named("scalar") || f.name.is_free_named("nested") {
+                            count
+                        } else {
+                            0
+                        }
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn inherited_method_cache_shares_methodless_routes_across_distinct_names() {
+    use super::declarations::{METHOD_ANCESTRY_PROBES, METHOD_TABLE_PROBES};
+    for depth in [1, 8, 32] {
+        for methods in [1, 8, 32] {
+            let names: Vec<_> = (0..methods).map(|i| format!("method{i}")).collect();
+            let declarations = names
+                .iter()
+                .enumerate()
+                .map(|(i, name)| format!("pub fn {name}(self) -> i64 {{ return {i}; }}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let classes = method_hierarchy(depth, &declarations);
+            let calls = |receiver| {
+                names
+                    .iter()
+                    .map(|name| format!("{receiver}.{name}()"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            };
+            let mut hir = checked_hir(&format!(
+                "{classes} fn scalar(x: C{depth}) -> Array<i64> {{ return [{}]; }}
+                 fn nested(x: C{depth}, flag: bool) -> Array<i64> {{ return [{}]; }}",
+                calls("x"),
+                calls("(flag ? x : x)")
+            ));
+            let base = TypeId::local("C0");
+            let leaf = TypeId::local(format!("C{depth}"));
+            let view = LoweringDeclarations::new(&hir.resolution);
+            METHOD_ANCESTRY_PROBES.set(0);
+            METHOD_TABLE_PROBES.set(0);
+            let mut peak = 0;
+            for _ in 0..2 {
+                for name in &names {
+                    assert!(std::ptr::eq(
+                        view.declared_method(leaf, name).unwrap().signature,
+                        &hir.resolution.classes[&base].methods[name]
+                    ));
+                    peak = peak.max(view.methodless_chain_entries());
+                    assert!(
+                        view.declared_method(leaf, &format!("missing_{name}"))
+                            .is_none()
+                    );
+                    peak = peak.max(view.methodless_chain_entries());
+                }
+            }
+            let visits = METHOD_ANCESTRY_PROBES.get();
+            assert_eq!((peak, visits), (depth + 2, depth + 1));
+            let probes = METHOD_TABLE_PROBES.get();
+            assert_eq!(probes, 4 * methods);
+            println!(
+                "methods={methods} depth={depth} peak_entries={peak} ancestry_visits={visits} table_probes={probes}"
+            );
+            hir.functions
+                .retain(|f| f.name.is_free_named("scalar") || f.name.is_free_named("nested"));
+            METHOD_ANCESTRY_PROBES.set(0);
+            let lowered = lower_source_program(&hir);
+            for function in ["scalar", "nested"] {
+                let emitted: Vec<_> = func(&lowered, function)
+                    .blocks
+                    .iter()
+                    .flat_map(|b| &b.instrs)
+                    .filter_map(|i| match i {
+                        SourceInst::Compute {
+                            value: LirRvalue::MethodCall { method, .. },
+                            ..
+                        } => Some(method),
+                        _ => None,
+                    })
+                    .collect();
+                assert!(emitted.into_iter().eq(&names));
+            }
+            assert_eq!(METHOD_ANCESTRY_PROBES.get(), visits);
+        }
+    }
+}
+
+#[test]
+fn inherited_method_cache_binds_each_interface_receiver_after_lookup() {
+    use super::declarations::METHOD_ANCESTRY_PROBES;
+    let hir = checked_hir("interface Pick<T> { fn value(self) -> T; fn receiver(self) -> Self; }");
+    let view = LoweringDeclarations::new(&hir.resolution);
+    let pick = TypeId::local("Pick");
+    let unbound = Type::Named(pick);
+    METHOD_ANCESTRY_PROBES.set(0);
+    // A failed arity check on the first query must not poison the declaration.
+    assert!(method_signature(&view, &unbound, "value").is_none());
+    for ty in [Type::Bool, Type::I64, Type::String] {
+        let receiver = Type::Generic(pick, vec![ty.clone()]);
+        let value = method_signature(&view, &receiver, "value").unwrap();
+        assert!(std::ptr::eq(
+            value.declaration,
+            &hir.resolution.interfaces[&pick].methods["value"]
+        ));
+        assert_eq!(*value.return_type(), ty);
+        assert_eq!(
+            *method_signature(&view, &receiver, "receiver")
+                .unwrap()
+                .return_type(),
+            receiver
+        );
+        assert!(method_signature(&view, &unbound, "value").is_none());
+    }
+    assert_eq!(METHOD_ANCESTRY_PROBES.get(), 1);
+}
+
+#[test]
+fn inherited_method_cache_preserves_overrides_and_bounds_cycles() {
+    use super::declarations::METHOD_ANCESTRY_PROBES;
+    use crate::ir::typed_ast::{HirClassInfo, HirResolution, HirSignature};
+    let mut hir = HirResolution::default();
+    let [a, b, child, sibling] = ["A", "B", "Child", "Sibling"].map(TypeId::local);
+    for (owner, base) in [(a, b), (b, a), (child, a), (sibling, b)] {
+        hir.classes.insert(
+            owner,
+            HirClassInfo {
+                base: Some(base),
+                ..Default::default()
+            },
+        );
+    }
+    for (class, ty) in [(a, Type::I64), (b, Type::Bool)] {
+        hir.classes.get_mut(&class).unwrap().methods.insert(
+            "which".into(),
+            HirSignature {
+                params: vec![],
+                param_modes: vec![],
+                is_static: false,
+                is_async: false,
+                return_type: ty,
+            },
+        );
+    }
+    let view = LoweringDeclarations::new(&hir);
+    METHOD_ANCESTRY_PROBES.set(0);
+    for _ in 0..8 {
+        for (class, owner) in [(child, a), (sibling, b), (a, a), (b, b)] {
+            assert!(std::ptr::eq(
+                view.declared_method(class, "which").unwrap().signature,
+                &hir.classes[&owner].methods["which"]
+            ));
+            assert!(view.declared_method(class, "missing").is_none());
+        }
+    }
+    // Exercise the complete index on the same cyclic hierarchy.
+    for n in 0..16 {
+        assert!(view.declared_method(child, &format!("absent{n}")).is_none());
+    }
+    for (class, owner) in [(child, a), (sibling, b)] {
+        assert!(std::ptr::eq(
+            view.declared_method(class, "which").unwrap().signature,
+            &hir.classes[&owner].methods["which"]
+        ));
+        assert!(view.declared_method(class, "missing").is_none());
+    }
+    assert_eq!(METHOD_ANCESTRY_PROBES.get(), 4);
+}
+
+// Unknown method names cannot pass the checker. Start with the checked call
+// and change its spelling at each dispatcher's validation boundary.
+pub(super) fn check_inherited_method_misses(
+    mut dispatch: impl for<'r> FnMut(&'r LoweringDeclarations<'r>, &HirExpr) -> bool,
+) {
+    use super::declarations::METHOD_ANCESTRY_PROBES;
+    for depth in [1, 8, 32] {
+        let hir = checked_hir(&format!(
+            "{} fn probe(x: C{depth}) -> i64 {{ return x.read(); }}",
+            method_hierarchy(depth, READ_METHOD)
+        ));
+        let f = hir
+            .functions
+            .iter()
+            .find(|f| f.name.is_free_named("probe"))
+            .unwrap();
+        let HirStmt::Return {
+            value: Some(hit), ..
+        } = &f.body[0]
+        else {
+            panic!("expected method call")
+        };
+        let mut miss = hit.clone();
+        let HirExprKind::MethodCall { method, .. } = &mut miss.kind else {
+            panic!("expected method call")
+        };
+        *method = "missing".into();
+        for count in [1, 8, 32] {
+            let declarations = LoweringDeclarations::new(&hir.resolution);
+            METHOD_ANCESTRY_PROBES.set(0);
+            for _ in 0..count {
+                assert!(!dispatch(&declarations, &miss));
+            }
+            let missing_visits = METHOD_ANCESTRY_PROBES.get();
+            assert_eq!(missing_visits, depth + 1);
+            assert_eq!(declarations.methodless_chain_entries(), depth + 2);
+            for _ in 0..count {
+                assert!(dispatch(&declarations, hit));
+            }
+            assert_eq!(METHOD_ANCESTRY_PROBES.get(), missing_visits);
+            assert_eq!(declarations.methodless_chain_entries(), depth + 2);
+        }
+    }
+}
+
+#[test]
+fn construction_lookups_share_field_layouts_across_scalar_and_nested_roots() {
+    use super::declarations::FIELD_CLASS_VISITS;
+    for depth in [1, 8, 32] {
+        let mut classes = String::from("open class A0 {} ");
+        for i in 1..depth {
+            classes.push_str(&format!("open class A{i} extends A{} {{}} ", i - 1));
+        }
+        classes.push_str(&format!(
+            "class Leaf extends A{} {{ pub x: i64; }} ",
+            depth - 1
+        ));
+        for count in [1, 8, 32] {
+            let literals = vec!["new Leaf(n)"; count].join(",");
+            let constructors = vec!["new Leaf(flag ? n : 0)"; count].join(",");
+            let source = format!(
+                "{classes}
+                fn literals(n: i64) -> Array<Leaf> {{ return [{literals}]; }}
+                fn constructed(flag: bool, n: i64) -> Array<Leaf> {{ return [{constructors}]; }}"
+            );
+            let mut hir = checked_hir(&source);
+            // The source language uses new. Exercise the typed object-literal
+            // form directly at the scalar entry point.
+            let literals = hir
+                .functions
+                .iter_mut()
+                .find(|f| f.name.is_free_named("literals"))
+                .unwrap();
+            let HirStmt::Return {
+                value: Some(root), ..
+            } = &mut literals.body[0]
+            else {
+                panic!("return")
+            };
+            let HirExprKind::Array { elements } = &mut root.kind else {
+                panic!("array of objects")
+            };
+            for element in elements {
+                let HirExprKind::New { class, args } = &mut element.kind else {
+                    panic!("memberwise constructor")
+                };
+                element.kind = HirExprKind::ObjectLiteral {
+                    class: *class,
+                    fields: vec![("x".into(), args.pop().unwrap())],
+                };
+            }
+            for (scalar, nested) in [(true, false), (false, true), (true, true)] {
+                let mut program = hir.clone();
+                program.functions.retain(|f| {
+                    (scalar && f.name.is_free_named("literals"))
+                        || (nested && f.name.is_free_named("constructed"))
+                });
+                CLASS_FIELD_ENUMERATIONS.set(0);
+                FIELD_CLASS_VISITS.set(0);
+                let lowered = lower_source_program(&program);
+                assert_eq!(CLASS_FIELD_ENUMERATIONS.get(), 1);
+                assert_eq!(FIELD_CLASS_VISITS.get(), depth + 1);
+                for f in &lowered.functions {
+                    let stores = f.blocks.iter().flat_map(|b| &b.instrs).filter(|inst|
+                        matches!(inst, SourceInst::Compute { value: LirRvalue::FieldStore { field, .. }, .. } if field == "x")
+                    ).count();
+                    assert_eq!(stores, count);
+                }
+                assert_eq!(
+                    lowered.functions.len(),
+                    usize::from(scalar) + usize::from(nested)
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn construction_lookups_share_one_variant_index_across_lowering_passes() {
+    use super::declarations::{VARIANT_PROBES, VARIANTS_INDEXED};
+    for width in [1, 8, 32] {
+        let mut variants: Vec<_> = (0..width - 1).map(|i| format!("Unused{i}")).collect();
+        variants.push("Last(i64)".into());
+        let variants = variants.join(",");
+        for count in [1, 8, 32] {
+            let scalar = vec!["Wide::Last(n)"; count].join(",");
+            let nested = vec!["Wide::Last(flag ? n : 0)"; count].join(",");
+            let hir = checked_hir(&format!(
+                "enum Wide {{ {variants} }}
+                fn scalar(n: i64) -> Array<Wide> {{ return [{scalar}]; }}
+                fn nested(n: i64, flag: bool) -> Array<Wide> {{ return [{nested}]; }}"
+            ));
+            VARIANTS_INDEXED.set(0);
+            VARIANT_PROBES.set(0);
+            let program = lower_source_program(&hir);
+            assert_eq!(VARIANTS_INDEXED.get(), width);
+            assert_eq!(VARIANT_PROBES.get(), 2 * count);
+            for f in &program.functions {
+                let stores = f.blocks.iter().flat_map(|b| &b.instrs).filter(|i|
+                    matches!(i, SourceInst::Compute { value: LirRvalue::EnumPayloadStore { variant, .. }, .. } if variant == "Last")
+                ).count();
+                assert_eq!(stores, count);
+            }
+        }
+    }
+}
+
+// Exercise checker-ineligible names directly at the two lowering dispatchers.
+pub(super) fn check_empty_and_missing_variants(
+    mut dispatch: impl for<'r> FnMut(&'r LoweringDeclarations<'r>, &HirExpr) -> bool,
+) {
+    use super::declarations::{VARIANT_PROBES, VARIANTS_INDEXED};
+    use crate::ir::typed_ast::{HirEnumInfo, HirEnumVariant};
+    let class = TypeId::local("Wide");
+    for width in [1, 8, 32] {
+        let mut hir = crate::ir::typed_ast::HirResolution::default();
+        hir.enums.insert(
+            class,
+            HirEnumInfo {
+                type_params: Default::default(),
+                variants: (0..width)
+                    .map(|i| HirEnumVariant {
+                        name: format!("V{i}"),
+                        tag: i as i64,
+                        payloads: vec![],
+                    })
+                    .collect(),
+            },
+        );
+        let expr = |name| HirExpr {
+            ty: Type::Named(class),
+            span: Span::dummy(),
+            kind: HirExprKind::StaticCall {
+                class,
+                method: name,
+                args: vec![],
+            },
+        };
+        let present = expr(format!("V{}", width - 1));
+        let missing = expr(String::from("Missing"));
+        for count in [1, 8, 32] {
+            let resolution = LoweringDeclarations::new(&hir);
+            VARIANTS_INDEXED.set(0);
+            VARIANT_PROBES.set(0);
+            for _ in 0..count {
+                assert!(!dispatch(&resolution, &missing));
+                assert!(dispatch(&resolution, &present));
+            }
+            assert_eq!(VARIANTS_INDEXED.get(), width);
+            assert_eq!(VARIANT_PROBES.get(), 2 * count);
+        }
+    }
 }

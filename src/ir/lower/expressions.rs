@@ -282,19 +282,77 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
     enum Step<'a> {
         Enter(&'a Expr),
         Binary(&'a BinaryExpr),
+        ShortCircuitRhs(&'a BinaryExpr),
+        ResumeRegistrations,
         Unary(&'a UnaryExpr),
     }
     let mut work = vec![Step::Enter(expr)];
     let mut values: Vec<HirExpr> = Vec::new();
     while let Some(step) = work.pop() {
-        let value = match step {
-            Step::Enter(Expr::Binary(binary)) => {
-                work.push(Step::Binary(binary));
-                work.push(Step::Enter(&binary.rhs));
-                work.push(Step::Enter(&binary.lhs));
+        let expr = match step {
+            Step::Enter(expr) => expr,
+            Step::ShortCircuitRhs(binary) => {
+                let lhs = values.last().expect("lowered short-circuit condition");
+                if !defer_stability::rhs_reachable(&binary.op, lhs) {
+                    ctx.deferred_callees.skipped = true;
+                    work.push(Step::ResumeRegistrations);
+                }
+                &binary.rhs
+            }
+            Step::ResumeRegistrations => {
+                ctx.deferred_callees.skipped = false;
                 continue;
             }
-            Step::Enter(Expr::Unary(unary)) => {
+            Step::Binary(binary) => {
+                let rhs = values.pop().expect("lowered right operand");
+                let lhs = values.pop().expect("lowered left operand");
+                let ty = required_expr_type(binary.id, binary.span, ctx)?
+                    .unwrap_or_else(|| binary_result_type(&binary.op, &lhs.ty.to_source()));
+                values.push(HirExpr {
+                    kind: HirExprKind::Binary {
+                        op: binary.op.clone(),
+                        lhs: Box::new(lhs),
+                        rhs: Box::new(rhs),
+                    },
+                    ty: ctx.normalize(&ty).into(),
+                    span: binary.span,
+                });
+                continue;
+            }
+            Step::Unary(unary) => {
+                let operand = values.pop().expect("lowered unary operand");
+                let ty = required_expr_type(unary.id, unary.span, ctx)?.unwrap_or_else(|| {
+                    match unary.op {
+                        UnaryOp::Neg => operand.ty.to_source(),
+                        // `!` is bitwise on `i64` and logical on `bool`.
+                        UnaryOp::Not if operand.ty.integer_layout().is_some() => {
+                            operand.ty.to_source()
+                        }
+                        UnaryOp::Not => Type::Bool,
+                    }
+                });
+                values.push(HirExpr {
+                    kind: HirExprKind::Unary {
+                        op: unary.op.clone(),
+                        operand: Box::new(operand),
+                    },
+                    ty: ctx.normalize(&ty).into(),
+                    span: unary.span,
+                });
+                continue;
+            }
+        };
+        match expr {
+            Expr::Binary(binary) => {
+                work.push(Step::Binary(binary));
+                if matches!(binary.op, BinOp::And | BinOp::Or) && !ctx.deferred_callees.skipped {
+                    work.push(Step::ShortCircuitRhs(binary));
+                } else {
+                    work.push(Step::Enter(&binary.rhs));
+                }
+                work.push(Step::Enter(&binary.lhs));
+            }
+            Expr::Unary(unary) => {
                 if unary.op == UnaryOp::Neg
                     && let Expr::Integer(n, _, _) = &unary.expr
                 {
@@ -312,57 +370,9 @@ fn lower_operator_tree(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Diagn
                 }
                 work.push(Step::Unary(unary));
                 work.push(Step::Enter(&unary.expr));
-                continue;
             }
-            Step::Enter(other) => match lower_expr(other, ctx) {
-                Ok(value) => {
-                    values.push(value);
-                    continue;
-                }
-                Err(error) => {
-                    // HIR ownership drains partial results iteratively.
-                    values.clear();
-                    return Err(error);
-                }
-            },
-            Step::Binary(binary) => {
-                let rhs = values.pop().expect("lowered right operand");
-                let lhs = values.pop().expect("lowered left operand");
-                let ty = required_expr_type(binary.id, binary.span, ctx)?
-                    .unwrap_or_else(|| binary_result_type(&binary.op, &lhs.ty.to_source()));
-                HirExpr {
-                    kind: HirExprKind::Binary {
-                        op: binary.op.clone(),
-                        lhs: Box::new(lhs),
-                        rhs: Box::new(rhs),
-                    },
-                    ty: ctx.normalize(&ty).into(),
-                    span: binary.span,
-                }
-            }
-            Step::Unary(unary) => {
-                let operand = values.pop().expect("lowered unary operand");
-                let ty = required_expr_type(unary.id, unary.span, ctx)?.unwrap_or_else(|| {
-                    match unary.op {
-                        UnaryOp::Neg => operand.ty.to_source(),
-                        // `!` is bitwise on `i64` and logical on `bool`.
-                        UnaryOp::Not if operand.ty.integer_layout().is_some() => {
-                            operand.ty.to_source()
-                        }
-                        UnaryOp::Not => Type::Bool,
-                    }
-                });
-                HirExpr {
-                    kind: HirExprKind::Unary {
-                        op: unary.op.clone(),
-                        operand: Box::new(operand),
-                    },
-                    ty: ctx.normalize(&ty).into(),
-                    span: unary.span,
-                }
-            }
-        };
-        values.push(value);
+            other => values.push(lower_expr(other, ctx)?),
+        }
     }
     Ok(values.pop().expect("lowered operator root"))
 }
@@ -479,9 +489,9 @@ fn lower_call_expr(
             HirStmt::While {
                 cond: condition,
                 body: vec![
-                    HirStmt::If {
-                        cond: decisive,
-                        then_branch: vec![
+                    HirStmt::conditional(
+                        decisive,
+                        vec![
                             HirStmt::Assign {
                                 name: result.clone(),
                                 value: lit(HirExprKind::Bool(!universal), Type::Bool, span),
@@ -489,9 +499,9 @@ fn lower_call_expr(
                             },
                             HirStmt::Break { span },
                         ],
-                        else_branch: None,
+                        None,
                         span,
-                    },
+                    ),
                     HirStmt::Assign {
                         name: index,
                         value: increment,
@@ -518,7 +528,8 @@ fn lower_call_expr(
         ));
     }
     let args = lower_value_args(&c.args, ctx)?;
-    if let Some(binding) = ctx.lookup(&c.callee).filter(|binding| binding.cell) {
+    let binding = ctx.lookup(&c.callee);
+    if let Some(binding) = binding.filter(|b| b.storage == BindingStorage::Cell) {
         let (Type::Fn(_, ret) | Type::Closure(_, ret)) = &binding.ty else {
             return Err(internal(c.span, "non-callable capture cell".to_string()));
         };
@@ -555,12 +566,15 @@ fn lower_call_expr(
     // A local fn-typed variable shadows a free function; its call is an
     // indirect call typed by the variable's `fn(..) -> R`, and it is
     // named by the binding's HIR name.
-    let (callee, ty) = if let Some((name, ret)) = ctx.lookup(&c.callee).and_then(|b| match &b.ty {
-        Type::Fn(_, ret) | Type::Closure(_, ret) => Some((&b.hir_name, ret.as_ref())),
+    let (callee, binding, ty) = if let Some((b, ret)) = binding.and_then(|b| match &b.ty {
+        Type::Fn(_, ret) | Type::Closure(_, ret) => Some((b, ret.as_ref())),
         _ => None,
     }) {
         (
-            name.as_str().into(),
+            b.hir_name.as_str().into(),
+            HirCallBinding::Local {
+                may_change: b.storage == BindingStorage::MayChange,
+            },
             ctx.normalize(checked_type.as_ref().unwrap_or(ret)),
         )
     } else {
@@ -581,10 +595,18 @@ fn lower_call_expr(
                     ),
                 )
             })?;
-        (c.callee.as_str().into(), ctx.normalize(ty))
+        (
+            c.callee.as_str().into(),
+            HirCallBinding::Function,
+            ctx.normalize(ty),
+        )
     };
     Ok(HirExpr {
-        kind: HirExprKind::Call { callee, args },
+        kind: HirExprKind::Call {
+            callee,
+            binding,
+            args,
+        },
         ty: ty.into(),
         span: c.span,
     })
@@ -774,8 +796,13 @@ fn lower_ternary_expr(
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
     let condition = lower_expr(&t.condition, ctx)?;
+    let enclosing_skipped = ctx.deferred_callees.skipped;
+    ctx.deferred_callees.skipped |= !defer_stability::branch_reachable(&condition, true);
     let then_expr = lower_expr(&t.then_expr, ctx)?;
+    ctx.deferred_callees.skipped =
+        enclosing_skipped || !defer_stability::branch_reachable(&condition, false);
     let else_expr = lower_expr(&t.else_expr, ctx)?;
+    ctx.deferred_callees.skipped = enclosing_skipped;
     // A diverging arm contributes no value to the result. If both diverge,
     // the result remains Never. Otherwise the checker's type is
     // authoritative: branches of distinct classes flowing into an interface
@@ -1297,10 +1324,12 @@ fn lower_select_expr(
                 };
                 ctx.push_scope();
                 let binding = ctx.bind(binding.clone(), binding_ty);
+                let enclosing_skipped = ctx.deferred_callees.skipped;
                 let mut body = Vec::with_capacity(case.body.stmts.len());
                 for stmt in &case.body.stmts {
                     body.push(lower_stmt(stmt, ctx)?);
                 }
+                ctx.deferred_callees.skipped = enclosing_skipped;
                 ctx.pop_scope();
                 cases.push(HirSelectCase {
                     kind: HirSelectCaseKind::Recv {
@@ -1335,10 +1364,12 @@ fn lower_select_expr(
                 })?;
                 ctx.push_scope();
                 let binding = ctx.bind(binding.clone(), (binding_ty).to_source());
+                let enclosing_skipped = ctx.deferred_callees.skipped;
                 let mut body = Vec::with_capacity(case.body.stmts.len());
                 for stmt in &case.body.stmts {
                     body.push(lower_stmt(stmt, ctx)?);
                 }
+                ctx.deferred_callees.skipped = enclosing_skipped;
                 ctx.pop_scope();
                 cases.push(HirSelectCase {
                     kind: HirSelectCaseKind::Join { binding, task },
@@ -1349,7 +1380,7 @@ fn lower_select_expr(
             }
             SelectCaseKind::Default => HirSelectCaseKind::Default,
         };
-        let body = lower_block(&case.body, ctx)?;
+        let body = lower_block(&case.body, ctx, true)?;
         cases.push(HirSelectCase {
             kind,
             body,
@@ -1526,6 +1557,7 @@ fn lower_lambda_expr(
     // enclosing function — and the backend, which binds the lifted
     // parameters by their source names, would never bind it.
     let outer_binds = std::mem::take(&mut ctx.binds_seen);
+    let outer_callees = std::mem::take(&mut ctx.deferred_callees);
     let outer_namespace_scope_base = ctx.namespace_scope_base;
     ctx.namespace_scope_base = ctx.scopes.len();
     // Bind the captures BEFORE anything else in the lambda's fresh
@@ -1535,7 +1567,15 @@ fn lower_lambda_expr(
     let captures: Vec<HirCapture> = capture_sources
         .into_iter()
         .map(|(source_name, source, ty, cell)| HirCapture {
-            name: ctx.bind_cell(source_name, ty.clone(), cell),
+            name: ctx.bind_with_storage(
+                source_name,
+                ty.clone(),
+                if cell {
+                    BindingStorage::Cell
+                } else {
+                    BindingStorage::Stable
+                },
+            ),
             source,
             ty: if cell {
                 Type::Array(Box::new(ty)).into()
@@ -1550,6 +1590,7 @@ fn lower_lambda_expr(
                 .or_else(|| inferred.and_then(|(params, _)| params.get(i)))
         else {
             ctx.pop_scope();
+            ctx.deferred_callees = outer_callees;
             ctx.binds_seen = outer_binds;
             ctx.namespace_scope_base = outer_namespace_scope_base;
             return Err(unsupported(p.span, "unannotated lambda parameter"));
@@ -1567,12 +1608,13 @@ fn lower_lambda_expr(
         .return_type
         .as_ref()
         .or_else(|| inferred.map(|(_, ret)| ret));
-    let (body, ret) = match &l.body {
+    let (mut body, ret) = match &l.body {
         crate::parser::ast::LambdaBody::Expr(e) => {
             let value = match lower_expr(e, ctx) {
                 Ok(value) => value,
                 Err(err) => {
                     ctx.pop_scope();
+                    ctx.deferred_callees = outer_callees;
                     ctx.binds_seen = outer_binds;
                     ctx.namespace_scope_base = outer_namespace_scope_base;
                     return Err(err);
@@ -1599,6 +1641,7 @@ fn lower_lambda_expr(
         crate::parser::ast::LambdaBody::Block(block) => {
             let Some(ret) = declared_ret.map(|ty| ctx.normalize(ty)) else {
                 ctx.pop_scope();
+                ctx.deferred_callees = outer_callees;
                 ctx.binds_seen = outer_binds;
                 ctx.namespace_scope_base = outer_namespace_scope_base;
                 return Err(unsupported(
@@ -1606,11 +1649,12 @@ fn lower_lambda_expr(
                     "block-bodied lambda without a return type annotation",
                 ));
             };
-            let block = lower_block(block, ctx);
+            let block = lower_block(block, ctx, true);
             match block {
                 Ok(block) => (block, ret),
                 Err(err) => {
                     ctx.pop_scope();
+                    ctx.deferred_callees = outer_callees;
                     ctx.binds_seen = outer_binds;
                     ctx.namespace_scope_base = outer_namespace_scope_base;
                     return Err(err);
@@ -1618,7 +1662,10 @@ fn lower_lambda_expr(
             }
         }
     };
+    ctx.deferred_callees
+        .resolve(&mut body, None, ctx.tables.symbols);
     ctx.pop_scope();
+    ctx.deferred_callees = outer_callees;
     ctx.binds_seen = outer_binds;
     ctx.namespace_scope_base = outer_namespace_scope_base;
     // The checker's kind (shareable or task-local) only constrains where
@@ -1795,7 +1842,7 @@ fn lower_match(
                 } else {
                     Type::Void
                 };
-                (lower_block(block, ctx)?, ty)
+                (lower_block(block, ctx, true)?, ty)
             }
         };
         ctx.pop_scope();

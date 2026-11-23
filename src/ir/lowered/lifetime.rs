@@ -302,6 +302,10 @@ mod tests {
 
     #[test]
     fn async_method_effect_cache_scales_with_inherited_calls() {
+        use super::super::{
+            LoweringDeclarations,
+            declarations::{METHOD_ANCESTRY_PROBES, METHOD_CACHE_PROBES},
+        };
         use crate::ir::typed_ast::{HirClassInfo, HirResolution, HirSignature};
         use crate::semantic::ids::{SemanticType as Type, TypeId};
         for depth in [1, 8, 64, 128] {
@@ -325,31 +329,31 @@ mod tests {
                 }
                 resolution.classes.insert(class, info);
             }
-            let mut cache = HashMap::new();
-            super::super::METHOD_EFFECT_PROBES.with(|count| count.set(0));
+            let declarations = LoweringDeclarations::new(&resolution);
+            METHOD_ANCESTRY_PROBES.set(0);
+            METHOD_CACHE_PROBES.set(0);
             assert!(super::super::method_is_async(
-                &resolution,
+                &declarations,
                 &Type::Named(classes[depth - 1]),
                 "read",
-                &mut cache
             ));
             for _ in 0..8 {
                 for &class in &classes {
                     assert!(super::super::method_is_async(
-                        &resolution,
+                        &declarations,
                         &Type::Named(class),
-                        "read",
-                        &mut cache
+                        "read"
                     ));
                 }
             }
-            assert_eq!(cache.len(), depth);
-            let probes = super::super::METHOD_EFFECT_PROBES.with(|count| count.get());
+            assert_eq!(METHOD_ANCESTRY_PROBES.get(), depth);
+            let probes = METHOD_CACHE_PROBES.get();
+            let cached = declarations.methodless_chain_entries();
+            assert_eq!(cached, depth + 1);
             assert_eq!(probes, 9 * depth);
             println!(
-                "inheritance depth={depth} repeated calls={} cached pairs={} probes={probes}",
-                8 * depth,
-                cache.len()
+                "inheritance depth={depth} repeated calls={} method index entries={cached} probes={probes}",
+                8 * depth
             );
             for fan_out in [false, true] {
                 for async_leaf in [false, true] {
@@ -372,45 +376,30 @@ mod tests {
                             .methods
                             .insert("read".into(), signature);
                     }
-                    let mut children: HashMap<_, Vec<_>> = HashMap::new();
-                    for i in 1..depth {
-                        children
-                            .entry(classes[if fan_out { 0 } else { i - 1 }])
-                            .or_default()
-                            .push(classes[i]);
+                    if fan_out {
+                        for &child in &classes[1..] {
+                            resolution.classes.get_mut(&child).unwrap().base = Some(classes[0]);
+                        }
                     }
-                    let mut effects = HashMap::new();
-                    let mut declarations = HashMap::new();
-                    super::super::DISPATCH_EFFECT_VISITS.with(|count| count.set(0));
-                    assert_eq!(
-                        super::super::dispatch_may_start_task(
-                            &resolution,
-                            &children,
-                            classes[0],
-                            "read",
-                            &mut effects,
-                            &mut declarations
-                        ),
-                        async_leaf
-                    );
+                    let declarations = LoweringDeclarations::new(&resolution);
+                    let mut effects = super::super::dispatch::DispatchEffects::default();
                     for _ in 0..8 {
-                        for &class in &classes {
-                            super::super::dispatch_may_start_task(
-                                &resolution,
-                                &children,
-                                class,
+                        for (i, &class) in classes.iter().enumerate() {
+                            let result = super::super::method_is_async(
+                                &declarations,
+                                &Type::Named(class),
                                 "read",
-                                &mut effects,
-                                &mut declarations,
+                            ) || effects.may_start_task(&declarations, class, "read");
+                            assert_eq!(
+                                result,
+                                async_leaf && (!fan_out || i == 0 || i == depth - 1)
                             );
                         }
                     }
-                    let visits = super::super::DISPATCH_EFFECT_VISITS.with(|count| count.get());
-                    assert_eq!(visits, depth);
-                    assert_eq!(effects.len(), depth);
-                    println!(
-                        "dispatch nodes={depth} fan_out={fan_out} async_leaf={async_leaf} repeated calls={} expanded pairs={visits}",
-                        8 * depth
+                    // An exact async hit on a singleton needs no descendant query.
+                    assert_eq!(
+                        effects.visits,
+                        if depth == 1 && async_leaf { 0 } else { depth }
                     );
                 }
             }

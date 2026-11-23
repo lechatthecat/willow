@@ -318,109 +318,125 @@ pub(crate) fn clear_local_scratch(set: &mut HashSet<LirLocalId>) {
     }
 }
 
+pub(super) enum LocalAccess {
+    Read,
+    Write,
+}
+
 pub(crate) fn instruction_use_def(
     inst: &SourceInst,
     names: &HashMap<&str, LirLocalId>,
     uses: &mut HashSet<LirLocalId>,
     defs: &mut HashSet<LirLocalId>,
 ) {
-    macro_rules! read {
-        ($expr:expr) => {
-            collect_expr_uses($expr, names, uses, defs)
-        };
-    }
+    visit_instruction_locals(inst, names, |access, id| match access {
+        LocalAccess::Read => {
+            if !defs.contains(&id) {
+                uses.insert(id);
+            }
+        }
+        LocalAccess::Write => {
+            defs.insert(id);
+        }
+    });
+}
+
+/// Report reads and writes in execution order, including reads preceding a write
+/// within one instruction. Each consumer chooses which IDs it needs to retain.
+pub(super) fn visit_instruction_locals(
+    inst: &SourceInst,
+    names: &HashMap<&str, LirLocalId>,
+    mut visit: impl FnMut(LocalAccess, LirLocalId),
+) {
+    use LocalAccess::{Read, Write};
+    let mut read_expr = |expr: &HirExpr| visit_expr_uses(expr, names, |id| visit(Read, id));
     match inst {
         SourceInst::Compute { local, value, .. } => {
             for operand in value.iter_operands() {
                 for id in operand.iter_locals() {
-                    if !defs.contains(&id) {
-                        uses.insert(id);
-                    }
+                    visit(Read, id);
                 }
             }
-            defs.insert(*local);
+            visit(Write, *local);
         }
-        SourceInst::Let { local, value, .. } => {
-            read!(value);
-            defs.insert(*local);
-        }
-        SourceInst::Assign { local, value, .. } => {
-            read!(value);
-            defs.insert(*local);
+        SourceInst::Let { local, value, .. } | SourceInst::Assign { local, value, .. } => {
+            read_expr(value);
+            visit(Write, *local);
         }
         SourceInst::FieldAssign { object, value, .. } => {
-            read!(object);
-            read!(value);
+            read_expr(object);
+            read_expr(value);
         }
         SourceInst::IndexAssign {
             array,
             index,
             value,
         } => {
-            read!(array);
-            read!(index);
-            read!(value);
+            read_expr(array);
+            read_expr(index);
+            read_expr(value);
         }
-        SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => read!(value),
+        SourceInst::StaticFieldAssign { value, .. } | SourceInst::Expr(value) => read_expr(value),
         SourceInst::SuperInit { args, .. } => {
             for arg in args {
-                read!(arg);
+                read_expr(arg);
             }
         }
         SourceInst::Defer { body, .. } => {
             for capture in &body.captures {
-                if !defs.contains(capture) {
-                    uses.insert(*capture);
-                }
+                visit(Read, *capture);
             }
         }
         SourceInst::SelectInit { operations } => {
             for operation in operations {
                 match operation {
                     LirSelectOp::Timeout { millis, deadline } => {
-                        if !defs.contains(millis) {
-                            uses.insert(*millis);
-                        }
-                        defs.insert(*deadline);
+                        visit(Read, *millis);
+                        visit(Write, *deadline);
                     }
                     LirSelectOp::Recv { .. }
                     | LirSelectOp::Send { .. }
                     | LirSelectOp::Join { .. }
-                    | LirSelectOp::Default => select_uses(operation, uses, defs),
+                    | LirSelectOp::Default => visit_select_uses(operation, |id| visit(Read, id)),
                 }
             }
         }
         SourceInst::SelectProbe { operations, ready } => {
             for operation in operations {
-                select_uses(operation, uses, defs);
+                visit_select_uses(operation, |id| visit(Read, id));
             }
-            defs.extend(ready.iter().flatten().copied());
+            for local in ready.iter().flatten() {
+                visit(Write, *local);
+            }
         }
         SourceInst::SelectPick { ready, chosen } => {
             for local in ready.iter().flatten() {
-                if !defs.contains(local) {
-                    uses.insert(*local);
-                }
+                visit(Read, *local);
             }
-            defs.insert(*chosen);
+            visit(Write, *chosen);
         }
         SourceInst::SelectUnregister { operations, winner } => {
-            if !defs.contains(winner) {
-                uses.insert(*winner);
-            }
+            visit(Read, *winner);
             for operation in operations {
-                select_uses(operation, uses, defs);
+                visit_select_uses(operation, |id| visit(Read, id));
             }
         }
         SourceInst::SelectCommit { operation, success } => {
-            select_uses(operation, uses, defs);
+            visit_select_uses(operation, |id| visit(Read, id));
             match operation {
-                LirSelectOp::Recv { binding, .. } | LirSelectOp::Join { binding, .. } => {
-                    defs.extend(binding.iter().copied());
+                LirSelectOp::Recv {
+                    binding: Some(id), ..
                 }
-                LirSelectOp::Send { .. } | LirSelectOp::Timeout { .. } | LirSelectOp::Default => {}
+                | LirSelectOp::Join {
+                    binding: Some(id), ..
+                } => visit(Write, *id),
+                LirSelectOp::Recv { binding: None, .. }
+                | LirSelectOp::Join { binding: None, .. }
+                | LirSelectOp::Send { .. }
+                | LirSelectOp::Timeout { .. }
+                | LirSelectOp::Default => {}
             }
-            defs.insert(*success);
+            visit(Write, *success);
         }
         // Releasing reads all four of the acquisition's frame slots, so
         // each one stays live from the `lock` down to every exit that
@@ -431,9 +447,7 @@ pub(crate) fn instruction_use_def(
             lock: Some(slots), ..
         } => {
             for local in slots.all_locals() {
-                if !defs.contains(&local) {
-                    uses.insert(local);
-                }
+                visit(Read, local);
             }
         }
         // The scrutinee is READ by every dispatch block and by the bind at
@@ -444,20 +458,18 @@ pub(crate) fn instruction_use_def(
         SourceInst::MatchTest {
             scrutinee, result, ..
         } => {
-            if !defs.contains(scrutinee) {
-                uses.insert(*scrutinee);
-            }
-            defs.insert(*result);
+            visit(Read, *scrutinee);
+            visit(Write, *result);
         }
         SourceInst::MatchBind {
             scrutinee,
             bindings,
             ..
         } => {
-            if !defs.contains(scrutinee) {
-                uses.insert(*scrutinee);
+            visit(Read, *scrutinee);
+            for local in bindings {
+                visit(Write, *local);
             }
-            defs.extend(bindings.iter().copied());
         }
         // Naming a local does not read it: the instruction drops the GC
         // root of a scope that ended, so nothing it names is live past it
@@ -475,35 +487,30 @@ pub(crate) fn terminator_uses(
     uses: &mut HashSet<LirLocalId>,
     defs: &HashSet<LirLocalId>,
 ) {
-    macro_rules! read {
-        ($expr:expr) => {
-            collect_expr_uses($expr, names, uses, defs)
-        };
-    }
+    visit_terminator_uses(terminator, names, |id| {
+        if !defs.contains(&id) {
+            uses.insert(id);
+        }
+    });
+}
+
+pub(super) fn visit_terminator_uses(
+    terminator: &SourceTerminator,
+    names: &HashMap<&str, LirLocalId>,
+    read: impl FnMut(LirLocalId),
+) {
     match terminator {
-        SourceTerminator::Branch { cond, .. } => read!(cond),
-        SourceTerminator::Return(Some(value)) => read!(value),
-        SourceTerminator::Suspend { operation, .. } => operation.for_each_local(|id| {
-            if !defs.contains(&id) {
-                uses.insert(id);
-            }
-        }),
+        SourceTerminator::Branch { cond: expr, .. } | SourceTerminator::Return(Some(expr)) => {
+            visit_expr_uses(expr, names, read);
+        }
+        SourceTerminator::Suspend { operation, .. } => operation.for_each_local(read),
         SourceTerminator::Jump(_)
         | SourceTerminator::Return(None)
         | SourceTerminator::CleanupReturn => {}
     }
 }
 
-fn select_uses(
-    operation: &LirSelectOp,
-    uses: &mut HashSet<LirLocalId>,
-    defs: &HashSet<LirLocalId>,
-) {
-    let mut read = |local| {
-        if !defs.contains(&local) {
-            uses.insert(local);
-        }
-    };
+fn visit_select_uses(operation: &LirSelectOp, mut read: impl FnMut(LirLocalId)) {
     match operation {
         LirSelectOp::Recv { channel, .. } => read(*channel),
         LirSelectOp::Send { channel, value, .. } => {
@@ -522,37 +529,55 @@ fn collect_expr_uses(
     uses: &mut HashSet<LirLocalId>,
     defs: &HashSet<LirLocalId>,
 ) {
+    visit_expr_uses(expr, names, |id| {
+        if !defs.contains(&id) {
+            uses.insert(id);
+        }
+    });
+}
+
+fn visit_expr_uses(
+    mut expr: &HirExpr,
+    names: &HashMap<&str, LirLocalId>,
+    mut visit: impl FnMut(LirLocalId),
+) {
     let mut read = |name: &str| {
-        if let Some(local) = names.get(name)
-            && !defs.contains(local)
-        {
-            uses.insert(*local);
+        if let Some(&id) = names.get(name) {
+            visit(id);
         }
     };
-    let mut pending = vec![expr];
-    while let Some(expr) = pending.pop() {
+    let mut pending = Vec::new();
+    loop {
         match &expr.kind {
             HirExprKind::Var(name) => read(name),
-            HirExprKind::Call { callee, .. } => {
-                if let Some(name) = callee.unqualified_name() {
-                    read(&name);
+            HirExprKind::Call {
+                callee,
+                binding,
+                args,
+                ..
+            } => {
+                if binding.is_local() {
+                    read(&callee.name());
                 }
+                pending.extend(args);
             }
             HirExprKind::Lambda { captures, .. } => {
                 for capture in captures {
                     read(&capture.source);
                 }
                 // Constructing the closure reads its environment. Its body runs later.
-                continue;
             }
             ir_variants!(
                 HirExprKind;
                 Int, Float, Bool, Str, FnRef, Binary, Unary, Invoke, Print, Array,
                 Index, Ternary, New, FieldAccess, MethodCall, ObjectLiteral, StaticField,
                 StaticCall, ReferenceArg, Range, Await, TryPropagate, Match, Select
-            ) => {}
+            ) => pending.extend(expr.children()),
         }
-        pending.extend(expr.children());
+        let Some(next) = pending.pop() else {
+            break;
+        };
+        expr = next;
     }
 }
 
@@ -796,18 +821,20 @@ mod coalescing_tests {
     #[test]
     fn local_call_reads_its_callee_and_arguments_before_definition() {
         use crate::diagnostics::Span;
+        use crate::ir::typed_ast::HirCallBinding;
         use crate::semantic::ids::FunctionId;
         let names = HashMap::from([("f", LirLocalId(0)), ("arg", LirLocalId(1))]);
-        let call = |name, args| HirExpr {
+        let call = |name, binding, args| HirExpr {
             kind: HirExprKind::Call {
                 callee: FunctionId::free_from_source_name(name),
+                binding,
                 args,
             },
             ty: Type::I64,
             span: Span::dummy(),
         };
         let mut uses = HashSet::new();
-        let f = call("f", vec![]);
+        let f = call("f", HirCallBinding::Local { may_change: false }, vec![]);
         collect_expr_uses(&f, &names, &mut uses, &HashSet::new());
         assert_eq!(uses, HashSet::from([LirLocalId(0)]));
         uses.clear();
@@ -817,7 +844,7 @@ mod coalescing_tests {
             span: Span::dummy(),
         };
         collect_expr_uses(
-            &call("f", vec![arg]),
+            &call("f", HirCallBinding::Local { may_change: false }, vec![arg]),
             &names,
             &mut uses,
             &HashSet::from([LirLocalId(0)]),
@@ -825,7 +852,14 @@ mod coalescing_tests {
         assert_eq!(uses, HashSet::from([LirLocalId(1)]));
         uses.clear();
         collect_expr_uses(
-            &call("module::f", vec![]),
+            &call("module::f", HirCallBinding::Function, vec![]),
+            &names,
+            &mut uses,
+            &HashSet::new(),
+        );
+        assert!(uses.is_empty());
+        collect_expr_uses(
+            &call("f", HirCallBinding::Function, vec![]),
             &names,
             &mut uses,
             &HashSet::new(),
@@ -923,6 +957,28 @@ mod coalescing_tests {
         for slot in layout.locals.values() {
             assert!(slot.index < layout.slots.len());
         }
+    }
+
+    #[test]
+    fn select_reads_respect_earlier_writes_in_the_same_instruction() {
+        let [source, first, second] = [0, 1, 2].map(LirLocalId);
+        let inst = SourceInst::SelectInit {
+            operations: vec![
+                LirSelectOp::Timeout {
+                    millis: source,
+                    deadline: first,
+                },
+                LirSelectOp::Timeout {
+                    millis: first,
+                    deadline: second,
+                },
+            ],
+        };
+        let mut uses = HashSet::new();
+        let mut defs = HashSet::new();
+        instruction_use_def(&inst, &HashMap::new(), &mut uses, &mut defs);
+        assert_eq!(uses, HashSet::from([source]));
+        assert_eq!(defs, HashSet::from([first, second]));
     }
 
     #[test]

@@ -177,7 +177,7 @@ fn resolution_snapshot_preserves_payload_order_and_parameter_modes() {
     );
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
     let reader = &hir.resolution.interfaces[&TypeId::local("Reader")];
-    assert_eq!(reader.type_params, vec![TypeId::local("T")]);
+    assert_eq!(reader.type_params.as_slice(), &[TypeId::local("T")]);
     assert_eq!(
         reader.methods["read"].return_type,
         crate::semantic::ids::SemanticType::Named(TypeId::local("T"))
@@ -591,7 +591,7 @@ fn p18_call_with_args() {
         .find(|fun| fun.name == crate::semantic::ids::FunctionId::free_from_source_name("f"))
         .expect("function f");
     match &first_return(&f.body).kind {
-        HirExprKind::Call { callee, args } => {
+        HirExprKind::Call { callee, args, .. } => {
             assert_eq!(
                 callee,
                 &crate::semantic::ids::FunctionId::free_from_source_name("add")
