@@ -667,14 +667,15 @@ mod tests {
                 await_sleeps(count * (round + 1));
                 assert!(waiters.iter().all(|w| !w.is_finished()));
             }
-            // Acknowledgement notifications must not wake sleeping waiters.
+            // Acknowledgement notifications must not release sleeping waiters.
+            // Platform condvars may wake spuriously, so sleeps are a lower
+            // bound; assert after releasing COORD so a failure cannot poison it.
             let coord = runtime().coord.0.lock().unwrap();
             runtime().coord.1.notify_all();
-            assert_eq!(
-                runtime().wait_observation.sleeps.load(Ordering::Acquire),
-                count * 5
-            );
+            let sleeps = runtime().wait_observation.sleeps.load(Ordering::Acquire);
             drop(coord);
+            assert!(sleeps >= count * 5, "sleeps={sleeps}");
+            assert!(waiters.iter().all(|w| !w.is_finished()));
             drop(elected);
             for worker in waiters {
                 worker.join().unwrap();
@@ -696,8 +697,7 @@ mod tests {
                 "completed cycles={completed} waiters={count}"
             );
             eprintln!(
-                "budget_wait scaling waiters={count} sleeps={} checks={checks} cycles={completed}",
-                count * 5
+                "budget_wait scaling waiters={count} sleeps={sleeps} checks={checks} cycles={completed}"
             );
         }
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
@@ -920,7 +920,9 @@ mod tests {
                     runtime().wait_observation.sleeps.load(Ordering::Relaxed)
                 );
                 if !legacy {
-                    assert_eq!(checks, 2 * count);
+                    // Joined-cycle wakes are exact; the post-join fresh
+                    // collection adds a timing-dependent number of checks.
+                    assert!(checks >= 2 * count, "checks={checks}");
                 }
             }
         }
