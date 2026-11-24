@@ -80,10 +80,20 @@ pub(super) fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
     }
     let me = std::thread::current().id();
     let mut coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
-    let generation = coord.cycle_generation;
     if coord.cycle_collector == Some(me) {
         return;
     }
+    if coord.cycle_collector.is_some() {
+        // A cycle elected before this caller's failed reservation keeps every
+        // object allocated since its snapshot (black allocation), so its
+        // completion can release nothing for that garbage. The caller treats
+        // an unchanged release count as exhaustion, so finish that cycle
+        // first and then require one whose snapshot postdates the failure.
+        let generation = coord.cycle_generation;
+        wait_for_cycle_in(owner, coord, generation);
+        coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    }
+    let generation = coord.cycle_generation;
     if coord.cycle_collector.is_none() {
         drop(coord);
         let _ = try_collect_internal_in(owner);
