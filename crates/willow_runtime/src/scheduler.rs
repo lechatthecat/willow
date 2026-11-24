@@ -4958,6 +4958,13 @@ fn claim_ready_for_worker_in(
                     0,
                 );
                 set_current_task(None);
+                // A terminal state is a boundary, like the end of a poll.
+                // Worker 0 may be parked without a timeout after it saw this
+                // task's previous poll as active; a Preempted poll end and a
+                // sole local requeue bump no generation, so wake it here,
+                // after the claim marker has resolved.
+                drop(in_flight);
+                queues.parking.notify_worker(0);
             }
             Claim::Reroute(owner) => {
                 queues.push_rerouted(owner, id);
