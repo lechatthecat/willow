@@ -679,18 +679,25 @@ mod tests {
             for worker in waiters {
                 worker.join().unwrap();
             }
-            assert_eq!(
-                runtime().wait_observation.checks.load(Ordering::Relaxed),
-                count * 6
-            );
-            assert_eq!(
-                runtime().coord.0.lock().unwrap().cycle_generation,
-                generation.wrapping_add(1)
+            // The joined cycle predates the waiters' budget failure, so each
+            // waiter also requires a fresh collection after it. Contending
+            // waiters may coalesce on one fresh cycle or elect their own.
+            let checks = runtime().wait_observation.checks.load(Ordering::Relaxed);
+            assert!(checks >= count * 6, "checks={checks}");
+            let completed = runtime()
+                .coord
+                .0
+                .lock()
+                .unwrap()
+                .cycle_generation
+                .wrapping_sub(generation);
+            assert!(
+                (2..=1 + count as u64).contains(&completed),
+                "completed cycles={completed} waiters={count}"
             );
             eprintln!(
-                "budget_wait scaling waiters={count} sleeps={} checks={}",
-                count * 5,
-                count * 6
+                "budget_wait scaling waiters={count} sleeps={} checks={checks} cycles={completed}",
+                count * 5
             );
         }
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
