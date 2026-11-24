@@ -3683,8 +3683,10 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
 static T9HA4_COMPLETION_ORDER: crate::runtime::PerRuntime<TestMutex<Vec<i64>>> =
     crate::runtime::PerRuntime::new(|| TestMutex::new(Vec::new()));
 
-/// Slot 0: poll count. Slot 1: tag. Slot 2: sleep duration in ms.
-/// Records its tag on completion so a test can assert the order.
+/// Slot 0: poll count. Slot 1: tag. Slot 2: absolute wake deadline in
+/// monotonic ms. Sleeping toward a shared absolute deadline (not a duration
+/// from this poll) keeps the deadline order fixed even when the runner stalls
+/// between polls. Records its tag on completion so a test can assert the order.
 unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
     let base = frame as *mut u8;
     // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
@@ -3692,7 +3694,7 @@ unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
     // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
     let tag = unsafe { *(base.add(async_frame_slot_offset(1)) as *const i64) };
     // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
-    let millis = unsafe { *(base.add(async_frame_slot_offset(2)) as *const i64) };
+    let deadline = unsafe { *(base.add(async_frame_slot_offset(2)) as *const i64) };
     *polls += 1;
     if *polls >= 2 {
         T9HA4_COMPLETION_ORDER
@@ -3701,7 +3703,7 @@ unsafe extern "C" fn poll_tagged_sleep_then_ready(frame: *mut c_void) -> i32 {
             .push(tag);
         RUNTIME_POLL_READY
     } else {
-        willow_sched_sleep(millis);
+        willow_sched_sleep((deadline - willow_monotonic_millis()).max(0));
         RUNTIME_POLL_PENDING
     }
 }
@@ -3718,14 +3720,17 @@ fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
 
-    // Spawn order deliberately disagrees with deadline order.
-    for (tag, millis) in [(1i64, 120i64), (2, 0), (3, 60)] {
+    // Spawn order deliberately disagrees with deadline order. Deadlines are
+    // absolute from one start and 500ms apart, so a preempted runner that
+    // polls the sleepers late cannot reorder them.
+    let start = willow_monotonic_millis();
+    for (tag, offset) in [(1i64, 1_000i64), (2, 0), (3, 500)] {
         let frame = willow_async_frame_alloc(3, 0) as *mut c_void;
         // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
         unsafe {
             let base = frame as *mut u8;
             *(base.add(async_frame_slot_offset(1)) as *mut i64) = tag;
-            *(base.add(async_frame_slot_offset(2)) as *mut i64) = millis;
+            *(base.add(async_frame_slot_offset(2)) as *mut i64) = start + offset;
         }
         // SAFETY: The supplied callback matches this frame layout; the frame storage remains
         // live across scheduling and callback execution.
