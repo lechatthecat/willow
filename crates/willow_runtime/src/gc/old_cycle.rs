@@ -605,7 +605,12 @@ mod integration_tests {
         // Short messages: the failure record truncates long panic reasons.
         assert_eq!(stops.by_reason[1].requests, 1, "remark stops");
         assert_eq!(stops.by_reason[1].work.swept_objects, 0, "remark sweep");
-        assert_eq!(stops.by_reason[3].requests, 1, "recovery stops");
+        // One recovery slice fits this heap, but the slice's 1ms work budget
+        // can end it early on a preempted host; bound it like other slices.
+        assert!(
+            (1..=8).contains(&stops.by_reason[3].requests),
+            "recovery stops"
+        );
         assert!(
             runtime().remark_observation.yields.load(Ordering::Relaxed) > 0,
             "remark yields"
@@ -661,7 +666,13 @@ mod integration_tests {
             (2 * (GC_HEADER_SIZE + 8)) as i64
         );
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        assert_eq!(stops.by_reason[3].requests, 1);
+        // One recovery slice fits this heap; its 1ms work budget can split it
+        // on a preempted host, so allow a constant factor.
+        assert!(
+            (1..=8).contains(&stops.by_reason[3].requests),
+            "recovery stops: {}",
+            stops.by_reason[3].requests
+        );
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
         assert_eq!(
             crate::runtime::current()
