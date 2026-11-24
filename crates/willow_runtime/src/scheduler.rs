@@ -5615,7 +5615,13 @@ fn scheduler_run_loop_in(
                         crate::observability::record(event, Some(worker), id, i64::from(result));
                         set_current_task(None);
                         finish_active_poll(shared);
-                        if matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL) {
+                        // As at the end of a regular poll: a runnable
+                        // boundary published its requeue before this
+                        // accounting ended, so a peer may already have
+                        // finished the continuation.
+                        if worker != 0
+                            || matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL)
+                        {
                             owner.parking.notify_worker(0);
                         }
                         continue;
@@ -5869,9 +5875,13 @@ fn scheduler_run_loop_in(
         // join this worker while its collection is waiting for worker 0 to
         // reach a safepoint.
         finish_active_poll(shared);
-        if !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
-            // Only the coordinator must recheck timers/netpoll/idleness.
-            // Waking the whole pool here would cost tasks * workers.
+        // Only the coordinator must recheck timers/netpoll/idleness.
+        // Waking the whole pool here would cost tasks * workers. A runnable
+        // outcome on another worker still ends an active poll that worker 0
+        // may be waiting on: the requeue above is published before this
+        // accounting ends, so a peer can steal and finish the continuation
+        // first, and no later poll is left to wake worker 0.
+        if worker != 0 || !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
             owner.parking.notify_worker(0);
         }
         if outcome == PollOutcome::Ready {
