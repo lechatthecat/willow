@@ -76,6 +76,8 @@ mod epoch_index;
 mod epoch_observation;
 mod free_spans;
 mod mark_closure;
+#[cfg(test)]
+pub(crate) use mark_closure::MAX_REMARK_ROUNDS;
 mod mark_termination;
 mod mark_workers;
 pub(crate) use mark_workers::marker_configuration;

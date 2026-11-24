@@ -48,11 +48,20 @@ fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     assert_eq!(stats.events_pending, 1);
     willow_gc_collect();
     let stats = snapshot_stops();
-    // The explicit major cycle adds its initial and remark handshakes while
-    // flushing the preceding failed callback's event.
+    // The explicit major cycle adds its initial and closure handshakes while
+    // flushing the preceding failed callback's event. Closure remark stops
+    // yield to one bounded recovery stop once they exceed the wall-clock
+    // remark budget, so that split is only bounded.
     assert_eq!(stats.by_reason[0].requests, 2);
     assert_eq!(stats.by_reason[0].aborted, 1);
-    assert_eq!(stats.by_reason[1].requests, 2);
+    let remark = stats.by_reason[1].requests;
+    let recovery = stats.by_reason[3].requests;
+    assert!(
+        (1..=(mark_closure::MAX_REMARK_ROUNDS - 1) as u64).contains(&remark),
+        "remark stops {remark}"
+    );
+    assert!(recovery <= 1, "recovery stops {recovery}");
+    assert!(remark + recovery >= 2, "closure stops {remark}+{recovery}");
     assert_eq!(stats.events_pending, 0);
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
