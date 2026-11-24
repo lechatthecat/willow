@@ -7,3 +7,5 @@
 # asserted output.
 /example/**/*.wi text eol=lf
 /tests/regressions/**/*.wi text eol=lf
+# Tests instrument the bundled standard library by exact-line rewrites.
+/std/**/*.wi text eol=lf

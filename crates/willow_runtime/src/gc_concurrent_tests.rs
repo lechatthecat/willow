@@ -3606,6 +3606,7 @@ fn m3_real_closure_last_work_latency_and_cpu() {
             }
             assert!(cycle.queue.snapshot().is_drained());
             let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let finished = mark_closure::finish_with_policy(
                 &cycle,
                 Instant::now(),
@@ -4708,6 +4709,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let mut rechecks = 0;
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let finished = mark_closure::finish_with_hooks(
                 &cycle,
                 Instant::now(),
@@ -4825,6 +4827,7 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
             cycle
         };
         let mut waits = 0;
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         assert!(
             mark_closure::finish_with_wait(&cycle, Instant::now(), |_| {
                 waits += 1;
@@ -5317,6 +5320,7 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
         assert_eq!(calls == 0, !predrain);
         let mut waits = 0;
         if predrain {
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             assert!(
                 mark_closure::finish_with_wait(&cycle, Instant::now(), |_| waits += 1).is_none()
             );

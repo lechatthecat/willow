@@ -1448,6 +1448,9 @@ fn compile_with_compiler_env_mode(
     // kill-switch and the require mode along with the AST fallback), and a test
     // that asserts on its absence must not inherit it from the environment.
     cmd.env_remove("WILLOW_LIR_LOG");
+    // CI sets `RUST_BACKTRACE=1`; the anyhow report would then append frame
+    // names (`{{closure}}`, ...) to stderr, which is not diagnostic text.
+    cmd.env("RUST_LIB_BACKTRACE", "0");
     for (key, value) in env {
         cmd.env(key, value);
     }

@@ -20,8 +20,8 @@ Explicitly record the returned `review_fingerprint` in `rust-review.toml`:
 fingerprint = "<reviewed SHA-256 from the query>"
 ```
 
-This file contains the project's single review value. Never put it in `.rs`
-or `.wi` declarations. `check`, `build`, `run` and dependency resolution never
+This file contains the project's single review value. Never put it in Rust
+or Willow declarations. `check`, `build`, `run` and dependency resolution never
 write this file. Changes to Rust sources (including attributes and unimported
 modules), Cargo resolution or Rust manifest settings require another review.
 The diagnostic supplies the current fingerprint and these manual review steps.

@@ -602,11 +602,15 @@ mod integration_tests {
         let before = willow_gc_allocated_bytes();
         willow_gc_collect();
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        assert_eq!(stops.by_reason[1].requests, 1);
-        assert_eq!(stops.by_reason[1].work.swept_objects, 0);
-        assert_eq!(stops.by_reason[3].requests, 1);
-        assert!(runtime().remark_observation.yields.load(Ordering::Relaxed) > 0);
-        assert_eq!(willow_gc_allocated_bytes(), before);
+        // Short messages: the failure record truncates long panic reasons.
+        assert_eq!(stops.by_reason[1].requests, 1, "remark stops");
+        assert_eq!(stops.by_reason[1].work.swept_objects, 0, "remark sweep");
+        assert_eq!(stops.by_reason[3].requests, 1, "recovery stops");
+        assert!(
+            runtime().remark_observation.yields.load(Ordering::Relaxed) > 0,
+            "remark yields"
+        );
+        assert_eq!(willow_gc_allocated_bytes(), before, "retained bytes");
         // SAFETY: The removed shadow-stack entries belong to this operation and their slot
         // storage is still live.
         unsafe { willow_pop_roots(1) };

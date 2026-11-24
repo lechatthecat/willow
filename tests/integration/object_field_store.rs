@@ -215,8 +215,10 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
     // Count relocation targets and inline context reads (the per-site
     // mark-phase byte load through the pinned context's gate cell) for
     // 1/8/32 store sites. A reference field
-    // store adds exactly one cold barrier call and one mark-phase load per
-    // site relative to an i64 field store, and no root or panic bracket. A
+    // store adds exactly one cold barrier call and two mark-phase loads per
+    // site (the hot filter's, and the cold re-read after publishing a
+    // private value) relative to an i64 field store, and no root or panic
+    // bracket. A
     // static (global) store keeps one unconditional barrier call and never
     // reads the mark phase.
     const TRACKED: [&str; 5] = [
@@ -252,7 +254,7 @@ fn object_field_store_sites_add_one_cold_barrier_and_phase_load_each() {
             );
         }
         assert_eq!(per_site(&reference, 3), added, "{reference:?}");
-        assert_eq!(per_site(&reference, 4), added, "{reference:?}");
+        assert_eq!(per_site(&reference, 4), 2 * added, "{reference:?}");
         assert_eq!(per_site(&global, 3), added, "{global:?}");
         assert_eq!(per_site(&global, 4), 0, "{global:?}");
     }

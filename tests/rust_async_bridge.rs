@@ -479,20 +479,20 @@ fn async_bridge_owned_record_aliases_do_not_shadow_native_types() {
         r#"
 import std::collections::Array;
 extern rust {
-    class u8 { pub values: Array<i64>; }
+    class usize { pub values: Array<i64>; }
     class Vec { pub values: Array<String>; }
-    async fn bytes(v: u8) -> u8;
+    async fn bytes(v: usize) -> usize;
     async fn texts(v: Vec) -> Vec;
 }
 async fn main() {
-    let a = await bytes(new u8([0,255]));
+    let a = await bytes(new usize([0,255]));
     let b = await texts(new Vec(["owned"]));
     println(a.values[1] == 255 && b.values[0] == "owned");
 }
 "#,
         r#"
-pub async fn bytes(v: crate::record_owned::u8)->crate::record_outputs::u8 {
-    crate::records::u8 { values:v.values }
+pub async fn bytes(v: crate::record_owned::usize)->crate::record_outputs::usize {
+    crate::records::usize { values:v.values }
 }
 pub async fn texts(v: crate::record_owned::Vec)->crate::record_outputs::Vec {
     crate::records::Vec { values:v.values }

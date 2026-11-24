@@ -493,40 +493,66 @@ fn native_modules_preserve_legacy_nonblocking_review_recovery() {
     };
     fixture.write("src/main.wi", &entry(&"0".repeat(64)));
     let review = || {
-        let output = fixture.success(&[
-            "query",
-            "rust-bridge",
-            "--project-dir",
-            ".",
-            "--offline",
-            "--format",
-            "json",
-        ]);
-        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        value["review_fingerprint"].as_str().unwrap().to_owned()
+        let value = fixture.review_query();
+        (
+            value["review_fingerprint"].as_str().unwrap().to_owned(),
+            value["legacy_review_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+    };
+    let approve = |fingerprint: &str| {
+        fixture.write(
+            "rust-review.toml",
+            &format!("fingerprint = \"{fingerprint}\"\n"),
+        );
+    };
+    let run_fails_review = || {
+        let stale = fixture
+            .command(&["run", ".", "--offline"])
+            .output()
+            .unwrap();
+        assert!(!stale.status.success());
+        assert!(
+            String::from_utf8_lossy(&stale.stderr).contains("rust_nonblocking_review_required")
+        );
     };
     let first = review();
-    fixture.write("src/main.wi", &entry(&first));
+    fixture.write("src/main.wi", &entry(&first.1));
+    // The inline legacy claim covers the legacy bridge; the shared record
+    // covers every Rust module. Both must be current.
+    run_fails_review();
+    approve(&first.0);
     assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"42\n");
     fixture.write("src/native.rs", "pub fn answer() -> i64 { 36 }");
-    assert_eq!(review(), first);
+    let native_edit = review();
+    assert_eq!(native_edit.1, first.1);
+    assert_ne!(native_edit.0, first.0);
+    run_fails_review();
+    approve(&native_edit.0);
     assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"43\n");
     fixture.write("bridge.rs", "pub fn legacy() -> i64 { 8 }");
     let second = review();
-    assert_ne!(first, second);
-    let stale = fixture
-        .command(&["run", ".", "--offline"])
-        .output()
-        .unwrap();
-    assert!(!stale.status.success());
-    assert!(String::from_utf8_lossy(&stale.stderr).contains("rust_nonblocking_review_required"));
-    fixture.write("src/main.wi", &entry(&second));
+    assert_ne!(first.1, second.1);
+    approve(&second.0);
+    run_fails_review();
+    fixture.write("src/main.wi", &entry(&second.1));
     assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"44\n");
     fixture.write("src/native.rs", "pub struct Data { pub value: i64 }");
     fs::remove_file(fixture.root.join("src/spare.rs")).unwrap();
     fs::remove_file(fixture.root.join("src/spare_user.wi")).unwrap();
-    fixture.write("src/main.wi", &format!("import native; extern rust {{ nonblocking(\"{second}\") fn legacy() -> i64; }} fn main() {{ println(legacy()); }}"));
-    assert_eq!(review(), second);
+    let legacy_only = |fingerprint: &str| {
+        format!(
+            "import native; extern rust {{ nonblocking(\"{fingerprint}\") fn legacy() -> i64; }} fn main() {{ println(legacy()); }}"
+        )
+    };
+    fixture.write("src/main.wi", &legacy_only(&second.1));
+    // Removing a discovered module changes the crate both reviews describe.
+    let third = review();
+    approve(&third.0);
+    fixture.write("src/main.wi", &legacy_only(&third.1));
+    assert_eq!(review(), third);
     assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"8\n");
 }
 
@@ -768,6 +794,8 @@ fn native_assume_unreviewed_contexts_keep_diagnostics() {
                 ),
             };
             f.write("src/main.wi", &format!("import native; {body}"));
+            // Review the remaining constructor claim so only context errors remain.
+            f.approve_native();
             let output = f.command(&["check", ".", "--offline"]).output().unwrap();
             assert!(!output.status.success(), "{call}/{context}");
             let error = String::from_utf8_lossy(&output.stderr);

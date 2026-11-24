@@ -282,11 +282,15 @@ mod tests {
     #[test]
     fn bridge_builtin_ids_preserve_shapes_and_opaque_precedence() {
         use crate::rust_bridge_ir::Scalar;
-        let array = BuiltinTypeId::Array.apply(vec![Type::I64]);
+        let array = BuiltinTypeId::Array.apply(vec![Type::U8]);
         assert_eq!(Scalar::from_type(&array), Some(Scalar::Bytes));
         assert_eq!(
-            Scalar::from_type(&Type::Array(Box::new(Type::I64))),
+            Scalar::from_type(&Type::Array(Box::new(Type::U8))),
             Some(Scalar::Bytes)
+        );
+        assert_eq!(
+            Scalar::from_type(&BuiltinTypeId::Array.apply(vec![Type::I64])),
+            Some(Scalar::Array(Box::new(Scalar::I64)))
         );
         let result = BuiltinTypeId::Result.apply(vec![array, Type::String]);
         assert_eq!(

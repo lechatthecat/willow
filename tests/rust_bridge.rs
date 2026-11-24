@@ -159,7 +159,10 @@ fn source_schema_abi_manifest_lock_and_profile_invalidate_compilation() {
                 .unwrap();
             }
             1 => fixture.options.wrapper_schema = "test-future-schema".into(),
-            2 => fixture.options.abi_revision = "2".into(),
+            2 => {
+                fixture.options.abi_revision =
+                    (willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION + 1).to_string();
+            }
             3 => {
                 let manifest = fixture.root.join("project.toml");
                 let text = fs::read_to_string(&manifest)

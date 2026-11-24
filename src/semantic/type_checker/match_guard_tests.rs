@@ -239,7 +239,7 @@ fn option_pattern_preserves_valid_and_unrelated_patterns() {
     ));
     assert_eq!(errors.len(), 1, "{errors:?}");
     assert!(errors[0].message.contains("expected `Option`"));
-    assert!(errors[0].helps[0].starts_with("if this i64 came from String.find"));
+    assert!(errors[0].helps.iter().all(|h| !h.contains("String.find")));
 }
 
 #[test]

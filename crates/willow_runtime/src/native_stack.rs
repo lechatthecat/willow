@@ -1074,8 +1074,33 @@ mod tests {
         async_checks_until_trip: u64,
     }
 
+    /// The task frame is a real managed async frame (spawn publishes its
+    /// reference slots); its scalar slot 0 points at the test's state.
+    fn boundary_budget_frame(state: &mut BoundaryBudget) -> *mut c_void {
+        let frame = crate::async_frame::willow_async_frame_alloc(1, 0);
+        assert!(!frame.is_null());
+        // SAFETY: the fresh frame holds one scalar word slot after its header.
+        unsafe { *boundary_budget_slot(frame) = std::ptr::from_mut(state) };
+        frame
+    }
+
+    fn boundary_budget_slot(frame: *mut c_void) -> *mut *mut BoundaryBudget {
+        // SAFETY: frames from `boundary_budget_frame` hold slot 0.
+        unsafe {
+            frame
+                .cast::<u8>()
+                .add(crate::async_frame::async_frame_slot_offset(0))
+                .cast()
+        }
+    }
+
+    fn boundary_budget_state(frame: *mut c_void) -> *mut BoundaryBudget {
+        // SAFETY: slot 0 was written before the task was spawned.
+        unsafe { *boundary_budget_slot(frame) }
+    }
+
     unsafe extern "C" fn boundary_budget_helper(frame: *mut c_void) -> i32 {
-        let state = frame.cast::<BoundaryBudget>();
+        let state = boundary_budget_state(frame);
         let (counter, stop) = crate::generated_context::published_sync_gates();
         assert_eq!(counter, crate::preempt::willow_sync_poll_counter());
         assert_eq!(stop, crate::gc::willow_gc_stop_flag());
@@ -1094,7 +1119,7 @@ mod tests {
 
     unsafe extern "C" fn boundary_budget_cooperative_poll(frame: *mut c_void) -> i32 {
         use crate::scheduler::{willow_task_stack_enter, willow_task_stack_leave};
-        let state = frame.cast::<BoundaryBudget>();
+        let state = boundary_budget_state(frame);
         // Keep the real cooperative task/ABI boundary but use deterministic,
         // per-test configuration instead of changing process-global env.
         let config = PreemptConfig::from_env_values(
@@ -1175,7 +1200,7 @@ mod tests {
             let id = (unsafe {
                 willow_sched_spawn_cooperative(
                     boundary_budget_cooperative_poll,
-                    std::ptr::from_mut(&mut state).cast(),
+                    boundary_budget_frame(&mut state),
                 )
             }) as u64;
             willow_sched_run_until(id);

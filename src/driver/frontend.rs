@@ -200,7 +200,10 @@ pub(crate) fn run_frontend_revision_cached(
     }
     let emit_assumptions = !inputs.capture_analysis;
     let review_diagnostics = super::foreign_review::apply(
-        std::iter::once(&mut program).chain(graph.files.iter_mut().map(|f| &mut f.program)),
+        std::iter::once(("", &mut program)).chain(graph.files.iter_mut().map(|f| {
+            let namespace = f.symbol_namespace.as_deref().unwrap_or(&f.canonical_path);
+            (namespace, &mut f.program)
+        })),
         &mut inputs,
     )?;
     emit_frontend_diagnostics(

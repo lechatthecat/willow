@@ -704,14 +704,6 @@ fn sorted_map_operation_counts_are_logarithmic() {
             "        while node >= 0 {\n            self.steps = self.steps + 1;\n            let current = self.node_keys[node];",
         )
         .replace(
-            "    fn insert_at(node: i64, key: K, value: V) -> i64 where K: i64 | f64 | String {",
-            "    fn insert_at(node: i64, key: K, value: V) -> i64 where K: i64 | f64 | String {\n        self.steps = self.steps + 1;",
-        )
-        .replace(
-            "    fn remove_at(node: i64, key: K) -> i64 where K: i64 | f64 | String {",
-            "    fn remove_at(node: i64, key: K) -> i64 where K: i64 | f64 | String {\n        self.steps = self.steps + 1;",
-        )
-        .replace(
             "            while node != last {",
             "            while node != last {\n                self.steps = self.steps + 1;",
         )
@@ -719,6 +711,13 @@ fn sorted_map_operation_counts_are_logarithmic() {
             "while self.left[successor] >= 0 { successor = self.left[successor]; }",
             "while self.left[successor] >= 0 { self.steps = self.steps + 1; successor = self.left[successor]; }",
         );
+    // Count every recursive insert/remove step, whatever key bound the
+    // declarations spell.
+    for header in ["    fn insert_at(", "    fn remove_at("] {
+        let start = source.find(header).expect(header);
+        let open = start + source[start..].find("{\n").expect("body") + 1;
+        source.insert_str(open, "\n        self.steps = self.steps + 1;");
+    }
     assert_eq!(source.matches("self.steps = self.steps + 1").count(), 5);
     source.push_str(
         r#"
