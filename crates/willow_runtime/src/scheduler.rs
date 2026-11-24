@@ -4156,6 +4156,10 @@ fn release_quiescent_frame_roots_in(
     }
     let bound = retirements.reclaim.release_bound();
     let frames = retirements.take_quiescent_frames(bound, &components.frame_roots);
+    #[cfg(test)]
+    retirements
+        .released_below
+        .fetch_max(bound, Ordering::SeqCst);
     for retired in frames {
         crate::gc::remove_runtime_root_in(owner, retired.frame as *mut u8);
         owner.frame_lifetime.record_with_sweep(

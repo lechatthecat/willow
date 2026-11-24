@@ -40,6 +40,11 @@ pub(super) struct TerminalRetirements {
     /// nothing is pending.
     pub(super) cleanups_pending: AtomicBool,
     pub(super) frame_release_due: AtomicBool,
+    /// Test-only: the highest bound a finished release scan used. No frame
+    /// tagged below it can be queued afterwards: its tag was taken under its
+    /// shard's lock before that scan read the epoch, so the scan popped it.
+    #[cfg(test)]
+    pub(super) released_below: std::sync::atomic::AtomicU64,
 }
 
 impl TerminalRetirements {
@@ -57,6 +62,8 @@ impl TerminalRetirements {
             cleanups: Mutex::new(Vec::new()),
             cleanups_pending: AtomicBool::new(false),
             frame_release_due: AtomicBool::new(false),
+            #[cfg(test)]
+            released_below: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -166,6 +173,15 @@ impl TerminalRetirements {
             .collect();
         tags.sort_unstable();
         tags
+    }
+
+    /// Lowest tag still queued in any shard.
+    #[cfg(test)]
+    pub(super) fn min_retired_tag(&self) -> Option<u64> {
+        self.shards
+            .iter()
+            .filter_map(|shard| Self::lock(shard).frames.front().map(|retired| retired.tag))
+            .min()
     }
 
     #[cfg(test)]
