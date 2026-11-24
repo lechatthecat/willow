@@ -637,7 +637,17 @@ impl RunQueues {
                     .local_pushes
                     .fetch_add(1, Ordering::Relaxed);
             }
-            None => self.push_global(id),
+            // A drive can run more workers than this scheduler has local
+            // queues (pinned stacks raise the pool size). Such an owner takes
+            // the task from the shared queue, so it must be woken by index: the
+            // generic backlog notification is suppressed for a single task
+            // inside a run, which would leave the owner parked while every
+            // other worker keeps rerouting the task.
+            None => {
+                self.publish_global_batch(std::slice::from_ref(&id), false);
+                self.observation.owner_notification();
+                self.parking.notify_worker(owner);
+            }
         }
     }
 
