@@ -3129,15 +3129,17 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             (count * (GC_HEADER_SIZE + 8)) as i64
         );
         // Initial stopped retirement, final accounting and the allocated-byte
-        // snapshot remain linear in the mutator/TLAB count. Each remark stop
-        // reads every record once; with many mutators a retry-capped remark
-        // completes as a recovery stop instead, so both kinds count.
+        // snapshot remain linear in the mutator/TLAB count. Each closure stop
+        // reads every record at most once: a remark that exceeds its
+        // wall-clock budget yields before its accounting pass, and a
+        // retry-capped remark completes as a recovery stop instead, so the
+        // per-stop reads are only bounded.
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        let remarks = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
-        let expected_reads = (2 + remarks) * count;
-        assert_eq!(
-            runtime().heap.lock().unwrap().tlab_accounting_observation,
-            expected_reads
+        let closures = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
+        let reads = runtime().heap.lock().unwrap().tlab_accounting_observation;
+        assert!(
+            (2 * count..=(2 + closures) * count).contains(&reads),
+            "mutators={count} closure_stops={closures} accounting_record_reads={reads}"
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[0].requests,
@@ -3172,7 +3174,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
             "root_handshake mutators={count} accounting_record_reads={} initial_stops=1",
-            expected_reads
+            reads
         );
     }
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
