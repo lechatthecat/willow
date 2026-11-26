@@ -49,8 +49,7 @@ unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             *ORIGINAL_THREAD.lock().unwrap() = Some(std::thread::current().id());
             assert_eq!(current_worker(), 1);
             let name = b"migrating_helper";
-            // SAFETY: The absent name is accepted and any nonempty byte range remains
-            // readable through the copy.
+            // SAFETY: The absent name is accepted and the name is a process-lifetime literal.
             unsafe {
                 crate::stack_trace::willow_callstack_push(
                     name.as_ptr(),

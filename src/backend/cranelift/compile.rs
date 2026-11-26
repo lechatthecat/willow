@@ -580,6 +580,10 @@ impl UnitCodegenContext<'_> {
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
+        }
+        // Function and method names label call-trace frames, which a release
+        // build with debug info keeps.
+        if self.call_trace {
             self.declare_reference_debug_strings(program)?;
         }
 
@@ -1191,6 +1195,10 @@ impl UnitCodegenContext<'_> {
             for name in collect_nil_check_names(program) {
                 self.declare_string_literal(&name)?;
             }
+        }
+        // Function and method names label call-trace frames, which a release
+        // build with debug info keeps.
+        if self.call_trace {
             self.declare_reference_debug_strings(program)?;
         }
 

@@ -602,6 +602,10 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
             }
             if !record.call_stack.is_empty() {
                 eprintln!("{}", record.call_stack);
+            } else if file.is_empty() {
+                // Only a release build without debug info reports a fault
+                // with neither a location nor a call stack.
+                eprintln!("{MISSING_LOCATION_NOTE}");
             }
         }
     }
@@ -611,6 +615,9 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
     crate::gc_telemetry::flush_observations();
     crate::exit::terminate_without_teardown(crate::exit::PANIC_EXIT_CODE);
 }
+
+/// Printed under a panic that has neither a source location nor a call stack.
+pub(crate) const MISSING_LOCATION_NOTE: &str = "note: this release build records no location for runtime faults; rebuild with `--release --debug-info` to see where the panic happened and its call stack";
 
 /// # Safety
 /// `info` must be a live `PanicInfo` allocated by this module. Its message

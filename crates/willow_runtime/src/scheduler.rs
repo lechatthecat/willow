@@ -3601,6 +3601,10 @@ pub fn async_chain_text() -> String {
                 .or(task.name())
                 .unwrap_or("<async task>");
             let location = match published_site {
+                Some(site) if crate::stack_trace::async_trace_calls(id) => format!(
+                    "{} (in a call made here)",
+                    crate::stack_trace::ExecutionSite::Published(site).location_text()
+                ),
                 Some(site) => crate::stack_trace::ExecutionSite::Published(site).location_text(),
                 None => task
                     .execution_site()

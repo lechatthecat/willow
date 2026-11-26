@@ -1855,8 +1855,7 @@ mod tests {
 
     unsafe extern "C" fn trace_poll(_: *mut c_void) -> i32 {
         let name = b"native_helper";
-        // SAFETY: The absent name is accepted and any nonempty byte range remains readable
-        // through the copy.
+        // SAFETY: The absent name is accepted and the name is a process-lifetime literal.
         unsafe {
             crate::stack_trace::willow_callstack_push(
                 name.as_ptr(),

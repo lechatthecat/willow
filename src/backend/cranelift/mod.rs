@@ -155,6 +155,9 @@ pub struct BuildCodegenDb {
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
     build_mode: BuildMode,
+    /// Source call frames and statement sites for panic stacks: debug builds
+    /// and release builds with `--debug-info`.
+    call_trace: bool,
     enum_infos: TypeMap<'static, EnumInfo>,
     class_descriptor_ids: TypeMap<'static, DataId>,
     lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
@@ -216,6 +219,9 @@ pub struct UnitCodegenContext<'a> {
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
     build_mode: BuildMode,
+    /// Source call frames and statement sites for panic stacks: debug builds
+    /// and release builds with `--debug-info`.
+    call_trace: bool,
     enum_infos: TypeMap<'a, EnumInfo>,
     class_descriptor_ids: TypeMap<'a, DataId>,
     lir_queries: Option<std::rc::Rc<crate::compiler_db::lir::LirQueries>>,
@@ -420,6 +426,8 @@ impl Codegen {
                 body_queries: None,
                 layout_queries: layouts,
                 build_mode: opts.target.build_mode,
+                call_trace: opts.target.build_mode == BuildMode::Debug
+                    || opts.target.emit_debug_info,
                 enum_infos: TypeMap::with_scope(type_scope.clone()),
                 class_descriptor_ids: TypeMap::with_scope(type_scope.clone()),
                 lir_queries: None,
@@ -1567,8 +1575,10 @@ struct FunctionDiagnostics<'a> {
     /// an awaited cancelled task) still records `file:line:column` in its
     /// `PanicInfo`.
     fault_site_span: Option<crate::diagnostics::Span>,
-    /// Build mode for source locations, call stacks, and debug instrumentation.
+    /// Build mode for debug checks and instrumentation.
     build_mode: BuildMode,
+    /// Publish source call frames and statement sites (see `Codegen`).
+    call_trace: bool,
     /// Source file path used in runtime diagnostics.
     source_file: &'a str,
     /// Source-level owner of diagnostic locations (including class qualification).
@@ -1791,6 +1801,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 build_mode: unit.build_mode,
+                call_trace: unit.call_trace,
                 source_file: &unit.source_file,
                 diagnostic_function: String::new(),
                 diagnostic_async: false,

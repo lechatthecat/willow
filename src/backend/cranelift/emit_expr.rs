@@ -552,7 +552,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     fn emit_caller_frame(&mut self, span: crate::diagnostics::Span, runtime: &str) -> bool {
-        if self.diagnostics.build_mode != BuildMode::Debug {
+        if !self.diagnostics.call_trace {
             return false;
         }
         let Some((name_ptr, name_len)) =

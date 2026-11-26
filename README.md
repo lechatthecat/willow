@@ -92,6 +92,7 @@ A few things to notice:
 - **`async fn` returns a Task.** Calling one creates the Task; `await` waits for its result.
 - **`i64` overflow is not silent in debug builds.** It raises a recoverable panic; `--release` wraps. Methods such as `wrapping_add` and `checked_add` behave the same in both modes.
 - **An unhandled panic ends the program with exit status 101** on Linux, macOS and Windows, after its defers run. It does not abort, so no core dump or crash reporter is involved. `main` returning `Err` exits with 1; only runtime integrity failures abort.
+- **Panic locations depend on the build.** A debug build reports where a runtime fault happened and its call stack. A `--release` build does not record a location for faults such as an out-of-bounds index; it prints a note instead, and an async frame that stopped inside a call is marked `(in a call made here)`. `--release --debug-info` keeps release optimizations and adds the location and call stack, at the cost of recording each call.
 
 | Area | What is available | Examples |
 | --- | --- | --- |

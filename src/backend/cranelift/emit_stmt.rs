@@ -1329,8 +1329,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.emit_stack_helper();
         }
         if self.diagnostics.diagnostic_function.is_empty()
-            || (self.diagnostics.build_mode != BuildMode::Debug
-                && !self.diagnostics.diagnostic_async)
+            || (!self.diagnostics.call_trace && !self.diagnostics.diagnostic_async)
         {
             return;
         }
@@ -1350,7 +1349,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let asynchronous = self.builder.ins().iconst(
             types::I32,
             i64::from(self.diagnostics.diagnostic_async)
-                | (i64::from(self.diagnostics.build_mode == BuildMode::Debug) << 1)
+                | (i64::from(self.diagnostics.call_trace) << 1)
                 | (i64::from(enters_willow) << 2),
         );
         self.emit_void_runtime_call(

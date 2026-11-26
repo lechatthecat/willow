@@ -40,7 +40,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     pub(super) fn flat_method_frame_enabled(&self, method: &str) -> bool {
-        self.diagnostics.build_mode == BuildMode::Debug
+        self.diagnostics.call_trace
             && self.string_literals.contains_key(method)
             && self
                 .string_literals

@@ -1724,7 +1724,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         task_id: cranelift_codegen::ir::Value,
         line: usize,
     ) {
-        if self.diagnostics.build_mode != super::BuildMode::Debug {
+        if !self.diagnostics.call_trace {
             return;
         }
         let source_file = self.diagnostics.source_file.to_string();

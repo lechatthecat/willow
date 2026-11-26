@@ -98,9 +98,19 @@ unsafe fn static_bytes(ptr: *const u8, len: i64) -> &'static [u8] {
     unsafe { std::slice::from_raw_parts(ptr, len as usize) }
 }
 
+/// A suspended caller on the call-trace stack. It borrows the generated
+/// program's static name and path bytes, so pushing a frame on every call
+/// neither allocates nor copies; text is materialized only when rendered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CallFrame {
+    site: TraceSite,
+    /// A prepared method call is hidden until its arguments have completed.
+    active: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeStackTrace {
-    frames: Vec<RuntimeFrame>,
+    frames: Vec<CallFrame>,
     /// Debug-build leaf: the executing function and its current statement.
     current: Option<TraceSite>,
     current_async: bool,
@@ -119,6 +129,9 @@ struct AsyncTaskTrace {
     task: crate::task::RuntimeTaskId,
     name: Option<&'static [u8]>,
     site: Option<TraceSite>,
+    /// `site` is a release call into another Willow function, which publishes
+    /// no site of its own, so a fault reported here may lie inside that call.
+    calling: bool,
 }
 
 thread_local! {
@@ -133,6 +146,7 @@ fn update_async_trace(task: crate::task::RuntimeTaskId, update: impl FnOnce(&mut
                 task,
                 name: None,
                 site: None,
+                calling: false,
             },
         };
         update(&mut trace);
@@ -151,6 +165,12 @@ pub(crate) unsafe fn tag_async_task(task: crate::task::RuntimeTaskId, name: *con
     update_async_trace(task, |trace| trace.name = Some(name));
 }
 
+/// Whether the site `task` last published on this thread is a release call
+/// whose callee published no site of its own.
+pub(crate) fn async_trace_calls(task: crate::task::RuntimeTaskId) -> bool {
+    matches!(ASYNC_TRACE.with(Cell::get), Some(trace) if trace.task == task && trace.calling)
+}
+
 /// The name and site `task` last published on this thread.
 pub(crate) fn async_trace_of(
     task: crate::task::RuntimeTaskId,
@@ -162,21 +182,42 @@ pub(crate) fn async_trace_of(
 }
 
 impl RuntimeStackTrace {
-    pub fn push(&mut self, frame: RuntimeFrame) {
-        self.frames.push(frame);
+    fn push(&mut self, site: TraceSite) {
+        self.frames.push(CallFrame { site, active: true });
     }
 
-    pub fn pop(&mut self) -> Option<RuntimeFrame> {
+    fn pop(&mut self) -> Option<CallFrame> {
         self.frames.pop()
     }
 
-    pub fn frames(&self) -> &[RuntimeFrame] {
-        &self.frames
+    /// Active frames, most recent call first, as `(function, file, line, col)`.
+    fn active_frames(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            std::borrow::Cow<'static, str>,
+            std::borrow::Cow<'static, str>,
+            usize,
+            usize,
+        ),
+    > + '_ {
+        self.frames
+            .iter()
+            .rev()
+            .filter(|frame| frame.active)
+            .map(|frame| {
+                (
+                    frame.site.function_name(),
+                    frame.site.file_name(),
+                    frame.site.line,
+                    frame.site.col,
+                )
+            })
     }
 }
 
 thread_local! {
-    /// Per-thread call stack maintained by debug builds: the compiler emits a
+    /// Per-thread call stack maintained by debug and `--debug-info` builds: the compiler emits a
     /// `willow_callstack_push` with the caller name/location before each call and a matching
     /// `willow_callstack_pop` after it returns. When a call never returns (it
     /// panics/aborts), its frames remain on the stack and the panic handlers
@@ -198,32 +239,21 @@ pub(crate) fn snapshot_current() -> RuntimeStackTrace {
 pub(crate) fn current_call_site() -> Option<(String, u32)> {
     CALL_STACK.with(|slot| {
         slot.borrow()
-            .frames()
+            .frames
             .last()
-            .map(|frame| (frame.file.clone(), frame.line as u32))
+            .map(|frame| (frame.site.file_name().into_owned(), frame.site.line as u32))
     })
 }
 
-/// Read `len` raw UTF-8 bytes at `ptr` into an owned (Rust-heap) String. Used
-/// for call-frame names/paths so the call stack never allocates on the Willow
-/// GC heap (which would pollute `gc_allocated_bytes`).
-unsafe fn raw_str(ptr: *const u8, len: i64) -> String {
-    if ptr.is_null() || len <= 0 {
-        return String::new();
-    }
-    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
-    let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-    String::from_utf8_lossy(bytes).into_owned()
-}
-
 /// Push a call frame. `function`/`file` are pointers to raw static UTF-8 bytes
-/// (NOT WillowStrings) with explicit lengths, copied onto the Rust heap so the
-/// debug call stack does not allocate on the Willow GC heap.
+/// (NOT WillowStrings) with explicit lengths. The frame keeps the pointers, so
+/// a call costs no allocation on either heap.
 /// Each frame names the caller and a location inside that caller.
 ///
 /// # Safety
-/// For each non-null pointer with a positive length, its allocation must contain that many
-/// initialized, readable bytes, immutable through the synchronous copy.
+/// For each non-null pointer with a positive length, provide that many initialized immutable
+/// bytes in a single allocation at a stable address for the lifetime of the process.
+/// Diagnostics retain the address.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_callstack_push(
@@ -234,26 +264,24 @@ pub unsafe extern "C" fn willow_callstack_push(
     line: i32,
     col: i32,
 ) {
-    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
-    let function = unsafe { raw_str(function, function_len) };
-    // SAFETY: The caller supplies len readable bytes for each non-null string through this call.
-    let file = unsafe { raw_str(file, file_len) };
-    CALL_STACK.with(|s| {
-        s.borrow_mut().push(RuntimeFrame {
+    // SAFETY: Generated code passes its static string data (see the ABI doc above).
+    let site = unsafe {
+        TraceSite::from_static(
             function,
+            function_len,
             file,
-            line: line as usize,
-            col: col as usize,
-            active: true,
-        });
-    });
+            file_len,
+            i64::from(line),
+            i64::from(col),
+        )
+    };
+    CALL_STACK.with(|s| s.borrow_mut().push(site));
 }
 
 /// Reserve a balanced shadow-stack slot without claiming the call has started.
 ///
 /// # Safety
-/// For each non-null pointer with a positive length, its allocation must contain that many
-/// initialized, readable bytes, immutable through the synchronous copy.
+/// See [`willow_callstack_push`]: both byte ranges must live for the process.
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_callstack_push_pending(
@@ -264,8 +292,7 @@ pub unsafe extern "C" fn willow_callstack_push_pending(
     line: i32,
     col: i32,
 ) {
-    // SAFETY: The caller lends both byte ranges through the immediate copy into the pending
-    // frame.
+    // SAFETY: The caller provides process-lifetime byte ranges, as the push requires.
     unsafe { willow_callstack_push(function, function_len, file, file_len, line, col) };
     CALL_STACK.with(|slot| slot.borrow_mut().frames.last_mut().unwrap().active = false);
 }
@@ -319,7 +346,8 @@ pub unsafe extern "C" fn willow_trace_site_set(
     }
     // SAFETY: generated code passes its static string data (see the ABI doc).
     let site = unsafe { TraceSite::from_static(function, function_len, file, file_len, line, col) };
-    if flags & 4 != 0 && !debug {
+    let calling = flags & 4 != 0 && !debug;
+    if calling {
         crate::panic_context::willow_fault_site_clear();
     } else {
         crate::panic_context::set_static_fault_site(site);
@@ -330,7 +358,10 @@ pub unsafe extern "C" fn willow_trace_site_set(
         None
     };
     if let Some(task) = task {
-        update_async_trace(task, |trace| trace.site = Some(site));
+        update_async_trace(task, |trace| {
+            trace.site = Some(site);
+            trace.calling = calling;
+        });
     }
     CALL_STACK.with(|slot| {
         let mut trace = slot.borrow_mut();
@@ -354,7 +385,10 @@ pub(crate) fn panic_call_stack_text(file: &str, line: usize, col: usize) -> Stri
             let function = current.function_name().into_owned();
             if let Some(task) = crate::scheduler::current_task() {
                 // The explicit location supersedes the last published site.
-                update_async_trace(task, |trace| trace.site = None);
+                update_async_trace(task, |trace| {
+                    trace.site = None;
+                    trace.calling = false;
+                });
             }
             crate::scheduler::set_current_execution_site(RuntimeFrame {
                 function,
@@ -377,22 +411,8 @@ pub(crate) fn panic_call_stack_text(file: &str, line: usize, col: usize) -> Stri
             "\n  0: {} at {leaf_file}:{leaf_line}:{leaf_col}",
             current.function_name()
         );
-        for (i, frame) in trace
-            .frames
-            .iter()
-            .rev()
-            .filter(|frame| frame.active)
-            .enumerate()
-        {
-            let _ = write!(
-                out,
-                "\n  {}: {} at {}:{}:{}",
-                i + 1,
-                frame.function,
-                frame.file,
-                frame.line,
-                frame.col
-            );
+        for (i, (function, file, line, col)) in trace.active_frames().enumerate() {
+            let _ = write!(out, "\n  {}: {function} at {file}:{line}:{col}", i + 1);
         }
         out
     })
@@ -412,16 +432,14 @@ pub extern "C" fn willow_callstack_pop() {
 pub fn current_call_stack_text() -> String {
     CALL_STACK.with(|s| {
         let trace = s.borrow();
-        let frames = trace.frames();
-        if !frames.iter().any(|frame| frame.active) {
+        let mut frames = trace.active_frames().peekable();
+        if frames.peek().is_none() {
             return String::new();
         }
+        use std::fmt::Write;
         let mut out = String::from("call stack (most recent call first):");
-        for (i, frame) in frames.iter().rev().filter(|frame| frame.active).enumerate() {
-            out.push_str(&format!(
-                "\n  {i}: {} at {}:{}:{}",
-                frame.function, frame.file, frame.line, frame.col
-            ));
+        for (i, (function, file, line, col)) in frames.enumerate() {
+            let _ = write!(out, "\n  {i}: {function} at {file}:{line}:{col}");
         }
         out
     })
@@ -442,9 +460,9 @@ mod tests {
     #[test]
     fn panic_frames_skip_unentered_calls_and_survive_stack_exchange() {
         let previous = replace_current(Default::default());
-        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        // SAFETY: Byte literals have process lifetime.
         unsafe { willow_callstack_push(b"main".as_ptr(), 4, b"main.wi".as_ptr(), 7, 8, 5) };
-        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        // SAFETY: Byte literals have process lifetime.
         unsafe {
             willow_callstack_push_pending(b"helper".as_ptr(), 6, b"helper.wi".as_ptr(), 9, 3, 5)
         };
@@ -530,12 +548,29 @@ mod tests {
             assert_eq!(current_fault_site(), (String::new(), 0, 0));
             let site = async_trace_of(41).1.expect("task site kept");
             assert_eq!((site.line(), site.col()), (8, 5));
+            assert!(async_trace_calls(41), "release call site is labelled");
             // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
             // and the supplied lengths fit those literals.
             unsafe {
                 willow_trace_site_set(b"caller".as_ptr(), 6, b"d.wi".as_ptr(), 4, 9, 2, 1 | 2 | 4)
             };
             assert_eq!(current_fault_site(), ("d.wi".to_string(), 9, 2));
+            assert!(
+                !async_trace_calls(41),
+                "traced callees publish their own sites"
+            );
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe {
+                willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 8, 5, 1 | 4)
+            };
+            // SAFETY: The nonempty diagnostic names are byte literals with process lifetime
+            // and the supplied lengths fit those literals.
+            unsafe { willow_trace_site_set(b"caller".as_ptr(), 6, b"a.wi".as_ptr(), 4, 9, 1, 1) };
+            assert!(
+                !async_trace_calls(41),
+                "a later plain site clears the label"
+            );
         });
         assert_eq!(current_fault_site(), (String::new(), 0, 0));
         replace_current(previous);
@@ -574,9 +609,9 @@ mod tests {
     fn current_call_site_tracks_innermost_frame_and_empty_stack() {
         let previous = replace_current(Default::default());
         assert_eq!(current_call_site(), None);
-        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        // SAFETY: Byte literals have process lifetime.
         unsafe { willow_callstack_push(b"outer".as_ptr(), 5, b"outer.wi".as_ptr(), 8, 12, 1) };
-        // SAFETY: The source strings cover their byte counts through the synchronous copy.
+        // SAFETY: Byte literals have process lifetime.
         unsafe { willow_callstack_push(b"inner".as_ptr(), 5, b"inner.wi".as_ptr(), 8, 34, 1) };
         let inner = current_call_site();
         willow_callstack_pop();
@@ -592,22 +627,22 @@ mod tests {
     #[test]
     fn stack_trace_records_source_frames() {
         let mut trace = RuntimeStackTrace::default();
-        trace.push(RuntimeFrame {
-            function: "main".to_string(),
-            file: "main.wi".to_string(),
-            line: 3,
-            col: 5,
-            active: true,
-        });
-        assert_eq!(trace.frames()[0].function, "main");
-        assert_eq!(trace.pop().unwrap().line, 3);
+        // SAFETY: Byte literals have process lifetime.
+        let site =
+            unsafe { TraceSite::from_static(b"main".as_ptr(), 4, b"main.wi".as_ptr(), 7, 3, 5) };
+        trace.push(site);
+        let frame = trace.active_frames().next().expect("frame");
+        assert_eq!(
+            (frame.0.as_ref(), frame.1.as_ref(), frame.2, frame.3),
+            ("main", "main.wi", 3, 5)
+        );
+        assert_eq!(trace.pop().unwrap().site.line, 3);
     }
 
     #[test]
     fn callstack_text_orders_most_recent_first() {
-        fn push(name: &str, file: &str, line: i32, col: i32) {
-            // SAFETY: The source strings cover their byte counts through the synchronous
-            // copy.
+        fn push(name: &'static str, file: &'static str, line: i32, col: i32) {
+            // SAFETY: Both strings have process lifetime.
             unsafe {
                 willow_callstack_push(
                     name.as_ptr(),

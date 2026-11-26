@@ -1715,7 +1715,7 @@ fn cooperative_spawn_publishes_call_site_before_first_poll() {
     let _guard = isolated_runtime();
     reset_global_scheduler_for_test();
     let previous = crate::stack_trace::replace_current(Default::default());
-    // SAFETY: The source strings cover their byte counts through the synchronous copy.
+    // SAFETY: Byte literals have process lifetime.
     unsafe {
         crate::stack_trace::willow_callstack_push(
             b"child".as_ptr(),
