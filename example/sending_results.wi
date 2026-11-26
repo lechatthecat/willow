@@ -1,0 +1,41 @@
+// `@sending` marks a function whose result the caller owns outright, so the
+// result (or a payload matched out of it) can be sent to another task.
+// A `@sending` parameter is consumed: the caller cannot use it afterwards.
+import std::collections::Array;
+
+class Gradients {
+    pub values: Array<f64>;
+    pub steps: i64;
+}
+
+@sending fn compute(steps: i64) -> Result<Gradients, String> {
+    if steps < 0 { return Err("negative steps"); }
+    let values: Array<f64> = [];
+    for i in 0..steps { values.push(1.0); }
+    return Ok(new Gradients(values, steps));
+}
+
+fn publish(@sending batch: Array<i64>, out: Channel<Array<i64>>) {
+    out.send(batch);
+}
+
+async fn worker(out: Channel<Gradients>) {
+    match compute(3) {
+        Ok(g) => { out.send(g); }
+        Err(_) => { out.close(); }
+    }
+}
+
+async fn main() {
+    let results: Channel<Gradients> = Channel::new();
+    let task = worker(results);
+    let g = results.recv();
+    println(g.steps);
+    println(g.values.len());
+    await task;
+
+    let batches: Channel<Array<i64>> = Channel::new();
+    let batch = [4, 5];
+    publish(batch, batches);
+    println(batches.recv()[1]);
+}

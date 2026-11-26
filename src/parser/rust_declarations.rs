@@ -227,6 +227,7 @@ impl Parser {
                         name: "handle".into(),
                         ty: Type::Named(name),
                         mode: ParamMode::Value,
+                        sending: false,
                         span,
                         type_span: span,
                     }],
@@ -263,6 +264,7 @@ impl Parser {
             let mut inputs = Vec::new();
             while !self.check(TokenKind::RParen) && !self.at_eof() {
                 let param = self.parse_param()?;
+                self.reject_sending(&[], std::slice::from_ref(&param), "extern declarations")?;
                 let ty = Scalar::from_type_with_records(
                     &param.ty,
                     &self.rust_opaque_names,

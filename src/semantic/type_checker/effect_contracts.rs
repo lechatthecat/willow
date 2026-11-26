@@ -972,6 +972,8 @@ impl TypeChecker {
             let index = match contract.kind {
                 EffectContractKind::Pure => 3,
                 EffectContractKind::Verified => 4,
+                // Ownership contract: checked by the transfer analysis.
+                EffectContractKind::Sending => continue,
                 EffectContractKind::NoWait => 0,
                 EffectContractKind::NoBlock => 1,
                 EffectContractKind::NoSuspend => 2,
@@ -1117,7 +1119,9 @@ impl TypeChecker {
         declarations.retain(|(_, c)| {
             !matches!(
                 c.kind,
-                EffectContractKind::Pure | EffectContractKind::Verified
+                EffectContractKind::Pure
+                    | EffectContractKind::Verified
+                    | EffectContractKind::Sending
             )
         });
         let (graph, contract_facts) = self.solve_contracts(

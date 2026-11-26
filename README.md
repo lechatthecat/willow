@@ -310,6 +310,25 @@ result and locals live across `await` are `Send`. After a value is sent on a
 channel (whose item type must be `Send`, E2403) or placed in a `Mutex`, its
 previous aliases cannot be used (E2408).
 
+Parameters, fields, globals and call results are borrowed, so they cannot be
+sent or locked away. Ownership crosses a call only through `@sending`
+([`sending_results.wi`](example/sending_results.wi)). Here `make` and
+`publish` are the declared functions:
+
+- **`@sending fn make() -> T`**: the caller owns the result. That includes a
+  payload matched out of an `Ok`, `Some` or `?` result. The compiler checks
+  that every `return` in `make` yields a value no parameter, field or escaped
+  alias can still reach.
+- **`fn publish(@sending x: T)`**: `publish` consumes `x`. It owns `x` and may
+  send it. The caller cannot use `x` or its aliases afterwards.
+
+`@sending` is accepted only on non-generic top-level functions and their
+parameters. Methods, constructors, interface methods, generic and extern
+functions are rejected, because overriding, dispatch or substitution would hide
+the contract. A function value such as `let f: fn() -> T = make` does not
+keep the contract. Neither does a Task stored before it is awaited: `let t =
+make_async(); await t`. Only `await make_async()` yields an owned result.
+
 `Send` and `Sync` are inferred structurally; user code cannot implement them
 (E2401):
 

@@ -354,6 +354,9 @@ pub enum EffectContractKind {
     /// A compiler-only body constraint, checked separately from waiting effects.
     Pure,
     Verified,
+    /// `@sending`: every returned value is fresh and unaliased, so the caller
+    /// receives exclusive ownership (checked in the callee body).
+    Sending,
     NoWait,
     NoBlock,
     NoSuspend,
@@ -367,6 +370,7 @@ impl EffectContractKind {
         match self {
             Self::Pure => "pure",
             Self::Verified => "verified",
+            Self::Sending => "sending",
             Self::NoWait => "no_wait",
             Self::NoBlock => "no_block",
             Self::NoSuspend => "no_suspend",
@@ -379,7 +383,7 @@ impl EffectContractKind {
     pub fn forbidden(self) -> willow_abi::RuntimeEffects {
         use willow_abi::RuntimeEffects as E;
         match self {
-            Self::Pure | Self::Verified => E::NONE,
+            Self::Pure | Self::Verified | Self::Sending => E::NONE,
             Self::NoWait => E::MAY_BLOCK.union(E::MAY_SUSPEND),
             Self::NoBlock => E::MAY_BLOCK,
             Self::NoSuspend => E::MAY_SUSPEND,
@@ -625,6 +629,10 @@ pub struct Param {
     pub name: String,
     pub ty: Type,
     pub mode: ParamMode,
+    /// `@sending name: T`: the caller transfers exclusive ownership of the
+    /// argument, and the callee body may treat it as a fresh local.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sending: bool,
     pub span: Span,
     pub type_span: Span,
 }

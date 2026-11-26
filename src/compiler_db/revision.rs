@@ -901,13 +901,13 @@ mod tests {
             let f = Fixture::new();
             for i in 0..count {
                 f.write(
-                    &format!("u{i}.wi"),
+                    &format!("unit{i}.wi"),
                     "pub fn f(n: i64) -> i64 { return 10 / n; } pub fn g(n: i64) -> i64 { return f(n) + 1; }",
                 );
             }
-            let imports: String = (0..count).map(|i| format!("import u{i};\n")).collect();
+            let imports: String = (0..count).map(|i| format!("import unit{i};\n")).collect();
             let calls: String = (0..count)
-                .map(|i| format!("println(u{i}::g({}));", i + 1))
+                .map(|i| format!("println(unit{i}::g({}));", i + 1))
                 .collect();
             let source = format!(
                 "{imports}fn div(n: i64) -> i64 {{ return 100 / n; }} fn main() {{ println(div(4)); {calls} }}"

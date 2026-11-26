@@ -174,13 +174,15 @@ impl Parser {
         while self.eat(TokenKind::At) {
             let start = self.previous_span();
             let attribute = self.expect_ident()?;
-            if attribute == "pure" || attribute == "verified" {
+            let simple = match attribute.as_str() {
+                "pure" => Some(EffectContractKind::Pure),
+                "verified" => Some(EffectContractKind::Verified),
+                "sending" => Some(EffectContractKind::Sending),
+                _ => None,
+            };
+            if let Some(kind) = simple {
                 contracts.push(EffectContract {
-                    kind: if attribute == "pure" {
-                        EffectContractKind::Pure
-                    } else {
-                        EffectContractKind::Verified
-                    },
+                    kind,
                     span: start.to(self.previous_span()),
                 });
                 continue;
@@ -188,7 +190,7 @@ impl Parser {
             if attribute != "effects" {
                 return Err(self.err(
                     ErrorCode::E0102,
-                    "unknown declaration attribute; expected `effects`, `pure`, or `verified`",
+                    "unknown declaration attribute; expected `effects`, `pure`, `sending`, or `verified`",
                 ));
             }
             self.expect(TokenKind::LParen)?;
@@ -228,6 +230,36 @@ impl Parser {
         Ok(contracts)
     }
 
+    /// `@sending` is a checked ownership contract on concrete top-level
+    /// functions. Methods can be overridden or dispatched through interfaces,
+    /// and generic bodies are checked before their element types are known,
+    /// so neither can carry it soundly yet.
+    pub(super) fn reject_sending(
+        &self,
+        contracts: &[EffectContract],
+        params: &[Param],
+        place: &str,
+    ) -> Result<(), Diagnostic> {
+        let span = contracts
+            .iter()
+            .find(|c| c.kind == EffectContractKind::Sending)
+            .map(|c| c.span)
+            .or_else(|| params.iter().find(|p| p.sending).map(|p| p.span));
+        match span {
+            Some(span) => Err(self
+                .err_at(
+                    ErrorCode::E0105,
+                    format!("`@sending` is not supported on {place}"),
+                    span,
+                )
+                .with_help(
+                    "declare `@sending` on a concrete top-level function or its parameters; \
+                     call such a function from this declaration instead",
+                )),
+            None => Ok(()),
+        }
+    }
+
     /// `Ok(None)`: the item was consumed but rejected, with its diagnostic
     /// already recorded in `recovered_errors` (see [`Self::parse_const`]).
     pub(super) fn parse_item(&mut self) -> Result<Option<Item>, Diagnostic> {
@@ -244,6 +276,9 @@ impl Parser {
             TokenKind::Fn => {
                 let mut function =
                     self.parse_fn(modifiers & (Modifiers::PUBLIC | Modifiers::ASYNC))?;
+                if !function.type_params.is_empty() {
+                    self.reject_sending(&contracts, &function.params, "generic functions")?;
+                }
                 function.effect_contracts = contracts;
                 Ok(Some(Item::Function(function)))
             }
@@ -408,11 +443,14 @@ impl Parser {
             match self.parse_member_head(&contracts)? {
                 MemberHead::Method(modifiers) => {
                     let mut method = self.parse_method(modifiers)?;
+                    self.reject_sending(&contracts, &method.params, "methods")?;
                     method.effect_contracts = contracts;
                     methods.push(method);
                 }
                 MemberHead::Constructor(modifiers) => {
-                    constructors.push(self.parse_constructor(modifiers)?)
+                    let constructor = self.parse_constructor(modifiers)?;
+                    self.reject_sending(&contracts, &constructor.params, "constructors")?;
+                    constructors.push(constructor)
                 }
                 MemberHead::Field(modifiers) => fields.push(self.parse_field(modifiers)?),
             }
@@ -531,6 +569,7 @@ impl Parser {
                 ));
             }
             let mut method = self.parse_interface_method()?;
+            self.reject_sending(&contracts, &method.params, "interface methods")?;
             method.effect_contracts = contracts;
             methods.push(method);
         }
@@ -952,6 +991,18 @@ impl Parser {
     }
 
     pub(super) fn parse_param(&mut self) -> Result<Param, Diagnostic> {
+        let sending = if self.eat(TokenKind::At) {
+            if self.expect_ident()? != "sending" {
+                return Err(self.err_at(
+                    ErrorCode::E0102,
+                    "unknown parameter attribute; expected `sending`",
+                    self.previous_span(),
+                ));
+            }
+            true
+        } else {
+            false
+        };
         let span = self.current_span();
         let name = self.expect_ident()?;
         self.expect(TokenKind::Colon)?;
@@ -981,6 +1032,7 @@ impl Parser {
             name,
             ty,
             mode,
+            sending,
             span,
             type_span,
         })

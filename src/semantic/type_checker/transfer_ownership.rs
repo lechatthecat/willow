@@ -57,6 +57,9 @@ struct OwnershipState {
     task_methods: HashMap<(String, String), (bool, bool)>,
     waits: Vec<(usize, usize)>,
     loan_errors: Vec<(Span, &'static str)>,
+    /// This body is a `@sending fn`: each returned value must be fresh.
+    sending_return: bool,
+    sending_returns: Vec<(usize, Span)>,
 }
 
 impl Graph {
@@ -220,6 +223,19 @@ impl TypeChecker {
         }
         let mut state = OwnershipState::default();
         state.graph.scopes.push(Vec::new());
+        if let AstEvent::Block(body) = root
+            && let Some((id, returns, params)) = &self.local.sending_body
+            && *id == body.id
+        {
+            state.sending_return = *returns;
+            // A `@sending` parameter was transferred by every caller, so the
+            // body owns it like a fresh local instead of borrowing it.
+            for name in params {
+                let id = state.graph.node(false);
+                state.graph.declarations.insert(id, 0);
+                state.graph.names.entry(name.clone()).or_default().push(id);
+            }
+        }
         let mut walk = AstWalk::new(root);
         while let Some(event) = walk.next() {
             state.graph.ticks += 1;
@@ -326,13 +342,47 @@ impl TypeChecker {
                 }
                 AstEvent::ExitStmt(Stmt::Return(ret)) => {
                     if let Some(value) = &ret.value {
-                        state.graph.escape(value);
+                        match state.graph.values.get(&value.id()).copied() {
+                            // The caller becomes the only owner: keep lock
+                            // and borrowed-argument checks, but judge the
+                            // component's own freshness after the walk.
+                            Some(id) if state.sending_return => {
+                                state.graph.escapes.push((id, value.span()));
+                                state.sending_returns.push((id, value.span()));
+                            }
+                            _ => state.graph.escape(value),
+                        }
                     }
                 }
                 _ => {}
             }
         }
         self.finish_transfer_ownership(&mut state);
+    }
+
+    /// A `@sending` function's caller owns its result exclusively, so every
+    /// returned root must be neither borrowed nor reachable through an escaped
+    /// alias. Lock-protected roots are reported once, as lock escapes.
+    fn report_sending_returns(&mut self, state: &mut OwnershipState) {
+        for (id, span) in std::mem::take(&mut state.sending_returns) {
+            let root = state.graph.root(id);
+            let reason = if state.graph.locks[root].is_some() {
+                // Reported as a protected-value escape.
+                continue;
+            } else if state.graph.borrowed[root] {
+                "`@sending` function cannot return a borrowed non-Sync value"
+            } else if state.graph.escaped[root] {
+                "`@sending` function cannot return a non-Sync value whose alias may have escaped"
+            } else {
+                continue;
+            };
+            self.push(
+                Diagnostic::new(Severity::Error, ErrorCode::E2408, reason)
+                    .with_label(Label::primary(span, "the caller cannot own this value exclusively"))
+                    .with_note("parameters, fields, globals and results of calls to functions without `@sending` are borrowed")
+                    .with_help("return a fresh local value (a literal, `new`, or a `@sending` call result) whose aliases are not stored, or declare the source parameter `@sending`"),
+            );
+        }
     }
 
     fn finish_transfer_ownership(&mut self, state: &mut OwnershipState) {
@@ -385,7 +435,7 @@ impl TypeChecker {
         for (value, task, start, span) in std::mem::take(&mut state.loans) {
             let value = state.graph.root(value);
             let task = state.graph.root(task);
-            if moved.get(&value).is_some_and(|tick| *tick < start) {
+            if moved.get(&value).is_some_and(|tick| *tick <= start) {
                 state.loan_errors.push((
                     span,
                     "cannot lend a non-Sync value after permanent transfer",
@@ -460,6 +510,7 @@ impl TypeChecker {
                 ));
             }
         }
+        self.report_sending_returns(state);
         for (id, span) in std::mem::take(&mut state.graph.escapes) {
             let root = state.graph.root(id);
             if self.local.current_async_context && state.graph.loan_borrowed[root] {
@@ -510,9 +561,19 @@ impl TypeChecker {
         let mut reported = HashSet::new();
         for (span, reason) in diagnostics {
             if reported.insert(span) {
-                self.push(Diagnostic::new(Severity::Error, ErrorCode::E2408, reason)
-                    .with_label(Label::primary(span, "exclusive ownership cannot be established"))
-                    .with_help("transfer a fresh, unescaped local value and stop using its aliases; keep protected references inside the lock, or copy Sync data"));
+                let help = if reason.starts_with("protected") {
+                    "keep protected references inside the lock, or copy Sync data out of it"
+                } else {
+                    "transfer a fresh, unescaped local value and stop using its aliases; a call result is borrowed unless its function is declared `@sending`, or copy Sync data"
+                };
+                self.push(
+                    Diagnostic::new(Severity::Error, ErrorCode::E2408, reason)
+                        .with_label(Label::primary(
+                            span,
+                            "exclusive ownership cannot be established",
+                        ))
+                        .with_help(help),
+                );
             }
         }
     }
@@ -548,8 +609,15 @@ impl TypeChecker {
         let aggregate = self.static_call_enum_key(&call.class).is_some()
             || array_constructor
             || (call.method == "new" && matches!(builtin, Some(B::Array | B::Map)));
+        // A checked `@sending` result never aliases the call's arguments.
+        let sending = self.local.sending_results.contains(&call.id);
         for arg in &call.args {
-            if transfers {
+            if self.local.sending_args.contains(&arg.expr.id()) {
+                continue;
+            }
+            if sending {
+                state.graph.escape(&arg.expr);
+            } else if transfers {
                 state.graph.transfer(&arg.expr);
             } else {
                 state.graph.alias(result, &arg.expr);
@@ -560,6 +628,7 @@ impl TypeChecker {
         }
         if !transfers
             && !aggregate
+            && !sending
             && let Some(id) = result
         {
             let root = state.graph.root(id);
@@ -704,7 +773,17 @@ impl TypeChecker {
         if let Some(ty) = self.expr_types.get(&expr.id())
             && !self.is_sync_cached(ty, &mut state.sync)
         {
-            let borrowed = matches!(expr, Expr::StaticField(_) | Expr::Call(_) | Expr::Await(_));
+            let borrowed = match expr {
+                Expr::StaticField(_) => true,
+                // Prelude variant construction wraps its payload like
+                // `Result::Ok(..)`; a `@sending` result is owned.
+                Expr::Call(call) => {
+                    !self.enum_variant_resolutions.contains_key(&call.id)
+                        && !self.local.sending_results.contains(&call.id)
+                }
+                Expr::Await(wait) => !self.local.sending_results.contains(&wait.expr.id()),
+                _ => false,
+            };
             let id = state.graph.node(borrowed);
             state.graph.loan_payload[id] = self.task_loan_type(ty, &mut state.sync);
             state.graph.loan_unsupported[id] = !state.graph.loan_payload[id];
@@ -739,6 +818,11 @@ impl TypeChecker {
             Expr::StaticCall(call) => Some(&call.args),
             _ => None,
         };
+        for arg in args.into_iter().flatten() {
+            if self.local.sending_args.contains(&arg.expr.id()) {
+                state.graph.transfer(&arg.expr);
+            }
+        }
         let mut loan_values: Vec<&Expr> = args
             .into_iter()
             .flatten()
@@ -877,9 +961,18 @@ impl TypeChecker {
             Expr::StaticCall(call) => self.transfer_static_call(state, expr, call, result),
             Expr::MethodCall(call) => self.transfer_method_call(state, call, result),
             Expr::Call(call) => {
+                let variant = self.enum_variant_resolutions.contains_key(&call.id);
+                let sending = self.local.sending_results.contains(&call.id);
                 for arg in &call.args {
-                    state.graph.escape(&arg.expr);
-                    state.graph.alias(result, &arg.expr);
+                    if self.local.sending_args.contains(&arg.expr.id()) {
+                        continue;
+                    }
+                    if !variant {
+                        state.graph.escape(&arg.expr);
+                    }
+                    if !sending {
+                        state.graph.alias(result, &arg.expr);
+                    }
                 }
             }
 
@@ -904,7 +997,7 @@ impl TypeChecker {
 }
 
 #[cfg(test)]
-thread_local! { static TOTAL_COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }
+thread_local! { pub(super) static TOTAL_COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }
 
 #[cfg(test)]
 thread_local! { static COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }

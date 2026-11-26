@@ -36,6 +36,7 @@ fn closure_env_param(lambda_type: &Type, span: Span) -> Param {
         name: CLOSURE_ENV_PARAM.to_string(),
         ty: lambda_type.clone().to_source(),
         mode: ParamMode::Value,
+        sending: false,
         span,
         type_span: span,
     }
@@ -1458,6 +1459,7 @@ impl UnitCodegenContext<'_> {
                 name: p.name.clone(),
                 ty: (ty.clone()).to_source(),
                 mode: ParamMode::Value,
+                sending: false,
                 span: p.span,
                 type_span: p.span,
             })

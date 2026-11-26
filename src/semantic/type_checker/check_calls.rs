@@ -90,6 +90,19 @@ impl TypeChecker {
         }
     }
 
+    /// Record the ownership contract of a resolved free-function call for
+    /// the body-local transfer analysis.
+    pub(super) fn record_sending_call(&mut self, call: ExprId, info: &FuncInfo, args: &[CallArg]) {
+        if info.sending {
+            self.local.sending_results.insert(call);
+        }
+        for (param, arg) in info.param_infos.iter().zip(args) {
+            if param.sending {
+                self.local.sending_args.insert(arg.expr.id());
+            }
+        }
+    }
+
     pub(super) fn check_call_args_against_param_infos(
         &mut self,
         params: &[ParamInfo],
@@ -1721,6 +1734,7 @@ mod reference_alias_index_tests {
                         mut_span: None,
                     }
                 },
+                sending: false,
                 span,
                 type_span: span,
             });

@@ -40,6 +40,13 @@ pub(super) struct BodyState {
     pub(super) async_local_types: Vec<Type>,
     /// Capture arguments awaiting the body-local exclusive-loan proof.
     pub(super) task_loan_args: HashSet<ExprId>,
+    /// Calls to `@sending` functions: their results are fresh owned values.
+    pub(super) sending_results: HashSet<ExprId>,
+    /// Arguments bound to `@sending` parameters: each call transfers them.
+    pub(super) sending_args: HashSet<ExprId>,
+    /// The function body whose returns must be fresh (`@sending fn`) and the
+    /// `@sending` parameters it owns.
+    pub(super) sending_body: Option<(BodyId, bool, Vec<String>)>,
     /// Coverage facts reused by source retention, scoped to the current body.
     pub(super) exhaustive_matches: std::collections::HashSet<ExprId>,
     /// Source/synthetic bindings keyed by frame slot for task-mobility labels.
@@ -109,6 +116,9 @@ impl Default for BodyState {
             lexical_block_depth: 0,
             async_local_types: Vec::new(),
             task_loan_args: HashSet::new(),
+            sending_results: HashSet::new(),
+            sending_args: HashSet::new(),
+            sending_body: None,
             exhaustive_matches: std::collections::HashSet::new(),
             async_local_bindings: HashMap::new(),
             declared_type_params: Default::default(),

@@ -135,7 +135,8 @@ impl TypeChecker {
                 f.public(),
                 f.is_async(),
                 f.constant,
-                f.rust_bridge
+                f.rust_bridge,
+                sending_function(f)
             ]);
             return self.precheck_operation(
                 format!("signature:{:?}", f.body.id),
@@ -155,6 +156,7 @@ impl TypeChecker {
             f.is_async(),
             f.constant,
             f.rust_bridge,
+            sending_function(f),
         ]));
         let queries = self.body_queries.clone();
         let cached = queries.as_ref().and_then(|q| {
@@ -201,6 +203,7 @@ impl TypeChecker {
                 .rust_bridge
                 .as_ref()
                 .is_some_and(|bridge| !bridge.assumes_no_block()),
+            sending: sending_function(f),
             param_infos,
             params,
             return_type,
@@ -246,4 +249,11 @@ impl TypeChecker {
         }
         info
     }
+}
+
+/// `@sending fn`: every call result is a fresh value owned by the caller.
+pub(super) fn sending_function(f: &FunctionDecl) -> bool {
+    f.effect_contracts
+        .iter()
+        .any(|c| c.kind == crate::parser::ast::EffectContractKind::Sending)
 }

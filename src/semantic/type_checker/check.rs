@@ -2615,6 +2615,7 @@ impl TypeChecker {
                             &bindings,
                         ),
                         mode: parameter.mode.clone(),
+                        sending: parameter.sending,
                         span: parameter.span,
                         type_span: parameter.type_span,
                     })
@@ -2654,7 +2655,7 @@ impl TypeChecker {
                 &[],
                 &s.method,
                 &s.args,
-                (s.span, s.method_span),
+                (s.id, s.span, s.method_span),
                 context,
             );
             if let Some((id, _)) = checked_argument {
@@ -2698,7 +2699,7 @@ impl TypeChecker {
             &s.type_args,
             &s.method,
             &s.args,
-            (s.span, s.method_span),
+            (s.id, s.span, s.method_span),
             context,
         );
         if let Some(callee) = callee {
@@ -3603,6 +3604,7 @@ impl TypeChecker {
             }
             self.check_call_args_against_param_infos(&info.param_infos, &c.args, false);
             self.check_async_call_captures(&info.param_infos, &c.args, info.is_async);
+            self.record_sending_call(c.id, &info, &c.args);
             if let Some(operation) = self.imported_blocking_std_functions.get(&c.callee).copied() {
                 self.record_direct_lock_effect(c.span, operation, LockEffectKind::Block);
             }
@@ -3628,7 +3630,7 @@ impl TypeChecker {
                 &[],
                 &c.callee,
                 &c.args,
-                (c.span, c.span),
+                (c.id, c.span, c.span),
                 CallContext::default(),
             );
             self.enum_variant_resolutions.insert(c.id, name.to_string());

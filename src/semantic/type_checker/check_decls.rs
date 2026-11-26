@@ -2017,7 +2017,23 @@ impl TypeChecker {
             );
         }
         self.check_contracts(f, &return_type);
+        let sending_params: Vec<String> = f
+            .params
+            .iter()
+            .filter(|p| p.sending)
+            .map(|p| p.name.clone())
+            .collect();
+        let sending_return = super::signature::sending_function(f);
+        let previous_sending = std::mem::replace(
+            &mut self.local.sending_body,
+            (sending_return || !sending_params.is_empty()).then_some((
+                f.body.id,
+                sending_return,
+                sending_params,
+            )),
+        );
         self.check_block(&f.body);
+        self.local.sending_body = previous_sending;
         // Entry-point status comes from WHICH PROGRAM this is, never from the
         // name: a module's `main` is called and compiled like any other
         // function.

@@ -442,3 +442,58 @@ fn ownership_transfer_follows_let_chain_step_bindings() {
         );
     }
 }
+
+#[test]
+fn sending_results_example_runs() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/sending_results.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n3\n5\n");
+}
+
+#[test]
+fn sending_contracts_cross_module_boundaries() {
+    let util = "module util;
+import std::collections::Array;
+@sending pub fn fresh() -> Array<i64> { return [8]; }
+pub fn plain() -> Array<i64> { return [9]; }
+pub fn give(@sending a: Array<i64>, c: Channel<Array<i64>>) { c.send(a); }
+";
+    let main = |body: &str| {
+        format!(
+            "import util;\nimport std::collections::Array;\nasync fn main() {{ let c: Channel<Array<i64>> = Channel::new(); {body} }}\n"
+        )
+    };
+    let accepted = main(
+        "c.send(util::fresh()); println(c.recv()[0]); let a = [3]; util::give(a, c); println(c.recv()[0]);",
+    );
+    let project = TestProject::new("sending_xmod", &[("util.wi", util), ("main.wi", &accepted)]);
+    let compiled = project.compile("main.wi");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    let output = project.run();
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "8\n3\n");
+
+    for (body, message) in [
+        (
+            "c.send(util::plain());",
+            "cannot transfer a borrowed non-Sync value",
+        ),
+        (
+            "let a = [3]; util::give(a, c); println(a[0]);",
+            "use of a non-Sync value after ownership transfer",
+        ),
+    ] {
+        let rejected = main(body);
+        let project =
+            TestProject::new("sending_xmod", &[("util.wi", util), ("main.wi", &rejected)]);
+        let compiled = project.compile("main.wi");
+        let stderr = String::from_utf8_lossy(&compiled.stderr);
+        assert!(
+            !compiled.status.success() && stderr.contains("E2408") && stderr.contains(message),
+            "{body}: {stderr}"
+        );
+    }
+}

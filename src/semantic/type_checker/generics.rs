@@ -1692,6 +1692,7 @@ impl TypeChecker {
                     f.name.clone(),
                     FuncInfo {
                         foreign: false,
+                        sending: false,
                         params,
                         param_infos,
                         return_type,

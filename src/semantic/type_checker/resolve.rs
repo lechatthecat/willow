@@ -15,6 +15,7 @@ use super::*;
 /// The inputs of one `Type::method(..)` call, shared by its resolvers.
 #[derive(Clone, Copy)]
 struct StaticCall<'a> {
+    id: ExprId,
     class_name: &'a str,
     type_args: &'a [Type],
     method_name: &'a str,
@@ -192,6 +193,7 @@ impl TypeChecker {
             "recover".to_string(),
             FuncInfo {
                 foreign: false,
+                sending: false,
                 params: Vec::new(),
                 param_infos: Vec::new(),
                 return_type: Builtin::Option.apply(vec![Type::Named("PanicInfo".to_string())]),
@@ -211,6 +213,7 @@ impl TypeChecker {
                 name.to_string(),
                 FuncInfo {
                     foreign: false,
+                    sending: false,
                     param_infos: value_param_infos(&params),
                     params,
                     return_type: Type::F64,
@@ -226,6 +229,7 @@ impl TypeChecker {
             "gc_collect".to_string(),
             FuncInfo {
                 foreign: false,
+                sending: false,
                 param_infos: vec![],
                 params: vec![],
                 return_type: Type::Void,
@@ -241,6 +245,7 @@ impl TypeChecker {
                 name.to_string(),
                 FuncInfo {
                     foreign: false,
+                    sending: false,
                     param_infos: vec![],
                     params: vec![],
                     return_type: Type::Void,
@@ -300,6 +305,7 @@ impl TypeChecker {
                 name.to_string(),
                 FuncInfo {
                     foreign: false,
+                    sending: false,
                     param_infos: vec![],
                     params: vec![],
                     return_type: Type::I64,
@@ -317,6 +323,7 @@ impl TypeChecker {
             "panic".to_string(),
             FuncInfo {
                 foreign: false,
+                sending: false,
                 param_infos: value_param_infos(&panic_params),
                 params: panic_params,
                 return_type: Type::Never,
@@ -332,6 +339,7 @@ impl TypeChecker {
             "sleep".to_string(),
             FuncInfo {
                 foreign: false,
+                sending: false,
                 param_infos: value_param_infos(&sleep_params),
                 params: sleep_params,
                 return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
@@ -346,6 +354,7 @@ impl TypeChecker {
             "yield".to_string(),
             FuncInfo {
                 foreign: false,
+                sending: false,
                 param_infos: vec![],
                 params: vec![],
                 return_type: Type::Generic("Future".to_string(), vec![Type::Void]),
@@ -390,6 +399,7 @@ impl TypeChecker {
                     item.name.to_string(),
                     FuncInfo {
                         foreign: false,
+                        sending: false,
                         param_infos: value_param_infos(&params),
                         params,
                         return_type: std_schema_type(return_type),
@@ -809,6 +819,7 @@ impl TypeChecker {
                                 .rust_bridge
                                 .as_ref()
                                 .is_some_and(|bridge| !bridge.assumes_no_block()),
+                            sending: super::signature::sending_function(f),
                             param_infos,
                             params,
                             return_type: qualify(&f.return_type),
@@ -1288,6 +1299,7 @@ impl TypeChecker {
                 .map(|(param, ty)| ParamInfo {
                     ty: ty.clone(),
                     mode: param.mode.clone(),
+                    sending: param.sending,
                     span: param.span,
                     type_span: param.type_span,
                 })
@@ -1412,6 +1424,7 @@ impl TypeChecker {
                             .map(|p| ParamInfo {
                                 ty: crate::semantic::symbols::substitute_type(&p.ty, &param_map),
                                 mode: p.mode.clone(),
+                                sending: p.sending,
                                 span: p.span,
                                 type_span: p.type_span,
                             })
@@ -2144,13 +2157,14 @@ impl TypeChecker {
         type_args: &[Type],
         method_name: &str,
         args: &[CallArg],
-        spans: (Span, Span),
+        spans: (ExprId, Span, Span),
         context: CallContext<'_>,
     ) -> Type {
-        let (span, method_span) = spans;
+        let (id, span, method_span) = spans;
         let references = self.analysis_symbols.references.len();
         let errors = self.error_generation;
         let result = self.resolve_static_call_inner(&StaticCall {
+            id,
             class_name,
             type_args,
             method_name,
@@ -2827,6 +2841,7 @@ impl TypeChecker {
         }
         self.check_call_args_against_param_infos(&fi.param_infos, args, call.context.checked);
         self.check_async_call_captures(&fi.param_infos, args, fi.is_async);
+        self.record_sending_call(call.id, &fi, args);
         // A module-qualified call to an async fn yields `Task<T>`,
         // just like a local async call — without this the call site
         // types as the bare `T` and `await` rejects it.

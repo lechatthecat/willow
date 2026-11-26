@@ -4,6 +4,8 @@ mod contracts_tests;
 mod effect_contracts;
 pub(crate) mod lock_order;
 pub(crate) mod purity;
+#[cfg(test)]
+mod sending_tests;
 
 use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;
@@ -796,6 +798,7 @@ impl TypeChecker {
             .map(|param| ParamInfo {
                 ty: self.normalize_type(&param.ty, param.type_span),
                 mode: param.mode.clone(),
+                sending: param.sending,
                 span: param.span,
                 type_span: param.type_span,
             })
@@ -1056,6 +1059,7 @@ impl TypeChecker {
             .map(|param| ParamInfo {
                 ty: self.normalize_decl_type(&param.ty, param.type_span, module_prefix),
                 mode: param.mode.clone(),
+                sending: param.sending,
                 span: param.span,
                 type_span: param.type_span,
             })
@@ -2316,6 +2320,7 @@ fn value_param_infos(params: &[Type]) -> Vec<ParamInfo> {
         .map(|ty| ParamInfo {
             ty: ty.clone(),
             mode: ParamMode::Value,
+            sending: false,
             span: Span::dummy(),
             type_span: Span::dummy(),
         })
@@ -2328,6 +2333,7 @@ fn param_infos_from_decl(params: &[Param], module_prefix: Option<&str>) -> Vec<P
         .map(|param| ParamInfo {
             ty: qualify_type_for_module(&param.ty, module_prefix),
             mode: param.mode.clone(),
+            sending: param.sending,
             span: param.span,
             type_span: param.type_span,
         })
@@ -2355,6 +2361,7 @@ fn imported_class_info_from_decl(
             .map(|param| ParamInfo {
                 ty: qualify(&param.ty),
                 mode: param.mode.clone(),
+                sending: param.sending,
                 span: param.span,
                 type_span: param.type_span,
             })

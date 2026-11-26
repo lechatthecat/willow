@@ -453,6 +453,7 @@ impl TypeChecker {
             .map(|(param, ty)| ParamInfo {
                 ty: self.normalize_type(ty, param.type_span),
                 mode: param.mode.clone(),
+                sending: param.sending,
                 span: param.span,
                 type_span: param.type_span,
             })

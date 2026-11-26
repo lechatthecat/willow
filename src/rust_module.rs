@@ -469,6 +469,7 @@ impl Deriver<'_> {
                 name: format!("a{i}"),
                 ty: ty.willow(),
                 mode: ParamMode::Value,
+                sending: false,
                 span: self.span(p.span()),
                 type_span: self.span(p.ty.span()),
             });
@@ -1096,6 +1097,7 @@ impl RecordInterfaces {
                 name: "handle".into(),
                 ty: Type::Named(name),
                 mode: ParamMode::Value,
+                sending: false,
                 span,
                 type_span: span,
             }],

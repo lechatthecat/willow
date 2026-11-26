@@ -107,6 +107,10 @@ impl TypeChecker {
         }
         let mut markers = MarkerCache::default();
         for (param, arg) in params.iter().zip(args.iter()) {
+            // The ownership pass moves a `@sending` argument into the task.
+            if param.sending {
+                continue;
+            }
             let ty = &param.ty;
             // Scalars are copied into the task (need Send, always satisfied);
             // GC references are shared with the task (need Sync).

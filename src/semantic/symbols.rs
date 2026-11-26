@@ -158,6 +158,9 @@ pub struct FuncInfo {
     #[serde(default)]
     /// Foreign call without a bounded, nonblocking developer declaration.
     pub foreign: bool,
+    /// `@sending fn`: each call result is a fresh, exclusively owned value.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sending: bool,
     pub params: Vec<Type>,
     pub param_infos: Vec<ParamInfo>,
     pub return_type: Type,
@@ -175,6 +178,9 @@ pub struct FuncInfo {
 pub struct ParamInfo<N = String> {
     pub ty: Type<N>,
     pub mode: ParamMode,
+    /// `@sending`: the call transfers exclusive ownership of the argument.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sending: bool,
     pub span: Span,
     pub type_span: Span,
 }
@@ -852,6 +858,7 @@ impl InterfaceInfo {
                                 .map(|p| ParamInfo {
                                     ty: (&p.ty).into(),
                                     mode: p.mode.clone(),
+                                    sending: p.sending,
                                     span: p.span,
                                     type_span: p.type_span,
                                 })
@@ -1057,6 +1064,7 @@ mod tests {
     fn function_info(ty: Type) -> FuncInfo {
         FuncInfo {
             foreign: false,
+            sending: false,
             params: vec![],
             param_infos: vec![],
             return_type: ty,
