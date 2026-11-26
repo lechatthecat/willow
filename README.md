@@ -346,7 +346,7 @@ make_async(); await t`. Only `await make_async()` yields an owned result.
 | `RwLock<T>` | When `T` is `Send` and `Sync` | When `T` is `Send` and `Sync` |
 | Classes | When all fields are | When all fields are, and no field is reassigned after construction |
 | Interfaces | When the interface extends `Send` or `Sync` | When the interface extends `Sync` |
-| Closures | Never | Never |
+| Closures | When every capture is an immutable `Send` + `Sync` binding | Same as `Send` |
 
 A mutable collection or a class containing one is not `Sync`, so it can only be
 lent:
@@ -400,7 +400,7 @@ See the runnable [collection](example/owned_task_loans.wi),
 | Static class fields are not a checked task boundary | Tasks can mutate a non-`Sync` static field concurrently without a diagnostic. Protect such state with `Mutex<T>` or atomics yourself. | The check runs on async call arguments only: `check_async_capture` in [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) |
 | Loans awaited only in a nested branch, loans of values from outside the current loop iteration, loans inside `defer` or a closure capture | Rejected, even when safe. Await the task in the block that lent the value, and create loop values inside the loop body. | `task_loans_reject_unsound_paths_with_a_specific_reason` in [`task_loan_flow_tests.rs`](src/semantic/type_checker/task_loan_flow_tests.rs) |
 | Lending an async parameter to another Task or storing it in shared state | Rejected | `owned_task_loans_imported_callee_and_escape_contract` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
-| Closure values | Never `Send` or `Sync`, so they cannot be passed to an async call; environment-free function pointers can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
+| Closure values | A closure that mutates a captured binding or captures a non-`Send` + `Sync` value is task-local and cannot be passed to an async call; one capturing only immutable `Send` + `Sync` bindings can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
 | Memory inside Rust adapters and native libraries | Not analyzed | [Where the guarantees stop](#where-the-guarantees-stop) |
 
 ### E2604: a lock body never waits

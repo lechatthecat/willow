@@ -114,8 +114,9 @@ fn normalized_unit_provenance_preserves_lambdas_before_await_and_builtin_aliases
                 "return apply(|n: i64| n + {}, await fetch(values[0]));",
                 if captures { "extra" } else { "2" }
             ));
-            // An immutable capture is `Send`: the lambda may stay live across
-            // the operand's suspension whether or not it captures.
+            // A lambda capturing only immutable `Send` + `Sync` bindings is
+            // shareable, so it may stay live across the operand's suspension
+            // whether or not it captures.
             let source = before_await;
             if module {
                 std::fs::write(project.0.join("worker.wi"), source).unwrap();

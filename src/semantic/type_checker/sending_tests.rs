@@ -309,3 +309,18 @@ fn sending_checks_scale_linearly() {
         );
     }
 }
+
+#[test]
+fn sending_argument_still_requires_send_contents() {
+    // `@sending` lifts only the Sync/loan requirement: a transferred value
+    // whose contents are task-local is still rejected at the async call.
+    let found = errors(
+        "async fn run(@sending xs: Array<fn() -> i64>) -> i64 { return xs.len(); }
+@sending fn callbacks() -> Array<fn() -> i64> { let k = [1]; return [|| k[0]]; }
+async fn main() { println(await run(callbacks())); }",
+    );
+    assert!(
+        found.iter().any(|d| d.code == ErrorCode::E2402),
+        "{found:?}"
+    );
+}

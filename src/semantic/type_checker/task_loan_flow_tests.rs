@@ -135,6 +135,12 @@ fn task_loans_reject_unsound_paths_with_a_specific_reason() {
             "same block",
         ),
         (
+            "lent task variable reassigned before await",
+            "let a = [1]; let mut t = take(a); t = take([0]); await t; a.push(2);",
+            "stays lent",
+            "same block",
+        ),
+        (
             "await in short-circuit operand",
             "let a = [1]; let t = take(a); let ok = a.len() > 5 && (await t) > 0; println(a[0]);",
             "",
