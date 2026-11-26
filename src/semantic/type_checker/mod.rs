@@ -1,6 +1,8 @@
 mod contracts;
 #[cfg(test)]
 mod contracts_tests;
+#[cfg(test)]
+mod core_models;
 mod effect_contracts;
 pub(crate) mod lock_order;
 pub(crate) mod purity;

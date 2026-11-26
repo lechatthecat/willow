@@ -111,6 +111,10 @@ calls carry blocking effects and are rejected in tasks and lexical locks.
 
 ### Concurrency details
 
+The [small concurrency core](formal/README.md) states the Send/Sync and loan,
+E2604 and lock-order judgments, soundness assumptions, bounded executable
+checks, implementation differential tests and trusted computing base.
+
 <a id="e2402-async-calls-capture-only-shareable-or-exclusively-lent-values"></a>
 
 **Captures and transfers (E2402/E2408).** `Send` and `Sync` are structurally inferred.
