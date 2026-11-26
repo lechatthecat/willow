@@ -167,6 +167,9 @@ pub(super) struct LambdaChildren {
 /// outputs start empty and can be stored under the lambda's own key.
 #[derive(Default)]
 pub(super) struct BodyOutputs {
+    // Marker dependency reads must belong to each independently cached lambda.
+    static_sync: HashMap<(TypeId, Span), bool>,
+    static_markers: super::send_sync::MarkerCache,
     errors: Vec<Diagnostic>,
     expr_types: HashMap<ExprId, Type>,
     reference_arg_modes: HashMap<ExprId, ReferenceArgMode>,
@@ -180,6 +183,7 @@ pub(super) struct BodyOutputs {
     lock_edges: HashMap<FunctionId, HashSet<FunctionId>>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
+    unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
@@ -214,6 +218,7 @@ pub(crate) struct TypedBody {
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
     #[serde(with = "crate::compiler_db::map_entries")]
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
+    unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
@@ -255,6 +260,7 @@ impl TypedBody {
             lock_edges: outputs.lock_edges,
             resolved_calls: outputs.resolved_calls,
             static_reads: outputs.static_reads,
+            unsafe_static_accesses: outputs.unsafe_static_accesses,
             analysis_calls: outputs.analysis_calls,
             analysis_symbols: outputs.analysis_symbols,
             task_method_calls: outputs.task_method_calls,
@@ -466,6 +472,8 @@ impl TypeChecker {
         body: TypedBody,
         queries: Option<&crate::compiler_db::body::BodyQueries>,
     ) -> anyhow::Result<()> {
+        self.unsafe_static_accesses
+            .extend(body.unsafe_static_accesses);
         for (caller, reads) in body.static_reads {
             self.static_reads.entry(caller).or_default().extend(reads);
         }
@@ -571,6 +579,12 @@ impl TypeChecker {
         swap(&mut self.effect_inputs.edges, &mut outputs.lock_edges);
         swap(&mut self.resolved_calls, &mut outputs.resolved_calls);
         swap(&mut self.static_reads, &mut outputs.static_reads);
+        swap(&mut self.static_sync, &mut outputs.static_sync);
+        swap(&mut self.static_markers, &mut outputs.static_markers);
+        swap(
+            &mut self.unsafe_static_accesses,
+            &mut outputs.unsafe_static_accesses,
+        );
         swap(&mut self.analysis_calls, &mut outputs.analysis_calls);
         swap(&mut self.analysis_symbols, &mut outputs.analysis_symbols);
         swap(&mut self.task_method_calls, &mut outputs.task_method_calls);

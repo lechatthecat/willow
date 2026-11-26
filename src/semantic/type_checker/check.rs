@@ -509,6 +509,9 @@ impl TypeChecker {
         self.effect_inputs.edges.clear();
         self.resolved_calls.clear();
         self.static_reads.clear();
+        self.unsafe_static_accesses.clear();
+        self.static_sync.clear();
+        self.static_markers = Default::default();
         self.analysis_calls.clear();
         self.pending_constructor_flow.clear();
         self.effect_inputs.direct.clear();
@@ -1304,14 +1307,7 @@ impl TypeChecker {
             }
         }
         self.report_task_method_calls();
-        if let Some((queries, unit)) = &self.effect_queries {
-            queries.static_initializers.record_preemption(
-                *unit,
-                program,
-                &effects,
-                &self.indirect_lock,
-            );
-        }
+        self.record_task_context(program, &graph, &effects, &imports);
         self.report_effect_contracts(program, &graph, &effects.facts, false);
         if let Some((queries, unit)) = &self.effect_queries
             && let Some(captured) = queries.analysis.borrow_mut().as_mut()

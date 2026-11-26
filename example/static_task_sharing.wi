@@ -1,0 +1,21 @@
+// Immutable static slots holding synchronized or frozen state are task-shareable.
+class Counter { pub n: i64; }
+class Shared {
+    pub static counter: Mutex<Counter> = Mutex::new(new Counter(0));
+    pub static total: AtomicI64 = AtomicI64::new(0);
+    pub static limit: RwLock<i64> = RwLock::new(2);
+    pub static increments: FrozenArray<i64> = [1, 2].freeze();
+}
+async fn work() {
+    lock Shared::counter as mut counter { counter.n += 1; }
+    Shared::total.add(Shared::increments[0]);
+}
+async fn main() {
+    let a = work();
+    let b = work();
+    await a;
+    await b;
+    lock Shared::counter as counter { println(counter.n); }
+    println(Shared::total.load());
+    lock read Shared::limit as limit { println(limit); }
+}

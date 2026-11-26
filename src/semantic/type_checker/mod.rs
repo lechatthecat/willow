@@ -51,6 +51,7 @@ mod never_tests;
 mod resolve;
 mod returns;
 mod send_sync;
+mod static_sharing;
 #[cfg(test)]
 mod subclass_constructor_tests;
 #[cfg(test)]
@@ -256,6 +257,9 @@ pub struct TypeChecker {
     missing_collection_imports_reported: ObservedSet<String>,
     resolved_calls: HashMap<FunctionId, crate::semantic::call_graph::CallSites>,
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
+    unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
+    static_sync: HashMap<(TypeId, Span), bool>,
+    static_markers: send_sync::MarkerCache,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     /// Constructor bodies whose call-agnostic flow reported a missing field;
     /// `finish_effect_analysis` decides their E0842 with panic facts.
@@ -453,6 +457,9 @@ impl TypeChecker {
             ),
             resolved_calls: HashMap::new(),
             static_reads: HashMap::new(),
+            unsafe_static_accesses: Vec::new(),
+            static_sync: HashMap::new(),
+            static_markers: Default::default(),
             analysis_calls: HashMap::new(),
             pending_constructor_flow: Vec::new(),
             analysis_symbols: Default::default(),

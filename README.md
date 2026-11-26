@@ -289,7 +289,7 @@ limit.
 
 | Check | Guarantee for an accepted program | Main limit |
 | --- | --- | --- |
-| [E2402, E2408](#e2402-async-calls-capture-only-shareable-or-exclusively-lent-values) | Every reference an `async fn` call captures is `Sync`, or is a fresh local value that nothing else can use until the Task is awaited. A value sent on a channel or put in a `Mutex` cannot be used through its old aliases. | Only these task boundaries are checked: static fields are shared without a check |
+| [E2402, E2408](#e2402-async-calls-capture-only-shareable-or-exclusively-lent-values) | Every reference an `async fn` call captures is `Sync`, or is a fresh local value that nothing else can use until the Task is awaited. A value sent on a channel or put in a `Mutex` cannot be used through its old aliases. | Non-`Sync` immutable static accesses are also rejected in task-reachable bodies; indirect calls use conservative target sets |
 | [E2604](#e2604-a-lock-body-never-waits) | A `lock` body never awaits, selects, waits on a channel, uses a blocking cell, calls a synchronous file API or calls foreign code, directly or through any chain of calls. A callee without effect evidence counts as waiting. | Console output is allowed; foreign code declared `nonblocking` is trusted |
 | [E2605](#e2605-nested-locks-follow-one-acyclic-order) | Nested `lock` statements across the whole project follow one acyclic order, and no lock is acquired again while held. | Locks that the compiler cannot tell apart cannot be nested; use a group `lock` |
 | [`@effects(...)`, E2610–E2612](#effect-contracts-declare-the-property-on-any-function) | A function with an effect contract performs the forbidden effect nowhere, directly or through helpers, dispatch and imports. A call whose effect is unknown is rejected as well. | Foreign declarations that promise `no_io` are trusted |
@@ -299,6 +299,8 @@ No check proves deadlock freedom: Tasks can still wait for each other forever
 through channels and `await` outside locks.
 
 ### E2402: async calls capture only shareable or exclusively lent values
+
+Immutable static slots are shared boundaries too. E2402 points to both the declaration and access when a task can reach a non-`Sync` static value, directly or through helpers, constructors, interface dispatch or callbacks. Use `Mutex<T>`, a suitable `RwLock<T>`, atomics, frozen collections of `Sync` elements, or structurally immutable values. This check is independent of `WILLOW_WORKERS`; initialization-only and other synchronous-only accesses remain allowed.
 
 **Guarantee.** Calling an `async fn` captures its arguments into a Task that
 may run on another worker. Each captured reference must be `Sync`, or it must
@@ -399,7 +401,7 @@ See the runnable [collection](example/owned_task_loans.wi),
 
 | Limit | Effect | Evidence |
 | --- | --- | --- |
-| Static class fields are not a checked task boundary | Tasks can mutate a non-`Sync` static field concurrently without a diagnostic. Protect such state with `Mutex<T>` or atomics yourself. | The check runs on async call arguments only: `check_async_capture` in [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) |
+| Static sharing uses conservative task reachability | E2402 rejects non-`Sync` immutable static reads in async bodies and reachable helpers, constructors and callbacks, including imports. Function values are conservatively grouped by arity, so a safe indirect call can include another candidate. Synchronous-only accesses remain allowed. `static mut` still requires single-worker task execution. | Structural checks in [`static_sharing.rs`](src/semantic/type_checker/static_sharing.rs), shared build-wide dispatch in [`preemption.rs`](src/compiler_db/static_init/preemption.rs) |
 | Loans awaited only in a nested branch, loans of values from outside the current loop iteration, loans inside `defer` or a closure capture | Rejected, even when safe. Await the task in the block that lent the value, and create loop values inside the loop body. | `task_loans_reject_unsound_paths_with_a_specific_reason` in [`task_loan_flow_tests.rs`](src/semantic/type_checker/task_loan_flow_tests.rs) |
 | Lending an async parameter to another Task or storing it in shared state | Rejected | `owned_task_loans_imported_callee_and_escape_contract` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
 | Closure values | A closure that mutates a captured binding or captures a non-`Send` + `Sync` value is task-local and cannot be passed to an async call; one capturing only immutable `Send` + `Sync` bindings can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
@@ -1018,7 +1020,7 @@ In the idle-spawn measurement, memory after parking 100,000 tasks was about **74
 Willow is an experimental language and compiler, **not yet suitable for production deployment**. Each check guarantees only what its section states; the limits tables list what falls outside it. In particular:
 
 - No check proves deadlock freedom or the absence of all data races. Tasks can wait for each other forever through channels and `await` outside locks, and E2607 reports only some such waits; its absence is **not** evidence of anything.
-- E2402 checks async-call arguments and movable Task frames, not every shared-memory access: static fields are shared without a check.
+- E2402 checks async-call arguments, movable Task frames, and non-`Sync` immutable static accesses reachable from tasks, including synchronous helpers and imported code. Indirect reachability uses conservative candidate sets; this is not a proof about arbitrary native shared-memory access.
 - E2604 does not count console output as a wait and does not bound computation time inside a lock body.
 - Conservative analysis of dynamic and indirect calls may reject code that is actually safe. Unavailable evidence is never treated as proof of purity.
 - Rust adapters, native libraries and the declarations that describe them (`nonblocking`, `@effects(no_io)`, `willow::assume`) are assumptions bound to one current review record, not proofs of foreign behavior. Compiler and runtime defects are outside every static guarantee.

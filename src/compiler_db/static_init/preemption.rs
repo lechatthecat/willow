@@ -14,6 +14,7 @@ pub(super) struct Inputs {
     foreign: HashSet<FunctionId>,
     indirect: IndirectInputs,
     std_aliases: HashMap<String, String>,
+    unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
 }
 
 impl StaticInitQueries {
@@ -23,6 +24,7 @@ impl StaticInitQueries {
         program: &Program,
         effects: &std::sync::Arc<UnitEffects>,
         indirect: &IndirectInputs,
+        unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     ) {
         let mut leaves = HashSet::new();
         let mut tasks = Vec::new();
@@ -102,6 +104,7 @@ impl StaticInitQueries {
                 .collect(),
             indirect: indirect.clone(),
             std_aliases,
+            unsafe_static_accesses,
         });
     }
 
@@ -291,6 +294,22 @@ impl StaticInitQueries {
                 }
             }
         }
+        // Static accesses consume this same closed-build dispatch/callback graph.
+        // Visit the union of all task roots once, not once per task or access.
+        let (reachable, _) = task_reachable(&edges, tasks.iter().map(|(node, _)| *node));
+        let mut diagnostics = Vec::new();
+        for &unit in order {
+            if let Some(inputs) = units.get(&unit).and_then(|u| u.preemption.as_ref()) {
+                for (caller, diagnostic) in &inputs.unsafe_static_accesses {
+                    if positions
+                        .get(&(unit, *caller))
+                        .is_some_and(|&node| reachable[node])
+                    {
+                        diagnostics.push(diagnostic.clone());
+                    }
+                }
+            }
+        }
         let async_nodes: HashSet<_> = tasks.iter().map(|(node, _)| *node).collect();
         for targets in &mut edges {
             targets.retain(|target| !async_nodes.contains(target));
@@ -397,8 +416,30 @@ impl StaticInitQueries {
                     .with_note(format!("unproven call in `{witness}`")),
                 )
             })
-            .collect()
+            .for_each(|diagnostic| diagnostics.push(diagnostic));
+        diagnostics
     }
+}
+
+/// O(nodes + edges), including cycles and shared helper chains.
+fn task_reachable(edges: &[Vec<usize>], roots: impl Iterator<Item = usize>) -> (Vec<bool>, usize) {
+    let mut marked = vec![false; edges.len()];
+    let mut pending = Vec::new();
+    for root in roots {
+        if !std::mem::replace(&mut marked[root], true) {
+            pending.push(root);
+        }
+    }
+    let mut visits = 0;
+    while let Some(node) = pending.pop() {
+        for &target in &edges[node] {
+            visits += 1;
+            if !std::mem::replace(&mut marked[target], true) {
+                pending.push(target);
+            }
+        }
+    }
+    (marked, visits)
 }
 
 /// Each node is queued once, each reverse edge is inspected at most once.
@@ -432,6 +473,31 @@ fn propagate(edges: &[Vec<usize>], mut marked: Vec<bool>) -> (Vec<bool>, Vec<usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn static_task_sharing_reachability_visits_each_edge_once() {
+        for n in [32, 128, 512, 2048] {
+            for shape in ["chain", "fanout", "cycle", "repeated", "many-roots"] {
+                let mut edges = vec![Vec::new(); n];
+                for (i, targets) in edges.iter_mut().enumerate().take(n - 1) {
+                    match shape {
+                        "fanout" => targets.extend(i + 1..n.min(i + 3)),
+                        "repeated" => targets.extend([i + 1; 8]),
+                        _ => targets.push(i + 1),
+                    }
+                }
+                if shape == "cycle" {
+                    edges[n - 1].push(0);
+                }
+                let roots = if shape == "many-roots" { n } else { 1 };
+                let (reachable, visits) = task_reachable(&edges, 0..roots);
+                let count: usize = edges.iter().map(Vec::len).sum();
+                assert!(reachable.iter().all(|b| *b));
+                assert_eq!(visits, count);
+                eprintln!("static-sharing shape={shape} nodes={n} edges={count} visits={visits}");
+            }
+        }
+    }
 
     #[test]
     fn preemption_propagation_visits_each_edge_once() {

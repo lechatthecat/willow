@@ -437,3 +437,6 @@ mod u8_scalar;
 
 #[path = "integration/scalar_widths.rs"]
 mod scalar_widths;
+
+#[path = "integration/static_task_sharing.rs"]
+mod static_task_sharing;

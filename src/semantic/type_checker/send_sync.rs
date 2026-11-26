@@ -1223,6 +1223,46 @@ mod tests {
     }
 
     #[test]
+    fn static_task_sharing_marker_work_is_shared_across_accesses() {
+        for size in [16, 64, 256] {
+            let mut source = String::from("class Leaf { pub bad: Array<i64>; }");
+            for i in 0..size {
+                let child = if i == 0 {
+                    "Leaf".into()
+                } else {
+                    format!("Node{}", i - 1)
+                };
+                source.push_str(&format!(
+                    "class Node{i} {{ pub left: {child}; pub right: {child}; }}"
+                ));
+            }
+            let mut c = checker(&source);
+            c.set_enforce_send_sync(true);
+            c.local.current_effect_callable = Some(FunctionId::free("task"));
+            for i in (0..size).rev() {
+                let info = StaticPropInfo {
+                    ty: named(&format!("Node{i}")),
+                    is_mut: false,
+                    public: true,
+                    protected: false,
+                    decl_index: i,
+                    declaration_span: Span::new(i, i + 1, 1, i + 1),
+                };
+                for _ in 0..size {
+                    c.record_static_sharing("Storage", "value", &info, Span::dummy());
+                }
+            }
+            assert_eq!(c.unsafe_static_accesses.len(), size * size);
+            assert!(c.static_markers.0.visits <= 3 * size + 3);
+            eprintln!(
+                "static-sharing depth={size} reads={} marker-visits={}",
+                size * size,
+                c.static_markers.0.visits
+            );
+        }
+    }
+
+    #[test]
     fn ownership_marker_cache_preserves_cycles_and_scales() {
         for size in [16, 64, 256] {
             let mut source = String::from("class Leaf { pub bad: Array<i64>; }");

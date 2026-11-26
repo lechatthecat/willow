@@ -3346,6 +3346,7 @@ impl TypeChecker {
                         );
                     }
                 }
+                self.record_static_sharing(&owner, field, &info, span);
                 info.ty.clone()
             }
             None => {
