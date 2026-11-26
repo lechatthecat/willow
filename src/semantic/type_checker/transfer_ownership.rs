@@ -52,14 +52,40 @@ struct OwnershipState {
     select_receives: HashSet<usize>,
     deferred: i32,
     conditional: usize,
-    loans: Vec<(usize, usize, usize, Span)>,
+    loans: Vec<Loan>,
     loan_exprs: HashMap<Span, ExprId>,
     task_methods: HashMap<(String, String), (bool, bool)>,
-    waits: Vec<(usize, usize)>,
+    /// `(task, tick, region)` for each `await` of a tracked task.
+    waits: Vec<(usize, usize, Option<usize>)>,
+    /// Open blocks as `(region id, conditional depth at entry)`. Code runs
+    /// straight through a block unless it leaves it entirely, so an `await`
+    /// unconditional in the same block instance ends a loan started there.
+    regions: Vec<(usize, usize)>,
     loan_errors: Vec<(Span, &'static str)>,
     /// This body is a `@sending fn`: each returned value must be fresh.
     sending_return: bool,
     sending_returns: Vec<(usize, Span)>,
+}
+
+/// A task loan: `value` is unavailable from `start` until `task` is awaited.
+struct Loan {
+    value: usize,
+    task: usize,
+    start: usize,
+    span: Span,
+    /// Innermost loop when the loan started; the value must belong to it.
+    loop_id: usize,
+    region: Option<usize>,
+}
+
+impl OwnershipState {
+    /// The block in which the current position executes unconditionally.
+    fn region(&self) -> Option<usize> {
+        self.regions
+            .last()
+            .filter(|(_, depth)| *depth == self.conditional)
+            .map(|(id, _)| *id)
+    }
 }
 
 impl Graph {
@@ -223,6 +249,7 @@ impl TypeChecker {
         }
         let mut state = OwnershipState::default();
         state.graph.scopes.push(Vec::new());
+        state.regions.push((0, 0));
         if let AstEvent::Block(body) = root
             && let Some((id, returns, params)) = &self.local.sending_body
             && *id == body.id
@@ -251,8 +278,12 @@ impl TypeChecker {
                 _ => {}
             }
             match event {
-                AstEvent::EnterScope => state.graph.scopes.push(Vec::new()),
+                AstEvent::EnterScope => {
+                    state.graph.scopes.push(Vec::new());
+                    state.regions.push((state.graph.ticks, state.conditional));
+                }
                 AstEvent::ExitScope => {
+                    state.regions.pop();
                     for name in state.graph.scopes.pop().unwrap() {
                         state.graph.names.get_mut(&name).unwrap().pop();
                     }
@@ -415,59 +446,7 @@ impl TypeChecker {
             }
             moved.entry(root).or_insert(tick);
         }
-        // Resolve aliases once, then scan each payload's ordered loan intervals.
-        // No per-use scan over all tasks or all aliases is needed.
-        let mut task_counts = HashMap::new();
-        let mut task_origins = HashSet::new();
-        for (_, task, _, _) in &state.loans {
-            if task_origins.insert(*task) {
-                *task_counts.entry(state.graph.root(*task)).or_insert(0usize) += 1;
-            }
-        }
-        let mut completed = HashMap::new();
-        for (task, tick) in std::mem::take(&mut state.waits) {
-            let task = state.graph.root(task);
-            if !state.graph.borrowed[task] && !state.graph.escaped[task] {
-                completed.entry(task).or_insert(tick);
-            }
-        }
-        let mut intervals: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
-        for (value, task, start, span) in std::mem::take(&mut state.loans) {
-            let value = state.graph.root(value);
-            let task = state.graph.root(task);
-            if moved.get(&value).is_some_and(|tick| *tick <= start) {
-                state.loan_errors.push((
-                    span,
-                    "cannot lend a non-Sync value after permanent transfer",
-                ));
-            }
-            let end = completed
-                .get(&task)
-                .copied()
-                .filter(|end| *end > start && task_counts[&task] == 1)
-                .unwrap_or(usize::MAX);
-            if state.graph.borrowed[value]
-                || state.graph.escaped[value]
-                || state.graph.loan_unsupported[value]
-                || state.graph.locks[value].is_some()
-            {
-                state.loan_errors.push((
-                    span,
-                    "cannot lend a borrowed, escaped, or unsupported non-Sync value to a task",
-                ));
-            }
-            let ranges = intervals.entry(value).or_default();
-            // Multiple aliases captured by this one task share a single loan.
-            if ranges.last() == Some(&(start, end)) {
-                continue;
-            }
-            if ranges.last().is_some_and(|(_, end)| start < *end) {
-                state
-                    .loan_errors
-                    .push((span, "non-Sync value already has an outstanding task loan"));
-            }
-            ranges.push((start, end));
-        }
+        let intervals = loan_intervals(state, &moved);
         let mut positions = HashMap::<usize, usize>::new();
         for (id, tick, span) in std::mem::take(&mut state.graph.uses) {
             let root = state.graph.root(id);
@@ -476,13 +455,17 @@ impl TypeChecker {
                 while *pos < ranges.len() && ranges[*pos].1 <= tick {
                     *pos += 1;
                 }
-                if ranges
-                    .get(*pos)
-                    .is_some_and(|(start, end)| *start < tick && tick < *end)
+                if let Some((start, end, elsewhere)) = ranges.get(*pos)
+                    && *start < tick
+                    && tick < *end
                 {
                     state.loan_errors.push((
                         span,
-                        "non-Sync value is unavailable until its task has been awaited",
+                        if *elsewhere {
+                            "non-Sync value stays lent: its task is not awaited unconditionally in the block that lent it"
+                        } else {
+                            "non-Sync value is unavailable until its task has been awaited"
+                        },
                     ));
                 }
             }
@@ -525,20 +508,27 @@ impl TypeChecker {
                 ));
             }
         }
+        // One primary diagnostic per lent value or use: the first reason wins.
+        let mut lent = HashSet::new();
         for (span, reason) in std::mem::take(&mut state.loan_errors) {
+            if !lent.insert(span) {
+                continue;
+            }
             if let Some(ty @ Type::Named(_)) = state
                 .loan_exprs
                 .get(&span)
                 .and_then(|id| self.expr_types.get(id))
             {
-                let diagnostic = self.task_loan_failure(ty, span, reason);
+                let diagnostic = self
+                    .task_loan_failure(ty, span, reason)
+                    .with_help(loan_help(reason));
                 self.push(diagnostic);
                 continue;
             }
             self.push(Diagnostic::new(Severity::Error, ErrorCode::E2402, reason)
                 .with_label(Label::primary(span, "exclusive task access cannot be established"))
                 .with_note("this value is not `Sync`; even immediately awaited calls require proof of exclusive access")
-                .with_help("use a fresh local Array/Map and await its task before reusing aliases; use FrozenArray/FrozenMap for snapshots or Mutex<Array<T>>/Mutex<Map<K, V>> for shared mutation"));
+                .with_help(loan_help(reason)));
         }
         #[cfg(test)]
         {
@@ -858,13 +848,18 @@ impl TypeChecker {
                 if let (Some(value_id), Some(task)) =
                     (state.graph.values.get(&value.id()).copied(), result)
                 {
-                    state
-                        .loans
-                        .push((value_id, task, state.graph.ticks, value.span()));
-                    if state.conditional > 0 || state.deferred > 0 || state.graph.scopes.len() > 2 {
+                    state.loans.push(Loan {
+                        value: value_id,
+                        task,
+                        start: state.graph.ticks,
+                        span: value.span(),
+                        loop_id: state.graph.loop_id,
+                        region: state.region(),
+                    });
+                    if state.deferred > 0 {
                         state.loan_errors.push((
                             value.span(),
-                            "non-Sync task loans require an unconditional body-level call",
+                            "non-Sync task loans cannot start inside `defer`",
                         ));
                     }
                 } else {
@@ -881,12 +876,9 @@ impl TypeChecker {
         }
         match expr {
             Expr::Await(wait) => {
-                if state.conditional == 0
-                    && state.deferred == 0
-                    && state.graph.scopes.len() <= 2
-                    && let Some(task) = state.graph.values.get(&wait.expr.id()).copied()
-                {
-                    state.waits.push((task, state.graph.ticks));
+                if let Some(task) = state.graph.values.get(&wait.expr.id()).copied() {
+                    let region = state.region().filter(|_| state.deferred == 0);
+                    state.waits.push((task, state.graph.ticks, region));
                 }
             }
             Expr::Var(name, span, _) => {
@@ -993,6 +985,104 @@ impl TypeChecker {
         if state.select_sends.contains(&expr.id()) {
             state.graph.transfer(expr);
         }
+    }
+}
+
+/// Orders each lent value's loan intervals `(start, end, awaited_elsewhere)`
+/// and records loan-start errors. Aliases are resolved once per loan and wait.
+fn loan_intervals(
+    state: &mut OwnershipState,
+    moved: &HashMap<usize, usize>,
+) -> HashMap<usize, Vec<(usize, usize, bool)>> {
+    // Resolve aliases once, then scan each payload's ordered loan intervals.
+    // No per-use scan over all tasks or all aliases is needed.
+    let mut task_counts = HashMap::new();
+    let mut task_origins = HashSet::new();
+    for loan in &state.loans {
+        if task_origins.insert(loan.task) {
+            *task_counts
+                .entry(state.graph.root(loan.task))
+                .or_insert(0usize) += 1;
+        }
+    }
+    // A wait ends a loan only when both run unconditionally in the same
+    // block instance; any other path may skip the `await`.
+    let mut completed = HashMap::new();
+    let mut awaited = HashSet::new();
+    for (task, tick, region) in std::mem::take(&mut state.waits) {
+        let task = state.graph.root(task);
+        awaited.insert(task);
+        if let Some(region) = region
+            && !state.graph.borrowed[task]
+            && !state.graph.escaped[task]
+        {
+            completed.entry((task, region)).or_insert(tick);
+        }
+    }
+    let mut intervals: HashMap<usize, Vec<(usize, usize, bool)>> = HashMap::new();
+    for loan in std::mem::take(&mut state.loans) {
+        let (start, span) = (loan.start, loan.span);
+        let value = state.graph.root(loan.value);
+        let task = state.graph.root(loan.task);
+        if moved.get(&value).is_some_and(|tick| *tick <= start) {
+            state.loan_errors.push((
+                span,
+                "cannot lend a non-Sync value after permanent transfer",
+            ));
+        }
+        let end = loan
+            .region
+            .and_then(|region| completed.get(&(task, region)).copied())
+            .filter(|end| *end > start && task_counts[&task] == 1)
+            .unwrap_or(usize::MAX);
+        let reason = if state.graph.locks[value].is_some() {
+            Some("cannot lend a protected non-Sync value to a task")
+        } else if state.graph.borrowed[value] {
+            Some("cannot lend a borrowed non-Sync value to a task")
+        } else if state.graph.escaped[value] {
+            Some("cannot lend a non-Sync value whose alias may have escaped")
+        } else if state.graph.loan_unsupported[value] {
+            Some("cannot lend this non-Sync type to a task")
+        } else if state.graph.origins[value] != loan.loop_id {
+            // Each iteration would lend the same value again.
+            Some("cannot lend a non-Sync value created outside this loop iteration")
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            state.loan_errors.push((span, reason));
+        }
+        // The task is awaited, but on a path that may not follow the loan.
+        let elsewhere = end == usize::MAX && awaited.contains(&task);
+        let ranges = intervals.entry(value).or_default();
+        // Multiple aliases captured by this one task share a single loan.
+        if ranges.last().map(|r| (r.0, r.1)) == Some((start, end)) {
+            continue;
+        }
+        if ranges.last().is_some_and(|(_, end, _)| start < *end) {
+            state
+                .loan_errors
+                .push((span, "non-Sync value already has an outstanding task loan"));
+        }
+        ranges.push((start, end, elsewhere));
+    }
+    intervals
+}
+
+/// Repair advice for a rejected task loan, specific to its reason.
+fn loan_help(reason: &str) -> &'static str {
+    if reason.contains("borrowed") {
+        "parameters, fields, globals and results of calls to functions without `@sending` are borrowed; lend a local literal, a `new` value or a `@sending` call result instead, or use FrozenArray/FrozenMap for snapshots or Mutex<Array<T>>/Mutex<Map<K, V>> for shared mutation"
+    } else if reason.contains("loop iteration") {
+        "create the value inside the loop body so each iteration lends its own value, or share it through Mutex"
+    } else if reason.contains("stays lent") {
+        "write the `await` in the same block as the call that lent the value, outside any branch, or stop using the value after the call"
+    } else if reason.contains("defer") {
+        "start the task outside `defer`"
+    } else if reason.contains("protected") {
+        "keep protected references inside the lock, or copy Sync data out of it"
+    } else {
+        "await the task before using the value or its aliases again; use FrozenArray/FrozenMap for snapshots or Mutex<Array<T>>/Mutex<Map<K, V>> for shared mutation"
     }
 }
 
@@ -1123,7 +1213,7 @@ mod tests {
             (
                 "conditional loan",
                 "let a = [1]; if true { await take(a); }",
-                true,
+                false,
             ),
             (
                 "loop loan",

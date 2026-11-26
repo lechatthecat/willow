@@ -451,6 +451,13 @@ fn sending_results_example_runs() {
 }
 
 #[test]
+fn task_loans_in_loops_example_runs() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/task_loans_in_loops.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "1\n3\n3\n4\n6\n5\n7\n7\n");
+}
+
+#[test]
 fn sending_contracts_cross_module_boundaries() {
     let util = "module util;
 import std::collections::Array;

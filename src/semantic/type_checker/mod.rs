@@ -6,6 +6,8 @@ pub(crate) mod lock_order;
 pub(crate) mod purity;
 #[cfg(test)]
 mod sending_tests;
+#[cfg(test)]
+mod task_loan_flow_tests;
 
 use crate::qualified_name::QualifiedName;
 use crate::semantic::async_borrows::ReferenceArgMode;

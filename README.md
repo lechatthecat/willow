@@ -303,7 +303,11 @@ may run on another worker. Each captured reference must be `Sync`, or it must
 be a fresh, unescaped local `Array`, `Map` or class value whose contents are
 `Send`. Such a value is *lent*: after `let t = change(values)`, neither
 `values` nor its aliases can be used until `await t` completes, and
-`await change(values)` restores access immediately. Independent values can be
+`await change(values)` restores access immediately. A loan may start inside a
+branch or loop body; it ends at an `await` that runs unconditionally in the
+same block, and inside a loop only values created in the current iteration (or
+returned by a `@sending` call) can be lent
+([`task_loans_in_loops.wi`](example/task_loans_in_loops.wi)). Independent values can be
 lent to parallel Tasks, and lending a class field also locks out the containing
 object and its aliases. A Task moves between workers only if its parameters,
 result and locals live across `await` are `Send`. After a value is sent on a
@@ -394,7 +398,7 @@ See the runnable [collection](example/owned_task_loans.wi),
 | Limit | Effect | Evidence |
 | --- | --- | --- |
 | Static class fields are not a checked task boundary | Tasks can mutate a non-`Sync` static field concurrently without a diagnostic. Protect such state with `Mutex<T>` or atomics yourself. | The check runs on async call arguments only: `check_async_capture` in [`send_sync.rs`](src/semantic/type_checker/send_sync.rs) |
-| Loans inside `if`, loops, `defer` or a closure capture | Rejected, even when safe. Lend at the top level of the function body. | `task_loans_accept_owned_and_reject_alias_hazards` in [`transfer_ownership.rs`](src/semantic/type_checker/transfer_ownership.rs) |
+| Loans awaited only in a nested branch, loans of values from outside the current loop iteration, loans inside `defer` or a closure capture | Rejected, even when safe. Await the task in the block that lent the value, and create loop values inside the loop body. | `task_loans_reject_unsound_paths_with_a_specific_reason` in [`task_loan_flow_tests.rs`](src/semantic/type_checker/task_loan_flow_tests.rs) |
 | Lending an async parameter to another Task or storing it in shared state | Rejected | `owned_task_loans_imported_callee_and_escape_contract` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
 | Closure values | Never `Send` or `Sync`, so they cannot be passed to an async call; environment-free function pointers can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
 | Memory inside Rust adapters and native libraries | Not analyzed | [Where the guarantees stop](#where-the-guarantees-stop) |
