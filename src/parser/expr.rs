@@ -1,7 +1,7 @@
 use super::Parser;
 use super::ast::*;
 use super::import_usage::ReferenceKind;
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 use crate::semantic::intrinsics::MethodName;
 
@@ -1485,19 +1485,17 @@ impl Parser {
                 self.eat(TokenKind::Comma);
                 continue;
             } else {
+                let mut open = self.current_span();
                 let expr = self.parse_expr()?;
                 if matches!(self.peek_kind(), TokenKind::Eq)
                     || super::stmt::compound_assignment_op(self.peek_kind()).is_some()
                     || self.shift_assign_op().is_some()
                 {
-                    let error = self
-                        .err_at(
-                            ErrorCode::E0102,
-                            "assignment in a match arm requires a block",
-                            self.current_span(),
-                        )
-                        .with_help("use a block, for example `{ n += v; }` or `{ n = v; }`");
-                    self.recovered_errors.push(error);
+                    let error = self.err_at(
+                        ErrorCode::E0102,
+                        "assignment in a match arm requires a block",
+                        self.current_span(),
+                    );
                     // Parse the RHS once so nested commas and matches retain
                     // their normal boundaries and diagnostics. Omit the invalid
                     // arm from the partial AST; parsing still fails overall.
@@ -1507,6 +1505,21 @@ impl Parser {
                     self.advance();
                     let result = self.parse_expr();
                     self.default_import_usage.restore(scope);
+                    // Wrap the statement the user wrote: `{ ` before its
+                    // target and `; }` after its value.
+                    open.end = open.start;
+                    let mut close = self.previous_span();
+                    close.col += close.end - close.start;
+                    close.start = close.end;
+                    let error = if result.is_ok() {
+                        error
+                            .with_help("wrap the assignment in a block")
+                            .with_fix(FixSuggestion::insertion(open, "{ ", "open a block"))
+                            .with_fix(FixSuggestion::insertion(close, "; }", "close the block"))
+                    } else {
+                        error.with_help("wrap the assignment in a block: `{ target = value; }`")
+                    };
+                    self.recovered_errors.push(error);
                     result?;
                     self.eat(TokenKind::Comma);
                     continue;

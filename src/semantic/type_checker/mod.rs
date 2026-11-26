@@ -2820,6 +2820,9 @@ mod type_parameter_bound_tests;
 mod lock_escape_cascade_tests;
 
 #[cfg(test)]
+mod common_mistake_hint_tests;
+
+#[cfg(test)]
 thread_local! {
     static CONSTRUCTOR_INFERENCE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

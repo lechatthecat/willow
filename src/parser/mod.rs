@@ -14,7 +14,7 @@ mod stmt;
 pub(crate) mod tuples;
 mod types;
 
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::lexer::token::{Token, TokenKind};
 use ast::*;
 
@@ -470,10 +470,41 @@ impl Parser {
             Ok(span)
         } else if self.check(TokenKind::Ampersand) {
             Err(self.err(ErrorCode::E0102, "`&` is only valid before a call argument"))
+        } else if kind == TokenKind::Semicolon
+            && let Some(after) = self.end_of_previous_line()
+        {
+            // The `;` belongs after the last token of the previous line, not
+            // before the first token of the next one.
+            let (code, msg) = token_expect_message(&kind);
+            Err(Diagnostic::new(Severity::Error, code, msg)
+                .with_label(Label::primary(after, "add `;` here"))
+                .with_help(format!("end the statement on line {} with `;`", after.line))
+                .with_fix(FixSuggestion::insertion(after, ";", "add `;`")))
         } else {
             let (code, msg) = token_expect_message(&kind);
             Err(self.err(code, msg))
         }
+    }
+
+    /// The empty span just after the previous token, when the current token
+    /// starts a later line.
+    fn end_of_previous_line(&self) -> Option<Span> {
+        let previous = self.last_span?;
+        let current = self.current_span();
+        if current.line <= previous.line || previous.end > current.start {
+            return None;
+        }
+        // Only a string literal can span lines; its end column is unknown
+        // here, so keep the default position after one.
+        if let TokenKind::StringLiteral(text) = &self.tokens[self.pos.checked_sub(1)?].kind
+            && text.contains('\n')
+        {
+            return None;
+        }
+        let mut after = previous;
+        after.col = previous.col + (previous.end - previous.start);
+        after.start = previous.end;
+        Some(after)
     }
 
     fn expect_ident(&mut self) -> Result<String, Diagnostic> {

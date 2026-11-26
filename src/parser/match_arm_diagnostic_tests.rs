@@ -26,85 +26,85 @@ fn match_arm_targeted_diagnostics() {
         (
             "n = v",
             "assignment in a match arm requires a block",
-            "{ n = v; }",
+            "wrap the assignment in a block",
             "=",
         ),
         (
             "n += v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "+=",
         ),
         (
             "n -= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "-=",
         ),
         (
             "n *= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "*=",
         ),
         (
             "n /= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "/=",
         ),
         (
             "n %= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "%=",
         ),
         (
             "n &= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "&=",
         ),
         (
             "n |= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "|=",
         ),
         (
             "n ^= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "^=",
         ),
         (
             "n <<= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "<<=",
         ),
         (
             "n >>= v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             ">>=",
         ),
         (
             "obj.field += v",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "wrap the assignment in a block",
             "+=",
         ),
         (
             "a[i] = v",
             "assignment in a match arm requires a block",
-            "{ n = v; }",
+            "wrap the assignment in a block",
             "=",
         ),
         (
             "C::field = v",
             "assignment in a match arm requires a block",
-            "{ n = v; }",
+            "wrap the assignment in a block",
             "=",
         ),
         (
@@ -135,6 +135,14 @@ fn match_arm_targeted_diagnostics() {
             .find(|e| e.message == message)
             .unwrap_or_else(|| panic!("{source}: {diagnostics:?}"));
         assert!(error.helps.iter().any(|h| h.contains(help)), "{error:?}");
+        if message.starts_with("assignment") {
+            // The fixes wrap exactly the statement that was written.
+            let mut fixed = source.clone();
+            for fix in error.fix_suggestions.iter().rev() {
+                fixed.replace_range(fix.span.start..fix.span.end, &fix.replacement);
+            }
+            assert!(fixed.contains(&format!("=> {{ {body}; }},")), "{fixed}");
+        }
         assert_eq!(
             error.primary_span().unwrap().start,
             prefix.len() + body.find(marker).unwrap(),

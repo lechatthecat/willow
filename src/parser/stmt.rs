@@ -1,6 +1,6 @@
 use super::Parser;
 use super::ast::*;
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
+use crate::diagnostics::{Diagnostic, ErrorCode, FixSuggestion, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
 #[willow_continuations::parser]
@@ -29,6 +29,24 @@ impl Parser {
                         self.current_span(),
                     )
                     .with_label(Label::secondary(start, "block opened here")));
+            }
+            if self.check(TokenKind::Semicolon) {
+                // A `;` with no statement before it, as in `f();;`. One error
+                // covers the whole run, and parsing goes on after it.
+                let first = self.current_span();
+                let mut last = first;
+                while self.check(TokenKind::Semicolon) {
+                    last = self.current_span();
+                    self.advance();
+                }
+                let span = first.to(last);
+                self.recovered_errors.push(
+                    Diagnostic::new(Severity::Error, ErrorCode::E0102, "unnecessary `;`")
+                        .with_label(Label::primary(span, "no statement ends here"))
+                        .with_help("remove the extra `;`")
+                        .with_fix(FixSuggestion::new(span, "", "remove the extra `;`")),
+                );
+                continue;
             }
             // Bind once, then put the remaining lexical scope in the first
             // arm. Folding these segments after parsing moves each statement

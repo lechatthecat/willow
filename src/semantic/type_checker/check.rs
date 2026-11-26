@@ -3649,15 +3649,48 @@ impl TypeChecker {
             }
             return Self::error_type();
         }
-        self.push(
-            Diagnostic::new(
-                Severity::Error,
-                ErrorCode::E0350,
-                format!("cannot find function `{}`", c.callee),
-            )
-            .with_label(Label::primary(c.span, "not found in this scope")),
-        );
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0350,
+            format!("cannot find function `{}`", c.callee),
+        )
+        .with_label(Label::primary(c.span, "not found in this scope"));
+        if let Some(name) = self.similar_function_name(&c.callee) {
+            diagnostic = diagnostic.with_help(format!("did you mean `{name}`?"));
+        }
+        self.push(diagnostic);
         Type::Void
+    }
+
+    /// A visible free function whose name is a likely typo of `callee`, or
+    /// the leading word of it (`yield_now` -> `yield`).
+    fn similar_function_name(&self, callee: &str) -> Option<String> {
+        let names: Vec<_> = self
+            .symbols
+            .functions
+            .keys()
+            .filter(|id| id.namespace().is_none() && id.owner().is_none() && !id.is_lambda())
+            .map(|id| id.name())
+            // Print functions are keywords, not entries in the function table.
+            .chain(["print", "println"].map(std::sync::Arc::<str>::from))
+            .filter(|name| {
+                name.as_ref() != callee
+                    && name.starts_with(|c: char| c.is_ascii_alphabetic())
+                    && name.len().abs_diff(callee.len()) <= 2
+                    || callee.split('_').next() == Some(name.as_ref())
+            })
+            .collect();
+        if let Some(name) = super::diagnostics::suggest_similar_name(callee, names.iter()) {
+            return Some(name);
+        }
+        let head = callee
+            .split('_')
+            .next()
+            .filter(|head| head.len() >= 3 && *head != callee)?;
+        names
+            .iter()
+            .find(|name| name.as_ref() == head)
+            .map(|name| name.to_string())
     }
 
     fn check_await_expr(&mut self, a: &AwaitExpr) -> Type {

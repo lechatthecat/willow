@@ -525,19 +525,24 @@ impl TypeChecker {
                 }
                 let other = spelling;
                 let mut diagnostic = Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0201,
-                        format!(
-                            "no method `{}` on type `Map<{}, {}>`",
-                            other,
-                            self.diagnostic_type_name(key_ty),
-                            self.diagnostic_type_name(val_ty)
-                        ),
-                    )
-                    .with_label(Label::primary(m.span, "unknown map method"))
-                    .with_help(
-                        "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.to_string()`",
-                    );
+                    Severity::Error,
+                    ErrorCode::E0201,
+                    format!(
+                        "no method `{}` on type `Map<{}, {}>`",
+                        other,
+                        self.diagnostic_type_name(key_ty),
+                        self.diagnostic_type_name(val_ty)
+                    ),
+                )
+                .with_label(Label::primary(m.span, "unknown map method"));
+                if matches!(other, "set" | "put" | "add" | "update") {
+                    diagnostic = diagnostic.with_help(format!(
+                        "use `.insert(k, v)` to set a value; there is no `.{other}`"
+                    ));
+                }
+                diagnostic = diagnostic.with_help(
+                    "maps support `.insert(k, v)`, `.get(k)`, `.remove(k)`, `.keys()`, `.values()`, `.entries()`, `.contains(k)`, `.len()`, `.freeze()`, `.to_string()`",
+                );
                 self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
                 self.push(diagnostic);
                 Type::Void

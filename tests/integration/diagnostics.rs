@@ -1173,7 +1173,7 @@ fn match_arm_actionable_diagnostics() {
         (
             "n += 1",
             "assignment in a match arm requires a block",
-            "{ n += v; }",
+            "_ => { n += 1; } }",
         ),
         (
             "{ let y = 1; y }",

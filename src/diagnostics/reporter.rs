@@ -187,47 +187,75 @@ fn render_footer<'a>(
         writeln!(writer, "help: {help}")?;
     }
 
-    for fix in &diag.fix_suggestions {
-        if fix.span.line == 0 {
+    // Fixes on the same line render as one fixed line, so a pair of
+    // insertions such as `{ ` and `; }` shows the repaired statement whole.
+    let mut fixes = diag.fix_suggestions.iter().peekable();
+    while let Some(first) = fixes.next() {
+        let mut group = vec![first];
+        while let Some(next) = fixes.peek()
+            && next.span.line == first.span.line
+            && next.span.file_id == first.span.file_id
+        {
+            group.push(fixes.next().expect("peeked fix"));
+        }
+        if first.span.line == 0 {
             continue;
         }
-        let Some(map) = map_for(fix.span.file_id) else {
+        let Some(map) = map_for(first.span.file_id) else {
             continue;
         };
-        let line = fix.span.line;
-        let margin = digits(line);
-        writeln!(writer, "{} |", " ".repeat(margin))?;
+        render_fixed_line(map, &mut group, writer)?;
+    }
+    Ok(())
+}
 
-        let original = map.line_text(line);
+/// Render one source line with every fix in `group` applied and a marker row
+/// under each change: `+` for inserted text, `~` for replaced text.
+fn render_fixed_line(
+    map: &SourceMap,
+    group: &mut [&crate::diagnostics::FixSuggestion],
+    writer: &mut dyn Write,
+) -> io::Result<()> {
+    let line = group[0].span.line;
+    let margin = digits(line);
+    writeln!(writer, "{} |", " ".repeat(margin))?;
+    let original = map.line_text(line);
+    let base = map.line_start(line);
+    group.sort_by_key(|fix| (fix.span.start, fix.span.end));
+    let mut fixed_line = String::with_capacity(original.len());
+    let mut markers = String::new();
+    let mut copied = 0;
+    for fix in group.iter() {
         let line_start = fix
             .span
             .start
-            .saturating_sub(map.line_start(line))
-            .min(original.len());
+            .saturating_sub(base)
+            .min(original.len())
+            .max(copied);
         let line_end = fix
             .span
             .end
-            .saturating_sub(map.line_start(line))
+            .saturating_sub(base)
             .min(original.len())
             .max(line_start);
-        let fixed_line = format!(
-            "{}{}{}",
-            &original[..line_start],
-            fix.replacement,
-            &original[line_end..]
-        );
-        writeln!(writer, "{:>width$} | {}", line, fixed_line, width = margin)?;
-
-        let col = fix.span.col.saturating_sub(1);
-        let old_len = line_end.saturating_sub(line_start);
+        fixed_line.push_str(&original[copied..line_start]);
+        let col = fixed_line.chars().count();
+        fixed_line.push_str(&fix.replacement);
+        copied = line_end;
+        let old_len = line_end - line_start;
         let new_len = fix.replacement.len();
-        let markers = if new_len >= old_len {
-            " ".repeat(col) + &"+".repeat(new_len.max(1))
+        let marker = if new_len >= old_len {
+            "+".repeat(new_len.max(1))
         } else {
-            " ".repeat(col) + &"~".repeat(old_len.max(1))
+            "~".repeat(old_len.max(1))
         };
-        writeln!(writer, "{} | {}", " ".repeat(margin), markers)?;
+        let pad = col.saturating_sub(markers.chars().count());
+        markers.push_str(&" ".repeat(pad));
+        markers.push_str(&marker);
     }
+    fixed_line.push_str(&original[copied..]);
+    writeln!(writer, "{:>width$} | {}", line, fixed_line, width = margin)?;
+    writeln!(writer, "{} | {}", " ".repeat(margin), markers)?;
     Ok(())
 }
 
