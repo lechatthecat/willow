@@ -402,10 +402,10 @@ runtime_abi_schema! {
     ALLOC; willow_channel_select_cleanup => ([Ptr, Ptr, I64] -> None);
     PANIC_ALLOC; willow_channel_new_bounded => ([I64, I64] -> Some(Ptr));
     NONE; willow_channel_send_ready => ([Ptr] -> Some(I32));
-    NONE; willow_channel_try_send_i64 => ([Ptr, I64] -> Some(I32));
-    NONE; willow_channel_try_send_bool => ([Ptr, I8] -> Some(I32));
-    NONE; willow_channel_try_send_f64 => ([Ptr, F64] -> Some(I32));
-    NONE; willow_channel_try_send_ptr => ([Ptr, Ptr] -> Some(I32));
+    PANIC_ALLOC; willow_channel_try_send_i64 => ([Ptr, I64] -> Some(I32));
+    PANIC_ALLOC; willow_channel_try_send_bool => ([Ptr, I8] -> Some(I32));
+    PANIC_ALLOC; willow_channel_try_send_f64 => ([Ptr, F64] -> Some(I32));
+    PANIC_ALLOC; willow_channel_try_send_ptr => ([Ptr, Ptr] -> Some(I32));
     NONE; willow_select_rotation => ([] -> Some(I64));
     NONE; willow_monotonic_millis => ([] -> Some(I64));
     BLOCK; willow_sleep_until_monotonic => ([I64] -> None);
@@ -596,6 +596,28 @@ pub fn runtime_symbol(name: &str) -> Option<&'static RuntimeSymbol> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn channel_send_commit_effects_include_panic_allocation() {
+        for name in [
+            names::willow_channel_try_send_i64,
+            names::willow_channel_try_send_bool,
+            names::willow_channel_try_send_f64,
+            names::willow_channel_try_send_ptr,
+        ] {
+            assert_eq!(
+                runtime_symbol(name).unwrap().effects(),
+                PANIC_ALLOC,
+                "{name}"
+            );
+        }
+        assert_eq!(
+            runtime_symbol(names::willow_channel_send_ready)
+                .unwrap()
+                .effects(),
+            NONE
+        );
+    }
 
     #[test]
     fn the_aliases_spell_the_combinations_they_are_named_for() {

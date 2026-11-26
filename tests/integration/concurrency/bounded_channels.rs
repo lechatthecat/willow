@@ -16,7 +16,7 @@ use super::*;
 //   6. A producer parked on a full buffer resumes once the consumer drains.
 //   7. Multiple producers into one bounded channel conserve the total.
 //   8. `close` wakes a producer parked on a full buffer (no hang).
-//   9. `send` after `close` is a no-op on a bounded channel.
+//   9. `send` after `close` panics on a bounded channel.
 //  10. `recv` after `close` still drains the buffered values.
 //  11. `bool` elements.
 //  12. `f64` elements.
@@ -103,22 +103,41 @@ fn bch_07_multiple_producers_conserve_total() {
 
 #[test]
 fn bch_08_close_wakes_parked_producer() {
-    // The producer parks on a full buffer; `close` wakes it and its remaining
-    // sends become no-ops, so it finishes instead of hanging.
-    let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) -> i64 { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } return 7; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); ch.close(); println(await p); }",
+    // The first value is the explicit signal that the producer is running.
+    // Close rejects its next send whether it has already parked or is about to.
+    let (out, ok) = compile_and_run_with_runtime_env(
+        r#"
+async fn produce(ch: Channel<i64>) {
+    defer match recover() { Some(info) => println(info.message), None => {} }
+    ch.send(1);
+    ch.send(2);
+    ch.send(3);
+    println("unreachable");
+}
+async fn main() {
+    let ch = Channel<i64>::with_capacity(1);
+    let p = produce(ch);
+    println(ch.recv());
+    ch.close();
+    await p;
+    println("done");
+}
+"#,
+        &[("WILLOW_WORKERS", "1")],
+        std::time::Duration::from_secs(60),
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "7\n");
+    assert_eq!(out, "1\nsend on closed channel\ndone\n");
 }
 
 #[test]
-fn bch_09_send_after_close_is_noop() {
-    let (out, ok) = compile_and_run(
-        "fn main() { let ch = Channel<i64>::with_capacity(2); ch.close(); ch.send(5); println(0); }",
+fn bch_09_send_after_close_panics() {
+    let (out, ok) = compile_and_run_check_exit(
+        "fn main() { let ch = Channel<i64>::with_capacity(2); ch.close(); ch.send(5); println(\"unreachable\"); }",
     );
-    assert!(ok, "{out}");
-    assert_eq!(out, "0\n");
+    assert!(!ok, "{out}");
+    assert!(out.contains("send on closed channel"), "{out}");
+    assert!(!out.contains("unreachable"), "{out}");
 }
 
 #[test]

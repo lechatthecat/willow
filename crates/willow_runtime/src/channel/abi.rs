@@ -105,7 +105,9 @@ pub unsafe extern "C" fn willow_channel_try_send_ptr(raw: *mut c_void, value: *m
 
 /// Send-readiness probe for select send cases: 1 when not full
 /// (or closed/unbounded); 0 after registering the running task as a send
-/// waiter on a FULL bounded channel.
+/// waiter on a FULL bounded channel. A closed channel is ready so the arm is
+/// chosen and its send raises `send on closed channel`, the same panic as a
+/// plain `send`.
 ///
 /// # Safety
 /// A non-null raw handle must denote a live Willow channel from this runtime, kept reachable

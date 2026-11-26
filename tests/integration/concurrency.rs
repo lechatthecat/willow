@@ -296,3 +296,6 @@ mod ordered_locks;
 
 #[path = "concurrency/ownership_transfer.rs"]
 mod ownership_transfer;
+
+#[path = "concurrency/closed_send.rs"]
+mod closed_send;

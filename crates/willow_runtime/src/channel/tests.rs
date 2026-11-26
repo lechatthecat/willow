@@ -817,25 +817,35 @@ fn bounded_unit_05_unbounded_send_ready_is_always_one() {
 }
 
 #[test]
-fn bounded_unit_06_closed_full_channel_accepts_sends_as_noops() {
+fn bounded_unit_06_closed_full_channel_panics_on_send() {
     let _guard = crate::gc::isolated_runtime();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { crate::gc::reset_internal_for_test() };
-    let ch = willow_channel_new_bounded(0, 1);
+    let root = crate::gc::GcRootHandle::new(willow_channel_new_bounded(0, 1).cast());
+    let ch = root.load().cast();
     // SAFETY: The constructor selected this channel element representation and the channel
     // remains live during the send.
     unsafe { willow_channel_try_send_i64(ch, 1) };
     // SAFETY: The handle is null or the live channel retained for this operation.
     unsafe { willow_channel_close(ch) };
-    // Send-on-closed is a documented no-op, so it must never report FULL:
-    // that would park a producer nobody is going to wake.
+    let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
+        crate::panic_context::PanicContext::new(6),
+    )));
+    // Closed is ready even when full: commit raises rather than parking forever.
     // SAFETY: The handle is null or the live channel retained for this operation.
     assert_eq!(unsafe { willow_channel_send_ready(ch) }, 1);
     // SAFETY: The constructor selected this channel element representation and the channel
     // remains live during the send.
     assert_eq!(unsafe { willow_channel_try_send_i64(ch, 2) }, 1);
-    assert_eq!(queued(ch), 1);
+    assert_eq!(crate::panic_context::willow_panic_active(), 1);
+    crate::panic_context::willow_panic_enter_defer();
+    let recovered = crate::panic_context::willow_panic_recover();
+    crate::panic_context::willow_panic_leave_defer();
+    assert!(!recovered.is_null());
+    crate::panic_context::willow_panic_release_recovered(recovered);
+    crate::panic_context::replace_current_context(previous);
+    assert_eq!(queued(root.load().cast()), 1);
 }
 
 #[test]
@@ -2080,4 +2090,58 @@ fn native_table_tombstones_do_not_hide_growth_in_another_buffer() {
     );
     drop(channel);
     assert_eq!(crate::gc_telemetry::external_bytes(), baseline);
+}
+
+// Explicitly place close between readiness/parking/handoff and send commit.
+// The scheduler placeholder makes each ownership transition deterministic.
+#[test]
+fn closed_send_commit_after_ready_wait_or_handoff() {
+    let _runtime = crate::gc::isolated_runtime();
+    for phase in ["ready", "waiting", "handoff"] {
+        crate::scheduler::reset_global_scheduler_for_test();
+        let task = crate::scheduler::with_global_for_test(|sched| sched.spawn_placeholder());
+        let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
+            crate::panic_context::PanicContext::new(task),
+        )));
+        let root = crate::gc::GcRootHandle::new(willow_channel_new_bounded(0, 1).cast());
+        crate::scheduler::with_current_task_for_test(task, || {
+            let raw = root.load().cast();
+            // SAFETY: The rooted channel carries i64 values and remains live throughout.
+            unsafe {
+                if phase == "ready" {
+                    assert_eq!(willow_channel_send_ready(raw), 1);
+                } else {
+                    assert_eq!(willow_channel_try_send_i64(raw, 11), 1);
+                    assert_eq!(willow_channel_try_send_i64(raw, 22), 0);
+                    assert_eq!(send_waiter_ids(raw), vec![task]);
+                    if phase == "handoff" {
+                        assert_eq!(willow_channel_recv_i64(raw), 11);
+                        assert_eq!(
+                            expected_test_ownership(task, raw)[0].role,
+                            ChannelRole::SendHandoff
+                        );
+                    }
+                }
+                willow_channel_close(raw);
+                assert_eq!(willow_channel_try_send_i64(root.load().cast(), 22), 1);
+            }
+            assert_eq!(crate::panic_context::willow_panic_active(), 1, "{phase}");
+            crate::panic_context::willow_panic_enter_defer();
+            let recovered = crate::panic_context::willow_panic_recover();
+            crate::panic_context::willow_panic_leave_defer();
+            assert!(!recovered.is_null());
+            crate::panic_context::willow_panic_release_recovered(recovered);
+            let raw = root.load().cast();
+            assert!(expected_test_ownership(task, raw).is_empty(), "{phase}");
+            assert!(crate::scheduler::take_channel_waits(task).is_empty());
+            assert_eq!(queued(raw), usize::from(phase == "waiting"));
+            // SAFETY: Reload the live rooted channel after panic allocation.
+            let channel = unsafe { channel_from_raw(raw) }.unwrap();
+            // Reacquiring both locks also checks the panic left neither poisoned/held.
+            assert!(channel.state.lock().unwrap().closed);
+            assert!(!channel.inbox.lock().unwrap().open);
+        });
+        crate::panic_context::replace_current_context(previous);
+    }
+    crate::scheduler::reset_global_scheduler_for_test();
 }

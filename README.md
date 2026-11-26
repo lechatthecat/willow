@@ -405,6 +405,21 @@ See the runnable [collection](example/owned_task_loans.wi),
 | Closure values | A closure that mutates a captured binding or captures a non-`Send` + `Sync` value is task-local and cannot be passed to an async call; one capturing only immutable `Send` + `Sync` bindings can | `test_closure_async_e2402_help` in [`capture_checking.rs`](tests/integration/concurrency/capture_checking.rs) |
 | Memory inside Rust adapters and native libraries | Not analyzed | [Where the guarantees stop](#where-the-guarantees-stop) |
 
+### Sending after channel close
+
+`Channel<T>.send(value)` raises the recoverable panic `send on closed channel`
+when the channel is closed, for both bounded and unbounded channels. This also
+applies to a producer waiting for buffer space when another task closes the
+channel. A rejected value is never queued; values accepted before close remain
+available to `recv()` and `recv_opt()` in FIFO order.
+
+A closed channel is ready for a `select` send arm. If that arm is chosen, the
+send raises before its arm body runs; `default` does not suppress this panic.
+Other ready arms still participate in the usual selection. Readiness does not
+reserve successful delivery: if close wins before the send commits, it raises.
+See [`example/channel_closed_send.wi`](example/channel_closed_send.wi) for
+recovery and draining after rejected sends.
+
 ### E2604: a lock body never waits
 
 **Guarantee.** A `lock` body (allowed only in an `async fn`, E2603) is rejected

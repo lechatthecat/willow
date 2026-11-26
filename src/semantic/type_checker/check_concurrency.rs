@@ -51,7 +51,9 @@ impl TypeChecker {
                 SelectCaseKind::Send { channel, value } => {
                     let ch_ty = self.check_expr(channel);
                     let elem = self.select_channel_elem(&ch_ty, channel.span());
-                    let v_ty = self.check_expr(value);
+                    // Match ordinary send: the channel supplies the expected
+                    // type for shorthand variants such as Some/None.
+                    let v_ty = self.check_expr_expecting(value, &elem);
                     if *elem != Type::Void
                         && v_ty != *elem
                         && !self.recovery_types_compatible(&elem, &v_ty)

@@ -1,0 +1,28 @@
+// A closed channel rejects every new send with a recoverable language panic.
+// A selected send arm raises before its body. Values accepted before close
+// remain available through recv/recv_opt; the rejected value is never queued.
+fn main() {
+    let ch = Channel<String>::with_capacity(1);
+    ch.send("accepted");
+    ch.close();
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => {}
+        }
+        ch.send("rejected");
+        println("unreachable");
+    }
+    if true {
+        defer match recover() {
+            Some(info) => println(info.message),
+            None => {}
+        }
+        select {
+            ch.send("also rejected") => { println("unreachable"); }
+            default => { println("unreachable: closed send is ready"); }
+        }
+    }
+    println(ch.recv());
+    println(ch.recv_opt().is_none());
+}

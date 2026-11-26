@@ -476,6 +476,9 @@ fn clear_reservation(raw: *mut c_void, owners: &mut IdMap<u64, u64>, task: u64, 
 }
 
 /// Successful sends reserve one value for each receiver we actually wake.
+/// Returns 1 when the send completed (or raised `send on closed channel`;
+/// the caller's panic check then unwinds) and 0 after registering the
+/// running task as a send waiter on a full bounded channel.
 ///
 /// # Safety
 /// A non-null raw pointer must identify a current live channel. The union value must have
@@ -534,6 +537,12 @@ unsafe fn channel_try_send_value(raw: *mut c_void, value: WillowChannelValue) ->
                 current,
                 ChannelRole::SendHandoff,
             );
+            // The value is never queued: the sender panics like `recv` on a
+            // closed empty channel. Raising allocates, so release the channel
+            // lock and the no-preempt region first.
+            drop(state);
+            drop(_no_preempt);
+            channel_raise_with("send on closed channel");
             return 1;
         }
         if !state.send_handoffs.contains_key(&current) && state_is_full(&state) {

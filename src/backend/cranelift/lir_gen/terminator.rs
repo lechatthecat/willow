@@ -240,9 +240,14 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         } else {
                             (channel, self.widen_integer(value, elem_ty))
                         };
-                        let sent = self.emit_value_runtime_call(runtime, &[channel, value]);
-                        self.emit_pop_roots_n(self.roots.gc_root_count - before);
-                        self.roots.gc_root_count = before;
+                        // Drop temporary boxing roots before either the normal
+                        // continuation or the closed-send panic cleanup edge.
+                        let sent = self
+                            .emit_runtime_call_with_cleanup(runtime, &[channel, value], |this| {
+                                this.emit_pop_roots_n(this.roots.gc_root_count - before);
+                                this.roots.gc_root_count = before;
+                            })
+                            .expect("channel try-send returns a status");
                         let sent = self.builder.ins().icmp_imm_s(IntCC::NotEqual, sent, 0);
                         let one = self.builder.ins().iconst(types::I8, 1);
                         let zero = self.builder.ins().iconst(types::I8, 0);
