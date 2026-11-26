@@ -427,7 +427,7 @@ pub unsafe extern "C" fn willow_array_join(array: *mut u8, separator: *mut u8) -
     }
     // SAFETY: The join caller supplies a stable Array<String>; element reads have exclusive
     // access to its handle.
-    let count = unsafe { crate::array::willow_array_len(array) };
+    let count = unsafe { crate::array::array_len(array) };
     // SAFETY: The operand is null or a live string, and no safepoint intervenes in this borrow.
     let separator_len = unsafe { ws_as_bytes(separator).1 };
     let Some(mut total) = separator_len.checked_mul((count as usize).saturating_sub(1)) else {
@@ -932,7 +932,7 @@ mod tests {
             assert_eq!(
                 // SAFETY: Split returned a populated Array<String>; this traversal reads it
                 // before another GC point.
-                unsafe { crate::array::willow_array_len(result) },
+                unsafe { crate::array::array_len(result) },
                 count as i64 + 1
             );
             assert_eq!(COPIED_BYTES.with(|bytes| bytes.get()), count * 3);
@@ -993,7 +993,7 @@ mod tests {
         let result = unsafe { willow_string_split(source.load(), separator.load()) };
         // SAFETY: Split returned a populated Array<String>; this traversal reads it before
         // another GC point.
-        assert_eq!(unsafe { crate::array::willow_array_len(result) }, 3);
+        assert_eq!(unsafe { crate::array::array_len(result) }, 3);
         // SAFETY: Split returned a populated Array<String>; this traversal reads it before
         // another GC point.
         let part = unsafe { crate::array::willow_array_get(result, 1) } as *const u8;

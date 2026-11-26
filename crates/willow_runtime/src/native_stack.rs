@@ -1042,7 +1042,7 @@ mod tests {
 
     #[test]
     fn inline_countdown_bounds_runtime_calls_and_keeps_budget_trip_points() {
-        use crate::preempt::SYNC_POLL_STRIDE;
+        use crate::preempt::{SYNC_POLL_STRIDE, SYNC_POLL_STRIDE_MAX};
         let _guard = crate::gc::isolated_runtime();
         for (budget, safepoints) in [(1000, 10_000), (1000, 100_000), (1, 50), (64, 640)] {
             let state = run_counted(budget, safepoints);
@@ -1051,14 +1051,17 @@ mod tests {
             assert_eq!(state.trips, expected, "budget {budget}");
             assert_eq!(state.resumes, safepoints / budget);
             // The first call charges one safepoint, then each quantum is
-            // covered by grants of at most SYNC_POLL_STRIDE safepoints.
+            // covered by grants of between SYNC_POLL_STRIDE and
+            // SYNC_POLL_STRIDE_MAX safepoints; the stride adapts to the clock.
             let quanta = safepoints / budget;
-            let per_quantum = budget.div_ceil(SYNC_POLL_STRIDE);
-            let first = 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE);
-            assert_eq!(
-                state.runtime_calls,
-                first + (quanta - 1) * per_quantum,
-                "budget {budget}, safepoints {safepoints}"
+            let calls = |stride: u64| {
+                1 + (budget - 1).div_ceil(stride) + (quanta - 1) * budget.div_ceil(stride)
+            };
+            assert!(
+                (calls(SYNC_POLL_STRIDE_MAX)..=calls(SYNC_POLL_STRIDE))
+                    .contains(&state.runtime_calls),
+                "budget {budget}, safepoints {safepoints}: {}",
+                state.runtime_calls
             );
             assert!(state.runtime_calls <= safepoints / SYNC_POLL_STRIDE + 2 * quanta);
         }

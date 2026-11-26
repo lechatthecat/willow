@@ -353,14 +353,13 @@ fn allocate_array(len: i64, elem_is_ref: i64) -> *mut u8 {
             // The handle's slot is null, so a collection here traces it safely.
             // SAFETY: The initialized slot stays at this address until its registration is
             // popped; collection may rewrite it there.
-            unsafe { crate::gc::willow_push_root(&raw mut handle) };
+            unsafe { crate::gc::push_root(&raw mut handle) };
             let buffer = match crate::gc::try_alloc_young([buffer_layout]) {
                 Some([buffer]) => buffer,
                 None => crate::gc::alloc_young_layout_slow(buffer_layout),
             };
-            // SAFETY: The removed shadow-stack entries belong to this operation and their
-            // slot storage is still live.
-            unsafe { crate::gc::willow_pop_roots(1) };
+            // The removed shadow-stack entry belongs to this operation.
+            crate::gc::pop_roots(1);
             if buffer.is_null() {
                 return buffer;
             }
@@ -497,7 +496,7 @@ pub unsafe extern "C" fn willow_array_copy(arr: *mut u8) -> *mut u8 {
         return std::ptr::null_mut();
     }
     // SAFETY: The caller supplied the current source handle and null was rejected.
-    let len = unsafe { willow_array_len(arr) };
+    let len = unsafe { array_len(arr) };
     // SAFETY: The live handle owns its buffer and the ABI fixes these word offsets.
     let is_ref = unsafe { handle_word(arr, H_IS_REF) };
     let arr = crate::gc::GcRootHandle::new(arr);
@@ -532,7 +531,7 @@ pub unsafe extern "C" fn willow_array_copy_scalar_pairs(arr: *mut u8) -> *mut u8
         return std::ptr::null_mut();
     }
     // SAFETY: The source handle is live by the caller contract and passed the null check.
-    let len = unsafe { willow_array_len(arr) };
+    let len = unsafe { array_len(arr) };
     let arr = crate::gc::GcRootHandle::new(arr);
     let copy = new_old_array(len, 1);
     if copy.is_null() {
@@ -644,6 +643,17 @@ pub(crate) unsafe fn copy_scalar_pair(source: *const i64) -> *mut u8 {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_array_len(arr: *mut u8) -> i64 {
+    // SAFETY: Forwarded caller contract.
+    unsafe { array_len(arr) }
+}
+
+/// [`willow_array_len`] for runtime callers, which are already inside an FFI
+/// boundary: entering a nested one per length read would repeat the
+/// native-frame bookkeeping and unwind guard on every call.
+///
+/// # Safety
+/// Same contract as [`willow_array_len`].
+pub(crate) unsafe fn array_len(arr: *mut u8) -> i64 {
     if arr.is_null() {
         raise_with("cannot take the length of a null array");
         return 0;
@@ -774,12 +784,11 @@ pub unsafe extern "C" fn willow_array_resize(arr: *mut u8, length: i64, pair_mas
     let slot = &raw mut root;
     // SAFETY: The slot storage stays live and stationary through the matching pop, including
     // during collection.
-    unsafe { crate::gc::willow_push_root(slot) };
+    unsafe { crate::gc::push_root(slot) };
     // SAFETY: This initialized slot stays registered and live until the pop below.
     unsafe { resize_rooted(slot, length, pair_mask) };
-    // SAFETY: The removed shadow-stack entries belong to this operation and their slot
-    // storage is still live.
-    unsafe { crate::gc::willow_pop_roots(1) };
+    // The removed shadow-stack entry belongs to this operation.
+    crate::gc::pop_roots(1);
 }
 
 /// # Safety
@@ -798,7 +807,7 @@ unsafe fn resize_rooted(root: *mut *mut u8, length: i64, pair_mask: i64) {
         return;
     }
     // SAFETY: Each call reads the current handle from the registered root slot.
-    let current_len = || unsafe { willow_array_len(arr()) };
+    let current_len = || unsafe { array_len(arr()) };
     while current_len() < length {
         let value = if pair_mask < 0 {
             0
@@ -875,9 +884,11 @@ pub unsafe extern "C" fn willow_array_push_owned_pair(arr: *mut u8, value: i64) 
     array_push(arr, value, true, true);
 }
 
-/// Allocate the grown buffer of `array_push` on the old-generation path,
-/// which may collect. Returns the reloaded handle and value with the buffer,
-/// or `None` after raising.
+/// Allocate the grown buffer of `array_push` on the allocation slow path,
+/// which may collect. A TLAB-sized buffer stays young like the fast path:
+/// a TLAB miss is not survival evidence, and allocating it old would leave
+/// only a major cycle to reclaim it. Returns the reloaded handle and value
+/// with the buffer, or `None` after raising.
 fn grow_rooted(
     mut arr: *mut u8,
     mut value: i64,
@@ -894,7 +905,19 @@ fn grow_rooted(
     // updated root slots after allocation in case the collector moves them.
     let arr_root = crate::gc::GcRootHandle::new(arr);
     let value_root = is_reference(flags).then(|| crate::gc::GcRootHandle::new(value as *mut u8));
-    let mut new_buf = alloc_buffer(new_cap, flags);
+    let mut new_buf = match crate::gc::array_buffer_layout(new_cap, flags) {
+        Some(layout) => {
+            let buffer = crate::gc::alloc_young_layout_slow(layout);
+            if buffer.is_null() {
+                raise_with("array buffer allocation failed");
+            } else {
+                // SAFETY: The fresh buffer has a word-aligned length field.
+                unsafe { set_buffer_len(buffer, 0) };
+            }
+            buffer
+        }
+        None => alloc_buffer(new_cap, flags),
+    };
     if new_buf.is_null() {
         return None;
     }
@@ -1216,7 +1239,7 @@ pub unsafe extern "C" fn willow_array_to_string(arr: *mut u8, elem_kind: i64) ->
         return std::ptr::null_mut();
     }
     // SAFETY: The caller supplies a live array with this element kind.
-    let len = unsafe { willow_array_len(arr) };
+    let len = unsafe { array_len(arr) };
     let mut out = String::from("[");
     for index in 0..len {
         if index > 0 {

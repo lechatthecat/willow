@@ -846,3 +846,78 @@ fn overlap_native_recovery_retry_history_follows_minor_relocation() {
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
 }
+
+/// Allocate a young chain of `count` nodes and return its head.
+fn young_chain(count: usize) -> *mut u8 {
+    let tls = tlab_state_for_test();
+    let nodes: Vec<_> = (0..count)
+        // SAFETY: The fixture owns the stable TLAB through unregistration. The
+        // requested size and tracing metadata describe the object initialized here.
+        .map(|_| unsafe { willow_gc_alloc_slow(tls.as_ptr(), 1, 0, 24, 3) })
+        .collect();
+    for (i, &node) in nodes.iter().enumerate() {
+        // SAFETY: The GC allocator word-aligns this payload and the fixture
+        // reserves the accessed words.
+        unsafe {
+            *node.cast::<*mut u8>() = nodes.get(i + 1).copied().unwrap_or_default();
+            *node.cast::<*mut u8>().add(1) = std::ptr::null_mut();
+            *node.cast::<usize>().add(2) = i;
+        }
+    }
+    nodes[0]
+}
+
+fn sizing(state: &GcState) -> (usize, u8) {
+    (state.nursery_threshold_bytes, state.tenuring.age())
+}
+
+#[test]
+fn minors_during_a_mark_keep_nursery_sizing() {
+    let _guard = isolated_runtime();
+    for count in [64usize, 256, 1024] {
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal_for_test() };
+        // Snapshot-only survivors: the mark queue roots a chain that died
+        // after the mark began, so every copy is floating garbage.
+        let mut root = young_chain(count);
+        let slot = (&mut root as *mut *mut u8).cast::<u8>();
+        runtime().runtime_root_slots.add(slot);
+        let (_, cycle) = root_handshake::begin().unwrap();
+        runtime().runtime_root_slots.remove(slot);
+        let before = sizing(&runtime().heap.lock().unwrap());
+        for _ in 0..3 {
+            let moved = runtime().heap.lock().unwrap().moved_objects;
+            young_chain(count);
+            collect_owned();
+            let state = runtime().heap.lock().unwrap();
+            assert!(
+                state.moved_objects > moved,
+                "count {count}: nothing survived"
+            );
+            assert_eq!(sizing(&state), before, "count {count}");
+        }
+        end(&cycle);
+
+        // The same survival outside a mark is real evidence and tenures.
+        // SAFETY: The test controls its isolated runtime at this reset boundary.
+        unsafe { reset_internal_for_test() };
+        let before = sizing(&runtime().heap.lock().unwrap());
+        let mut root = std::ptr::null_mut();
+        let slot = (&mut root as *mut *mut u8).cast::<u8>();
+        runtime().runtime_root_slots.add(slot);
+        for _ in 0..3 {
+            root = young_chain(count);
+            collect_owned();
+        }
+        runtime().runtime_root_slots.remove(slot);
+        let after = sizing(&runtime().heap.lock().unwrap());
+        assert_ne!(
+            after, before,
+            "count {count}: survival never reached the policy"
+        );
+    }
+    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
+    // or subsequent access relies on the discarded heap.
+    unsafe { reset_internal_for_test() };
+}

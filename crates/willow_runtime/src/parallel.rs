@@ -320,7 +320,7 @@ pub unsafe extern "C" fn willow_parallel_map_i64(input: *mut u8, mapper: *mut u8
         return std::ptr::null_mut();
     }
     // SAFETY: The caller supplies a live frozen word array, and input passed the null check.
-    let len = unsafe { crate::array::willow_array_len(input) };
+    let len = unsafe { crate::array::array_len(input) };
     if crate::panic_context::willow_panic_active() != 0 {
         return std::ptr::null_mut();
     }

@@ -83,7 +83,7 @@ pub unsafe extern "C" fn willow_rust_bridge_string_data(object: u64, out: *mut W
 #[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_rust_bridge_bytes_len(object: u64) -> usize {
     // SAFETY: The bridge caller supplies the current live array handle.
-    (unsafe { array::willow_array_len(object as *mut u8) }) as usize
+    (unsafe { array::array_len(object as *mut u8) }) as usize
 }
 
 /// # Safety

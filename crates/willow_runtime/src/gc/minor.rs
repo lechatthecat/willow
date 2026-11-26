@@ -1670,6 +1670,7 @@ fn minor_collect_with_roots(
     let promoted_before = state.promoted_bytes;
     let copied_before = state.survivor_stats.survivor_bytes;
     let pinned_before = state.survivor_stats.pinned_promotions;
+    let marking = state.concurrent_cycle.is_some();
     let collector = MinorCollector::new(owner, &mut state, registry, stop_work);
     let root_enumeration = crate::gc_telemetry::pause::Span::new(
         &owner.telemetry.pause,
@@ -1689,15 +1690,22 @@ fn minor_collect_with_roots(
             .survivor_stats
             .survivor_bytes
             .saturating_sub(copied_before);
-    state.tenuring.complete(young_before, survived);
-    let allocators = std::mem::take(&mut state.young_allocators);
-    state.nursery_threshold_bytes = state.nursery_policy.next(
-        state.nursery_threshold_bytes,
-        young_before,
-        survived,
-        allocators,
-        state.memory_limit_bytes,
-    );
+    // During a concurrent mark the major's snapshot (queued, deferred and
+    // barrier-logged referents) roots young objects that died after the mark
+    // began. Their copies are floating garbage, not nursery survival, so
+    // they neither grow the nursery nor tenure directly; allocator evidence
+    // waits for the next minor outside the mark.
+    if !marking {
+        state.tenuring.complete(young_before, survived);
+        let allocators = std::mem::take(&mut state.young_allocators);
+        state.nursery_threshold_bytes = state.nursery_policy.next(
+            state.nursery_threshold_bytes,
+            young_before,
+            survived,
+            allocators,
+            state.memory_limit_bytes,
+        );
+    }
     if *owner.diagnostics.verify_regions
         && let Err(message) = verify_old_region_metadata(&state)
     {

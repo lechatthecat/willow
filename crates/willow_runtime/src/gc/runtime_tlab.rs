@@ -887,6 +887,54 @@ mod tests {
     }
 
     #[test]
+    fn push_growth_on_a_tlab_miss_keeps_buffers_young() {
+        let _guard = isolated_runtime();
+        // Up to 250 elements every grown buffer still fits a TLAB object;
+        // larger buffers are large objects and are allocated old by design.
+        for (flags, pushes) in [(0, 9i64), (0, 64), (0, 250), (1, 9), (1, 64), (1, 250)] {
+            // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+            // mutator or subsequent access relies on the discarded heap.
+            unsafe { reset_internal() };
+            let _owner = RuntimeTlabOwner::enter();
+            // SAFETY: Flags 0 and 1 select word and reference storage.
+            let mut arr = unsafe { willow_array_new(0, flags) };
+            // SAFETY: The initialized slot stays at this address until its registration is
+            // popped; collection may rewrite it there.
+            unsafe { willow_push_root(&raw mut arr) };
+            let (old_before, _) = path_counts();
+            let mut misses = 0;
+            for i in 0..pushes {
+                if word(arr, 0) == word(arr, 1) {
+                    // Fill the TLAB so this growth misses it and takes the
+                    // allocation slow path.
+                    while try_alloc_young([array_pair_layout(0).unwrap()]).is_some() {}
+                    misses += 1;
+                }
+                // A reference array holds null elements, which need no tracing.
+                let value = if flags == 0 { i } else { 0 };
+                // SAFETY: The fixture retains the array and stores a word matching its
+                // element layout.
+                unsafe { willow_array_push(arr, value) };
+            }
+            assert!(young(buffer(arr)), "flags {flags}, pushes {pushes}");
+            assert!(misses >= 1, "flags {flags}, pushes {pushes}");
+            assert_eq!(
+                path_counts().0,
+                old_before,
+                "flags {flags}, pushes {pushes}"
+            );
+            // SAFETY: The fixture retains the array allocated for these accesses.
+            assert_eq!(unsafe { willow_array_len(arr) }, pushes);
+            // SAFETY: The removed shadow-stack entries belong to this operation and their slot
+            // storage is still live.
+            unsafe { willow_pop_roots(1) };
+        }
+        // SAFETY: The test controls its isolated runtime at this reset boundary; no other
+        // mutator or subsequent access relies on the discarded heap.
+        unsafe { reset_internal() };
+    }
+
+    #[test]
     fn push_growth_under_relocation_keeps_every_element() {
         let _guard = isolated_runtime();
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other

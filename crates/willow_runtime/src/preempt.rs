@@ -97,6 +97,13 @@ struct QuantumState {
     direct_granted: Cell<i32>,
     direct_saved: Cell<(i32, i32)>,
     deadline: Cell<Option<Instant>>,
+    /// Inline safepoints granted per runtime check while no budget caps the
+    /// grant; see [`next_poll_stride`].
+    poll_stride: Cell<u64>,
+    /// Clock reading of the previous time-quantum check and the target
+    /// interval between checks.
+    checked_at: Cell<Option<Instant>>,
+    check_interval: Cell<Duration>,
     flag: Cell<*const AtomicBool>,
     /// Re-entrant no-preempt nesting depth (§22). While > 0, `willow_preempt_check`
     /// always reports "do not preempt" even if the flag/budget/time say otherwise.
@@ -111,6 +118,9 @@ thread_local! {
             direct_granted: Cell::new(0),
             direct_saved: Cell::new((0, 0)),
             deadline: Cell::new(None),
+            poll_stride: Cell::new(SYNC_POLL_STRIDE),
+            checked_at: Cell::new(None),
+            check_interval: Cell::new(Duration::ZERO),
             flag: Cell::new(std::ptr::null()),
             no_preempt_depth: Cell::new(0),
         }
@@ -247,11 +257,18 @@ pub unsafe extern "C" fn willow_preempt_begin(flag: *const c_void) {
 /// its address and allocation live throughout the bound quantum, including suspension and
 /// restoration, until unbound.
 pub(crate) unsafe fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
-    let deadline = Instant::now().checked_add(Duration::from_millis(config.time_quantum_ms()));
+    let now = Instant::now();
+    let quantum = Duration::from_millis(config.time_quantum_ms());
+    let deadline = now.checked_add(quantum);
     QUANTUM.with(|q| {
         q.flag.set(flag as *const AtomicBool);
         q.budget.set(config.task_budget());
         q.deadline.set(deadline);
+        // Every quantum starts at the minimum stride: the previous task's
+        // safepoint rate says nothing about this one.
+        q.poll_stride.set(SYNC_POLL_STRIDE);
+        q.checked_at.set(Some(now));
+        q.check_interval.set(quantum / POLL_CHECKS_PER_QUANTUM);
         q.no_preempt_depth.set(0);
         q.direct_countdown.set(0);
         q.direct_granted.set(0);
@@ -286,6 +303,7 @@ pub extern "C" fn willow_preempt_end() {
         q.flag.set(std::ptr::null());
         q.budget.set(0);
         q.deadline.set(None);
+        q.checked_at.set(None);
         q.no_preempt_depth.set(0);
         q.direct_countdown.set(0);
         q.direct_granted.set(0);
@@ -297,6 +315,12 @@ pub extern "C" fn willow_preempt_end() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_enter_no_preempt() {
+    enter_no_preempt();
+}
+
+/// [`willow_preempt_enter_no_preempt`] for runtime guards, which already run
+/// inside an FFI boundary and must not pay a nested one per region.
+fn enter_no_preempt() {
     QUANTUM.with(|q| {
         if q.no_preempt_depth.get() == 0 {
             #[cfg(any(
@@ -324,6 +348,11 @@ pub extern "C" fn willow_preempt_enter_no_preempt() {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_preempt_leave_no_preempt() {
+    leave_no_preempt();
+}
+
+/// [`willow_preempt_leave_no_preempt`] for runtime guards.
+fn leave_no_preempt() {
     QUANTUM.with(|q| {
         // Preserve pre-region debt without sampling the clock, and discard
         // inline work executed while suppressed.
@@ -357,14 +386,14 @@ pub(crate) struct NoPreemptGuard;
 
 impl NoPreemptGuard {
     pub(crate) fn enter() -> Self {
-        willow_preempt_enter_no_preempt();
+        enter_no_preempt();
         Self
     }
 }
 
 impl Drop for NoPreemptGuard {
     fn drop(&mut self) {
-        willow_preempt_leave_no_preempt();
+        leave_no_preempt();
     }
 }
 
@@ -467,24 +496,57 @@ pub(crate) fn charge_safepoints(count: u64) -> i32 {
         }
 
         // (3) Wall-clock time quantum.
-        if let Some(deadline) = q.deadline.get()
-            && Instant::now() >= deadline
-        {
-            if let Some(flag) = flag {
-                flag.store(true, Ordering::Release);
+        if let Some(deadline) = q.deadline.get() {
+            let now = Instant::now();
+            if now >= deadline {
+                if let Some(flag) = flag {
+                    flag.store(true, Ordering::Release);
+                }
+                return 1;
             }
-            return 1;
+            if let Some(previous) = q.checked_at.replace(Some(now)) {
+                q.poll_stride.set(next_poll_stride(
+                    q.poll_stride.get(),
+                    now.saturating_duration_since(previous),
+                    q.check_interval.get(),
+                ));
+            }
         }
 
         0
     })
 }
 
-/// Maximum inline safepoints generated synchronous code runs between runtime
-/// checks. It bounds how stale the time quantum, preemption flag, and
-/// cancellation state can be while the per-safepoint cost stays one counter
-/// decrement.
+/// Minimum inline safepoints generated synchronous code runs between runtime
+/// checks, and the stride outside a timed quantum. The per-safepoint cost
+/// stays one counter decrement either way.
 pub const SYNC_POLL_STRIDE: u64 = 256;
+
+/// Largest stride a fast loop grows to. Together with the check interval it
+/// bounds how stale the time quantum, preemption flag, and cancellation state
+/// can be.
+pub const SYNC_POLL_STRIDE_MAX: u64 = 8192;
+
+/// A timed quantum aims for this many runtime checks: often enough to keep
+/// the deadline, preemption flag, and cancellation fresh, rarely enough that
+/// a tight loop does not spend its time reading the clock.
+const POLL_CHECKS_PER_QUANTUM: u32 = 64;
+
+/// The stride after a check that found `elapsed` since the previous one.
+/// Checks arriving in under half the target interval double the stride; a
+/// check later than the interval halves it. Strides stay within
+/// [`SYNC_POLL_STRIDE`, `SYNC_POLL_STRIDE_MAX`], so a loop whose safepoints
+/// slow down returns to the minimum in a few checks.
+pub(crate) fn next_poll_stride(stride: u64, elapsed: Duration, interval: Duration) -> u64 {
+    let next = if elapsed.saturating_mul(2) < interval {
+        stride.saturating_mul(2)
+    } else if elapsed > interval {
+        stride / 2
+    } else {
+        stride
+    };
+    next.clamp(SYNC_POLL_STRIDE, SYNC_POLL_STRIDE_MAX)
+}
 
 /// The next inline safepoint grant: never past the remaining budget, so the
 /// budget still trips at the exact safepoint it would without batching.
@@ -494,7 +556,7 @@ fn sync_poll_grant() -> i32 {
         if budget == 0 || q.no_preempt_depth.get() > 0 {
             SYNC_POLL_STRIDE as i32
         } else {
-            budget.min(SYNC_POLL_STRIDE) as i32
+            budget.min(q.poll_stride.get()) as i32
         }
     })
 }
@@ -712,12 +774,15 @@ mod tests {
                 calls += usize::from(unsafe { *willow_async_poll_counter() } <= 1);
                 assert_eq!(direct_check(), 0);
             }
-            assert_eq!(calls, 1 + (safepoints - 1) / SYNC_POLL_STRIDE as usize);
+            // The stride adapts to the clock, so only its range is fixed.
+            let most = 1 + (safepoints - 1) / SYNC_POLL_STRIDE as usize;
+            let least = 1 + (safepoints - 1) / SYNC_POLL_STRIDE_MAX as usize;
+            assert!((least..=most).contains(&calls), "{safepoints}: {calls}");
             QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
             let mut until_preempt = 0;
             while direct_check() == 0 {
                 until_preempt += 1;
-                assert!(until_preempt < SYNC_POLL_STRIDE);
+                assert!(until_preempt < SYNC_POLL_STRIDE_MAX);
             }
             willow_preempt_end();
         }
@@ -725,7 +790,9 @@ mod tests {
 
     #[test]
     fn direct_async_batches_preserve_exact_budgets_and_bound_checks() {
-        for budget in [1, 2, 3, 63, 64, 65, 127, 255, 256, 257, 1000, 4096] {
+        for budget in [
+            1, 2, 3, 63, 64, 65, 127, 255, 256, 257, 1000, 4096, 8191, 8192, 8193, 20000,
+        ] {
             // SAFETY: A null flag binds no storage and is explicitly supported.
             unsafe { begin_quantum(cfg(budget, 100000), std::ptr::null()) };
             let mut calls = 0;
@@ -741,9 +808,83 @@ mod tests {
                     "budget={budget} n={n}"
                 );
             }
-            assert_eq!(calls, 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE));
+            let most = 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE);
+            let least = 1 + (budget - 1).div_ceil(SYNC_POLL_STRIDE_MAX);
+            assert!((least..=most).contains(&calls), "budget={budget}: {calls}");
             willow_preempt_end();
         }
+    }
+
+    #[test]
+    fn poll_stride_follows_the_check_interval() {
+        let interval = Duration::from_micros(100);
+        let early = Duration::from_micros(10);
+        let on_time = Duration::from_micros(80);
+        let late = Duration::from_micros(500);
+        for (stride, elapsed, expected) in [
+            (SYNC_POLL_STRIDE, early, 2 * SYNC_POLL_STRIDE),
+            (1024, early, 2048),
+            (SYNC_POLL_STRIDE_MAX, early, SYNC_POLL_STRIDE_MAX),
+            (1024, on_time, 1024),
+            (1024, interval, 1024),
+            (1024, late, 512),
+            (SYNC_POLL_STRIDE, late, SYNC_POLL_STRIDE),
+            (
+                SYNC_POLL_STRIDE_MAX,
+                Duration::MAX,
+                SYNC_POLL_STRIDE_MAX / 2,
+            ),
+        ] {
+            assert_eq!(
+                next_poll_stride(stride, elapsed, interval),
+                expected,
+                "{stride} {elapsed:?}"
+            );
+        }
+        // A fast loop reaches the largest stride in log2(MAX / MIN) checks,
+        // and a slow one falls back to the smallest in as many.
+        let mut stride = SYNC_POLL_STRIDE;
+        let mut steps = 0;
+        while stride < SYNC_POLL_STRIDE_MAX {
+            stride = next_poll_stride(stride, early, interval);
+            steps += 1;
+        }
+        let doublings = (SYNC_POLL_STRIDE_MAX / SYNC_POLL_STRIDE).ilog2();
+        assert_eq!(steps, doublings);
+        for _ in 0..doublings {
+            stride = next_poll_stride(stride, late, interval);
+        }
+        assert_eq!(stride, SYNC_POLL_STRIDE);
+    }
+
+    #[test]
+    fn fast_quantum_grows_the_grant_and_new_quantum_resets_it() {
+        // An unreachable check interval makes every check early, so the
+        // stride doubles once per runtime check regardless of timing.
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(u64::MAX, 100000), std::ptr::null()) };
+        QUANTUM.with(|q| q.check_interval.set(Duration::MAX));
+        let doublings = (SYNC_POLL_STRIDE_MAX / SYNC_POLL_STRIDE).ilog2() as usize;
+        let mut grants = Vec::new();
+        for _ in 0..=doublings + 1 {
+            assert_eq!(willow_preempt_check(), 0);
+            grants.push(QUANTUM.with(|q| q.direct_granted.get()) as u64);
+        }
+        let expected: Vec<u64> = (1..=doublings + 2)
+            .map(|k| (SYNC_POLL_STRIDE << k.min(doublings)).min(SYNC_POLL_STRIDE_MAX))
+            .collect();
+        assert_eq!(grants, expected);
+        willow_preempt_end();
+        // SAFETY: A null flag binds no storage and is explicitly supported.
+        unsafe { begin_quantum(cfg(u64::MAX, 100000), std::ptr::null()) };
+        assert_eq!(QUANTUM.with(|q| q.poll_stride.get()), SYNC_POLL_STRIDE);
+        // A budget still caps the grown grant at the exact remaining count.
+        QUANTUM.with(|q| {
+            q.poll_stride.set(SYNC_POLL_STRIDE_MAX);
+            q.budget.set(300);
+        });
+        assert_eq!(sync_poll_grant(), 300);
+        willow_preempt_end();
     }
 
     #[test]
@@ -771,15 +912,18 @@ mod tests {
             } else {
                 QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
             }
+            // The pending request is seen at the end of the current grant.
+            let grant = QUANTUM.with(|q| q.direct_granted.get()) as u64;
             let mut checks = 0;
             loop {
                 checks += 1;
                 if direct_check() != 0 {
                     break;
                 }
-                assert!(checks < SYNC_POLL_STRIDE);
+                assert!(checks < grant);
             }
-            assert_eq!(checks, SYNC_POLL_STRIDE);
+            assert_eq!(checks, grant);
+            assert!((SYNC_POLL_STRIDE..=SYNC_POLL_STRIDE_MAX).contains(&grant));
             willow_preempt_end();
         }
     }

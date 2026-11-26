@@ -1,0 +1,20 @@
+// Short-lived growing arrays from a synchronous loop called by async main.
+// Grown buffers die young, so the churn needs no old-region allocations
+// and no major cycle, the same as under a synchronous main.
+import std::collections::Array;
+fn churn(n: i64) -> i64 {
+    let mut s = 0;
+    for i in 0..n {
+        let a: Array<i64> = [];
+        for j in 0..100 { a.push(j); }
+        s += a.len();
+    }
+    return s;
+}
+async fn main() {
+    println(churn(100000)); // 10000000
+    println(gc_minor_collections() > 0);
+    println(gc_major_collections() == 0);
+    println(gc_old_region_allocations() < 8);
+    println(gc_promoted_objects() == 0);
+}

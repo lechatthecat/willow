@@ -3185,7 +3185,7 @@ mod iteration_tests {
             let snapshot = GcRootHandle::new(unsafe { willow_map_snapshot(map.load(), 0, 0) });
             assert_eq!(
                 // SAFETY: The root supplies the current live array for this access.
-                unsafe { crate::array::willow_array_len(snapshot.load()) },
+                unsafe { crate::array::array_len(snapshot.load()) },
                 count
             );
             let comparisons = SNAPSHOT_COMPARISONS.with(|n| n.get());

@@ -143,6 +143,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "tests/regressions/async_allocation_churn.wi",
             "12795904\ntrue\n",
         ),
+        (
+            "tests/regressions/async_array_push_churn.wi",
+            "10000000\ntrue\ntrue\ntrue\ntrue\n",
+        ),
         ("tests/regressions/async_dead_locals.wi", "42\n42\n2\n3\n"),
         (
             "tests/regressions/closed_world_dispatch.wi",
@@ -1949,6 +1953,18 @@ fn test_runnable_example_catalog_is_complete() {
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
     );
+}
+
+#[test]
+fn test_async_array_push_churn_stays_young() {
+    let path = "tests/regressions/async_array_push_churn.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
 }
 
 #[test]

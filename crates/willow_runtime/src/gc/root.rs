@@ -49,6 +49,16 @@ pub extern "C" fn willow_reserve_roots(count: usize) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub unsafe extern "C" fn willow_push_root(slot: *mut *mut u8) {
+    // SAFETY: Forwarded caller contract.
+    unsafe { push_root(slot) };
+}
+
+/// [`willow_push_root`] for runtime callers, which already run inside an FFI
+/// boundary; pair it with [`pop_roots`].
+///
+/// # Safety
+/// Same contract as [`willow_push_root`].
+pub(crate) unsafe fn push_root(slot: *mut *mut u8) {
     let _no_preempt = crate::preempt::NoPreemptGuard::enter();
     claim_root_stack_owner();
     ROOT_STACK.with(|rs| {
