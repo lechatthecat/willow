@@ -139,17 +139,18 @@ impl RuntimeWorkerConfig {
 }
 
 /// Set by the worker that is finalizing an unhandled language panic (or a poll
-/// ABI violation) and will abort the process. Spec §23 requires the terminal
+/// ABI violation) and will end the process: a language panic exits with
+/// `PANIC_EXIT_CODE`, an ABI violation aborts. Spec §23 requires the terminal
 /// publication, relationship detach and root release to happen before the
-/// abort, and that publication wakes the panicked task's awaiters — so the
-/// claim path must stop handing out work first, or a sibling worker runs
-/// ordinary code past `await <panicked task>` in the window before the abort.
+/// process ends, and that publication wakes the panicked task's awaiters — so
+/// the claim path must stop handing out work first, or a sibling worker runs
+/// ordinary code past `await <panicked task>` in the window before the exit.
 ///
 /// The gate is `Runtime::fatal_panic_pending`: the siblings that must stop are
 /// that runtime's workers.
 ///
 /// Close the claim gate. Only the fatal path calls this, and that path always
-/// ends in `std::process::abort`, so the gate is never reopened.
+/// ends the process, so the gate is never reopened.
 fn begin_fatal_panic(owner: &crate::runtime::Runtime) {
     owner.fatal_panic_pending.store(true, Ordering::Release);
 }
@@ -159,9 +160,9 @@ fn fatal_panic_pending(owner: &crate::runtime::Runtime) -> bool {
 }
 
 /// Stop this worker for good: the thread that closed the gate is formatting an
-/// unhandled-panic report and ends in `std::process::abort`. Waiting is the
+/// unhandled-panic report and then ends the process. Waiting is the
 /// point — the woken awaiters of the panicked task must never get a turn.
-fn park_until_fatal_abort() -> ! {
+fn park_until_fatal_exit() -> ! {
     loop {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -3442,9 +3443,9 @@ fn sched_await_check(id: u64) {
     // The lifecycle collapses every terminal outcome into `Terminal`, so the
     // id-only path cannot tell Panicked from Completed. The gate answers the
     // question that matters: an unhandled panic is being published, and no
-    // awaiter may resume before the abort.
+    // awaiter may resume before the process ends.
     if fatal_panic_pending(crate::runtime::current()) {
-        park_until_fatal_abort();
+        park_until_fatal_exit();
     }
     let id = id as RuntimeTaskId;
     let cancelled = global_task_table()
@@ -3759,13 +3760,13 @@ pub unsafe extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
     }
     if fatal_panic_pending(crate::runtime::current()) {
         // Awaiting a task whose panic escaped is not recoverable and has no
-        // result to read: the process is aborting, so this task stops here
+        // result to read: the process is ending, so this task stops here
         // instead of running its continuation. The gate closes before the
         // PANICKED status is published, so a woken awaiter always observes it. Frame status
         // alone is NOT the trigger: a PANICKED
-        // frame with no abort in flight (a recovered panic republished by a
+        // frame with no fatal exit in flight (a recovered panic republished by a
         // test harness) must still return normally.
-        park_until_fatal_abort();
+        park_until_fatal_exit();
     }
     // SAFETY: The frame owner retains the initialized ABI status word through this atomic
     // access.
@@ -5430,7 +5431,7 @@ fn scheduler_run_loop_in(
         }
         components.run_queues.flush_local_wake_notification(worker);
         if fatal_panic_pending(owner) {
-            park_until_fatal_abort();
+            park_until_fatal_exit();
         }
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             break;
@@ -5554,7 +5555,7 @@ fn scheduler_run_loop_in(
         // task in hand may be exactly the awaiter that the fatal publication
         // just woke. Re-check before dispatching any work.
         if fatal_panic_pending(owner) {
-            park_until_fatal_abort();
+            park_until_fatal_exit();
         }
         // Poll, cleanup and their terminal boundaries form one unit: frames
         // retired while it runs keep their roots until it ends. A poll that
@@ -5876,10 +5877,10 @@ fn scheduler_run_loop_in(
             PollOutcome::Panicked | PollOutcome::Invalid(_) => {
                 // Close the claim gate BEFORE the terminal publication. Spec
                 // §23 requires publishing PANICKED, detaching relationships and
-                // releasing task roots before the abort, but that publication
+                // releasing task roots before the process ends, but that publication
                 // wakes this task's awaiters — without the gate another worker
                 // claims one and runs ordinary code past `await <panicked
-                // task>` in the window before the abort lands.
+                // task>` in the window before the exit lands.
                 begin_fatal_panic(owner);
                 SchedulerServices::with_scheduler(|| services, |sched| sched.finalize_panicked(id));
             }
@@ -5999,8 +6000,8 @@ pub fn reset_global_scheduler_for_test() {
     CURRENT_RUN_STATE.with(|state| {
         state.replace(None);
     });
-    // In a real process the fatal gate is one-way (the closer aborts), but a
-    // unit test can drive a panicking poll without the abort. Reopen it so the
+    // In a real process the fatal gate is one-way (the closer ends the process), but
+    // a unit test can drive a panicking poll without the exit. Reopen it so the
     // next test is not parked forever.
     crate::runtime::current()
         .fatal_panic_pending

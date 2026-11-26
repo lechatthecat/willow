@@ -608,7 +608,8 @@ pub(crate) fn finish_unhandled_with_async_chain(async_chain: &str) -> ! {
     if !async_chain.is_empty() {
         eprintln!("{async_chain}");
     }
-    std::process::abort();
+    crate::gc_telemetry::flush_observations();
+    crate::exit::terminate_without_teardown(crate::exit::PANIC_EXIT_CODE);
 }
 
 /// # Safety
@@ -688,7 +689,11 @@ mod tests {
                     .output()
                     .unwrap();
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(!output.status.success(), "unhandled panic must terminate");
+                assert_eq!(
+                    output.status.code(),
+                    Some(crate::exit::PANIC_EXIT_CODE),
+                    "unhandled panic must exit, not abort: {stderr}"
+                );
                 assert!(stderr.contains(MARKER), "workers={workers}: {stderr}");
                 assert!(stderr.contains("runtime panic: report-order"), "{stderr}");
             }

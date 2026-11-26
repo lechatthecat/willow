@@ -91,6 +91,7 @@ A few things to notice:
 - **Classes are closed by default.** Inheritance needs `open`, and replacing a method needs `override`. A class without an `init` constructor can be created with its fields in declaration order.
 - **`async fn` returns a Task.** Calling one creates the Task; `await` waits for its result.
 - **`i64` overflow is not silent in debug builds.** It raises a recoverable panic; `--release` wraps. Methods such as `wrapping_add` and `checked_add` behave the same in both modes.
+- **An unhandled panic ends the program with exit status 101** on Linux, macOS and Windows, after its defers run. It does not abort, so no core dump or crash reporter is involved. `main` returning `Err` exits with 1; only runtime integrity failures abort.
 
 | Area | What is available | Examples |
 | --- | --- | --- |

@@ -1,0 +1,22 @@
+// test: manual
+// An unhandled panic ends the program with exit status 101 after its defers
+// run. Run it and check the status:
+//
+//   willow run example/panic_exit_status.wi; echo "exit=$?"
+//
+// prints `saving`, `closing log`, the panic report on stderr, then `exit=101`.
+// tests/integration/panic_exit_status.rs checks this example.
+
+fn save(items: i64) {
+    defer println("closing log");
+    println("saving");
+    if items > 2 {
+        panic("disk full while saving " + items.to_string() + " items");
+    }
+    println("saved");
+}
+
+fn main() {
+    save(3);
+    println("not reached");
+}

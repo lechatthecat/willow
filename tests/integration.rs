@@ -313,6 +313,9 @@ mod generic_constructor_inference;
 #[path = "integration/type_parameter_bounds.rs"]
 mod type_parameter_bounds;
 
+#[path = "integration/panic_exit_status.rs"]
+mod panic_exit_status;
+
 #[path = "integration/static_mut_policy.rs"]
 mod static_mut_policy;
 

@@ -23,6 +23,14 @@
 //! `print` flushes before it returns, and the runtime registers no `atexit`
 //! handlers and keeps no exit-time reporting.
 
+/// Exit status of a program ended by an unhandled language panic, the same on
+/// every platform. A panic is an expected program failure, so it ends like
+/// `main` returning `Err` (status 1) does, under its own status, and never
+/// raises `SIGABRT`: that would hand the exit to a crash handler (a core dump,
+/// apport, Windows Error Reporting) for no useful report. Runtime integrity
+/// failures still abort.
+pub const PANIC_EXIT_CODE: i32 = 101;
+
 /// Exit the process with `code`, without running user-mode process teardown.
 ///
 /// Callers must have flushed anything they need durable. Every Willow print
