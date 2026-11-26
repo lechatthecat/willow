@@ -529,6 +529,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/f64_integral_display.wi",
             "0\n0\n0\n0\ntrue\n-0\n-0\n-0\n-0\ntrue\n2\n2\n2\n2\ntrue\n-2\n-2\n-2\n-2\ntrue\n1\n1\n1\n1\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n",
         ),
+        (
+            "example/f64_exponent_display.wi",
+            "5.3622168208462125e-20\n1e30\n-1.5e-7\n0.000001 true\n9.99e-7 true\n100000000000000000000 true\n1e21 true\n5e-324 true\n1.7976931348623157e308 true\n0.30000000000000004 true\n2 true\n[1e-9, 0.5, 2.5e22]\nloss=3.2e-12\ntrue\n",
+        ),
         ("example/floats.wi", "4\ntrue\n-4\n"),
         (
             "example/float_exponents.wi",
@@ -2060,6 +2064,18 @@ fn test_contextual_ctor_args_example() {
         .expect("example must be cataloged");
     let (out, ok) = compile_file_and_run(path);
     assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_f64_exponent_display_example() {
+    let path = "example/f64_exponent_display.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run: {out}");
     assert_eq!(out, *expected, "{path} output mismatch");
 }
 

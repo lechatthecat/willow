@@ -386,6 +386,14 @@ placeholders such as `{:.6f}` retain their requested decimal places.
 Collections use the same default formatting for floating-point elements.
 See [f64_integral_display.wi](f64_integral_display.wi) for all four entry points.
 
+Digits are always the shortest decimal that parses back to the same `f64`.
+Magnitudes in `1e-6 <= |x| < 1e21` print in fixed notation (`0.000001`,
+`100000000000000000000`); smaller or larger values switch to exponent form,
+so `5.3622168208462125e-20`, `1e30`, `1e21`, and the smallest subnormal
+`5e-324` stay compact. The exponent has no `+` sign: every printed finite
+value is also a valid Willow `f64` literal and parses back with `f64::parse`
+bit for bit. See [f64_exponent_display.wi](f64_exponent_display.wi).
+
 ## Rust regex bridge
 
 `cargo run --bin willow -- run example/rust_regex` resolves the crates.io

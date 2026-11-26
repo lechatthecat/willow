@@ -1,0 +1,33 @@
+// Default f64 display uses exponent form outside 1e-6 <= |x| < 1e21.
+// Every printed finite value parses back to the same f64 and is also a
+// valid Willow literal.
+import std::collections::Array;
+
+fn show(value: f64) {
+    let text = value.to_string();
+    println(format("{} {}", text, f64::parse(text).unwrap() == value));
+}
+
+fn main() {
+    // Training-loss sized values stay readable.
+    println(5.3622168208462125e-20);
+    println(1.0e30);
+    println(-1.5e-7);
+    // The fixed range: 1e-6 and anything below 1e21.
+    show(0.000001);
+    show(9.99e-7);
+    show(1e20);
+    show(1e21);
+    // Subnormal and extreme finite values.
+    show(5e-324);
+    show(1.7976931348623157e308);
+    // Ordinary values keep their fixed text.
+    show(0.1 + 0.2);
+    show(2.0);
+    // Collections and interpolation share the rule.
+    let xs: Array<f64> = [1e-9, 0.5, 2.5e22];
+    println(xs.to_string());
+    println(format("loss={}", 3.2e-12));
+    // A printed value can be pasted back as a literal.
+    println(1e21 == 1000000000000000000000.0);
+}

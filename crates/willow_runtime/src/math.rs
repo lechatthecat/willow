@@ -7,9 +7,18 @@ const RESULT_OK_TAG: i64 = 0;
 const RESULT_ERR_TAG: i64 = 1;
 const PARSE_INVALID_TAG: i64 = 0;
 
-/// Default f64 display omits `.0` for every integral value, including signed
-/// zeros (`0` and `-0`). Parsing preserves the sign bit. Explicit precision
-/// formatting uses its own rules.
+/// Default f64 display (`to_string`, `print`, `println`, array display).
+///
+/// - Digits are the shortest decimal that parses back to the same bits.
+/// - Magnitudes in `1e-6 <= |x| < 1e21` print in fixed notation (`0.000001`,
+///   `123.5`, `100000000000000000000`); smaller or larger values print as
+///   `d.ddde<exp>` (`5.3622168208462125e-20`, `1e21`, `5e-324`). The exponent
+///   has no `+`, so every finite output is also a valid Willow `f64` literal.
+/// - Integral values omit `.0`, including signed zeros (`0` and `-0`).
+/// - Non-finite values print as `NaN`, `Infinity` and `-Infinity`.
+///
+/// `f64::parse` accepts every output, preserving the sign bit. Explicit
+/// precision formatting uses its own rules.
 pub fn format_f64_shortest(value: f64) -> String {
     if value.is_nan() {
         return "NaN".to_string();
@@ -20,28 +29,71 @@ pub fn format_f64_shortest(value: f64) -> String {
     if value == f64::NEG_INFINITY {
         return "-Infinity".to_string();
     }
-    let mut buffer = ryu::Buffer::new();
-    let text = buffer.format_finite(value).to_string();
-
-    // ryu uses scientific notation for some values (e.g. 1e-3 for 0.001).
-    // Prefer fixed notation when it also round-trips and is not longer.
-    let mut text = if text.contains('e') || text.contains('E') {
-        let fixed = format!("{value}");
-        if fixed.parse::<f64>().ok() == Some(value) && !fixed.contains('e') && !fixed.contains('E')
-        {
-            fixed
-        } else {
-            text
-        }
-    } else {
-        text
-    };
-
-    // Strip trailing ".0" (e.g. "12.0" → "12") for integer-valued floats.
-    if text.ends_with(".0") {
-        text.truncate(text.len() - 2);
+    let mut sci = SciText::default();
+    // `{:e}` writes the shortest round-trip digits as `-d.ddde<exp>`.
+    std::fmt::write(&mut sci, format_args!("{value:e}")).expect("f64 exponent text fits");
+    let text = sci.as_str();
+    let (mantissa, exp) = text.split_once('e').expect("exponent form");
+    let exp: i32 = exp.parse().expect("decimal exponent");
+    if !(FIXED_MIN_EXP..=FIXED_MAX_EXP).contains(&exp) {
+        return text.to_string();
     }
-    text
+    let (negative, mantissa) = match mantissa.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, mantissa),
+    };
+    let (lead, rest) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+    let digits = lead.len() + rest.len();
+    let mut out = String::with_capacity(digits + exp.unsigned_abs() as usize + 3);
+    if negative {
+        out.push('-');
+    }
+    if exp < 0 {
+        out.push_str("0.");
+        out.extend(std::iter::repeat_n('0', (-exp - 1) as usize));
+        out.push_str(lead);
+        out.push_str(rest);
+    } else {
+        let point = exp as usize;
+        out.push_str(lead);
+        if rest.len() <= point {
+            out.push_str(rest);
+            out.extend(std::iter::repeat_n('0', point - rest.len()));
+        } else {
+            out.push_str(&rest[..point]);
+            out.push('.');
+            out.push_str(&rest[point..]);
+        }
+    }
+    out
+}
+
+/// Smallest and largest decimal exponents printed in fixed notation.
+const FIXED_MIN_EXP: i32 = -6;
+const FIXED_MAX_EXP: i32 = 20;
+
+/// Stack buffer for one `{:e}` rendering; the longest is
+/// `-2.2250738585072014e-308` (24 bytes).
+#[derive(Default)]
+struct SciText {
+    bytes: [u8; 32],
+    len: usize,
+}
+
+impl SciText {
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..self.len]).expect("ASCII exponent text")
+    }
+}
+
+impl std::fmt::Write for SciText {
+    fn write_str(&mut self, s: &str) -> std::fmt::Result {
+        let end = self.len + s.len();
+        let slot = self.bytes.get_mut(self.len..end).ok_or(std::fmt::Error)?;
+        slot.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
 }
 
 pub fn format_f64_17g(value: f64) -> String {
@@ -293,12 +345,110 @@ mod tests {
                 value.to_bits(),
                 "{text}"
             );
-            if value.fract() == 0.0 {
+            if value.fract() == 0.0 && value.abs() < 1e21 {
                 assert!(!text.contains('.'), "integral value {value:?}: {text}");
             }
         }
         assert_eq!(format_f64_shortest(0.0), "0");
         assert_eq!(format_f64_shortest(-0.0), "-0");
+    }
+
+    #[test]
+    fn display_switches_to_exponent_outside_the_fixed_range() {
+        for (value, expected) in [
+            // Tiny and huge magnitudes from training logs.
+            (5.3622168208462125e-20, "5.3622168208462125e-20"),
+            (1.0e30, "1e30"),
+            (1.5e-7, "1.5e-7"),
+            (-1.5e-7, "-1.5e-7"),
+            (-1.0e30, "-1e30"),
+            // Lower fixed boundary: 1e-6 stays fixed, the next power does not.
+            (1.0e-6, "0.000001"),
+            (1.25e-6, "0.00000125"),
+            (9.99e-7, "9.99e-7"),
+            (1.0e-7, "1e-7"),
+            // Upper fixed boundary: below 1e21 stays fixed.
+            (1.0e20, "100000000000000000000"),
+            (1.5e20, "150000000000000000000"),
+            (123456789012345680000.0, "123456789012345680000"),
+            (1.0e21, "1e21"),
+            (1.5e21, "1.5e21"),
+            // Subnormal and extreme finite values.
+            (f64::from_bits(1), "5e-324"),
+            (-f64::from_bits(1), "-5e-324"),
+            (
+                f64::from_bits(0x000f_ffff_ffff_ffff),
+                "2.225073858507201e-308",
+            ),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (f64::MAX, "1.7976931348623157e308"),
+            (f64::MIN, "-1.7976931348623157e308"),
+            // Ordinary fixed values keep their existing text.
+            (0.1 + 0.2, "0.30000000000000004"),
+            (0.001, "0.001"),
+            (123.456, "123.456"),
+            (-2.5, "-2.5"),
+            (9007199254740993.0, "9007199254740992"),
+            (2.0, "2"),
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+        ] {
+            let text = format_f64_shortest(value);
+            assert_eq!(text, expected, "{value:?}");
+            let back: f64 = text.parse().unwrap();
+            if value.is_nan() {
+                assert!(back.is_nan(), "{text}");
+            } else {
+                assert_eq!(back.to_bits(), value.to_bits(), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn display_round_trips_across_every_binade() {
+        // Every power of two, its neighbours, and a fraction-heavy value per
+        // binade: each prints at most 17 significant digits and parses back.
+        for exp in -1074..=1023 {
+            let base = 2f64.powi(exp);
+            for value in [
+                base,
+                f64::from_bits(base.to_bits() + 1),
+                f64::from_bits(base.to_bits().saturating_sub(1)),
+                base * 1.1,
+                -base / 3.0,
+            ] {
+                if !value.is_finite() || value == 0.0 {
+                    continue;
+                }
+                let text = format_f64_shortest(value);
+                assert_eq!(
+                    text.parse::<f64>().unwrap().to_bits(),
+                    value.to_bits(),
+                    "{value:e} -> {text}"
+                );
+                let digits = text
+                    .split('e')
+                    .next()
+                    .unwrap()
+                    .bytes()
+                    .filter(u8::is_ascii_digit)
+                    .skip_while(|&b| b == b'0')
+                    .count();
+                let exponent = text.contains('e');
+                let magnitude = value.abs();
+                assert_eq!(
+                    exponent,
+                    !(1e-6..1e21).contains(&magnitude),
+                    "{value:e} -> {text}"
+                );
+                if exponent {
+                    assert!(digits <= 17, "{value:e} -> {text}");
+                }
+            }
+        }
     }
 
     #[test]
