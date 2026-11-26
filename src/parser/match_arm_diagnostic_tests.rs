@@ -124,7 +124,7 @@ fn match_arm_targeted_diagnostics() {
             "{ (n + v) }",
             "block arms cannot yield a value",
             "helper function",
-            "+",
+            "(n + v)",
         ),
     ] {
         let prefix = "fn main() { match true { true => ";
@@ -154,6 +154,52 @@ fn match_arm_targeted_diagnostics() {
                 .all(|e| !e.helps.iter().any(|h| h.contains("rename"))),
             "{diagnostics:?}"
         );
+    }
+}
+
+#[test]
+fn block_arm_value_error_covers_the_whole_trailing_expression() {
+    // Operators, calls, paths, prefixes and postfix chains; the label starts
+    // at the first token of the value and ends at its last.
+    for value in [
+        "1 + i64::max(a, b)",
+        "a * b + c",
+        "g(1) + 2",
+        "g(1, h(2))",
+        "i64::max(a, b)",
+        "-n",
+        "!flag",
+        "x.len()",
+        "s.trim().len() + 1",
+        "a[0] + 1",
+        "(n + v) * 2",
+        "n == v",
+        "a && b",
+        "a || b && c",
+        "n << 2",
+        "\"s\" + \"t\"",
+        "[1, 2]",
+        "obj.field",
+        "n",
+        "Point { x: 1 }.x",
+    ] {
+        for lead in ["", "let y = 1; ", "println(1); g(2); "] {
+            let prefix = format!("fn main() {{ match true {{ true => {{ {lead}");
+            let source = format!("{prefix}{value} }}, false => {{}} }} }}");
+            let diagnostics = errors(&source);
+            let error = diagnostics
+                .iter()
+                .find(|e| e.message == "block arms cannot yield a value")
+                .unwrap_or_else(|| panic!("{source}: {diagnostics:?}"));
+            let span = error.primary_span().unwrap();
+            assert_eq!(
+                (span.start, span.end),
+                (prefix.len(), prefix.len() + value.len()),
+                "{source}: {:?}",
+                &source[span.start..span.end]
+            );
+            assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+        }
     }
 }
 

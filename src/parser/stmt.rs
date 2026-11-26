@@ -1019,7 +1019,7 @@ impl Parser {
             && self.check(TokenKind::RBrace)
         {
             return Err(self
-                .err_at(ErrorCode::E0101, "block arms cannot yield a value", expr.span())
+                .err_at(ErrorCode::E0101, "block arms cannot yield a value", span.to(self.previous_span()))
                 .with_help("move the block arm logic into a helper function and call it as an expression arm; add `;` if this is only a statement"));
         }
         self.expect(TokenKind::Semicolon)?;

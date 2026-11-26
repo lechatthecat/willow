@@ -2817,6 +2817,8 @@ mod generic_new_inference_tests;
 mod type_parameter_bound_tests;
 
 #[cfg(test)]
+mod defer_await_diagnostic_tests;
+#[cfg(test)]
 mod lock_escape_cascade_tests;
 
 #[cfg(test)]

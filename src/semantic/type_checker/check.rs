@@ -2252,6 +2252,11 @@ impl TypeChecker {
     fn check_defer_stmt(&mut self, d: &DeferStmt) {
         self.check_defer_body_shape(d);
         match &d.body {
+            // The deferred `await` itself is the reported mistake; checking it
+            // would add an unrelated "await outside async" error.
+            DeferBody::Expr(Expr::Await(awaited)) => {
+                self.check_expr(&awaited.expr);
+            }
             DeferBody::Expr(expr) => {
                 self.check_expr(expr);
             }
@@ -2274,7 +2279,27 @@ impl TypeChecker {
         // An ASYNC callee would only SPAWN a task at scope exit — the
         // cleanup body would never be driven to completion. Reject
         // until async defer (Phase 3) defines this (review fix).
-        if let Some(span) = defer_async_call_span(&d.body, &self.expr_types) {
+        if let DeferBody::Expr(Expr::Await(awaited)) = &d.body {
+            // One mistake, one error: the shape and suspension checks skip a
+            // directly deferred `await`, which is reported here instead.
+            let message = if matches!(
+                awaited.expr,
+                Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+            ) {
+                "cannot `defer` an async call"
+            } else {
+                "cannot `defer` an `await`"
+            };
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    message,
+                    awaited.span,
+                    "deferred cleanup runs synchronously and cannot wait for a task",
+                )
+                .with_help(DEFER_ASYNC_HELP),
+            );
+        } else if let Some(span) = defer_async_call_span(&d.body, &self.expr_types) {
             self.push(
                 Self::error_at(
                     ErrorCode::E0905,
@@ -2282,7 +2307,7 @@ impl TypeChecker {
                     span,
                     "this would only spawn a task at scope exit, not run it to completion",
                 )
-                .with_help("perform the async cleanup explicitly, or defer a synchronous helper"),
+                .with_help(DEFER_ASYNC_HELP),
             );
         }
     }
@@ -2295,11 +2320,17 @@ impl TypeChecker {
         // and arguments are evaluated at registration. A match/block
         // is evaluated at scope exit, allowing explicit Result
         // handling without changing the parent's result/control flow.
-        let supported = matches!(
-            &d.body,
-            DeferBody::Expr(Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_))
-                | DeferBody::Block(_)
-        );
+        // A directly deferred `await` is reported once, after typing, and a
+        // directly deferred `select` by the suspension check below.
+        let direct_await = matches!(&d.body, DeferBody::Expr(Expr::Await(_)));
+        let supported = direct_await
+            || matches!(&d.body, DeferBody::Expr(Expr::Select(_)))
+            || matches!(
+                &d.body,
+                DeferBody::Expr(
+                    Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_)
+                ) | DeferBody::Block(_)
+            );
         if !supported {
             self.push_error(
                 ErrorCode::E0905,
@@ -2341,15 +2372,18 @@ impl TypeChecker {
             );
         }
 
-        if defer_body_contains_suspend(&d.body) {
+        if !direct_await && defer_body_contains_suspend(&d.body) {
             // The registration happens at the defer statement; an
             // async operation inside the deferred body has no suspension point
             // to resume from at flush/cancel time.
-            self.push_error(
-                ErrorCode::E0905,
-                "`await` and `select` are not allowed inside a `defer`",
-                d.body.span(),
-                "deferred bodies run synchronously",
+            self.push(
+                Self::error_at(
+                    ErrorCode::E0905,
+                    "`await` and `select` are not allowed inside a `defer`",
+                    d.body.span(),
+                    "deferred bodies run synchronously",
+                )
+                .with_help(DEFER_ASYNC_HELP),
             );
         }
         // Reference arguments would act on a hidden COPY of the value
@@ -4381,9 +4415,22 @@ pub(crate) fn defer_body_contains_direct_recover(body: &DeferBody) -> bool {
     contains
 }
 
+const DEFER_ASYNC_HELP: &str =
+    "perform the async cleanup explicitly, or defer a synchronous helper";
+
 fn defer_async_call_span(body: &DeferBody, expr_types: &HashMap<ExprId, Type>) -> Option<Span> {
     let mut found = None;
+    // An awaited call is already reported by the suspension error; the walk
+    // visits each `await` before its operand.
+    let mut awaited: Option<ExprId> = None;
     walk_defer_body(body, &mut |_| {}, &mut |expr| {
+        if let Expr::Await(a) = expr {
+            awaited = Some(a.expr.id());
+            return;
+        }
+        if awaited.take() == Some(expr.id()) {
+            return;
+        }
         if found.is_some()
             || !matches!(
                 expr,
