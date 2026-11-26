@@ -2811,6 +2811,9 @@ mod generic_variant_tests;
 mod constructor_inference_tests;
 
 #[cfg(test)]
+mod generic_new_inference_tests;
+
+#[cfg(test)]
 thread_local! {
     static CONSTRUCTOR_INFERENCE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

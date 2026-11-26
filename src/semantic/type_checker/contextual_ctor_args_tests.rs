@@ -493,7 +493,10 @@ fn contextual_new_rejects_invalid_construction() {
         if name == "no context" || name == "different class" {
             assert!(
                 errors.iter().any(|error| error.code == ErrorCode::E0201
-                    && error.helps.iter().any(|help| help.contains("new Box<T>()"))),
+                    && error
+                        .helps
+                        .iter()
+                        .any(|help| help.contains("as in `Box<T>`"))),
                 "{errors:?}"
             );
         }

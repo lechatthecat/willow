@@ -166,8 +166,14 @@ impl TypeChecker {
             .with_label(Label::primary(span, "generic instantiation"));
             if args.is_empty() {
                 diagnostic = diagnostic.with_help(format!(
-                    "specify type arguments explicitly, for example `new {name}<{}>()`, or provide a matching expected class type",
-                    template.type_params.join(", ")
+                    "write the type arguments after the class name, as in `{name}<{}>`, replacing {} with concrete types, or provide a matching expected class type",
+                    template.type_params.join(", "),
+                    template
+                        .type_params
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ));
             }
             self.push(diagnostic);
@@ -272,6 +278,52 @@ impl TypeChecker {
         })
     }
 
+    /// Provider spelling -> this module's spelling of every declaration an
+    /// imported template's signature names, read off the qualified class
+    /// info registered at import. One structural walk over the signature.
+    fn provider_spellings(&self, access: &str, template: &ClassDecl) -> HashMap<String, String> {
+        let mut renames = HashMap::new();
+        let info = self.generics.class_paths.get(access).and_then(|path| {
+            self.symbols
+                .lookup_class(&QualifiedName::join(path, &template.name))
+                .or_else(|| self.symbols.lookup_class(access))
+        });
+        let Some(info) = info else {
+            return renames;
+        };
+        if let (Some(written), Some(qualified)) = (&template.base_class, &info.base_class) {
+            let written = written.spelling();
+            if written != *qualified {
+                renames.insert(written, qualified.clone());
+            }
+        }
+        for field in &template.fields {
+            let qualified = info.fields.get(&field.name).map(|field| &field.ty);
+            if let Some(qualified) = qualified {
+                collect_spellings(&field.ty, qualified, &mut renames);
+            }
+        }
+        if let (Some(decl), Some(ctor)) = (template.constructors.first(), &info.constructor)
+            && decl.params.len() == ctor.param_infos.len()
+        {
+            for (param, qualified) in decl.params.iter().zip(&ctor.param_infos) {
+                collect_spellings(&param.ty, &qualified.ty, &mut renames);
+            }
+        }
+        for method in &template.methods {
+            let Some(qualified) = info.methods.get(&method.name) else {
+                continue;
+            };
+            collect_spellings(&method.return_type, &qualified.return_type, &mut renames);
+            if method.params.len() == qualified.param_infos.len() {
+                for (param, qualified) in method.params.iter().zip(&qualified.param_infos) {
+                    collect_spellings(&param.ty, &qualified.ty, &mut renames);
+                }
+            }
+        }
+        renames
+    }
+
     fn build_class_instantiation(&mut self, instance: ClassInstantiation<'_>) -> Option<Type> {
         let ClassInstantiation {
             template,
@@ -334,7 +386,11 @@ impl TypeChecker {
             unreachable!()
         };
         let generation = self.error_generation;
-        if template_access == template.name {
+        // An item import keeps the template's name but not its module: only
+        // a local template's signature is spelled for this module.
+        if template_access == template.name
+            && !self.generics.class_paths.contains_key(&template_access)
+        {
             self.register_class(&class, None);
         } else {
             // Registration happens in the consumer, while the queued body is
@@ -353,6 +409,21 @@ impl TypeChecker {
             }
             signature.name = name.clone();
             signature.type_params.clear();
+            // The template is spelled for its own module. Its imported class
+            // info already names every declaration in this module's spelling;
+            // carry those spellings into the specialized signature, the base
+            // included, so its fields and methods name the provider's types.
+            let renames = self.provider_spellings(&template_access, template);
+            if let Some(base) = &signature.base_class
+                && let Some(qualified) = renames.get(&base.spelling())
+            {
+                signature.base_class = Some(TypePath::Qualified(
+                    QualifiedName::new(qualified)
+                        .segments()
+                        .map(str::to_string)
+                        .collect(),
+                ));
+            }
             let mut signature = Item::Class(signature);
             visit_item(
                 &mut signature,
@@ -361,7 +432,7 @@ impl TypeChecker {
                         if n == &template.name {
                             template_access.clone()
                         } else {
-                            n.clone()
+                            renames.get(n).cloned().unwrap_or_else(|| n.clone())
                         }
                     });
                     crate::semantic::generic_inference::substitute(&qualified, &bindings)
@@ -689,6 +760,38 @@ impl TypeChecker {
                 unreachable!()
             };
             self.check_method(&copy.methods[0], &copy, &receiver);
+        }
+    }
+}
+
+/// Record each name `written` spells differently from `qualified` at the
+/// same position. Positions whose shapes differ (a normalized storage type)
+/// carry no spelling and are skipped.
+fn collect_spellings(written: &Type, qualified: &Type, renames: &mut HashMap<String, String>) {
+    let mut pending = vec![(written, qualified)];
+    while let Some(pair) = pending.pop() {
+        match pair {
+            (Type::Named(a), Type::Named(b)) => {
+                if a != b {
+                    renames.entry(a.clone()).or_insert_with(|| b.clone());
+                }
+            }
+            (Type::Generic(a, xs), Type::Generic(b, ys)) if xs.len() == ys.len() => {
+                if a != b {
+                    renames.entry(a.clone()).or_insert_with(|| b.clone());
+                }
+                pending.extend(xs.iter().zip(ys));
+            }
+            (Type::Array(a), Type::Array(b)) | (Type::FixedArray(a, _), Type::FixedArray(b, _)) => {
+                pending.push((a, b));
+            }
+            (Type::Fn(xs, a), Type::Fn(ys, b)) | (Type::Closure(xs, a), Type::Closure(ys, b))
+                if xs.len() == ys.len() =>
+            {
+                pending.extend(xs.iter().zip(ys));
+                pending.push((a, b));
+            }
+            _ => {}
         }
     }
 }

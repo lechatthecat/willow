@@ -1,0 +1,51 @@
+// `new C(args)` takes a generic class's type arguments from the constructor
+// arguments, the same way a generic function call does.
+import std::collections::Array;
+
+class Heap<T> {
+    pub items: Array<T>;
+    pub before: fn(T, T) -> bool;
+
+    pub fn push(self, x: T) {
+        self.items.push(x);
+        let before = self.before;
+        let mut i = self.items.len() - 1;
+        while i > 0 && before(self.items[i], self.items[i - 1]) {
+            let t = self.items[i];
+            self.items[i] = self.items[i - 1];
+            self.items[i - 1] = t;
+            i -= 1;
+        }
+    }
+}
+
+class Entry<K, V> {
+    pub key: K;
+    pub value: V;
+    pub init(self, key: K, value: V) {
+        self.key = key;
+        self.value = value;
+    }
+}
+
+fn main() {
+    // Element type from the array literal, closure parameters from `T`.
+    let h = new Heap([5, 9], |a, b| a < b);
+    h.push(1);
+    println(h.items[0]);
+
+    // An empty array is fixed by the typed closure.
+    let names = new Heap([], |a: String, b: String| -> bool { return a < b; });
+    names.push("pear");
+    names.push("apple");
+    println(names.items[0]);
+
+    // `init` constructors infer every parameter.
+    let e = new Entry("answer", 42);
+    println(e.key);
+    println(e.value);
+
+    // Nested instances infer inside out.
+    let nested = new Entry(1, new Entry(true, 2.5));
+    println(nested.value.value);
+}

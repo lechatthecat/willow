@@ -3187,6 +3187,12 @@ impl TypeChecker {
             return self.check_object_literal(literal);
         }
 
+        if let Expr::New(n) = expr
+            && n.type_args.is_empty()
+            && let Some(ty) = self.check_inferred_generic_new(n)
+        {
+            return ty;
+        }
         let generic_class = self.generic_class_site(expr);
         if let Some((name, args)) = generic_class
             && let Some(ty) = self.instantiate_class(name, args, expr.span())

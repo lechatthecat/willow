@@ -425,6 +425,7 @@ impl TypeChecker {
             span,
             &parameter_names,
             arguments,
+            None,
         )
         else {
             return Some(Self::error_type());
@@ -441,6 +442,8 @@ impl TypeChecker {
                 {
                     self.resolve_generic_argument(&arg.expr, &expected);
                     expected
+                } else if is_empty_array_literal(&arg.expr) {
+                    self.check_argument_expecting(&arg.expr, &expected, false)
                 } else {
                     actual
                 }
@@ -719,6 +722,7 @@ impl TypeChecker {
         span: Span,
         parameter_names: &HashSet<&str>,
         arguments: GenericCallArguments,
+        constructed: Option<&str>,
     ) -> Option<CheckedGenericArguments> {
         let GenericCallArguments {
             params,
@@ -769,6 +773,14 @@ impl TypeChecker {
         let mut poisoned = false;
         for (i, ty) in actual.iter().enumerate() {
             let Some(ty) = ty else { continue };
+            // `[]` says nothing about its element type: the other arguments
+            // bind it, and the literal is typed against the result afterwards.
+            if is_empty_array_literal(&call_args[i].expr)
+                && matches!(contextual_params.get(i), Some(None))
+                && untyped_array(ty)
+            {
+                continue;
+            }
             let fixed = contextual_params
                 .get(i)
                 .and_then(Option::as_ref)
@@ -813,6 +825,14 @@ impl TypeChecker {
             let Expr::Lambda(lambda) = &call_args[i].expr else {
                 unreachable!("deferred arguments are lambdas")
             };
+            // A constructor reports the type parameters left open as one
+            // diagnostic naming them; an untyped closure parameter that only
+            // they would type is checked as recovery instead of adding E1001.
+            let open = constructed.is_some()
+                && !poisoned
+                && open_lambda_parameter(lambda, &params[i], |name| {
+                    parameter_names.contains(name) && inference.binding(name).is_none()
+                });
             let lambda_ty = self.check_inferred_generic_lambda(
                 lambda,
                 &params[i],
@@ -820,12 +840,16 @@ impl TypeChecker {
                     parameter_names,
                     inference: &inference,
                     spellings: &spellings,
-                    poisoned,
+                    poisoned: poisoned || open,
                     span,
                 },
             );
             self.expr_types
                 .insert(call_args[i].expr.id(), lambda_ty.clone());
+            if open {
+                actual[i] = Some(lambda_ty);
+                continue;
+            }
             let lambda_ty =
                 lambda_ty.substitute_names(|n| self.generics.logical_types.get(n).cloned());
             let canonical = match self.generic_self_argument(
@@ -875,6 +899,37 @@ impl TypeChecker {
         if poisoned {
             return None;
         }
+        let unbound = |name: &str| {
+            inference
+                .binding(name)
+                .is_none_or(crate::semantic::generic_inference::has_enum_hole)
+        };
+        if let Some(class) = constructed
+            && template.type_params.iter().any(|name| unbound(name))
+        {
+            let shown: Vec<_> = template
+                .type_params
+                .iter()
+                .map(|name| {
+                    inference
+                        .binding(name)
+                        .filter(|_| !unbound(name))
+                        .map_or_else(
+                            || name.clone(),
+                            |bound| {
+                                self.diagnostic_type_name(&bound.map_names(|identity| {
+                                    spellings
+                                        .get(identity)
+                                        .cloned()
+                                        .unwrap_or_else(|| identity.clone())
+                                }))
+                            },
+                        )
+                })
+                .collect();
+            self.push_uninferred_constructor(class, template, &shown, call_args, span, unbound);
+            return None;
+        }
         let bindings = match inference.finish(false) {
             Ok(bindings) => bindings
                 .into_iter()
@@ -902,6 +957,233 @@ impl TypeChecker {
             reference_places,
             actual,
         })
+    }
+
+    /// `new Box(5)` of a generic class with no written type arguments and no
+    /// expected class type. The constructor is a generic call: its value
+    /// parameters are the `init` parameters (or the memberwise fields) and its
+    /// type parameters are the class's, so the arguments bind them exactly as
+    /// they bind a generic function's. The class is then instantiated with the
+    /// bindings and the constructor checked concretely; that check reuses the
+    /// argument types computed here instead of walking the arguments again.
+    pub(in crate::semantic::type_checker) fn check_inferred_generic_new(
+        &mut self,
+        n: &NewExpr,
+    ) -> Option<Type> {
+        // No argument can fix a type parameter; the explicit-arguments
+        // diagnostic says what to write.
+        if n.args.is_empty() {
+            return None;
+        }
+        let template = self.generics.classes.get(&n.class_name)?.clone();
+        if !self.signature_metadata && !template.public() && template.span.file_id != n.span.file_id
+        {
+            return None;
+        }
+        let params = self.generic_constructor_params(&n.class_name, &template)?;
+        #[cfg(test)]
+        GENERIC_NEW_INFERENCES.with(|count| count.set(count.get() + 1));
+        if params.len() != n.args.len() {
+            for arg in &n.args {
+                self.check_expr(&arg.expr);
+            }
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E0845,
+                    format!(
+                        "constructor `{}::init` expects {} argument(s) but got {}",
+                        n.class_name,
+                        params.len(),
+                        n.args.len()
+                    ),
+                )
+                .with_label(Label::primary(n.span, "wrong number of arguments")),
+            );
+            return Some(Self::error_type());
+        }
+        let signature = FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            effect_contracts: Vec::new(),
+            type_params: template.type_params.clone(),
+            rust_bridge: None,
+            name: n.class_name.clone(),
+            modifiers: Modifiers::PUBLIC,
+            params,
+            return_type: Type::Generic(
+                n.class_name.clone(),
+                template
+                    .type_params
+                    .iter()
+                    .cloned()
+                    .map(Type::Named)
+                    .collect(),
+            ),
+            return_type_span: None,
+            body: Block {
+                id: BodyId::fresh(),
+                stmts: Vec::new(),
+                span: template.span,
+            },
+            span: template.span,
+            constant: None,
+        };
+        let parameter_names: HashSet<_> =
+            signature.type_params.iter().map(String::as_str).collect();
+        // No generic function is registered under a class name, so the
+        // signature is never mistaken for an imported function's.
+        let arguments = self.prepare_generic_call_arguments(
+            &signature,
+            &parameter_names,
+            GenericCallSite {
+                callee: "",
+                type_args: &[],
+                call_args: &n.args,
+                span: n.span,
+                context: CallContext {
+                    expected: None,
+                    checked: false,
+                },
+            },
+        );
+        let Some(checked) = self.infer_generic_call_arguments(
+            &signature,
+            &n.args,
+            n.span,
+            &parameter_names,
+            arguments,
+            Some(&n.class_name),
+        ) else {
+            return Some(Self::error_type());
+        };
+        let args: Vec<_> = signature
+            .type_params
+            .iter()
+            .map(|name| checked.bindings[name].clone())
+            .collect();
+        let ty = self.instantiate_class(&n.class_name, &args, n.span)?;
+        let Type::Named(name) = &ty else {
+            return Some(ty);
+        };
+        self.generics.objects.insert(n.id, name.clone());
+        Some(self.check_new_with_effects(n, name, true))
+    }
+
+    /// The constructor parameters of a generic class, spelled in this module:
+    /// an imported template's signature comes from its qualified class info,
+    /// a local one from its declaration. `None` when the class has no
+    /// constructor signature to infer from (its base declares `init`).
+    fn generic_constructor_params(&self, name: &str, template: &ClassDecl) -> Option<Vec<Param>> {
+        let field_param = |field_name: &str, ty: Type, span: Span| Param {
+            name: field_name.to_string(),
+            ty,
+            mode: ParamMode::Value,
+            sending: false,
+            span,
+            type_span: span,
+        };
+        let inherited = |base: &str| {
+            self.implicit_constructor_field_infos(base).map(|fields| {
+                fields
+                    .into_iter()
+                    .map(|(_, field_name, field)| {
+                        field_param(&field_name, field.ty, field.declaration_span)
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        if let Some(path) = self.generics.class_paths.get(name) {
+            let info = self.symbols.lookup_class(name).or_else(|| {
+                self.symbols
+                    .lookup_class(&QualifiedName::join(path, &template.name))
+            })?;
+            return match (&info.constructor, template.constructors.first()) {
+                (Some(ctor), Some(decl)) => Some(
+                    decl.params
+                        .iter()
+                        .zip(&ctor.param_infos)
+                        .map(|(param, info)| Param {
+                            ty: info.ty.clone(),
+                            ..param.clone()
+                        })
+                        .collect(),
+                ),
+                (Some(_), None) => None,
+                (None, _) => inherited(&info.name.clone()),
+            };
+        }
+        if let Some(ctor) = template.constructors.first() {
+            return Some(ctor.params.clone());
+        }
+        let mut params = match &template.base_class {
+            Some(base) => inherited(&base.spelling())?,
+            None => Vec::new(),
+        };
+        params.extend(
+            template
+                .fields
+                .iter()
+                .filter(|field| !field.is_static())
+                .map(|field| field_param(&field.name, field.ty.clone(), field.span)),
+        );
+        Some(params)
+    }
+
+    /// Inference left a class type parameter unbound. Name it, say which
+    /// parameters mention it, and show the explicit form with the bound
+    /// parameters filled in, keeping the call's arguments.
+    fn push_uninferred_constructor(
+        &mut self,
+        class: &str,
+        signature: &FunctionDecl,
+        shown: &[String],
+        call_args: &[CallArg],
+        span: Span,
+        unbound: impl Fn(&str) -> bool,
+    ) {
+        let missing: Vec<_> = signature
+            .type_params
+            .iter()
+            .filter(|name| unbound(name))
+            .collect();
+        let names = missing
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let plural = if missing.len() == 1 { "" } else { "s" };
+        let mut diagnostic = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0201,
+            format!(
+                "cannot infer type parameter{plural} {names} of generic class `{class}` from the constructor arguments"
+            ),
+        )
+        .with_label(Label::primary(span, "type argument not determined"));
+        for name in &missing {
+            let users: Vec<_> = signature
+                .params
+                .iter()
+                .zip(call_args)
+                .filter(|(param, _)| mentions(&param.ty, |n| n == name.as_str()))
+                .map(|(param, _)| format!("`{}`", param.name))
+                .collect();
+            diagnostic = diagnostic.with_note(if users.is_empty() {
+                format!("no constructor parameter mentions `{name}`")
+            } else {
+                format!(
+                    "`{name}` appears only in {}, whose argument does not fix it (an empty array literal or an untyped closure parameter leaves it open)",
+                    users.join(", ")
+                )
+            });
+        }
+        let arguments = if call_args.is_empty() { "" } else { "..." };
+        self.push(diagnostic.with_help(format!(
+            "write the type argument{plural} and keep the arguments as they are: `new {class}<{}>({arguments})`, replacing {names} with a concrete type; or annotate the expected type, as in `let value: {class}<{}> = new {class}({arguments});`",
+            shown.join(", "),
+            shown.join(", ")
+        )));
     }
 
     fn check_inferred_generic_lambda(
@@ -981,4 +1263,34 @@ impl TypeChecker {
             self.check_lambda(lambda)
         }
     }
+}
+
+/// The type of `[]` checked without an element context.
+fn untyped_array(ty: &Type) -> bool {
+    match ty {
+        Type::Array(element) => **element == Type::Void,
+        Type::Generic(_, args) => matches!(args.as_slice(), [Type::Void]),
+        _ => false,
+    }
+}
+
+fn is_empty_array_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::ArrayLiteral(elements, _, _) if elements.is_empty())
+}
+
+/// Whether a closure parameter without an annotation sits where the formal
+/// names a type parameter that is still unbound.
+fn open_lambda_parameter(
+    lambda: &LambdaExpr,
+    formal: &Type,
+    unbound: impl Fn(&str) -> bool,
+) -> bool {
+    let (Type::Fn(formal_params, _) | Type::Closure(formal_params, _)) = formal else {
+        return false;
+    };
+    lambda
+        .params
+        .iter()
+        .zip(formal_params)
+        .any(|(param, formal)| param.ty.is_none() && mentions(formal, &unbound))
 }

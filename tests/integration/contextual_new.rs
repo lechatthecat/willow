@@ -40,9 +40,9 @@ fn contextual_new_imported_class_runs() {
 #[test]
 fn contextual_new_missing_context_has_help() {
     let stderr =
-        compile_error_stderr("class Box<T> { pub value: T; } fn main() { let b = new Box(1); }");
+        compile_error_stderr("class Box<T> { pub value: T; } fn main() { let b = new Box([]); }");
     assert!(stderr.contains("error[E0201]"), "{stderr}");
-    assert!(stderr.contains("new Box<T>()"), "{stderr}");
+    assert!(stderr.contains("new Box<T>(...)"), "{stderr}");
     assert!(!stderr.contains("internal compiler error"), "{stderr}");
 }
 

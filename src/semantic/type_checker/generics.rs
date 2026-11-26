@@ -114,6 +114,13 @@ impl Default for GeneratedOrigins {
     }
 }
 
+#[cfg(test)]
+impl TemplateRegistry {
+    pub(super) fn class_specialization_count(&self) -> usize {
+        self.class_specializations
+    }
+}
+
 impl TemplateRegistry {
     fn reserve(&mut self, key: &InstantiationKey) -> Result<bool, ()> {
         if self.requested.contains_key(key) {
@@ -252,6 +259,7 @@ enum InstantiationTypeRef<'a> {
 thread_local! {
     pub(super) static GENERIC_ENUM_ARGUMENT_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static GENERIC_CALL_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(super) static GENERIC_NEW_INFERENCES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     pub(super) static EXPECTED_RESULT_HINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static CONTEXTUAL_NEW_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static INSTANTIATION_METADATA_COPIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
