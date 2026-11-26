@@ -16,6 +16,19 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/io_contracts.wi", "value=42\n"),
         (
+            "example/packed_byte_arrays.wi",
+            "255\ntrue\n393\n[7, 128, 255]\n255\n4\n",
+        ),
+        ("example/proven_no_panic.wi", "42\n9\n99\n"),
+        (
+            "example/scalar_widths.wi",
+            "-128\n-32768\n-2147483648\n65535\n4294967295\n18446744073709551615\n-128\ntrue\n-1\n65535\n18446744073709551615\n\u{1f332}\n127794\ntrue\ntrue\ntree\n",
+        ),
+        (
+            "example/u8_scalar.wi",
+            "255\n255\n255\n255\n0\ntrue\n0\ntrue\ntrue\n127\nmax\n",
+        ),
+        (
             "example/json.wi",
             "Willow\n{\"name\":\"Willow\",\"count\":18446744073709551615,\"tags\":[true,null]}\n3\n",
         ),
@@ -1572,6 +1585,16 @@ fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static st
             "example/rust_opaque_bridge",
             "example/rust_opaque_bridge/src/main.wi",
             "true\nfalse\n",
+        ),
+        (
+            "example/rust_assume",
+            "example/rust_assume/src/main.wi",
+            "42\n42\n",
+        ),
+        (
+            "example/rust_modules",
+            "example/rust_modules/src/main.wi",
+            "true\ntrue\nWillow\n",
         ),
         (
             "example/rust_regex",

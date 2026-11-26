@@ -605,7 +605,7 @@ fn binding_declarations_report_declared_types_and_gaps_have_no_expression() {
         ("src/main.wi:11:9", "i64"),            // for binding
         ("src/main.wi:1:10", "fn(i64) -> f64"), // function parameter
         ("src/main.wi:2:9", "Option<f64>"),     // function parameter
-        ("src/main.wi:1:60", "i64"),            // parameter use
+        ("src/main.wi:1:55", "i64"),            // parameter use
         ("src/main.wi:3:18", "Option<f64>"),    // scrutinee use
         ("src/main.wi:12:13", "fn(Option<f64>) -> i64"), // callee token
         ("src/main.wi:12:35", "i64"),           // literal inside parentheses
@@ -6894,7 +6894,7 @@ fn string_builtin_paths_preserve_conservative_bounds() {
     for (name, ret, method) in [
         ("length", "i64", "len()"),
         ("contains", "bool", "contains(t)"),
-        ("find", "i64", "find(t)"),
+        ("find", "Option<i64>", "find(t)"),
         ("starts", "bool", "starts_with(t)"),
         ("ends", "bool", "ends_with(t)"),
     ] {
@@ -7018,15 +7018,27 @@ fn io_contract_effect_queries_report_external_access() {
             assert!(!fact["witness"].is_null(), "{value}");
         }
     }
-    for (annotation, state) in [("", "unknown"), ("@effects(no_io)", "none")] {
+    let foreign = |annotation: &str| {
         fs::write(f.0.join("src/main.wi"), format!("extern rust {{ {annotation} fn foreign(); }} fn relay() {{ foreign(); }} fn main() {{}}")).unwrap();
-        let value = f.json(&["effects", "main::relay"], 1);
-        let fact = value["result"]["effects"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|fact| fact["effect"] == 64)
-            .unwrap();
-        assert_eq!(fact["state"], state, "{value}");
-    }
+    };
+    foreign("");
+    let value = f.json(&["effects", "main::relay"], 1);
+    let fact = value["result"]["effects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|fact| fact["effect"] == 64)
+        .unwrap();
+    assert_eq!(fact["state"], "unknown", "{value}");
+    // An unreviewed external `no_io` claim is never evidence: the query fails
+    // closed instead of reporting `none`.
+    foreign("@effects(no_io)");
+    let output = f.run(&["effects", "main::relay", "--format", "json"]);
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("rust_nonblocking_review_required"),
+        "{stderr}"
+    );
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("\"state\":\"none\""));
 }

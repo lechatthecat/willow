@@ -1671,11 +1671,11 @@ mod tests {
     // Radix 19: decimal overflow still reports E0052 when separators are used.
     #[test]
     fn separator_19_decimal_overflow_with_separators() {
-        let d = first_error("9_223_372_036_854_775_808");
+        let d = first_error("18_446_744_073_709_551_616");
         assert_eq!(d.code, ErrorCode::E0052);
         assert_eq!(
-            ints("9_223_372_036_854_775_807"),
-            vec![i128::from(i64::MAX)]
+            ints("18_446_744_073_709_551_615"),
+            vec![i128::from(u64::MAX)]
         );
     }
 

@@ -195,8 +195,9 @@ fn actual_baseline_stops_are_visible_even_for_empty_heaps() {
     assert_eq!(stats.flags, STOP_COUNTERS_VALID);
     assert_eq!(stats.active_sequence, 0);
     assert_eq!(stats.events_pending, 0);
-    assert_eq!(stats.by_reason.map(|t| t.requests), [1, 2, 1, 0]);
-    assert_eq!(stats.by_reason.map(|t| t.completed), [1, 2, 1, 0]);
+    assert_eq!(stats.by_reason[0].requests, 1);
+    assert_eq!(stats.by_reason[2].requests, 1);
+    assert_old_cycle_closure_stops(&stats, 1);
     let sequence = stats.last_sequence;
     let generation = stats.reset_generation;
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -223,8 +224,9 @@ fn normal_old_cycles_do_not_scan_headers_or_sweep_under_stops() {
         let stats = snapshot_stops();
         // Root handshakes are recorded even with no roots; their stopped
         // work must remain independent of the heap object count.
-        assert_eq!(stats.by_reason.map(|r| r.requests), [1, 2, 0, 0]);
-        assert_eq!(stats.by_reason.map(|r| r.completed), [1, 2, 0, 0]);
+        assert_eq!(stats.by_reason[0].requests, 1);
+        assert_eq!(stats.by_reason[2].requests, 0);
+        assert_old_cycle_closure_stops(&stats, 1);
         assert_eq!(stats.by_reason[0].work.root_values, 0);
         assert_eq!(stats.by_reason[0].work.metadata_objects, 0);
         assert_eq!(stats.by_reason[1].work.metadata_objects, 0);
@@ -382,4 +384,32 @@ fn private_stop_history_configuration_survives_reset_and_peer_teardown() {
     second.reset_for_test();
     assert_eq!(second.transport_capacity(), EVENT_CAPACITY);
     assert_ne!(second.snapshot_stops().flags & STOP_CONFIG_INVALID, 0);
+}
+
+/// Closure stops of `cycles` completed old cycles. The remark stop yields to
+/// bounded recovery once it exceeds its wall-clock work budget
+/// (`WILLOW_GC_REMARK_MAX_WORK_NS`), so the split between remark and recovery
+/// stops is time-dependent and only bounded: each cycle runs one or more
+/// remark stops (at most `MAX_REMARK_ROUNDS - 1`), at most one recovery stop, and
+/// at least two closure stops in total.
+fn assert_old_cycle_closure_stops(stats: &StopStatsV2, cycles: u64) {
+    let max_remarks = (crate::gc::MAX_REMARK_ROUNDS - 1) as u64;
+    let remark = stats.by_reason[1].requests;
+    let recovery = stats.by_reason[3].requests;
+    assert!(
+        (cycles..=cycles * max_remarks).contains(&remark),
+        "remark stops {remark} for {cycles} cycles"
+    );
+    assert!(
+        recovery <= cycles,
+        "recovery stops {recovery} for {cycles} cycles"
+    );
+    assert!(
+        remark + recovery >= 2 * cycles,
+        "closure stops {remark}+{recovery} for {cycles} cycles"
+    );
+    assert_eq!(
+        stats.by_reason.map(|t| t.completed),
+        stats.by_reason.map(|t| t.requests)
+    );
 }

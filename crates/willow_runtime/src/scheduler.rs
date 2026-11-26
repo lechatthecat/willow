@@ -637,7 +637,17 @@ impl RunQueues {
                     .local_pushes
                     .fetch_add(1, Ordering::Relaxed);
             }
-            None => self.push_global(id),
+            // A drive can run more workers than this scheduler has local
+            // queues (pinned stacks raise the pool size). Such an owner takes
+            // the task from the shared queue, so it must be woken by index: the
+            // generic backlog notification is suppressed for a single task
+            // inside a run, which would leave the owner parked while every
+            // other worker keeps rerouting the task.
+            None => {
+                self.publish_global_batch(std::slice::from_ref(&id), false);
+                self.observation.owner_notification();
+                self.parking.notify_worker(owner);
+            }
         }
     }
 
@@ -4156,6 +4166,10 @@ fn release_quiescent_frame_roots_in(
     }
     let bound = retirements.reclaim.release_bound();
     let frames = retirements.take_quiescent_frames(bound, &components.frame_roots);
+    #[cfg(test)]
+    retirements
+        .released_below
+        .fetch_max(bound, Ordering::SeqCst);
     for retired in frames {
         crate::gc::remove_runtime_root_in(owner, retired.frame as *mut u8);
         owner.frame_lifetime.record_with_sweep(
@@ -4958,6 +4972,13 @@ fn claim_ready_for_worker_in(
                     0,
                 );
                 set_current_task(None);
+                // A terminal state is a boundary, like the end of a poll.
+                // Worker 0 may be parked without a timeout after it saw this
+                // task's previous poll as active; a Preempted poll end and a
+                // sole local requeue bump no generation, so wake it here,
+                // after the claim marker has resolved.
+                drop(in_flight);
+                queues.parking.notify_worker(0);
             }
             Claim::Reroute(owner) => {
                 queues.push_rerouted(owner, id);
@@ -5535,10 +5556,12 @@ fn scheduler_run_loop_in(
         if fatal_panic_pending(owner) {
             park_until_fatal_abort();
         }
-        // Poll, cleanup and their post-poll boundaries form one unit: frames
-        // retired while it runs keep their roots until it ends.
+        // Poll, cleanup and their terminal boundaries form one unit: frames
+        // retired while it runs keep their roots until it ends. A poll that
+        // returned to a live boundary ends it before publishing the task, and
+        // every path ends it before the poll accounting.
         // Idle waits stay outside it so a parked worker never delays release.
-        let _unit = frame_participant.enter();
+        let unit = frame_participant.enter();
         // A task the claim moved to Cancelling: run its cleanup entry WITHOUT
         // the scheduler lock (poll-like), then finalize as Cancelled. The frame stays rooted
         // until finalization.
@@ -5607,8 +5630,15 @@ fn scheduler_run_loop_in(
                         };
                         crate::observability::record(event, Some(worker), id, i64::from(result));
                         set_current_task(None);
+                        drop(unit);
                         finish_active_poll(shared);
-                        if matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL) {
+                        // As at the end of a regular poll: a runnable
+                        // boundary published its requeue before this
+                        // accounting ended, so a peer may already have
+                        // finished the continuation.
+                        if worker != 0
+                            || matches!(result, RUNTIME_POLL_PENDING | RUNTIME_POLL_BLOCKED_SYSCALL)
+                        {
                             owner.parking.notify_worker(0);
                         }
                         continue;
@@ -5662,6 +5692,7 @@ fn scheduler_run_loop_in(
             );
             drain_terminal_cleanups_in(owner, components);
             crate::gc::stress_collect_in(owner, "scheduler");
+            drop(unit);
             finish_active_poll(shared);
             owner.parking.notify_worker(0);
             if cleanup_panicked {
@@ -5690,6 +5721,7 @@ fn scheduler_run_loop_in(
             drain_terminal_cleanups_in(owner, components);
             crate::gc::stress_collect_in(owner, "await");
             crate::gc::stress_collect_in(owner, "scheduler");
+            drop(unit);
             finish_active_poll(shared);
             owner.parking.notify_worker(0);
             record_completed_task(&mut completed, shared);
@@ -5717,12 +5749,13 @@ fn scheduler_run_loop_in(
             ),
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         ))]
-        let (result, native_cancelled) = {
+        let (result, native_cancelled, suspended) = {
             if work.direct_poll {
                 (
                     // SAFETY: The claimed task retains its frame and pairs it with the installed
                     // callback for this execution.
                     unsafe { crate::generated_context::invoke(poll as *const (), frame) },
+                    false,
                     false,
                 )
             } else {
@@ -5735,12 +5768,13 @@ fn scheduler_run_loop_in(
                 // callback for this execution.
                 let result = unsafe { crate::native_stack::NativeStack::resume(&mut *stack) };
                 let cancelled = stack.is_cancelled();
-                if stack.is_suspended() {
+                let suspended = stack.is_suspended();
+                if suspended {
                     CURRENT_EXECUTION.with(|slot| slot.borrow_mut().stack = Some(stack));
                 } else {
                     crate::native_stack::NativeStack::recycle(stack);
                 }
-                (result, cancelled)
+                (result, cancelled, suspended)
             }
         };
         #[cfg(not(any(
@@ -5755,10 +5789,11 @@ fn scheduler_run_loop_in(
             ),
             all(target_os = "windows", target_env = "msvc", target_arch = "x86_64")
         )))]
-        let (result, native_cancelled) = (
+        let (result, native_cancelled, suspended) = (
             // SAFETY: the worker owns the poll claim and its registered frame remains live
             // until this non-unwinding callback returns.
             unsafe { crate::generated_context::invoke(poll as *const (), frame) },
+            false,
             false,
         );
         crate::preempt::willow_preempt_end();
@@ -5779,6 +5814,25 @@ fn scheduler_run_loop_in(
         let outcome = classify_poll_result(result);
         let fatal_chain = matches!(outcome, PollOutcome::Panicked | PollOutcome::Invalid(_))
             .then(async_chain_text);
+        // A poll that returned to a live boundary holds no frame pointer any
+        // more: its own frame stays rooted, and nothing of the poll remains on
+        // a stack. End the unit before the boundary publishes the task, or a
+        // peer that claims the continuation at once would still see this
+        // worker's older epoch and keep everything retired during the poll
+        // rooted. A suspended native stack still holds the poll's registers.
+        let unit = if !suspended
+            && matches!(
+                outcome,
+                PollOutcome::Yield
+                    | PollOutcome::Preempted
+                    | PollOutcome::Pending
+                    | PollOutcome::BlockedSyscall
+            ) {
+            drop(unit);
+            None
+        } else {
+            Some(unit)
+        };
         match outcome {
             PollOutcome::Ready if native_cancelled => {
                 SchedulerServices::with_scheduler(
@@ -5861,10 +5915,19 @@ fn scheduler_run_loop_in(
         // boundaries. Otherwise worker 0 can leave the scoped pool and wait to
         // join this worker while its collection is waiting for worker 0 to
         // reach a safepoint.
+        //
+        // End the frame unit first: a drive that sees no active poll may
+        // return and collect at once, and must not find this worker still
+        // covering the frames it retired.
+        drop(unit);
         finish_active_poll(shared);
-        if !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
-            // Only the coordinator must recheck timers/netpoll/idleness.
-            // Waking the whole pool here would cost tasks * workers.
+        // Only the coordinator must recheck timers/netpoll/idleness.
+        // Waking the whole pool here would cost tasks * workers. A runnable
+        // outcome on another worker still ends an active poll that worker 0
+        // may be waiting on: the requeue above is published before this
+        // accounting ends, so a peer can steal and finish the continuation
+        // first, and no later poll is left to wake worker 0.
+        if worker != 0 || !matches!(outcome, PollOutcome::Yield | PollOutcome::Preempted) {
             owner.parking.notify_worker(0);
         }
         if outcome == PollOutcome::Ready {

@@ -403,7 +403,7 @@ fn mixed_scalar_arguments_cross_register_and_stack_abi_boundaries() {
     // Nine integers and nine floating-point values overflow native argument
     // register banks on each supported ABI; bool crosses the boundary too.
     let params: Vec<_> = (0..9)
-        .flat_map(|i| [format!("i{i}: i64"), format!("f{i}: f64")])
+        .flat_map(|i| [format!("n{i}: i64"), format!("f{i}: f64")])
         .chain(["flag: bool".into()])
         .collect();
     let args: Vec<_> = (0..9)
@@ -411,7 +411,7 @@ fn mixed_scalar_arguments_cross_register_and_stack_abi_boundaries() {
         .chain(["true".into()])
         .collect();
     let sum = (0..9)
-        .map(|i| format!("i{i} as f64 + f{i}"))
+        .map(|i| format!("n{i} as f64 + f{i}"))
         .collect::<Vec<_>>()
         .join(" + ");
     f.sources(
@@ -1019,7 +1019,18 @@ fn run_byte_lifetime_probe(f: &Fixture) -> Output {
         compiler.arg("-C").arg(arg);
     }
     if cfg!(target_env = "msvc") {
-        compiler.args(["-l", "psapi", "-l", "dbghelp", "-l", "ws2_32"]);
+        // The same system libraries the Willow MSVC link adds: the runtime
+        // calls the C stdio formatters, which `legacy_stdio_definitions` defines.
+        compiler.args([
+            "-l",
+            "psapi",
+            "-l",
+            "dbghelp",
+            "-l",
+            "ws2_32",
+            "-l",
+            "legacy_stdio_definitions",
+        ]);
     }
     if cfg!(target_os = "macos") {
         compiler.args(["-l", "iconv"]);
@@ -1829,6 +1840,25 @@ fn nonblocking_imported_declaration_under_lock_and_no_wait() {
     )
     .unwrap();
     f.sources("import foreign; @effects(no_wait) fn invoke()->i64 { return foreign::add(20,22); } async fn main() { let m = Mutex::new(0); lock m as value { println(invoke()); } }", ADD);
+    // The claim identity is now `foreign::add`: the shared review must be renewed.
+    let output = f.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
+    let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    fs::write(
+        f.root.join("rust-review.toml"),
+        format!(
+            "fingerprint = \"{}\"\n",
+            query["review_fingerprint"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    let legacy = query["legacy_review_fingerprint"].as_str().unwrap();
+    let foreign = fs::read_to_string(f.root.join("src/foreign.wi")).unwrap();
+    let previous = foreign.split('"').nth(1).unwrap().to_owned();
+    fs::write(
+        f.root.join("src/foreign.wi"),
+        foreign.replace(&previous, legacy),
+    )
+    .unwrap();
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "42\n"
@@ -2200,29 +2230,29 @@ fn widened_bridge_primitive_named_records_roundtrip() {
         import std::collections::Array;
         extern rust {
             class str { pub text: String; }
-            class u8 { pub data: Array<i64>; }
+            class usize { pub data: Array<i64>; }
             fn text(v: str) -> str;
-            fn bytes(v: u8) -> u8;
+            fn bytes(v: usize) -> usize;
             fn maybe(v: Option<str>) -> Option<str>;
-            fn checked(v: Result<u8, str>) -> Result<u8, str>;
+            fn checked(v: Result<usize, str>) -> Result<usize, str>;
         }
         fn main() {
             println(text(new str("雪🙂")).text == "雪🙂");
             println(text(new str("")).text == "");
-            let output = bytes(new u8([0, 128, 255]));
+            let output = bytes(new usize([0, 128, 255]));
             println(output.data[0] == 0 && output.data[1] == 128 && output.data[2] == 255);
-            println(bytes(new u8([])).data.len() == 0);
+            println(bytes(new usize([])).data.len() == 0);
             println(maybe(Some(new str("nested"))).unwrap().text == "nested");
             println(maybe(None).is_none());
-            println(checked(Ok(new u8([255]))).unwrap().data[0] == 255);
+            println(checked(Ok(new usize([255]))).unwrap().data[0] == 255);
             println(checked(Err(new str("error"))).unwrap_err().text == "error");
         }
     "#, r#"
         use crate::{record_inputs as input, record_outputs as output, records};
         pub fn text(v: input::str<'_>) -> output::str { records::str { text: v.text.into() } }
-        pub fn bytes(v: input::u8<'_>) -> output::u8 { records::u8 { data: v.data.to_vec() } }
+        pub fn bytes(v: input::usize<'_>) -> output::usize { records::usize { data: v.data.to_vec() } }
         pub fn maybe(v: Option<input::str<'_>>) -> Option<output::str> { v.map(text) }
-        pub fn checked(v: Result<input::u8<'_>, input::str<'_>>) -> Result<output::u8, output::str> { v.map(bytes).map_err(text) }
+        pub fn checked(v: Result<input::usize<'_>, input::str<'_>>) -> Result<output::usize, output::str> { v.map(bytes).map_err(text) }
     "#);
     for args in [
         &["run", "--offline"][..],

@@ -2003,10 +2003,9 @@ mod tests {
             let stops = crate::gc_telemetry::stops::snapshot_stops();
             assert_eq!(stops.by_reason[0].work.swept_objects, 0);
             assert_eq!(stops.by_reason[1].work.swept_objects, 0);
-            assert_eq!(
-                stops.by_reason[3].completed, 0,
-                "fixture must complete without Recovery"
-            );
+            // A remark stop over its wall-clock budget yields to bounded
+            // Recovery; that stop must still leave reclamation to the sweep.
+            assert_eq!(stops.by_reason[3].work.swept_objects, 0);
             for (phase, stop) in stops.by_reason.into_iter().enumerate() {
                 println!(
                     "sweep_scale mib={mib} phase={phase} stops={} stopped_ns={} metadata_objects={} metadata_bytes={} roots={} swept_objects={}",

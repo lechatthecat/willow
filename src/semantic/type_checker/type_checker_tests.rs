@@ -106,7 +106,8 @@ fn async_local_occurrences_survive_shared_spans() {
             let scalars = (0..scalar_count)
                 .map(|i| format!("let value_{i}: i64 = {i};"))
                 .collect::<String>();
-            let bad = "let op: fn(i64) -> i64 = |x| x;";
+            // Only a function value that mutates a capture is task-local.
+            let bad = "let mut n: i64 = 0; let op: fn(i64) -> i64 = |x| { n = n + x; return n; };";
             let body = if bad_first {
                 format!("{bad}{scalars}")
             } else {

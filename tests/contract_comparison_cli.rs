@@ -98,7 +98,7 @@ fn contract_comparison_cli_protected_manifest_and_semantic_status() {
                 "--protected-base",
                 commit,
                 "--schema",
-                "v2",
+                "v4",
                 "--format",
                 "json",
             ])
@@ -218,7 +218,7 @@ fn contract_repair_cli_exposes_evidence_and_rechecks_fixed_source() {
                 "--base",
                 &commit,
                 "--schema",
-                "v2",
+                "v4",
                 "--protected-base",
                 &commit,
                 "--format",
@@ -351,7 +351,7 @@ fn contract_comparison_cli_immutable_data_and_quantified_lock() {
             "--protected-base",
             base,
             "--schema",
-            "v2",
+            "v4",
             "--format",
             "json",
         ]);

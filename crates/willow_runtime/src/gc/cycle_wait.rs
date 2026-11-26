@@ -80,10 +80,20 @@ pub(super) fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
     }
     let me = std::thread::current().id();
     let mut coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
-    let generation = coord.cycle_generation;
     if coord.cycle_collector == Some(me) {
         return;
     }
+    if coord.cycle_collector.is_some() {
+        // A cycle elected before this caller's failed reservation keeps every
+        // object allocated since its snapshot (black allocation), so its
+        // completion can release nothing for that garbage. The caller treats
+        // an unchanged release count as exhaustion, so finish that cycle
+        // first and then require one whose snapshot postdates the failure.
+        let generation = coord.cycle_generation;
+        wait_for_cycle_in(owner, coord, generation);
+        coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
+    }
+    let generation = coord.cycle_generation;
     if coord.cycle_collector.is_none() {
         drop(coord);
         let _ = try_collect_internal_in(owner);
@@ -657,30 +667,37 @@ mod tests {
                 await_sleeps(count * (round + 1));
                 assert!(waiters.iter().all(|w| !w.is_finished()));
             }
-            // Acknowledgement notifications must not wake sleeping waiters.
+            // Acknowledgement notifications must not release sleeping waiters.
+            // Platform condvars may wake spuriously, so sleeps are a lower
+            // bound; assert after releasing COORD so a failure cannot poison it.
             let coord = runtime().coord.0.lock().unwrap();
             runtime().coord.1.notify_all();
-            assert_eq!(
-                runtime().wait_observation.sleeps.load(Ordering::Acquire),
-                count * 5
-            );
+            let sleeps = runtime().wait_observation.sleeps.load(Ordering::Acquire);
             drop(coord);
+            assert!(sleeps >= count * 5, "sleeps={sleeps}");
+            assert!(waiters.iter().all(|w| !w.is_finished()));
             drop(elected);
             for worker in waiters {
                 worker.join().unwrap();
             }
-            assert_eq!(
-                runtime().wait_observation.checks.load(Ordering::Relaxed),
-                count * 6
-            );
-            assert_eq!(
-                runtime().coord.0.lock().unwrap().cycle_generation,
-                generation.wrapping_add(1)
+            // The joined cycle predates the waiters' budget failure, so each
+            // waiter also requires a fresh collection after it. Contending
+            // waiters may coalesce on one fresh cycle or elect their own.
+            let checks = runtime().wait_observation.checks.load(Ordering::Relaxed);
+            assert!(checks >= count * 6, "checks={checks}");
+            let completed = runtime()
+                .coord
+                .0
+                .lock()
+                .unwrap()
+                .cycle_generation
+                .wrapping_sub(generation);
+            assert!(
+                (2..=1 + count as u64).contains(&completed),
+                "completed cycles={completed} waiters={count}"
             );
             eprintln!(
-                "budget_wait scaling waiters={count} sleeps={} checks={}",
-                count * 5,
-                count * 6
+                "budget_wait scaling waiters={count} sleeps={sleeps} checks={checks} cycles={completed}"
             );
         }
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
@@ -903,7 +920,9 @@ mod tests {
                     runtime().wait_observation.sleeps.load(Ordering::Relaxed)
                 );
                 if !legacy {
-                    assert_eq!(checks, 2 * count);
+                    // Joined-cycle wakes are exact; the post-join fresh
+                    // collection adds a timing-dependent number of checks.
+                    assert!(checks >= 2 * count, "checks={checks}");
                 }
             }
         }

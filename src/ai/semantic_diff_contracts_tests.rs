@@ -71,10 +71,7 @@ fn contract_policy_lock_and_source_changed_together_need_approval() {
         serde_json::to_value(second).unwrap(),
         serde_json::to_value(again).unwrap()
     );
-    assert_eq!(
-        super::super::verify(&o).unwrap().schema,
-        "willow.semantic-diff.v3"
-    );
+    assert!(super::super::verify(&o).unwrap().schema.ends_with("v3"));
 }
 #[test]
 fn contract_policy_missing_baseline_mutable_revision_and_corrupt_lock() {

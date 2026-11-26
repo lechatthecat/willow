@@ -1041,6 +1041,9 @@ fn snapshot_with_boundary(
         indirect: &indirect_ids,
     };
     let mut functions = produced.merge_synthetic(functions, retained_synthetic, fixed_ids);
+    if retained.is_some() {
+        attach_retained_panic_evidence(&captured, &paths, &resolve, &functions, &mut semantic);
+    }
     // Instance graph node numbers follow this order; the node map has none.
     functions.sort_by(|a, b| a.id.cmp(&b.id));
     let instance_ids: Vec<String> = functions.iter().map(|f| f.id.clone()).collect();
@@ -1451,19 +1454,14 @@ fn function_nodes(
             let (owner, local) = resolve(unit, *id);
             let key = (owner, local);
             nodes.entry(key).or_insert_with(|| {
-                let module = paths[&owner].clone();
-                let name = captured[&owner]
-                    .lambda_names
-                    .get(&local)
-                    .cloned()
-                    .unwrap_or_else(|| local.to_string());
+                let (module, name) = node_name(captured, paths, owner, local);
                 Function {
                     identity: None,
                     body_id: None,
                     body_location: None,
                     rename_calls: vec![],
                     rename_imports: vec![],
-                    id: hash(serde_json::to_vec(&(&module, &name)).unwrap()),
+                    id: node_id(&module, &name),
                     module,
                     name,
                     locations: vec![],
@@ -1479,6 +1477,55 @@ fn function_nodes(
         }
     }
     nodes
+}
+
+/// Module and display name of a node built from a capture, not a body.
+fn node_name(
+    captured: &HashMap<UnitId, CapturedUnit>,
+    paths: &HashMap<UnitId, String>,
+    owner: UnitId,
+    local: FunctionId,
+) -> (String, String) {
+    let name = captured[&owner]
+        .lambda_names
+        .get(&local)
+        .cloned()
+        .unwrap_or_else(|| local.to_string());
+    (paths[&owner].clone(), name)
+}
+
+fn node_id(module: &str, name: &str) -> String {
+    hash(serde_json::to_vec(&(module, name)).unwrap())
+}
+
+/// A patch keeps synthetic nodes it does not rebuild (an interface method's
+/// union node) from the retained snapshot, so `semantic::finish` finds no
+/// node for their evidence. Key that evidence the way `function_nodes` keys
+/// those nodes. O(evidence) per patch.
+fn attach_retained_panic_evidence(
+    captured: &HashMap<UnitId, CapturedUnit>,
+    paths: &HashMap<UnitId, String>,
+    resolve: &impl Fn(UnitId, FunctionId) -> CallKey,
+    functions: &[Function],
+    semantic: &mut semantic::SemanticFacts,
+) {
+    let ids: std::collections::HashSet<&str> = functions.iter().map(|f| f.id.as_str()).collect();
+    for (&unit, capture) in captured {
+        for (&id, evidence) in &capture.semantic.panic_evidence {
+            let (owner, local) = resolve(unit, id);
+            if !captured.contains_key(&owner) || !paths.contains_key(&owner) {
+                continue;
+            }
+            let (module, name) = node_name(captured, paths, owner, local);
+            let key = node_id(&module, &name);
+            if ids.contains(key.as_str()) {
+                semantic
+                    .panic_evidence
+                    .entry(key)
+                    .or_insert_with(|| evidence.clone());
+            }
+        }
+    }
 }
 
 /// A patch keeps retained nodes for direct call targets outside its closure.

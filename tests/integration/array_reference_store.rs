@@ -359,8 +359,9 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
     // mark-phase byte load through the pinned context's gate cell) for 1/8/32
     // store sites of `Array<i64>` and `Array<Node>`. The reference store must add exactly the per-site calls
     // of the i64 store (its cold `willow_array_set` slow path) plus one cold
-    // barrier call and one mark-phase load: no extra root pair and no hot
-    // panic-depth bracket. The loaded array temporaries of successive sites
+    // barrier call and two mark-phase loads (the hot filter's, and the cold
+    // re-read after publishing a private value): no extra root pair and no
+    // hot panic-depth bracket. The loaded array temporaries of successive sites
     // share one reused entry root slot, so roots stay flat.
     // Scalar stores form one GC-free run, so their array temporaries need no
     // root at all.
@@ -407,7 +408,7 @@ fn array_reference_store_sites_match_scalar_store_runtime_calls() {
             "reused store roots: {reference:?}"
         );
         assert_eq!(per_site(&reference, 4), added, "{reference:?}");
-        assert_eq!(per_site(&reference, 5), added, "{reference:?}");
+        assert_eq!(per_site(&reference, 5), 2 * added, "{reference:?}");
     }
     assert_eq!(scalar[0][5], 0, "scalar stores never read the mark phase");
 }

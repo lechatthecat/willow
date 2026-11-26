@@ -212,7 +212,14 @@ impl TypeNames {
         };
         if !params.is_empty() {
             let binder = format!("<{}>", params.join(", "));
-            if matches!(ty, Type::Fn(..)) {
+            // A function-valued field or local is a value of the owner's
+            // instantiation, not a generic declaration of its own.
+            if matches!(ty, Type::Fn(..))
+                && !matches!(
+                    symbol.kind.as_str(),
+                    "field" | "binding" | "parameter" | "static" | "const"
+                )
+            {
                 display.insert_str(2, &binder);
             } else if matches!(ty, Type::Named(_))
                 && matches!(symbol.kind.as_str(), "class" | "interface" | "enum")

@@ -54,10 +54,13 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
         // SAFETY: This fixture selects the payload size and tracing layout for its object and
         // initializes any native fields before collection.
         assert!(!unsafe { allocate_old(0, 0, 8192, 0) }.is_null());
+        let registered = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let workers: Vec<_> = (0..count)
             .map(|i| {
+                let registered = Arc::clone(&registered);
                 std::thread::spawn(crate::runtime::serving(move || {
                     let _registration = MutatorRegistration::new();
+                    registered.fetch_add(1, Ordering::Release);
                     let size = if i % 2 == 0 {
                         8192
                     } else {
@@ -75,16 +78,24 @@ fn sweep_allocation_waits_cooperatively_and_collector_is_reentrant() {
                 }))
             })
             .collect();
+        // Every allocator is registered and the sweep wait has slept at least
+        // once per allocator. A condvar may wake spuriously, so the sleep
+        // count is only a lower bound and does not identify each waiter.
         let deadline = Instant::now() + Duration::from_secs(10);
-        while runtime().wait_observation.sleeps.load(Ordering::Acquire) < count {
+        while registered.load(Ordering::Acquire) < count
+            || runtime().wait_observation.sleeps.load(Ordering::Acquire) < count
+        {
             assert!(Instant::now() < deadline, "allocators did not join sweep");
             std::thread::yield_now();
         }
         assert!(workers.iter().all(|worker| !worker.is_finished()));
         // A sleeping allocation still participates in subsequent stop rounds.
-        with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
-            assert_eq!(coord.parked.len(), count);
+        // Dedicated GC markers park in the same rounds, so check membership.
+        let ids: Vec<_> = workers.iter().map(|worker| worker.thread().id()).collect();
+        let parked = with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
+            ids.iter().filter(|id| coord.parked.contains(id)).count()
         });
+        assert_eq!(parked, count, "every allocator parks in the stop");
         runtime().heap.lock().unwrap().sweeping = None;
         drop(owner);
         for worker in workers {

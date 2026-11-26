@@ -9,7 +9,7 @@ fn main() {
     println(x);
 }
 "#,
-        &["error[E0052]", "out of range for `i64`"],
+        &["error[E0052]", "out of range for `u64`"],
     );
 }
 
@@ -116,15 +116,15 @@ fn lexer_diag_misplaced_separator_e0054() {
     );
 }
 
-// End-to-end: a hex literal with the sign bit set is E0052, not `-1`.
+// End-to-end: a hex literal with the sign bit set is an `i64` range error
+// (E0201), not `-1`.
 #[test]
-fn lexer_diag_hex_sign_bit_e0052() {
+fn lexer_diag_hex_sign_bit_is_i64_range_error() {
     assert_compile_error_contains(
         "fn main() { println(0xFFFF_FFFF_FFFF_FFFF); }\n",
         &[
-            "error[E0052]",
-            "integer literal `0xFFFF_FFFF_FFFF_FFFF` out of range for `i64`",
-            "`!0`",
+            "error[E0201]",
+            "integer literal `18446744073709551615` is outside -9223372036854775808..=9223372036854775807 for `i64`",
         ],
     );
 }

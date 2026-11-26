@@ -279,20 +279,23 @@ fn default_budgets_complete_small_allocations_and_cap_full_buffer_recovery() {
         willow_gc_collect();
         let stops = crate::gc_telemetry::stops::snapshot_stops();
         assert_eq!(stops.by_reason[0].work.metadata_objects, 0);
+        let remark_indexed = stops.by_reason[1].work.metadata_objects;
         if count <= 128 {
-            assert_eq!(stops.by_reason[1].work.metadata_objects, count as u64);
+            // The slot and byte budgets cover small buffers; only the 1 ms
+            // work budget can end remark early, on a slow or preempted host.
+            assert!(remark_indexed <= count as u64);
         } else {
-            assert!(stops.by_reason[1].work.metadata_objects < count as u64);
+            assert!(remark_indexed < count as u64);
         }
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
-        if count > 128 {
-            // Overflowing buffers continue in classified bounded Recovery
-            // slices; each slice stays within the fixed recovery reserve. Each
-            // remaining entry costs two slots, so full slices need
-            // ceil(2 * remaining / RECOVERY_SLOTS) stops. The 1 ms work budget
-            // can end slices early on slow hosts, so allow a constant factor,
-            // which still rejects per-object Recovery stops.
-            let remaining = count as u64 - stops.by_reason[1].work.metadata_objects;
+        if remark_indexed < count as u64 {
+            // Overflowing (or time-cut) buffers continue in classified bounded
+            // Recovery slices; each slice stays within the fixed recovery
+            // reserve. Each remaining entry costs two slots, so full slices
+            // need ceil(2 * remaining / RECOVERY_SLOTS) stops. The 1 ms work
+            // budget can end slices early on slow hosts, so allow a constant
+            // factor, which still rejects per-object Recovery stops.
+            let remaining = count as u64 - remark_indexed;
             let slices = (2 * remaining).div_ceil(mark_closure::RECOVERY_SLOTS);
             let recovery_cap = 4 * slices + 4;
             assert!(

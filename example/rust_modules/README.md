@@ -23,8 +23,8 @@ Only unrestricted `pub fn`, `pub async fn`, and `pub struct` form the interface.
 Use private visibility or `pub(crate)` for implementation details. Methods and
 macro expansion are not imported as Willow functions. Generics, explicit
 lifetimes, `impl Trait`, unsupported types, and conditional interface attributes
-produce diagnostics at their Rust source location. A same-name `.wi` and `.rs`
-module is an error. Exported names must also be valid Willow identifiers.
+produce diagnostics at their Rust source location. A Willow module and a Rust
+module with the same name is an error. Exported names must also be valid Willow identifiers.
 
 Canonical standard-library type paths such as `::std::string::String` and
 `::core::primitive::i64` are recognized. A local alias, private type, or custom

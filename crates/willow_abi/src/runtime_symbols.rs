@@ -642,7 +642,7 @@ mod io_classification_tests {
             );
             classified += usize::from(external);
         }
-        assert_eq!(classified, 34);
+        assert_eq!(classified, 35);
         assert!(!RuntimeEffects::MAY_CHECKED_PANIC.intersects(RuntimeEffects::ALL));
         assert_eq!(RuntimeEffects::from_bit(6), RuntimeEffects::MAY_IO);
     }

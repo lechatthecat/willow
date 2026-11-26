@@ -70,7 +70,7 @@ pub(super) fn finish_with_wait(
 // The first seal and one optimistic recheck are the only normal remark stops.
 // Exhaustion then enters separately observed, budgeted Recovery slices. Recovery
 // preserves its cursors and resumes mutators between stops; it has no full walk.
-pub(super) const MAX_REMARK_ROUNDS: usize = 3;
+pub(crate) const MAX_REMARK_ROUNDS: usize = 3;
 pub(super) const MAX_DRAIN_WAVES: usize = 128;
 /// Consecutive waves in which no drain completed a work item, no native slice
 /// retried and no other drain held work, before closure escalates to the
@@ -770,6 +770,13 @@ fn finish_recovery_with_wait_in(
                     "concurrent GC requires a successful bounded native trace",
                 );
             }
+            // Recovery, like remark, awaits in-flight readers resumed.
+            RuntimeWaitObservation::reader_wait(|| {
+                (
+                    &owner.gc.wait_observation,
+                    marking.active_drains.load(Ordering::Acquire) != 0,
+                )
+            });
             let before = marking.recovery_retry_generation.load(Ordering::Acquire);
             marking.drain_checked_until_in(
                 owner,

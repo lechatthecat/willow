@@ -125,7 +125,7 @@ fn generic_bodies_report_template_types_without_aliases() {
                 "pop",
                 "fn<T>() -> Option<T>",
             ),
-            ("less: closure", 0, "less", "fn(T, T) -> bool"),
+            ("less: fn", 0, "less", "fn(T, T) -> bool"),
             // Concrete locals in the caller.
             ("let first", 0, "first", "Patient"),
             ("let direct", 0, "direct", "Option<Patient>"),

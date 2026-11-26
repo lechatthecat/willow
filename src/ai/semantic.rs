@@ -686,6 +686,31 @@ struct Segment {
 const EXPRESSION: u8 = 0;
 const DECLARATION: u8 = 1;
 const WRITE: u8 = 2;
+/// Call references through a callable binding or parameter, keyed by its
+/// shareable type: a named function flows into a task-local `fn(...)` too.
+fn indirect_reference_index(
+    snapshot: &Snapshot,
+    symbols: &HashMap<String, usize>,
+) -> HashMap<Type, Vec<usize>> {
+    let mut index: HashMap<Type, Vec<usize>> = HashMap::new();
+    for (i, r) in snapshot.semantic.references.iter().enumerate() {
+        if r.role == "call"
+            && let Some(&s) = symbols.get(&r.target)
+            && matches!(
+                snapshot.semantic.symbols[s].kind.as_str(),
+                "binding" | "parameter"
+            )
+            && let Some(ty) = &snapshot.semantic.symbols[s].ty
+        {
+            index
+                .entry(ty.with_callable_kind(true))
+                .or_default()
+                .push(i);
+        }
+    }
+    index
+}
+
 impl QuerySession {
     pub fn new(snapshot: Snapshot) -> Result<Self> {
         snapshot.validate()?;
@@ -830,19 +855,7 @@ impl QuerySession {
             positions.sort();
             positions.dedup();
         }
-        let mut indirect_references: HashMap<Type, Vec<usize>> = HashMap::new();
-        for (i, r) in snapshot.semantic.references.iter().enumerate() {
-            if r.role == "call"
-                && let Some(&s) = symbols.get(&r.target)
-                && matches!(
-                    snapshot.semantic.symbols[s].kind.as_str(),
-                    "binding" | "parameter"
-                )
-                && let Some(ty) = &snapshot.semantic.symbols[s].ty
-            {
-                indirect_references.entry(ty.clone()).or_default().push(i);
-            }
-        }
+        let indirect_references = indirect_reference_index(&snapshot, &symbols);
         let graph = graph::Index::new(&snapshot.functions);
         let dispatch_callers = graph
             .callers
@@ -1271,7 +1284,7 @@ impl QuerySession {
             .symbols
             .get(function)
             .and_then(|&i| self.snapshot.semantic.symbols[i].ty.as_ref())
-            .and_then(|ty| self.indirect_references.get(ty))
+            .and_then(|ty| self.indirect_references.get(&ty.with_callable_kind(true)))
             .into_iter()
             .flatten()
             .map(|&i| {

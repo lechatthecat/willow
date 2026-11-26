@@ -586,24 +586,28 @@ fn v2_trace_records_required_initial_and_remark_stops() {
         .lines()
         .filter(|line| line.contains("\"version\":2"))
         .collect();
+    let count = |reason: &str| {
+        events
+            .iter()
+            .filter(|event| event.contains(&format!("\"reason\":{reason}")))
+            .count()
+    };
+    // Each stop is one request/release pair. Two cycles take two initial-mark
+    // stops; closure uses remark stops that yield to bounded recovery once they
+    // exceed the wall-clock remark budget, so that split is only bounded.
+    let max_remarks = 2 * (crate::gc::MAX_REMARK_ROUNDS - 1) * 2;
+    let (initial, remark, recovery) = (count("1"), count("2"), count("4"));
+    assert_eq!(initial, 4);
+    assert!(
+        (4..=max_remarks).contains(&remark),
+        "remark events {remark}"
+    );
+    assert!(recovery <= 4, "recovery events {recovery}");
+    assert!(remark + recovery >= 8, "closure events {remark}+{recovery}");
     assert_eq!(
         events.len(),
-        12,
-        "two cycles have six request/release pairs"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.contains("\"reason\":1"))
-            .count(),
-        4
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| event.contains("\"reason\":2"))
-            .count(),
-        8
+        initial + remark + recovery,
+        "only cycle stops"
     );
     assert_eq!(
         text.lines()

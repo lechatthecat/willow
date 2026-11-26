@@ -48,11 +48,20 @@ fn failed_stopped_callback_resumes_world_and_remains_in_stop_telemetry() {
     assert_eq!(stats.events_pending, 1);
     willow_gc_collect();
     let stats = snapshot_stops();
-    // The explicit major cycle adds its initial and remark handshakes while
-    // flushing the preceding failed callback's event.
+    // The explicit major cycle adds its initial and closure handshakes while
+    // flushing the preceding failed callback's event. Closure remark stops
+    // yield to one bounded recovery stop once they exceed the wall-clock
+    // remark budget, so that split is only bounded.
     assert_eq!(stats.by_reason[0].requests, 2);
     assert_eq!(stats.by_reason[0].aborted, 1);
-    assert_eq!(stats.by_reason[1].requests, 2);
+    let remark = stats.by_reason[1].requests;
+    let recovery = stats.by_reason[3].requests;
+    assert!(
+        (1..=(mark_closure::MAX_REMARK_ROUNDS - 1) as u64).contains(&remark),
+        "remark stops {remark}"
+    );
+    assert!(recovery <= 1, "recovery stops {recovery}");
+    assert!(remark + recovery >= 2, "closure stops {remark}+{recovery}");
     assert_eq!(stats.events_pending, 0);
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
@@ -1973,7 +1982,13 @@ fn assert_sweep_retains_new_allocations(recovery: bool) {
         assert_eq!(stops.by_reason[1].work.swept_objects, 0);
         assert_eq!(stops.by_reason[3].work.swept_objects, 0);
         if recovery {
-            assert_eq!(stops.by_reason[3].requests, 1);
+            // One recovery slice fits this heap; its 1ms work budget can split
+            // it on a preempted host, so allow a constant factor.
+            assert!(
+                (1..=8).contains(&stops.by_reason[3].requests),
+                "recovery stops: {}",
+                stops.by_reason[3].requests
+            );
         }
         willow_gc_collect();
         assert_eq!(willow_gc_allocated_bytes(), 0);
@@ -3114,15 +3129,17 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
             (count * (GC_HEADER_SIZE + 8)) as i64
         );
         // Initial stopped retirement, final accounting and the allocated-byte
-        // snapshot remain linear in the mutator/TLAB count. Each remark stop
-        // reads every record once; with many mutators a retry-capped remark
-        // completes as a recovery stop instead, so both kinds count.
+        // snapshot remain linear in the mutator/TLAB count. Each closure stop
+        // reads every record at most once: a remark that exceeds its
+        // wall-clock budget yields before its accounting pass, and a
+        // retry-capped remark completes as a recovery stop instead, so the
+        // per-stop reads are only bounded.
         let stops = crate::gc_telemetry::stops::snapshot_stops();
-        let remarks = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
-        let expected_reads = (2 + remarks) * count;
-        assert_eq!(
-            runtime().heap.lock().unwrap().tlab_accounting_observation,
-            expected_reads
+        let closures = (stops.by_reason[1].requests + stops.by_reason[3].requests) as usize;
+        let reads = runtime().heap.lock().unwrap().tlab_accounting_observation;
+        assert!(
+            (2 * count..=(2 + closures) * count).contains(&reads),
+            "mutators={count} closure_stops={closures} accounting_record_reads={reads}"
         );
         assert_eq!(
             crate::gc_telemetry::stops::snapshot_stops().by_reason[0].requests,
@@ -3157,7 +3174,7 @@ fn root_handshake_tlab_owner_index_avoids_mutator_squared_accounting() {
         assert_eq!(willow_gc_allocated_bytes(), 0);
         println!(
             "root_handshake mutators={count} accounting_record_reads={} initial_stops=1",
-            expected_reads
+            reads
         );
     }
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -3606,6 +3623,7 @@ fn m3_real_closure_last_work_latency_and_cpu() {
             }
             assert!(cycle.queue.snapshot().is_drained());
             let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let finished = mark_closure::finish_with_policy(
                 &cycle,
                 Instant::now(),
@@ -4708,6 +4726,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let mut rechecks = 0;
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             let finished = mark_closure::finish_with_hooks(
                 &cycle,
                 Instant::now(),
@@ -4825,6 +4844,7 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
             cycle
         };
         let mut waits = 0;
+        crate::gc::preemption_tolerant_remark_budget_for_test();
         assert!(
             mark_closure::finish_with_wait(&cycle, Instant::now(), |_| {
                 waits += 1;
@@ -5317,6 +5337,7 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
         assert_eq!(calls == 0, !predrain);
         let mut waits = 0;
         if predrain {
+            crate::gc::preemption_tolerant_remark_budget_for_test();
             assert!(
                 mark_closure::finish_with_wait(&cycle, Instant::now(), |_| waits += 1).is_none()
             );
