@@ -1,6 +1,6 @@
 use super::ast::*;
 use super::{Parser, modifiers::MemberHead};
-use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
+use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
 const EFFECT_CONTRACT_NAMES: [&str; 6] = [
@@ -338,6 +338,10 @@ impl Parser {
                     "already declared in this parameter list",
                 )));
             }
+            if self.check(TokenKind::Colon) {
+                let bound = self.unsupported_bound(&name, false);
+                self.recovered_errors.push(bound);
+            }
             params.push(name);
             if !self.eat(TokenKind::Comma) {
                 break;
@@ -345,6 +349,70 @@ impl Parser {
         }
         self.expect(TokenKind::Gt)?;
         Ok(params)
+    }
+
+    /// A `where T: Show` clause on a function or class declaration. Only a
+    /// method's `where` restricts a class type parameter to listed types.
+    /// Each predicate is reported and skipped so the declaration still parses.
+    fn reject_where_clause(&mut self) -> Result<(), Diagnostic> {
+        if !matches!(self.peek_kind(), TokenKind::Ident(n) if n == "where") {
+            return Ok(());
+        }
+        let mut keyword = Some(self.current_span());
+        self.advance();
+        loop {
+            let start = keyword.take().unwrap_or_else(|| self.current_span());
+            let TokenKind::Ident(parameter) = self.peek_kind().clone() else {
+                return Err(unsupported_where(start));
+            };
+            self.advance();
+            if !self.check(TokenKind::Colon) {
+                return Err(unsupported_where(start));
+            }
+            let mut diagnostic = self.unsupported_bound(&parameter, true);
+            if let Some(label) = diagnostic.labels.first_mut() {
+                label.span = start.to(label.span);
+            }
+            self.recovered_errors.push(diagnostic);
+            if !self.eat(TokenKind::Comma) {
+                return Ok(());
+            }
+        }
+    }
+
+    /// `<T: Show>` or `where T: Show`, with the parser at the `:`. Willow
+    /// generics take every type, so report the bound with the two forms that
+    /// express the requirement instead.
+    fn unsupported_bound(&mut self, parameter: &str, clause: bool) -> Diagnostic {
+        let start = self.current_span();
+        self.advance();
+        let mut bounds = Vec::new();
+        while let Ok(ty) = self.parse_type() {
+            bounds.push(bound_spelling(&ty));
+            if !self.eat(TokenKind::Plus) {
+                break;
+            }
+        }
+        let span = start.to(self.previous_span());
+        let bound = bounds.join(" + ");
+        let interface = bounds.first().map_or("Show", String::as_str);
+        let written = if clause {
+            format!("where {parameter}: {bound}")
+        } else {
+            format!("{parameter}: {bound}")
+        };
+        Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0102,
+            format!("type parameter bounds are not supported: `{written}`"),
+        )
+        .with_label(Label::primary(span, "bound on a type parameter"))
+        .with_note(format!(
+            "a type parameter accepts every type, so a generic body may only use operations valid for all of them; `{parameter}` cannot require an interface"
+        ))
+        .with_help(format!(
+            "take the interface itself instead of `{parameter}`, as in `x: {interface}` or `Array<{interface}>`, so method calls dispatch through it; or keep `{parameter}` and pass the operation as a function parameter, as in `op: fn({parameter}) -> String`"
+        ))
     }
 
     pub(super) fn parse_enum_decl(&mut self, public: bool) -> Result<EnumDecl, Diagnostic> {
@@ -432,6 +500,7 @@ impl Parser {
             }
         }
 
+        self.reject_where_clause()?;
         self.expect(TokenKind::LBrace)?;
 
         let mut fields = Vec::new();
@@ -483,7 +552,12 @@ impl Parser {
         let mut type_params = Vec::new();
         if self.eat(TokenKind::Lt) {
             while !matches!(self.peek_kind(), TokenKind::Gt | TokenKind::Eof) {
-                type_params.push(self.expect_ident()?);
+                let parameter = self.expect_ident()?;
+                if self.check(TokenKind::Colon) {
+                    let bound = self.unsupported_bound(&parameter, false);
+                    self.recovered_errors.push(bound);
+                }
+                type_params.push(parameter);
                 if matches!(self.peek_kind(), TokenKind::Comma) {
                     self.advance();
                 }
@@ -890,6 +964,7 @@ impl Parser {
             (Type::Void, None)
         };
 
+        self.reject_where_clause()?;
         let mut requires = Vec::new();
         let mut ensures = Vec::new();
         while let TokenKind::Ident(keyword) = self.peek_kind() {
@@ -1581,4 +1656,47 @@ pub(super) fn sync_callable_signature(params: &mut [Param], return_type: &mut Ty
         param.ty = param.ty.with_callable_kind(true);
     }
     *return_type = return_type.with_callable_kind(true);
+}
+
+fn unsupported_where(span: Span) -> Diagnostic {
+    Diagnostic::new(
+        Severity::Error,
+        ErrorCode::E0102,
+        "`where` clauses are not supported here",
+    )
+    .with_label(Label::primary(span, "`where` clause"))
+}
+
+/// A bound as written, for diagnostics: an interface name with its arguments.
+fn bound_spelling(ty: &Type) -> String {
+    let list = |types: &[Type]| {
+        types
+            .iter()
+            .map(bound_spelling)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match ty {
+        Type::I8 => "i8".to_string(),
+        Type::I16 => "i16".to_string(),
+        Type::I32 => "i32".to_string(),
+        Type::I64 => "i64".to_string(),
+        Type::U8 => "u8".to_string(),
+        Type::U16 => "u16".to_string(),
+        Type::U32 => "u32".to_string(),
+        Type::U64 => "u64".to_string(),
+        Type::Char => "char".to_string(),
+        Type::F64 => "f64".to_string(),
+        Type::Bool => "bool".to_string(),
+        Type::String => "String".to_string(),
+        Type::Void => "void".to_string(),
+        Type::Never => "!".to_string(),
+        Type::Named(name) => name.clone(),
+        Type::Array(element) => format!("Array<{}>", bound_spelling(element)),
+        Type::FixedArray(element, n) => format!("[{}; {n}]", bound_spelling(element)),
+        Type::Generic(name, args) => format!("{name}<{}>", list(args)),
+        Type::Fn(params, ret) | Type::Closure(params, ret) => {
+            format!("fn({}) -> {}", list(params), bound_spelling(ret))
+        }
+    }
 }

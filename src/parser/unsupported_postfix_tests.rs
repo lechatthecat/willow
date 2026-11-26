@@ -130,7 +130,11 @@ fn generic_functions_accept_parameters_and_recover_malformed_lists() {
             );
             let (program, diagnostics) =
                 Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-            if matches!(parameters, "T: Bound" | "") {
+            if parameters == "T: Bound" {
+                // The bound is reported and skipped; the function still parses.
+                assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 2, "{source}");
+            } else if parameters.is_empty() {
                 assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
                 assert_eq!(program.items.len(), 1, "{source}");
             } else {
@@ -223,7 +227,11 @@ fn generic_classes_accept_parameters_and_recover_malformed_lists() {
             );
             let (program, diagnostics) =
                 Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-            if matches!(header, "<>" | "<T: Bound>") {
+            if header == "<T: Bound>" {
+                // The bound is reported and skipped; the class still parses.
+                assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
+                assert_eq!(program.items.len(), 2);
+            } else if header == "<>" {
                 assert_eq!(diagnostics.len(), 1, "{source}: {diagnostics:?}");
                 assert_eq!(program.items.len(), 1);
             } else {
@@ -321,7 +329,7 @@ fn following_item_boundaries() {
         let (expected, errors) = Parser::new(tokens).parse();
         assert!(errors.is_empty());
         for malformed in [false, true] {
-            let header = if malformed { "<T: Bound>" } else { "<T>" };
+            let header = if malformed { "<>" } else { "<T>" };
             let source = format!("class Box{header} {{}} {following}");
             let (actual, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
             assert_eq!(errors.len(), usize::from(malformed), "{source}: {errors:?}");

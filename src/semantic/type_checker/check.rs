@@ -4032,6 +4032,51 @@ impl TypeChecker {
         result
     }
 
+    /// A type parameter has no bounds. Name an interface that declares the
+    /// method, which the parameter's values could be taken as, and the
+    /// function parameter that would carry the operation instead.
+    fn explain_parameter_method(
+        &self,
+        diagnostic: Diagnostic,
+        parameter: &str,
+        method: &str,
+    ) -> Diagnostic {
+        // The alphabetically first owner keeps the suggestion deterministic.
+        let owner = self
+            .symbols
+            .interfaces
+            .values()
+            .filter(|info| info.type_params.is_empty())
+            .filter_map(|info| {
+                let found = info.methods.get(method).filter(|m| !m.is_static)?;
+                Some((info.name.as_str(), found))
+            })
+            .min_by_key(|(name, _)| *name);
+        let diagnostic = diagnostic.with_note(format!(
+            "a type parameter accepts every type and Willow has no interface bounds, so `{parameter}` only supports operations valid for all types"
+        ));
+        match owner {
+            Some((interface, info)) => {
+                let params = info
+                    .params
+                    .iter()
+                    .map(|ty| self.diagnostic_type_name(ty))
+                    .collect::<Vec<_>>();
+                let params = std::iter::once(parameter.to_string())
+                    .chain(params)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let result = self.diagnostic_type_name(&info.return_type);
+                diagnostic.with_help(format!(
+                    "take `{interface}` instead of `{parameter}`, as in `x: {interface}` or `Array<{interface}>`, so `{method}` dispatches through the interface; or keep `{parameter}` and pass the operation as a parameter, as in `{method}: fn({params}) -> {result}`"
+                ))
+            }
+            None => diagnostic.with_help(format!(
+                "pass the operation as a function parameter, as in `{method}: fn({parameter}) -> R` with `R` its result type, or take an interface that declares `{method}` instead of `{parameter}`"
+            )),
+        }
+    }
+
     /// Member calls on an already-checked, non-error receiver.
     pub(super) fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
         if let Type::Named(name) = obj_ty
@@ -4045,6 +4090,7 @@ impl TypeChecker {
                 )
                 .with_label(Label::primary(m.span, "unknown method on a type parameter"));
                 self.label_receiver_call_origin(&mut diagnostic, &m.object, obj_ty);
+                let diagnostic = self.explain_parameter_method(diagnostic, name, m.method.as_str());
                 self.push(diagnostic);
             }
             for arg in &m.args {

@@ -1,0 +1,49 @@
+// Willow generics have no interface bounds: `fn f<T: Show>` is rejected and
+// a body cannot call `x.show()` on a plain `T`. Two forms express the need.
+import std::collections::Array;
+
+interface Show {
+    fn show(self) -> String;
+}
+
+class Point implements Show {
+    pub x: i64;
+    pub y: i64;
+    pub fn show(self) -> String {
+        return "(" + self.x.to_string() + "," + self.y.to_string() + ")";
+    }
+}
+
+class Name implements Show {
+    pub text: String;
+    pub fn show(self) -> String {
+        return self.text;
+    }
+}
+
+// 1. Take the interface itself. Calls dispatch through `Show`, and one array
+//    can hold different implementing classes.
+fn join_shown(items: Array<Show>) -> String {
+    let mut out = "";
+    for item in items {
+        out = out + item.show() + " ";
+    }
+    return out;
+}
+
+// 2. Keep `T` and pass the operation in. Works for any type, including ones
+//    that implement no interface.
+fn join_with<T>(items: Array<T>, show: fn(T) -> String) -> String {
+    let mut out = "";
+    for item in items {
+        out = out + show(item) + " ";
+    }
+    return out;
+}
+
+fn main() {
+    let mixed: Array<Show> = [new Point(1, 2), new Name("willow")];
+    println(join_shown(mixed));
+    println(join_with([new Point(3, 4)], |p| p.show()));
+    println(join_with([1, 2, 3], |n| (n * 10).to_string()));
+}
