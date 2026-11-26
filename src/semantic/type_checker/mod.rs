@@ -2817,6 +2817,9 @@ mod generic_new_inference_tests;
 mod type_parameter_bound_tests;
 
 #[cfg(test)]
+mod lock_escape_cascade_tests;
+
+#[cfg(test)]
 thread_local! {
     static CONSTRUCTOR_INFERENCE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }

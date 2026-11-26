@@ -30,7 +30,7 @@ struct Graph {
     scopes: Vec<Vec<String>>,
     uses: Vec<(usize, usize, Span)>,
     transfers: Vec<(usize, usize, usize, Span)>,
-    escapes: Vec<(usize, Span)>,
+    escapes: Vec<(usize, usize, Span)>,
     declarations: HashMap<usize, usize>,
     stores: Vec<(usize, usize, Span)>,
     ticks: usize,
@@ -172,7 +172,7 @@ impl Graph {
         if let Some(id) = self.values.get(&value.id()).copied() {
             let root = self.root(id);
             self.escaped[root] = true;
-            self.escapes.push((id, value.span()));
+            self.escapes.push((id, self.ticks, value.span()));
         }
     }
 
@@ -378,7 +378,8 @@ impl TypeChecker {
                             // and borrowed-argument checks, but judge the
                             // component's own freshness after the walk.
                             Some(id) if state.sending_return => {
-                                state.graph.escapes.push((id, value.span()));
+                                let tick = state.graph.ticks;
+                                state.graph.escapes.push((id, tick, value.span()));
                                 state.sending_returns.push((id, value.span()));
                             }
                             _ => state.graph.escape(value),
@@ -421,6 +422,7 @@ impl TypeChecker {
         // argument, then moved by a later argument before its task is scheduled.
         // Reuse this component index for both loan starts and later value uses.
         let mut diagnostics = Vec::new();
+        let mut lock_escapes = LockEscapes::default();
         let mut moved = HashMap::new();
         for (id, tick, loop_id, span) in std::mem::take(&mut state.graph.transfers) {
             let root = state.graph.root(id);
@@ -481,31 +483,43 @@ impl TypeChecker {
             if let Some((start, end_key)) = state.graph.locks[root]
                 && (tick < start || tick > state.graph.lock_ends[&end_key])
             {
-                diagnostics.push((span, "protected non-Sync value escapes its lock scope"));
+                lock_escapes.add(
+                    root,
+                    span,
+                    false,
+                    "protected non-Sync value escapes its lock scope",
+                );
             }
         }
         for (id, declared, span) in std::mem::take(&mut state.graph.stores) {
             let root = state.graph.root(id);
             if state.graph.locks[root].is_some_and(|(start, _)| declared < start) {
-                diagnostics.push((
+                lock_escapes.add(
+                    root,
                     span,
+                    true,
                     "protected non-Sync value is stored outside its lock scope",
-                ));
+                );
             }
         }
         self.report_sending_returns(state);
-        for (id, span) in std::mem::take(&mut state.graph.escapes) {
+        for (id, tick, span) in std::mem::take(&mut state.graph.escapes) {
             let root = state.graph.root(id);
             if self.local.current_async_context && state.graph.loan_borrowed[root] {
                 state
                     .loan_errors
                     .push((span, "borrowed non-Sync argument may escape its async call"));
             }
-            if state.graph.locks[root].is_some() {
-                diagnostics.push((
+            if let Some((start, end_key)) = state.graph.locks[root] {
+                // An escape inside the lock lets the value out; one after it
+                // uses a value that already left.
+                let inside = start <= tick && tick <= state.graph.lock_ends[&end_key];
+                lock_escapes.add(
+                    root,
                     span,
+                    inside,
                     "protected non-Sync value may escape through this operation",
-                ));
+                );
             }
         }
         // One primary diagnostic per lent value or use: the first reason wins.
@@ -549,22 +563,35 @@ impl TypeChecker {
             });
         }
         let mut reported = HashSet::new();
-        for (span, reason) in diagnostics {
-            if reported.insert(span) {
-                let help = if reason.starts_with("protected") {
-                    "keep protected references inside the lock, or copy Sync data out of it"
+        let mut emitted: Vec<_> = diagnostics
+            .into_iter()
+            .filter(|(span, _)| reported.insert(*span))
+            .map(|(span, reason)| (span, reason, 0))
+            .collect();
+        emitted.extend(lock_escapes.primaries(&mut reported));
+        emitted.sort_by_key(|(span, _, _)| (span.start, span.end));
+        for (span, reason, dependent) in emitted {
+            let help = if reason.starts_with("protected") {
+                "keep protected references inside the lock, or copy Sync data out of it"
+            } else {
+                "transfer a fresh, unescaped local value and stop using its aliases; a call result is borrowed unless its function is declared `@sending`, or copy Sync data"
+            };
+            let mut diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E2408, reason)
+                .with_label(Label::primary(
+                    span,
+                    "exclusive ownership cannot be established",
+                ))
+                .with_help(help);
+            if dependent > 0 {
+                let uses = if dependent == 1 {
+                    "use depends on this escape and is"
                 } else {
-                    "transfer a fresh, unescaped local value and stop using its aliases; a call result is borrowed unless its function is declared `@sending`, or copy Sync data"
+                    "uses depend on this escape and are"
                 };
-                self.push(
-                    Diagnostic::new(Severity::Error, ErrorCode::E2408, reason)
-                        .with_label(Label::primary(
-                            span,
-                            "exclusive ownership cannot be established",
-                        ))
-                        .with_help(help),
-                );
+                diagnostic = diagnostic
+                    .with_note(format!("{dependent} later {uses} not reported separately"));
             }
+            self.push(diagnostic);
         }
     }
 
@@ -793,7 +820,8 @@ impl TypeChecker {
                 }
                 let root = state.graph.root(id);
                 state.graph.escaped[root] = true;
-                state.graph.escapes.push((id, lambda.span));
+                let tick = state.graph.ticks;
+                state.graph.escapes.push((id, tick, lambda.span));
             }
             return true;
         }
@@ -1091,6 +1119,55 @@ thread_local! { pub(super) static TOTAL_COUNTS: std::cell::Cell<(usize, usize, u
 
 #[cfg(test)]
 thread_local! { static COUNTS: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) }; }
+
+/// Lock-escape findings grouped by alias component. One protected value that
+/// leaves its lock taints every later use of its aliases, so a component
+/// reports each place that let a protected value out of its lock (a store to
+/// an outer variable or an escaping operation inside the lock: each one is a
+/// root cause), or its first use in source order when none did. The other
+/// uses are counted on the first reported error.
+#[derive(Default)]
+struct LockEscapes {
+    order: Vec<usize>,
+    /// `(span, root cause, reason)` per finding.
+    by_root: HashMap<usize, Vec<(Span, bool, &'static str)>>,
+}
+
+impl LockEscapes {
+    fn add(&mut self, root: usize, span: Span, cause: bool, reason: &'static str) {
+        let found = self.by_root.entry(root).or_insert_with(|| {
+            self.order.push(root);
+            Vec::new()
+        });
+        found.push((span, cause, reason));
+    }
+
+    /// `(span, reason, dependent uses)` per reported error, skipping spans in
+    /// `reported`.
+    fn primaries(mut self, reported: &mut HashSet<Span>) -> Vec<(Span, &'static str, usize)> {
+        let mut out = Vec::with_capacity(self.order.len());
+        for root in self.order {
+            let mut found = self.by_root.remove(&root).unwrap_or_default();
+            found.retain(|(span, _, _)| reported.insert(*span));
+            found.sort_by_key(|(span, cause, _)| (!*cause, span.start, span.end));
+            let causes = found
+                .iter()
+                .take_while(|(_, cause, _)| *cause)
+                .count()
+                .max(1);
+            let Some(&(span, _, reason)) = found.first() else {
+                continue;
+            };
+            out.push((span, reason, found.len() - causes));
+            out.extend(
+                found[1..causes]
+                    .iter()
+                    .map(|&(span, _, reason)| (span, reason, 0)),
+            );
+        }
+        out
+    }
+}
 
 #[cfg(test)]
 mod tests {
