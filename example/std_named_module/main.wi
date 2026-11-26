@@ -1,0 +1,7 @@
+// A project module named like a std function module.
+import diff;
+
+fn main() {
+    println(diff::total());
+    println(diff::copied());
+}

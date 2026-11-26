@@ -801,6 +801,9 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
             "example/imported_enum_match/main.wi",
             "1\n42\n200\n8\nink\n2\n20\n",
         ),
+        ("example/std_named_module/main.wi", "6\n5\n"),
+        ("example/sending_results.wi", "3\n3\n5\n"),
+        ("example/task_loans_in_loops.wi", "1\n3\n3\n4\n6\n5\n7\n7\n"),
         (
             "tests/regressions/imported_enum_payload/main.wi",
             "3\n14\n25\n2\n3\nhi!\n25\nhi\nhi!\n42\n25\n",
@@ -1943,6 +1946,18 @@ fn test_runnable_example_catalog_is_complete() {
 #[test]
 fn test_string_concat_fusion_example() {
     let path = "tests/regressions/string_concat_fusion.wi";
+    let (_, expected) = runnable_example_cases()
+        .iter()
+        .find(|(entry, _)| *entry == path)
+        .expect("example must be cataloged");
+    let (out, ok) = compile_file_and_run(path);
+    assert!(ok, "{path} failed to compile or run");
+    assert_eq!(out, *expected, "{path} output mismatch");
+}
+
+#[test]
+fn test_std_named_module_example() {
+    let path = "example/std_named_module/main.wi";
     let (_, expected) = runnable_example_cases()
         .iter()
         .find(|(entry, _)| *entry == path)

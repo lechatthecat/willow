@@ -1,0 +1,28 @@
+// Without `import text;` the qualified `text::Edit::Keep(k)` below would be
+// rejected with E0350 ("module `text` is not imported"), never matched
+// against the std `text` functions.
+import text;
+import text::Copy;
+
+pub fn weight(e: text::Edit) -> i64 {
+    return match e {
+        text::Edit::Keep(k) => k,
+        text::Edit::Insert(s) => s.len(),
+        text::Edit::Delete => 1,
+    };
+}
+
+pub fn total() -> i64 {
+    let mut sum = 0;
+    for e in text::edits() { sum += weight(e); }
+    return sum;
+}
+
+// A class pattern names its class bare, after importing it.
+pub fn copied() -> i64 {
+    let mut n = 0;
+    for op in text::ops() {
+        n += match op { Copy(c) => c.n, _ => op.cost() };
+    }
+    return n;
+}

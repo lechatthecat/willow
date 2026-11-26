@@ -1,0 +1,18 @@
+// A user module may share its name with a std function module (`text`,
+// `time`, `env`, `fs`, `path`, `net`, `parallel`). Other files reach it only
+// through an explicit `import text;`.
+import std::collections::Array;
+
+pub enum Edit { Keep(i64), Insert(String), Delete }
+
+pub interface Op { fn cost(self) -> i64; }
+pub class Copy implements Op { pub n: i64; pub fn cost(self) -> i64 { return self.n; } }
+pub class Skip implements Op { pub fn cost(self) -> i64 { return 0; } }
+
+pub fn edits() -> Array<Edit> {
+    return [Edit::Keep(3), Edit::Insert("ab"), Edit::Delete];
+}
+
+pub fn ops() -> Array<Op> {
+    return [new Copy(5), new Skip()];
+}

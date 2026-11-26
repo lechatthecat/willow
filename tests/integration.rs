@@ -304,6 +304,9 @@ mod buildgraph_regressions;
 #[path = "integration/module_inference_regressions.rs"]
 mod module_inference_regressions;
 
+#[path = "integration/std_named_user_modules.rs"]
+mod std_named_user_modules;
+
 #[path = "integration/static_mut_policy.rs"]
 mod static_mut_policy;
 

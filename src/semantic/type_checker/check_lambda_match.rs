@@ -1071,23 +1071,11 @@ impl TypeChecker {
             self.poison_bindings(source, out);
             return None;
         }
-        match source {
-            Pattern::EnumVariant {
-                enum_name, span, ..
-            }
-            | Pattern::EnumVariantTuple {
-                enum_name, span, ..
-            } if !enum_name.is_empty() => {
-                self.check_source_type_name(enum_name, *span);
-                // Preserve the source alias before normalization canonicalizes it.
-                self.record_type_use(enum_name, ty, *span);
-            }
-            Pattern::ClassDowncast {
-                class_name, span, ..
-            } => {
-                self.check_source_type_name(class_name, *span);
-            }
-            _ => {}
+        if !self.pattern_type_in_scope(source, ty) {
+            // The E0350 is the one root cause: matching a type the file
+            // cannot name would only cascade.
+            self.poison_bindings(source, out);
+            return None;
         }
         let head = self.normalize_match_pattern(source, ty);
         let node: &Pattern = head.as_ref().unwrap_or(source);
@@ -1268,6 +1256,43 @@ impl TypeChecker {
             }
         }
         head
+    }
+
+    /// Whether the type a qualified pattern names is in this file's import
+    /// scope (E0350 otherwise), recording the written enum spelling.
+    fn pattern_type_in_scope(&mut self, source: &Pattern, ty: &Type) -> bool {
+        match source {
+            Pattern::EnumVariant {
+                enum_name,
+                variant,
+                span,
+                ..
+            }
+            | Pattern::EnumVariantTuple {
+                enum_name,
+                variant,
+                span,
+                ..
+            } if !enum_name.is_empty() => {
+                // `module::Class(c)` names no enum; its module must still be
+                // in scope before anything else is said about it.
+                let named =
+                    if self.symbols.lookup_enum(enum_name).is_none() && !enum_name.contains("::") {
+                        self.check_source_type_name(&format!("{enum_name}::{variant}"), *span)
+                    } else {
+                        self.check_source_type_name(enum_name, *span)
+                    };
+                if named {
+                    // Preserve the source alias before normalization canonicalizes it.
+                    self.record_type_use(enum_name, ty, *span);
+                }
+                named
+            }
+            Pattern::ClassDowncast {
+                class_name, span, ..
+            } => self.check_source_type_name(class_name, *span),
+            _ => true,
+        }
     }
 
     /// Every name under a pattern that cannot be typed, bound as the error
@@ -1480,16 +1505,21 @@ impl TypeChecker {
         if !is_builtin_match {
             match scrutinee_ty {
                 Type::Named(sname) if sname == enum_name => {}
+                _ if self.push_qualified_class_pattern(enum_name, variant, "", span) => return,
                 _ => {
+                    let (pattern, found, note) =
+                        self.enum_pattern_mismatch_names(enum_name, scrutinee_ty);
                     self.push_pattern_type_mismatch(
                         format!(
-                            "enum pattern `{}::{}` cannot match scrutinee of type `{}`",
-                            enum_name,
-                            variant,
-                            self.diagnostic_type_name(scrutinee_ty)
+                            "enum pattern `{pattern}::{variant}` cannot match scrutinee of type `{found}`{note}"
                         ),
                         span,
                     );
+                    // A pattern enum that does not resolve has no variants to
+                    // check; the mismatch already names it as the cause.
+                    if self.symbols.lookup_enum(enum_name).is_none() {
+                        return;
+                    }
                 }
             }
             // Verify variant exists
@@ -1527,16 +1557,19 @@ impl TypeChecker {
             // User-defined enum variant
             match scrutinee_ty {
                 Type::Named(sname) if sname == enum_name => {}
+                _ if self.push_qualified_class_pattern(enum_name, variant, "(..)", span) => {
+                    return None;
+                }
                 _ => {
+                    let (pattern, found, note) =
+                        self.enum_pattern_mismatch_names(enum_name, scrutinee_ty);
                     self.push_pattern_type_mismatch(
                         format!(
-                            "enum pattern `{}::{}(..)` cannot match scrutinee of type `{}`",
-                            enum_name,
-                            variant,
-                            self.diagnostic_type_name(scrutinee_ty)
+                            "enum pattern `{pattern}::{variant}(..)` cannot match scrutinee of type `{found}`{note}"
                         ),
                         span,
                     );
+                    self.symbols.lookup_enum(enum_name)?;
                 }
             }
             let payload_types = self
@@ -1617,6 +1650,74 @@ impl TypeChecker {
                 "unrelated class",
             );
         }
+    }
+
+    /// `module::Class(c)` is not an enum pattern: a class pattern names its
+    /// class bare. Say so instead of reporting `module` as a missing enum.
+    fn push_qualified_class_pattern(
+        &mut self,
+        module: &str,
+        class: &str,
+        payload: &str,
+        span: Span,
+    ) -> bool {
+        if self.symbols.lookup_enum(module).is_some()
+            || self.symbols.lookup_module(module).is_none()
+            || self
+                .symbols
+                .lookup_class(&format!("{module}::{class}"))
+                .is_none()
+        {
+            return false;
+        }
+        self.push(
+            Diagnostic::new(
+                Severity::Error,
+                ErrorCode::E1205,
+                format!("class pattern `{module}::{class}{payload}` cannot be module-qualified"),
+            )
+            .with_label(Label::primary(span, "module-qualified class pattern"))
+            .with_help(format!(
+                "import the class (`import {module}::{class};`) and match `{class}{payload}`"
+            )),
+        );
+        true
+    }
+
+    /// Display names for an enum pattern and a scrutinee of another type,
+    /// plus a clause telling them apart when both print alike (an alias and
+    /// the type it shadows, or two modules' enums with one spelling), so the
+    /// message never seems to contrast a type with itself.
+    pub(super) fn enum_pattern_mismatch_names(
+        &self,
+        enum_name: &str,
+        scrutinee_ty: &Type,
+    ) -> (String, String, String) {
+        let pattern_ty = Type::Named(enum_name.to_string());
+        let pattern = self.diagnostic_type_name(&pattern_ty);
+        let found = self.diagnostic_type_name(scrutinee_ty);
+        // Compare the spellings the user will read: rendering drops internal
+        // namespaces such as `$local::`.
+        let no_packages = std::collections::HashMap::new();
+        let rendered = |name: &str| {
+            crate::diagnostics::diagnostic::source_names(name.to_string(), &no_packages)
+        };
+        if rendered(&pattern) != rendered(&found) {
+            return (pattern, found, String::new());
+        }
+        let identity = |ty: &Type| match ty {
+            Type::Named(name) | Type::Generic(name, _) => match self.symbols.lookup_enum(name) {
+                Some(info) => format!("enum `{}`", info.name),
+                None => format!("`{name}`, which does not resolve to an enum in this file"),
+            },
+            other => format!("`{}`", self.diagnostic_type_name(other)),
+        };
+        let note = format!(
+            ": they are different types with the same name (the pattern names {}, the scrutinee is {})",
+            identity(&pattern_ty),
+            identity(scrutinee_ty)
+        );
+        (pattern, found, note)
     }
 
     fn push_pattern_type_mismatch(&mut self, message: String, span: Span) {

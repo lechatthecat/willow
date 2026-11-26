@@ -561,7 +561,7 @@ impl TypeChecker {
                     .contains(&class.declaration_span.file_id)
             })
             || !self.signature_only_modules.contains(module)
-            || self.symbols.lookup_module(module).is_some()
+            || self.source_module_in_scope(module)
         {
             return true;
         }
@@ -580,6 +580,15 @@ impl TypeChecker {
             )),
         );
         false
+    }
+
+    /// Whether this file can spell `module::Type`. Every file sees the builtin
+    /// function modules (`text`, `time`, ...), but those declare no types: a
+    /// user module of the same name is in scope only when this file imports it.
+    fn source_module_in_scope(&self, module: &str) -> bool {
+        self.symbols.lookup_module(module).is_some()
+            && (!crate::stdlib_schema::is_function_module(module)
+                || self.imported_names.contains_key(module))
     }
 
     fn check_source_type_access(&mut self, ty: &Type, span: Span) {
@@ -2808,6 +2817,9 @@ thread_local! {
 
 #[cfg(test)]
 mod function_value_unification_tests;
+
+#[cfg(test)]
+mod enum_pattern_mismatch_tests;
 
 /// A signature registered from another module keeps its source spelling, so a
 /// bundled storage class (`Array<T>`) must become its storage type there, as
