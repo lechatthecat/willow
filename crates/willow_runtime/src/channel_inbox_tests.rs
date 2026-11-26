@@ -118,7 +118,8 @@ fn inbox_03_slow_path_sender_absorbs_the_inbox_first() {
 #[test]
 fn inbox_04_close_drains_the_inbox_then_reports_closed() {
     let _guard = crate::gc::isolated_runtime();
-    let raw = opened_channel(0);
+    let root = crate::gc::GcRootHandle::new(opened_channel(0).cast());
+    let raw = root.load().cast();
     // SAFETY: The constructor selected this channel element representation and the channel
     // remains live during the send.
     unsafe {
@@ -129,11 +130,22 @@ fn inbox_04_close_drains_the_inbox_then_reports_closed() {
     unsafe { willow_channel_close(raw) };
     assert!(!inbox_open(raw));
     assert_eq!(inbox_len(raw), 0, "closed inbox is empty");
-    // A closed channel completes the try-send without queueing (the generated
-    // send then raises).
+    // The runtime raises on a closed send. Install the execution context that
+    // generated callers provide, and retain the channel across panic allocation.
+    let previous = crate::panic_context::replace_current_context(Some(std::sync::Arc::new(
+        crate::panic_context::PanicContext::new(4),
+    )));
     // SAFETY: The constructor selected this channel element representation and the channel
     // remains live during the send.
     assert_eq!(unsafe { willow_channel_try_send_i64(raw, 9) }, 1);
+    assert_eq!(crate::panic_context::willow_panic_active(), 1);
+    crate::panic_context::willow_panic_enter_defer();
+    let recovered = crate::panic_context::willow_panic_recover();
+    crate::panic_context::willow_panic_leave_defer();
+    assert!(!recovered.is_null());
+    crate::panic_context::willow_panic_release_recovered(recovered);
+    crate::panic_context::replace_current_context(previous);
+    let raw = root.load().cast();
     assert_eq!(inbox_len(raw), 0);
     assert_eq!(take(raw), (1, 7));
     assert_eq!(take(raw), (1, 8));

@@ -2941,7 +2941,8 @@ fn t8hq4_18_component_access_is_stable_until_reset() {
 
 #[test]
 fn t8hq4_18_task_id_hash_spreads_ids_of_one_shard() {
-    use std::hash::BuildHasher;
+    use crate::id_hash::IdHasher as TaskIdHasher;
+    use std::hash::{BuildHasher, BuildHasherDefault};
     const IDS: u64 = 4096;
     let build = BuildHasherDefault::<TaskIdHasher>::default();
     for residue in [0, 1, 17, (TASK_TABLE_SHARDS - 1) as u64] {

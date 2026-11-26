@@ -12,9 +12,8 @@ use queue_observation::{QueueObservation, RuntimeQueueObservation};
 
 use crossbeam_deque::{Injector, Steal, Stealer, Worker};
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::ffi::c_void;
-use std::hash::BuildHasherDefault;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1004,12 +1003,9 @@ impl RunQueues {
 /// count, so no per-operation path scales with it.
 const TASK_TABLE_SHARDS: usize = 256;
 
-/// Hasher for task-id keys. Ids in one shard share
-/// `id % TASK_TABLE_SHARDS` (the low eight bits), so the hash must spread the
-/// high id bits to both ends; the shared folded multiply does.
-use crate::id_hash::IdHasher as TaskIdHasher;
-
-type TaskShard = HashMap<RuntimeTaskId, RuntimeTask, BuildHasherDefault<TaskIdHasher>>;
+#[path = "scheduler_task_shard.rs"]
+mod task_shard;
+use task_shard::TaskShard;
 
 // Independent task locks must not invalidate a neighbour's lock/map metadata.
 // Use the same conservative cache-line separation as the worker queues.
