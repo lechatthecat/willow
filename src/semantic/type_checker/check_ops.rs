@@ -251,14 +251,8 @@ impl TypeChecker {
                     );
                 }
                 self.push(diagnostic);
-
-                // Recover with the base type when it is numeric so a single bad
-                // exponent does not cascade into unrelated errors downstream.
-                if lty == Type::I64 || lty == Type::F64 {
-                    lty
-                } else {
-                    Type::I64
-                }
+                // The result has no type: later uses must not report again.
+                Self::error_type()
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 if b.op == BinOp::Add && lty == Type::String && rty == Type::String {
@@ -328,6 +322,7 @@ impl TypeChecker {
                         );
                     }
                     self.push(diagnostic);
+                    return Self::error_type();
                 }
                 lty
             }
@@ -362,12 +357,9 @@ impl TypeChecker {
                         }
                     }
                     self.push(diagnostic);
+                    return Self::error_type();
                 }
-                if lty.integer_layout().is_some() {
-                    lty
-                } else {
-                    Type::I64
-                }
+                lty
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 if !matches!(
@@ -565,6 +557,7 @@ impl TypeChecker {
                             ),
                         )),
                     );
+                    return Self::error_type();
                 }
                 ty
             }
@@ -668,7 +661,7 @@ impl TypeChecker {
             }
         }
         if info.ty != Type::Void && !self.types_compatible(&info.ty, &val_ty) {
-            self.push_type_mismatch(&info.ty, &val_ty, s.span);
+            self.push_value_type_mismatch(&info.ty, &val_ty, s.span, &s.value);
         }
     }
 
@@ -791,15 +784,15 @@ mod operator_tree_tests {
             ("-1.0", Type::F64, 0),
             ("!false", Type::Bool, 0),
             ("-(1 + 2) * -3", Type::I64, 0),
-            ("1 + true", Type::I64, 1),
-            ("-false", Type::Bool, 1),
+            ("1 + true", TypeChecker::error_type(), 1),
+            ("-false", TypeChecker::error_type(), 1),
             ("!1", Type::I64, 0),
             ("!1.0", Type::Bool, 1),
             ("2 ** -1", Type::I64, 1),
             ("6 & 3 | 1 ^ 2 << 1 >> 1", Type::I64, 0),
             ("1 & 2 == 0", Type::Bool, 0),
-            ("true & false", Type::I64, 1),
-            ("1.0 << 1", Type::I64, 1),
+            ("true & false", TypeChecker::error_type(), 1),
+            ("1.0 << 1", TypeChecker::error_type(), 1),
         ];
         for (expression, expected, error_count) in cases {
             let source = format!("fn probe() {{ let value = {expression}; }}");

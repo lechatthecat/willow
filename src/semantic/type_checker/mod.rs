@@ -23,6 +23,7 @@ use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arit
 mod check_decls;
 mod check_lambda_match;
 mod exhaustiveness;
+mod expr_text;
 pub(crate) mod generics;
 pub(crate) mod precheck;
 pub(crate) mod precheck_journal;
@@ -2271,6 +2272,17 @@ impl TypeChecker {
         found: &Type,
         span: Span,
     ) {
+        let diagnostic = self.type_mismatch_diagnostic(code, expected, found, span);
+        self.push(diagnostic);
+    }
+
+    fn type_mismatch_diagnostic(
+        &self,
+        code: ErrorCode,
+        expected: &Type,
+        found: &Type,
+        span: Span,
+    ) -> Diagnostic {
         let expected_name = self.diagnostic_type_name(expected);
         let found_name = self.diagnostic_type_name(found);
         let diagnostic = Self::error_at(
@@ -2279,7 +2291,65 @@ impl TypeChecker {
             span,
             format!("expected `{expected_name}`"),
         );
-        self.push(self.with_callable_kind_help(diagnostic, expected, found));
+        self.with_callable_kind_help(diagnostic, expected, found)
+    }
+
+    /// [`Self::push_type_mismatch`] for a mismatch caused by `value`: a task
+    /// whose result would fit gets the `await` hint.
+    fn push_value_type_mismatch(
+        &mut self,
+        expected: &Type,
+        found: &Type,
+        span: Span,
+        value: &Expr,
+    ) {
+        let code = self.type_mismatch_error_code(expected, found);
+        let diagnostic = self.type_mismatch_diagnostic(code, expected, found, span);
+        self.push(self.with_task_await_help(diagnostic, expected, found, value));
+    }
+
+    /// When `value` is a task (or other awaitable) whose result fits
+    /// `expected`, say so: in an async body suggest `await value`, elsewhere
+    /// explain that only an async function can wait for it.
+    fn with_task_await_help(
+        &self,
+        diagnostic: Diagnostic,
+        expected: &Type,
+        found: &Type,
+        value: &Expr,
+    ) -> Diagnostic {
+        let Some(output) = await_output_type(found) else {
+            return diagnostic;
+        };
+        if Self::contains_error_type(&output) || !self.types_compatible(expected, &output) {
+            return diagnostic;
+        }
+        let output = self.diagnostic_type_name(&output);
+        let found = self.diagnostic_type_name(found);
+        let text = expr_text::simple_expr_text(value);
+        let is_call = matches!(
+            value,
+            Expr::Call(_) | Expr::MethodCall(_) | Expr::StaticCall(_)
+        );
+        let subject = match (&text, is_call) {
+            (Some(text), true) => format!("`{text}` is an async call that gives `{found}`"),
+            (Some(text), false) => format!("`{text}` is a `{found}`"),
+            (None, true) => format!("this is an async call that gives `{found}`"),
+            (None, false) => format!("this value is a `{found}`"),
+        };
+        let awaited = text.map_or_else(
+            || "`await` it".to_string(),
+            |t| format!("write `await {t}`"),
+        );
+        if self.local.current_async_context {
+            diagnostic.with_help(format!(
+                "{subject}; {awaited} to wait for its `{output}` result"
+            ))
+        } else {
+            diagnostic.with_help(format!(
+                "{subject}, not its `{output}` result; only an `async` function can wait for it, so mark this function `async` and {awaited}"
+            ))
+        }
     }
 
     /// [`Self::push_type_mismatch_with_code`] with the code chosen by
@@ -2818,6 +2888,8 @@ mod type_parameter_bound_tests;
 
 #[cfg(test)]
 mod defer_await_diagnostic_tests;
+#[cfg(test)]
+mod follow_on_hint_tests;
 #[cfg(test)]
 mod lock_escape_cascade_tests;
 

@@ -1915,7 +1915,8 @@ impl TypeChecker {
     fn push_let_annotation_mismatch(&mut self, s: &LetStmt, ann: &Type, inferred: &Type) {
         let code = self.type_mismatch_error_code(ann, inferred);
         if code != ErrorCode::E0704 {
-            self.push_type_mismatch_with_code(code, ann, inferred, s.span);
+            let diagnostic = self.type_mismatch_diagnostic(code, ann, inferred, s.span);
+            self.push(self.with_task_await_help(diagnostic, ann, inferred, &s.init));
             return;
         }
         let expected = self.diagnostic_type_name(ann);
@@ -1940,7 +1941,7 @@ impl TypeChecker {
             self.check_expr_expecting(&s.value, &field_ty)
         };
         if field_ty != Type::Void && !self.types_compatible(&field_ty, &val_ty) {
-            self.push_type_mismatch(&field_ty, &val_ty, s.span);
+            self.push_value_type_mismatch(&field_ty, &val_ty, s.span, &s.value);
         }
         if obj_ty == Type::Named("PanicInfo".to_string()) {
             self.push_error(
@@ -2068,7 +2069,7 @@ impl TypeChecker {
                 }
                 let got = self.check_expr_expecting(&s.value, &info.ty);
                 if !self.types_compatible(&info.ty, &got) {
-                    self.push_type_mismatch(&info.ty, &got, s.span);
+                    self.push_value_type_mismatch(&info.ty, &got, s.span, &s.value);
                 }
             }
         }
@@ -2515,7 +2516,10 @@ impl TypeChecker {
         }
         if !self.types_compatible(&self.local.current_return_type, &ret_ty) {
             let expected = self.local.current_return_type.clone();
-            self.push_type_mismatch(&expected, &ret_ty, s.span);
+            match &s.value {
+                Some(value) => self.push_value_type_mismatch(&expected, &ret_ty, s.span, value),
+                None => self.push_type_mismatch(&expected, &ret_ty, s.span),
+            }
         }
     }
 

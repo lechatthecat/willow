@@ -242,7 +242,8 @@ impl TypeChecker {
                 arg.expr.span(),
                 format!("expected `{}`", self.diagnostic_type_name(param_ty)),
             ));
-            self.push(self.with_callable_kind_help(diagnostic, param_ty, &arg_ty));
+            let diagnostic = self.with_callable_kind_help(diagnostic, param_ty, &arg_ty);
+            self.push(self.with_task_await_help(diagnostic, param_ty, &arg_ty, &arg.expr));
         }
     }
 
@@ -692,7 +693,8 @@ impl TypeChecker {
                     ),
                 )
                 .with_label(Label::primary(arg.expr.span(), "wrong argument type"));
-                self.push(self.with_callable_kind_help(diagnostic, param_ty, &arg_ty));
+                let diagnostic = self.with_callable_kind_help(diagnostic, param_ty, &arg_ty);
+                self.push(self.with_task_await_help(diagnostic, param_ty, &arg_ty, &arg.expr));
             }
         }
         self.record_variant_use(enum_name, &c.callee, c.span);

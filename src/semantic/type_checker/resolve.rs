@@ -1924,9 +1924,7 @@ impl TypeChecker {
                             field.declaration_span,
                             "callable field declared here",
                         ))
-                        .with_help(format!(
-                            "`{method_name}` is a callable field; bind it to a local variable first: `let callback = receiver.{method_name}; callback(...)` (replace `receiver` with the object expression)"
-                        ));
+                        .with_help(callable_field_help(receiver, method_name, args));
                     self.push(diagnostic);
                     return Self::error_type();
                 }
@@ -3547,4 +3545,18 @@ mod package_registration_scaling {
             eprintln!("enum registration modules={modules} lookups={lookups}");
         }
     }
+}
+
+/// How to call a callable field `receiver.name(args)`: bind the field to a
+/// local first. Uses the written receiver and arguments when they are short.
+fn callable_field_help(receiver: &Expr, name: &str, args: &[CallArg]) -> String {
+    let Some(object) = super::expr_text::simple_expr_text(receiver) else {
+        return format!(
+            "`{name}` is a callable field; bind it to a local variable first: `let callback = receiver.{name}; callback(...)` (replace `receiver` with the object expression)"
+        );
+    };
+    let args = super::expr_text::simple_args_text(args).unwrap_or_else(|| "...".into());
+    format!(
+        "`{name}` is a callable field; bind it to a local variable first: `let {name} = {object}.{name}; {name}({args})`"
+    )
 }
