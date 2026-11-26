@@ -1841,6 +1841,9 @@ impl TypeChecker {
                     Type::F64 | Type::Bool => "to_string",
                     _ => "",
                 };
+                if let Some(help) = primitive_function_help(obj_ty, receiver, method_name, args) {
+                    diagnostic = diagnostic.with_help(help);
+                }
                 if !methods.is_empty() {
                     diagnostic = diagnostic.with_help(format!("available methods: {methods}"));
                 }
@@ -2884,6 +2887,10 @@ impl TypeChecker {
             ..
         } = *call;
         let Some(class) = self.symbols.lookup_class(class_name).cloned() else {
+            if PRIMITIVE_TYPE_NAMES.contains(&class_name) {
+                self.push_unknown_primitive_static(call);
+                return Self::error_type();
+            }
             self.push_error(
                 ErrorCode::E0350,
                 format!("unknown name `{}` (not a module or class)", class_name),
@@ -2921,6 +2928,54 @@ impl TypeChecker {
         self.check_call_args_against_param_infos(&mi.param_infos, args, call.context.checked);
         self.check_async_call_captures(&mi.param_infos, args, mi.is_async);
         method_call_return_type(&mi)
+    }
+
+    /// `f64::floorr(x)`: the type exists, the member does not. Suggest a near
+    /// static function, or a free function such as `powf` when that is what
+    /// the call meant.
+    fn push_unknown_primitive_static(&mut self, call: &StaticCall<'_>) {
+        let StaticCall {
+            class_name,
+            method_name,
+            args,
+            span,
+            ..
+        } = *call;
+        let statics: Vec<&str> = PRIMITIVE_STATICS
+            .iter()
+            .filter(|(owner, ..)| *owner == class_name)
+            .map(|(_, name, _)| *name)
+            .collect();
+        let mut diagnostic = Self::error_at(
+            ErrorCode::E0502,
+            format!("no static function `{method_name}` on `{class_name}`"),
+            span,
+            "unknown static function",
+        );
+        // `pow` and `powf` take `f64` arguments.
+        let float = class_name == "f64";
+        if let Some(near) = suggest_similar_name(method_name, statics.iter()) {
+            diagnostic = diagnostic.with_help(format!("did you mean `{class_name}::{near}`?"));
+        } else if float
+            && let Some(free) = suggest_similar_name(
+                method_name,
+                crate::semantic::intrinsics::ADDRESSABLE_BUILTINS.iter(),
+            )
+        {
+            let args = super::expr_text::simple_args_text(args).unwrap_or_else(|| "...".into());
+            diagnostic = diagnostic.with_help(format!(
+                "`{free}` is a free function, not a static function of `{class_name}`: write `{free}({args})`"
+            ));
+        }
+        diagnostic = if statics.is_empty() {
+            diagnostic.with_note(format!("`{class_name}` has no static functions"))
+        } else {
+            diagnostic.with_note(format!(
+                "static functions of `{class_name}`: {}",
+                statics.join(", ")
+            ))
+        };
+        self.push(diagnostic);
     }
 
     fn push_unknown_static_method(&mut self, call: &StaticCall<'_>, class: &ClassInfo) {
@@ -3559,4 +3614,90 @@ fn callable_field_help(receiver: &Expr, name: &str, args: &[CallArg]) -> String 
     format!(
         "`{name}` is a callable field; bind it to a local variable first: `let {name} = {object}.{name}; {name}({args})`"
     )
+}
+
+/// Primitive types a static call can name, as in `f64::sqrt(x)`.
+const PRIMITIVE_TYPE_NAMES: [&str; 4] = ["i64", "f64", "u8", "String"];
+
+/// The `T::name(..)` functions of primitive types, with the type of their
+/// first parameter: the receiver a method-style call would have supplied.
+/// The type checker and `intrinsics::namespace_builtin` must agree.
+pub(super) const PRIMITIVE_STATICS: [(&str, &str, &str); 17] = [
+    ("i64", "abs", "i64"),
+    ("i64", "min", "i64"),
+    ("i64", "max", "i64"),
+    ("i64", "clamp", "i64"),
+    ("i64", "parse", "String"),
+    ("f64", "abs", "f64"),
+    ("f64", "min", "f64"),
+    ("f64", "max", "f64"),
+    ("f64", "clamp", "f64"),
+    ("f64", "sqrt", "f64"),
+    ("f64", "floor", "f64"),
+    ("f64", "ceil", "f64"),
+    ("f64", "round", "f64"),
+    ("f64", "from_i64", "i64"),
+    ("f64", "trunc_to_i64", "f64"),
+    ("f64", "to_string", "f64"),
+    ("f64", "parse", "String"),
+];
+
+/// `x.trunc_to_i64()` on an `f64`: the function exists as a static function
+/// (or, for `pow`/`powf`, a free function) taking the receiver first.
+fn primitive_function_help(
+    receiver_ty: &Type,
+    receiver: &Expr,
+    method_name: &str,
+    args: &[CallArg],
+) -> Option<String> {
+    let receiver_name = match receiver_ty {
+        Type::I64 => "i64",
+        Type::F64 => "f64",
+        _ => return None,
+    };
+    let call_args = || {
+        let object = super::expr_text::simple_expr_text(receiver)?;
+        let rest = super::expr_text::simple_args_text(args)?;
+        Some(if rest.is_empty() {
+            object
+        } else {
+            format!("{object}, {rest}")
+        })
+    };
+    let written = |callee: &str| match call_args() {
+        Some(args) => format!("`{callee}({args})`"),
+        None => format!("`{callee}(value, ...)` with the receiver as the first argument"),
+    };
+    if let Some((owner, name, _)) = PRIMITIVE_STATICS
+        .iter()
+        .find(|(_, name, first)| *name == method_name && *first == receiver_name)
+    {
+        let callee = format!("{owner}::{name}");
+        return Some(format!(
+            "`{name}` is a static function, not a method: write {}",
+            written(&callee)
+        ));
+    }
+    if receiver_name == "f64"
+        && crate::semantic::intrinsics::ADDRESSABLE_BUILTINS.contains(&method_name)
+    {
+        return Some(format!(
+            "`{method_name}` is a free function, not a method: write {}",
+            written(method_name)
+        ));
+    }
+    // A misspelled static function: `x.floorr()` meant `f64::floor(x)`.
+    let candidates: Vec<&str> = PRIMITIVE_STATICS
+        .iter()
+        .filter(|(_, _, first)| *first == receiver_name)
+        .map(|(_, name, _)| *name)
+        .collect();
+    let near = suggest_similar_name(method_name, candidates.iter())?;
+    let (owner, ..) = PRIMITIVE_STATICS
+        .iter()
+        .find(|(_, name, first)| *name == near && *first == receiver_name)?;
+    Some(format!(
+        "did you mean the static function `{owner}::{near}`? write {}",
+        written(&format!("{owner}::{near}"))
+    ))
 }

@@ -167,6 +167,7 @@ impl Parser {
         let span = self.current_span();
         self.expect(TokenKind::Let)?;
         let pattern = self.parse_pattern()?;
+        let pattern = self.reject_or_pattern(pattern, false)?;
         let ty = if self.eat(TokenKind::Colon) {
             Some(self.parse_type()?)
         } else {
@@ -749,6 +750,7 @@ impl Parser {
                 let start = self.current_span();
                 self.advance();
                 let pattern = self.parse_pattern()?;
+                let pattern = self.reject_or_pattern(pattern, false)?;
                 self.expect(TokenKind::Eq)?;
                 let scrutinee = self.parse_chain_operand()?;
                 self.default_import_usage.bind_pattern(&pattern);

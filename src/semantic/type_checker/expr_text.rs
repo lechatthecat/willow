@@ -29,6 +29,15 @@ fn write_expr(expr: &Expr, depth: usize, out: &mut String) -> bool {
     match expr {
         Expr::Integer(n, ..) => out.push_str(&n.to_string()),
         Expr::Bool(b, ..) => out.push_str(if *b { "true" } else { "false" }),
+        Expr::Float(f, ..) => {
+            // `{:?}` keeps the `.0` of a whole number; exponent forms are
+            // not quoted.
+            let text = format!("{f:?}");
+            if !text.bytes().all(|b| b.is_ascii_digit() || b == b'.') {
+                return false;
+            }
+            out.push_str(&text);
+        }
         Expr::Var(name, ..) => out.push_str(name),
         Expr::String(s, ..) => {
             if s.chars()

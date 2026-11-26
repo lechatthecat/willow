@@ -2892,6 +2892,8 @@ mod defer_await_diagnostic_tests;
 mod follow_on_hint_tests;
 #[cfg(test)]
 mod lock_escape_cascade_tests;
+#[cfg(test)]
+mod primitive_static_hint_tests;
 
 #[cfg(test)]
 mod common_mistake_hint_tests;

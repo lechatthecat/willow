@@ -187,7 +187,12 @@ impl Parser {
                 .with_help("bind an inner payload to a name and match it separately"));
         }
         self.pattern_depth += 1;
-        let pattern = self.parse_pattern();
+        // Alternatives parse at this depth too, so `Some(1 | Some(1 | ..))`
+        // still counts toward the limit.
+        let pattern = match self.parse_pattern() {
+            Ok(pattern) => self.reject_or_pattern(pattern, false),
+            Err(error) => Err(error),
+        };
         self.pattern_depth -= 1;
         pattern
     }
@@ -201,6 +206,73 @@ impl Parser {
             .with_label(Label::primary(start, "unsupported literal pattern"))
             .with_help("bind the value to a name and compare it in a match guard, for example `Value(x) if x == 1.5`")
     }
+}
+
+impl Parser {
+    /// Willow has no or-patterns. After `first`, consume every `| pattern`
+    /// alternative, report them once, and keep `first` so parsing continues.
+    /// `match_arm` says whether the guard rewrite applies.
+    pub(super) fn reject_or_pattern(
+        &mut self,
+        first: Pattern,
+        match_arm: bool,
+    ) -> Result<Pattern, Diagnostic> {
+        if !self.check(TokenKind::Pipe) {
+            return Ok(first);
+        }
+        let mut alternatives = vec![first];
+        while self.eat(TokenKind::Pipe) {
+            alternatives.push(self.parse_pattern()?);
+        }
+        let span = alternatives[0]
+            .span()
+            .to(alternatives[alternatives.len() - 1].span());
+        let written = alternatives
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let mut error = Diagnostic::new(
+            Severity::Error,
+            ErrorCode::E0102,
+            format!("or-patterns are not supported: `{written}`"),
+        )
+        .with_label(Label::primary(span, "or-pattern"));
+        error = if match_arm {
+            let help = "write a separate arm for each alternative";
+            match literal_guard(&alternatives) {
+                Some(guard) => error.with_help(format!(
+                    "{help}, or bind the value and test it in a guard: `v if {guard} =>`"
+                )),
+                None => error.with_help(format!(
+                    "{help}, sharing the body through a helper function"
+                )),
+            }
+        } else {
+            error.with_help(
+                "match each alternative separately, or use a `match` with one arm per alternative",
+            )
+        };
+        self.recovered_errors.push(error);
+        Ok(alternatives.swap_remove(0))
+    }
+}
+
+/// `v == 1 || v == 2` for alternatives that are all integer or character
+/// literals; `None` otherwise.
+fn literal_guard(alternatives: &[Pattern]) -> Option<String> {
+    let mut tests = Vec::with_capacity(alternatives.len());
+    for alternative in alternatives {
+        let literal = match alternative {
+            Pattern::LiteralInt(n, ..) => n.to_string(),
+            Pattern::LiteralChar(c, ..) if !c.is_control() && !matches!(c, '\\' | '\'') => {
+                format!("'{c}'")
+            }
+            _ => return None,
+        };
+        tests.push(format!("v == {literal}"));
+    }
+    Some(tests.join(" || "))
 }
 
 #[cfg(test)]

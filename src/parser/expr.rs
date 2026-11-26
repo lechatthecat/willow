@@ -1435,6 +1435,7 @@ impl Parser {
         while !matches!(self.peek_kind(), TokenKind::RBrace | TokenKind::Eof) {
             let arm_start = self.current_span();
             let pattern = self.parse_pattern()?;
+            let pattern = self.reject_or_pattern(pattern, true)?;
             let scope = self.default_import_usage.scope();
             self.default_import_usage.bind_pattern(&pattern);
             // `pattern if guard => body`, where the guard may be a let chain.
