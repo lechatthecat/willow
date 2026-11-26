@@ -7,14 +7,15 @@ async fn cancelled(x: &mut i64, ready: Channel<i64>) {
     defer { x = x + 1; }
     x = 40;
     ready.send(1);
-    await sleep(10000);
+    let hold_until_cancel = Channel<i64>::new();
+    hold_until_cancel.recv();
 }
 async fn panicked(x: &mut i64) {
     defer match recover() { Some(_) => {}, None => {} };
     defer { gc_collect(); println(x); }
     defer { x = x + 1; }
     x = 41;
-    await sleep(1);
+    await yield();
     panic("borrow unwind");
 }
 async fn main() {

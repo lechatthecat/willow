@@ -51,7 +51,11 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// One idle iteration. Selection, retries and case bodies live in LIR.
-    pub(super) fn emit_flat_select_idle_wait(&mut self, deadlines: &[Value]) -> Value {
+    pub(super) fn emit_flat_select_idle_wait(
+        &mut self,
+        deadlines: &[Value],
+        quiescent: Value,
+    ) -> Value {
         let minimum = deadlines.iter().copied().reduce(|current, deadline| {
             let before = self
                 .builder
@@ -59,27 +63,37 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 .icmp(IntCC::SignedLessThan, deadline, current);
             self.builder.ins().select(before, deadline, current)
         });
-        let completed = match minimum {
-            Some(deadline) => {
-                self.emit_value_runtime_call(rt::willow_sched_run_until_deadline, &[deadline])
-            }
-            None => self.emit_value_runtime_call(rt::willow_sched_run, &[]),
-        };
-        let progressed = self.builder.ins().icmp_imm_s(IntCC::NotEqual, completed, 0);
+        let drive = self.builder.create_block();
         let wait = self.builder.create_block();
         let done = self.builder.create_block();
-        self.builder.ins().brif(progressed, done, &[], wait, &[]);
+        self.builder.append_block_param(done, types::I8);
+        self.builder.ins().brif(quiescent, wait, &[], drive, &[]);
+        self.builder.switch_to_block(drive);
+        self.builder.seal_block(drive);
+        match minimum {
+            Some(deadline) => {
+                self.emit_value_runtime_call(rt::willow_sched_run_until_deadline, &[deadline]);
+            }
+            None => {
+                self.emit_value_runtime_call(rt::willow_sched_run, &[]);
+            }
+        }
+        // Observe producers before re-entering the one shared case-probe block.
+        // The local completion count cannot establish whether a peer published data.
+        let quiescent = self.emit_value_runtime_call(rt::willow_select_drive_is_quiescent, &[]);
+        self.builder.ins().jump(done, &[quiescent.into()]);
         self.builder.switch_to_block(wait);
         self.builder.seal_block(wait);
         match minimum {
             Some(deadline) => {
-                self.emit_void_runtime_call(rt::willow_sleep_until_monotonic, &[deadline])
+                self.emit_void_runtime_call(rt::willow_select_wait_until, &[deadline])
             }
             None => self.emit_void_runtime_call(rt::willow_select_idle_wait, &[]),
         }
-        self.builder.ins().jump(done, &[]);
+        let retry = self.builder.ins().iconst(types::I8, 0);
+        self.builder.ins().jump(done, &[retry.into()]);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
-        self.builder.ins().iconst(types::I64, 0)
+        self.builder.block_params(done)[0]
     }
 }

@@ -1699,39 +1699,75 @@ mod tests {
     #[test]
     fn concurrent_cancel_and_handoff_agree_on_one_outcome() {
         let _guard = isolated_runtime();
-        for iteration in 0..64 {
+        #[derive(Clone, Copy, Debug)]
+        enum Order {
+            HandoffFirst,
+            CancelFirst,
+            Race,
+        }
+        for order in [Order::HandoffFirst, Order::CancelFirst]
+            .into_iter()
+            .chain(std::iter::repeat_n(Order::Race, 64))
+        {
             reset_global_scheduler_for_test();
             let state = Arc::new(AsyncLockState::new());
             let task = parked_task();
             let token = state.register_waiter(task).expect("registered");
             let barrier = Arc::new(Barrier::new(2));
+            let (handed_tx, handed_rx) = std::sync::mpsc::channel();
+            let (cancelled_tx, cancelled_rx) = std::sync::mpsc::channel();
 
             let handoff = {
                 let state = Arc::clone(&state);
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
-                    state.handoff_to_next_waiter_and_wake()
+                    if matches!(order, Order::CancelFirst) {
+                        cancelled_rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .expect("cancellation did not complete");
+                    }
+                    let result = state.handoff_to_next_waiter_and_wake();
+                    if matches!(order, Order::HandoffFirst) {
+                        handed_tx.send(()).unwrap();
+                    }
+                    result
                 }))
             };
             let cancel = {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(crate::runtime::serving(move || {
                     barrier.wait();
-                    // Alternate which side is favoured: without the handicap the
-                    // canceller almost always reaches the task shard first, and
-                    // the "handoff completed, then cancellation gave the lock
-                    // back" interleaving would never be sampled here.
-                    if iteration % 2 == 0 {
-                        std::thread::sleep(std::time::Duration::from_micros(200));
+                    if matches!(order, Order::HandoffFirst) {
+                        handed_rx
+                            .recv_timeout(std::time::Duration::from_secs(30))
+                            .expect("handoff did not complete");
                     }
-                    cancel_lock_wait(task)
+                    let result = cancel_lock_wait(task);
+                    if matches!(order, Order::CancelFirst) {
+                        cancelled_tx.send(()).unwrap();
+                    }
+                    result
                 }))
             };
 
             let handed = handoff.join().expect("handoff");
             let cancelled = cancel.join().expect("cancel");
 
+            match order {
+                Order::HandoffFirst => {
+                    assert!(matches!(
+                        cancelled,
+                        LockCancelOutcome::ReleasedOwnership { .. }
+                    ));
+                    assert_eq!(handed, Some((task, token)));
+                }
+                Order::CancelFirst => {
+                    assert!(matches!(cancelled, LockCancelOutcome::RemovedWaiter { .. }));
+                    assert_eq!(handed, None);
+                }
+                Order::Race => {}
+            }
             match (handed, cancelled) {
                 // The handoff won the race, then cancellation observed the
                 // reserved ownership and gave the lock back.

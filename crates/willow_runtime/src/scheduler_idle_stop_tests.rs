@@ -826,6 +826,7 @@ fn claim_behind_a_decision(
 ) {
     let held = state.claim_gate.lock().unwrap();
     state.stop_intent.store(true, Ordering::SeqCst);
+    let before = crate::test_sync::count("scheduler_claim_gate");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(state);
     let claimer = std::thread::spawn(crate::runtime::serving(move || {
@@ -838,6 +839,9 @@ fn claim_behind_a_decision(
     while claim_word_count() == 0 && Instant::now() < deadline {
         std::thread::yield_now();
     }
+    crate::test_sync::until("claim never attempted decision gate", || {
+        crate::test_sync::count("scheduler_claim_gate") > before
+    });
     (held, done_rx, claimer)
 }
 
@@ -853,7 +857,10 @@ fn idle_27_a_claim_behind_a_decision_honours_its_stop() {
         "the claim must be visible while it waits"
     );
     assert!(
-        done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
+        matches!(
+            done_rx.try_recv(),
+            Err(std::sync::mpsc::TryRecvError::Empty)
+        ),
         "a claim must not resolve while a decision is in progress"
     );
     // Publish a stop the way a decision would, then release the gate.

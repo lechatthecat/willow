@@ -1,5 +1,69 @@
 use super::*;
 use willow_abi::plugin::{HEADER_BYTES, NATIVE_ENGINE, VERSION, WASM_ENGINE};
+
+// Controls belong to one cancellation token and all its clones. No global
+// registry or production clock/state is needed.
+#[derive(Default)]
+pub(super) struct CheckControl {
+    now: std::sync::Mutex<Option<Instant>>,
+    checks: AtomicU64,
+    pause_at: AtomicU64,
+    entered: std::sync::atomic::AtomicBool,
+    resume: std::sync::atomic::AtomicBool,
+}
+impl CheckControl {
+    pub(super) fn checkpoint(&self) {
+        let check = self.checks.fetch_add(1, Ordering::AcqRel) + 1;
+        if check == self.pause_at.load(Ordering::Acquire) {
+            self.entered.store(true, Ordering::Release);
+            crate::test_sync::until("plugin checkpoint was not released", || {
+                self.resume.load(Ordering::Acquire)
+            });
+        }
+    }
+
+    pub(super) fn now(&self) -> Instant {
+        self.now.lock().unwrap().unwrap_or_else(Instant::now)
+    }
+}
+
+fn interrupt_running(s: &mut Session, id: RequestId, token: Cancellation, timeout: bool) {
+    let deadline = s.pending[&id].deadline;
+    *token.1.now.lock().unwrap() = Some(deadline - Duration::from_nanos(1));
+    // Check 1 is Session's pre-dispatch gate. For Wasm check 2 precedes
+    // execution and check 3 follows a real fuel slice. For native check 2
+    // enters transport writing and check 3 is the next transport checkpoint.
+    token.1.pause_at.store(3, Ordering::Release);
+    std::thread::scope(|scope| {
+        scope.spawn(crate::runtime::serving(move || {
+            crate::test_sync::until("plugin backend did not reach its checkpoint", || {
+                token.1.entered.load(Ordering::Acquire)
+            });
+            if timeout {
+                *token.1.now.lock().unwrap() = Some(deadline);
+            } else {
+                assert!(token.cancel());
+            }
+            token.1.resume.store(true, Ordering::Release);
+        }));
+        assert!(s.drive_one());
+    });
+    assert_eq!(s.counters().0, 1, "request must reach the real backend");
+    assert_eq!(s.counters().1, 1);
+    assert_eq!(s.state(), State::Failed);
+}
+
+#[test]
+fn cancellation_clock_checks_deadline_boundary_and_cancel_priority() {
+    let token = Cancellation::new();
+    let deadline = Instant::now();
+    *token.1.now.lock().unwrap() = Some(deadline - Duration::from_nanos(1));
+    assert_eq!(token.check(deadline), Ok(()));
+    *token.1.now.lock().unwrap() = Some(deadline);
+    assert_eq!(token.check(deadline), Err(Error::Timeout));
+    assert!(token.cancel());
+    assert_eq!(token.check(deadline), Err(Error::Cancelled));
+}
 fn wasm_bytes(body: &str) -> Vec<u8> {
     wat::parse_str(format!("(module (memory (export \"memory\") 1 2) (func (export \"call\") (param i32 i32 i32 i64) (result i64) {body}))")).unwrap()
 }
@@ -185,18 +249,9 @@ fn running_wasm_cancellation_and_timeout() {
         let b = wasm_bytes("(loop $l br $l) i64.const 0");
         let mut m = manifest(&b);
         m.budgets.fuel = 1_000_000_000;
-        m.budgets.deadline_ms = if timeout { 10 } else { 1000 };
         let mut s = Session::start(m, &b, HashMap::new()).unwrap();
         let (id, c) = s.submit(1, None, b"").unwrap();
-        std::thread::scope(|scope| {
-            if !timeout {
-                scope.spawn(crate::runtime::serving(move || {
-                    std::thread::sleep(Duration::from_millis(2));
-                    c.cancel();
-                }));
-            }
-            s.drive_one();
-        });
+        interrupt_running(&mut s, id, c, timeout);
         assert_eq!(
             s.take(id),
             Some(Err(if timeout {
@@ -398,13 +453,7 @@ fn native_fragmented_frames_round_trip() {
 fn native_cancellation_terminates_and_reaps() {
     let Some(mut s) = native() else { return };
     let (id, c) = s.submit(3, None, b"").unwrap();
-    std::thread::scope(|scope| {
-        scope.spawn(crate::runtime::serving(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            c.cancel();
-        }));
-        s.drive_one();
-    });
+    interrupt_running(&mut s, id, c, false);
     assert_eq!(s.take(id), Some(Err(Error::Cancelled)));
     assert!(s.backend.is_none());
 }
@@ -412,9 +461,8 @@ fn native_cancellation_terminates_and_reaps() {
 #[test]
 fn native_deadline_terminates_and_reaps() {
     let Some(mut s) = native() else { return };
-    let (id, _) = s.submit(3, None, b"").unwrap();
-    s.pending.get_mut(&id).unwrap().deadline = Instant::now() + Duration::from_millis(10);
-    s.drive_one();
+    let (id, c) = s.submit(3, None, b"").unwrap();
+    interrupt_running(&mut s, id, c, true);
     assert_eq!(s.take(id), Some(Err(Error::Timeout)));
     assert!(s.backend.is_none());
 }

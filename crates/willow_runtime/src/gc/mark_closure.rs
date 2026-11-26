@@ -239,7 +239,11 @@ fn finish_with_policy_in(
         }
         let wave_start = std::time::Instant::now();
         let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
-        let deadline = wave_start + wave_budget;
+        // Tests can disable the clock without inventing a large real deadline.
+        #[cfg(test)]
+        let deadline = (wave_budget != std::time::Duration::MAX).then(|| wave_start + wave_budget);
+        #[cfg(not(test))]
+        let deadline = Some(wave_start + wave_budget);
         recorder.counts.waves += 1;
         // Keep claiming while drains complete items and wave time remains.
         // Items, not bytes: a zero-slot native continuation is progress too.
@@ -249,13 +253,12 @@ fn finish_with_policy_in(
         loop {
             recorder.counts.drains += 1;
             let retries = cycle.native_retries.load(Ordering::Acquire);
-            let (items, _) =
-                cycle.drain_checked_items_until_in(owner, DRAIN_WAVE_ITEMS, Some(deadline));
+            let (items, _) = cycle.drain_checked_items_until_in(owner, DRAIN_WAVE_ITEMS, deadline);
             if items == 0
                 || cycle.native_retries.load(Ordering::Acquire) != retries
                 || cycle.queue.snapshot().is_drained()
                 || minor::requested(&owner.gc)
-                || std::time::Instant::now() >= deadline
+                || deadline.is_some_and(|end| std::time::Instant::now() >= end)
             {
                 break;
             }

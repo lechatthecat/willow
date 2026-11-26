@@ -9,17 +9,21 @@ use crate::support::*;
 fn structured_01_token_cancels_multiple_tasks_and_runs_defers() {
     let (out, ok) = compile_and_run_with_env(
         r#"
-async fn worker(done: AtomicI64) {
+async fn worker(done: AtomicI64, ready: AtomicI64) {
     defer done.add(1);
-    await sleep(10000);
+    await yield();
+    ready.add(1);
+    let gate = Channel<i64>::new();
+    gate.recv();
 }
 
 async fn main() {
     let done = AtomicI64::new(0);
+    let ready = AtomicI64::new(0);
     let token = CancellationToken::new();
-    let first = token.attach(worker(done));
-    let second = token.attach(worker(done));
-    await sleep(5);
+    let first = token.attach(worker(done, ready));
+    let second = token.attach(worker(done, ready));
+    while ready.load() < 2 { await yield(); }
     token.cancel();
     match await first.result() { Ok(value) => println("bad"), Err(Cancelled) => println("first"), }
     match await second.result() { Ok(value) => println("bad"), Err(Cancelled) => println("second"), }
@@ -36,7 +40,7 @@ async fn main() {
 fn structured_02_late_attachment_to_cancelled_token_is_cancelled() {
     let (out, ok) = compile_and_run(
         r#"
-async fn slow() -> i64 { await sleep(10000); return 1; }
+async fn slow() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }
 async fn main() {
     let token = CancellationToken::new();
     token.cancel();
@@ -54,7 +58,7 @@ async fn main() {
 fn structured_03_parent_token_cancels_child_token_participants() {
     let (out, ok) = compile_and_run(
         r#"
-async fn slow() { await sleep(10000); }
+async fn slow() { let gate = Channel<i64>::new(); gate.recv(); }
 async fn main() {
     let parent = CancellationToken::new();
     let child = parent.child();
@@ -73,7 +77,7 @@ async fn main() {
 fn structured_04_child_token_cancellation_does_not_propagate_upward() {
     let (out, ok) = compile_and_run(
         r#"
-async fn value() -> i64 { await sleep(2); return 7; }
+async fn value() -> i64 { await yield(); return 7; }
 async fn main() {
     let parent = CancellationToken::new();
     let child = parent.child();
@@ -90,18 +94,26 @@ async fn main() {
 
 #[test]
 fn structured_05_scope_finish_waits_for_all_children() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn add(total: AtomicI64, value: i64, delay: i64) {
-    await sleep(delay);
+async fn add(total: AtomicI64, value: i64, gate: Channel<i64>) {
+    gate.recv();
     total.add(value);
 }
 async fn main() {
     let total = AtomicI64::new(0);
+    let gate = Channel<i64>::new();
     let scope = TaskScope::new();
-    let first = scope.add(add(total, 10, 10));
-    let second = scope.add(add(total, 20, 2));
-    match await scope.finish() { Ok(value) => println(total.load()), Err(Cancelled) => println(-1), }
+    let first = scope.add(add(total, 10, gate));
+    let second = scope.add(add(total, 20, gate));
+    test_observe_next_task();
+    let finishing = scope.finish();
+    let id = test_observed_task();
+    if id <= 0 { panic("scope finish did not spawn its task"); }
+    while !test_task_parked(id) { await yield(); }
+    gate.send(1);
+    gate.send(1);
+    match await finishing { Ok(value) => println(total.load()), Err(Cancelled) => println(-1), }
     await first;
     await second;
 }
@@ -116,11 +128,12 @@ async fn main() {
 fn structured_06_scope_cancel_finish_returns_cancelled() {
     let (out, ok) = compile_and_run(
         r#"
-async fn slow() { await sleep(10000); }
+async fn slow(ready: AtomicBool) { await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }
 async fn main() {
+    let ready = AtomicBool::new(false);
     let scope = TaskScope::new();
-    let task = scope.add(slow());
-    await sleep(5);
+    let task = scope.add(slow(ready));
+    while !ready.load() { await yield(); }
     scope.cancel();
     match await scope.finish() { Ok(value) => println("bad"), Err(Cancelled) => println("cancelled"), }
     println(task.is_cancelled());
@@ -134,16 +147,24 @@ async fn main() {
 
 #[test]
 fn structured_07_parent_scope_finish_includes_nested_scope() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn set(value: AtomicI64, delay: i64) { await sleep(delay); value.add(1); }
+async fn set(value: AtomicI64, gate: Channel<i64>) { gate.recv(); value.add(1); }
 async fn main() {
     let value = AtomicI64::new(0);
+    let gate = Channel<i64>::new();
     let parent = TaskScope::new();
     let child = parent.child();
-    parent.add(set(value, 2));
-    child.add(set(value, 10));
-    match await parent.finish() { Ok(done) => println(value.load()), Err(Cancelled) => println(-1), }
+    parent.add(set(value, gate));
+    child.add(set(value, gate));
+    test_observe_next_task();
+    let finishing = parent.finish();
+    let id = test_observed_task();
+    if id <= 0 { panic("scope finish did not spawn its task"); }
+    while !test_task_parked(id) { await yield(); }
+    gate.send(1);
+    gate.send(1);
+    match await finishing { Ok(done) => println(value.load()), Err(Cancelled) => println(-1), }
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
@@ -156,7 +177,7 @@ async fn main() {
 fn structured_08_finish_closes_scope_to_late_tasks() {
     let (out, ok) = compile_and_run(
         r#"
-async fn slow() -> i64 { await sleep(10000); return 1; }
+async fn slow() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }
 async fn main() {
     let scope = TaskScope::new();
     let finishing = scope.finish();
@@ -172,20 +193,24 @@ async fn main() {
 
 #[test]
 fn structured_09_scope_cancel_cleans_channel_waiter() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 async fn receive(channel: Channel<i64>) -> i64 { return channel.recv(); }
 async fn main() {
     let channel = Channel<i64>::new();
     let scope = TaskScope::new();
+    test_observe_next_task();
     scope.add(receive(channel));
-    await sleep(5);
+    let id = test_observed_task();
+    if id <= 0 { panic("channel receiver did not spawn its task"); }
+    while !test_task_parked(id) { await yield(); }
     scope.cancel();
     match await scope.finish() { Ok(value) => println("bad"), Err(Cancelled) => println("cancelled"), }
     channel.send(42);
     println(channel.recv());
 }
 "#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "cancelled\n42\n");
@@ -193,15 +218,18 @@ async fn main() {
 
 #[test]
 fn structured_10_token_cancel_cleans_netpoll_waiter() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 import std::net;
 async fn main() {
     match net::bind("127.0.0.1:0") {
         Ok(listener) => {
             let token = CancellationToken::new();
+            test_observe_next_task();
             let accepting = token.attach(net::accept_async(listener));
-            await sleep(5);
+            let id = test_observed_task();
+            if id <= 0 { panic("accept did not spawn its task"); }
+            while !test_task_parked(id) { await yield(); }
             token.cancel();
             match await accepting.result() { Ok(stream) => println("bad"), Err(Cancelled) => println("cancelled"), }
         }
@@ -242,7 +270,7 @@ async fn main() {
 fn structured_12_nested_scope_gc_stress_multi_worker() {
     let (out, ok) = compile_and_run_with_env(
         r#"
-async fn text(value: String) -> String { await sleep(1); return value + "!"; }
+async fn text(value: String) -> String { await yield(); return value + "!"; }
 async fn main() {
     let parent = TaskScope::new();
     let child = parent.child();
@@ -277,7 +305,7 @@ fn structured_13_non_task_attachment_is_rejected() {
 fn structured_14_concurrent_finish_calls_report_one_cancelled_outcome() {
     let (out, ok) = compile_and_run_with_env(
         r#"
-async fn slow() { await sleep(10000); }
+async fn slow() { let gate = Channel<i64>::new(); gate.recv(); }
 async fn main() {
     let scope = TaskScope::new();
     scope.add(slow());
@@ -296,13 +324,19 @@ async fn main() {
 
 #[test]
 fn structured_15_scope_traces_unbound_completed_task_frames() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn text() -> String { await sleep(1); return "kept" + "!"; }
+async fn text(ready: Channel<i64>) -> String {
+    ready.send(test_current_task());
+    await yield();
+    return "kept" + "!";
+}
 async fn main() {
     let scope = TaskScope::new();
-    scope.add(text());
-    await sleep(20);
+    let ready = Channel<i64>::new();
+    scope.add(text(ready));
+    let id = ready.recv();
+    while !test_task_finished(id) { await yield(); }
     gc_collect();
     match await scope.finish() { Ok(value) => println("kept"), Err(Cancelled) => println("bad"), }
 }

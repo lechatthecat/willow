@@ -895,31 +895,33 @@ async fn main() {
 
 #[test]
 fn rwlock_lower_10_one_worker_progresses_unrelated_task_while_waiter_is_parked() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn hold(r: RwLock<i64>, entered: AtomicI64) {
+async fn hold(r: RwLock<i64>, entered: AtomicI64, progressed: AtomicI64) {
     lock write r as mut value {
         entered.store(1);
-        let mut i = 0;
-        while i < 5000 { i = i + 1; }
+        while progressed.load() == 0 {}
         value = 9;
     }
 }
-async fn wait_for_read(r: RwLock<i64>, entered: AtomicI64) -> i64 {
+async fn wait_for_read(r: RwLock<i64>, entered: AtomicI64, ready: Channel<i64>) -> i64 {
     while entered.load() == 0 { await yield(); }
+    ready.send(test_current_task());
     lock read r as value { return value; }
 }
-async fn unrelated(entered: AtomicI64, progressed: AtomicI64) {
-    while entered.load() == 0 { await yield(); }
+async fn unrelated(ready: Channel<i64>, progressed: AtomicI64) {
+    let waiter = ready.recv();
+    while !test_task_parked(waiter) { await yield(); }
     progressed.store(1);
 }
 async fn main() {
     let r = RwLock::new(0);
     let entered = AtomicI64::new(0);
     let progressed = AtomicI64::new(0);
-    let owner = hold(r, entered);
-    let waiter = wait_for_read(r, entered);
-    let bystander = unrelated(entered, progressed);
+    let ready = Channel<i64>::new();
+    let owner = hold(r, entered, progressed);
+    let waiter = wait_for_read(r, entered, ready);
+    let bystander = unrelated(ready, progressed);
     await owner;
     await bystander;
     println(progressed.load());
@@ -1025,33 +1027,37 @@ async fn main() {
 
 #[test]
 fn lock_gc_handle_05_waiting_and_owned_frames_root_rwlock_during_collection() {
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 class Node { pub value: i64; }
-async fn hold(r: RwLock<Node>, started: AtomicI64) {
+async fn hold(r: RwLock<Node>, started: AtomicI64, collected: AtomicBool) {
     lock write r as mut node {
         started.store(1);
-        let mut i = 0;
-        while i < 20000 { i = i + 1; }
+        while !collected.load() {}
         node = new Node(node.value + 1);
     }
 }
-async fn wait_read(r: RwLock<Node>, started: AtomicI64) -> i64 {
+async fn wait_read(r: RwLock<Node>, started: AtomicI64, ready: Channel<i64>) -> i64 {
     // Spawn order does not guarantee acquisition order. Wait until the writer
     // owns the lock so this read must observe its update after release.
     while started.load() == 0 { await yield(); }
+    ready.send(test_current_task());
     lock read r as node { return node.value; }
 }
-async fn collect_when_held(started: AtomicI64) {
-    while started.load() == 0 { await yield(); }
+async fn collect_when_held(ready: Channel<i64>, collected: AtomicBool) {
+    let waiter = ready.recv();
+    while !test_task_parked(waiter) { await yield(); }
     gc_collect();
+    collected.store(true);
 }
 async fn main() {
     let r = RwLock::new(new Node(10));
     let started = AtomicI64::new(0);
-    let owner = hold(r, started);
-    let waiter = wait_read(r, started);
-    let collector = collect_when_held(started);
+    let ready = Channel<i64>::new();
+    let collected = AtomicBool::new(false);
+    let owner = hold(r, started, collected);
+    let waiter = wait_read(r, started, ready);
+    let collector = collect_when_held(ready, collected);
     await owner;
     await collector;
     println(await waiter);

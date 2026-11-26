@@ -127,6 +127,10 @@ pub mod string;
 pub mod sync;
 pub mod task;
 pub mod task_state;
+#[cfg(feature = "deterministic-test-clock")]
+pub(crate) mod test_clock;
+#[cfg(test)]
+pub(crate) mod test_sync;
 pub mod timer;
 pub(crate) mod timer_queue;
 pub mod trace;

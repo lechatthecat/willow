@@ -1067,12 +1067,9 @@ unsafe extern "C" fn poll_record_parallel_worker(_frame: *mut c_void) -> i32 {
         .expect("parallel poll thread log poisoned")
         .push(std::thread::current().id());
     PARALLEL_POLL_ENTERED.fetch_add(1, TestOrdering::SeqCst);
-    let start = Instant::now();
-    while PARALLEL_POLL_ENTERED.load(TestOrdering::SeqCst) < 2
-        && start.elapsed() < Duration::from_millis(200)
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    crate::test_sync::until("parallel workers did not rendezvous", || {
+        PARALLEL_POLL_ENTERED.load(TestOrdering::SeqCst) >= 2
+    });
     RUNTIME_POLL_READY
 }
 
@@ -1132,31 +1129,31 @@ fn parallel_completion_retains_early_notifications() {
 }
 
 #[test]
-fn parallel_completion_wakes_promptly() {
+fn parallel_completion_wakes_registered_driver() {
     let _guard = isolated_runtime();
-    let mut latencies = Vec::new();
-    for _ in 0..16 {
-        let completion = Arc::new(ParallelCompletion::new(1));
+    for workers in [1, 2, 16] {
+        let completion = Arc::new(ParallelCompletion::new(workers));
         let worker_completion = Arc::clone(&completion);
         let worker = std::thread::spawn(crate::runtime::serving(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            let sent = Instant::now();
-            worker_completion.finish();
-            sent
+            crate::test_sync::until("completion driver never parked", || {
+                worker_completion.parking.registered_for_test(true) >= 1
+            });
+            for remaining in (1..=workers).rev() {
+                assert_eq!(
+                    worker_completion.remaining.load(Ordering::SeqCst),
+                    remaining
+                );
+                worker_completion.finish();
+                if remaining > 1 {
+                    assert_eq!(worker_completion.parking.registered_for_test(true), 1);
+                }
+            }
         }));
         completion.wait();
-        let returned = Instant::now();
-        latencies.push(returned.duration_since(worker.join().unwrap()));
+        worker.join().unwrap();
+        assert_eq!(completion.remaining.load(Ordering::SeqCst), 0);
+        assert_eq!(completion.parking.registered_for_test(true), 0);
     }
-    latencies.sort_unstable();
-    let median = latencies[latencies.len() / 2];
-    eprintln!("parallel completion median wake latency: {median:?}");
-    // A median tolerates occasional host scheduling delays; this is not a
-    // hard real-time guarantee on a general-purpose operating system.
-    assert!(
-        median < Duration::from_millis(1),
-        "wake latency: {median:?}"
-    );
 }
 
 unsafe extern "C" fn poll_collect_and_nested_drive(_frame: *mut c_void) -> i32 {
@@ -1190,55 +1187,31 @@ fn parallel_completion_allows_worker_gc_and_nested_drive() {
     unsafe { reset_internal_for_test() };
 }
 
-#[cfg(target_os = "linux")]
-unsafe extern "C" fn poll_one_second_of_work(_frame: *mut c_void) -> i32 {
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(1) {
-        std::hint::spin_loop();
-    }
+unsafe extern "C" fn poll_until_driver_parks(_frame: *mut c_void) -> i32 {
+    crate::test_sync::until("parallel drive polled instead of parking", || {
+        crate::runtime::current().parking.registered_for_test(true) >= 1
+    });
     RUNTIME_POLL_READY
 }
 
-#[cfg(target_os = "linux")]
 #[test]
-fn parallel_completion_driver_cpu_below_five_percent() {
-    fn thread_cpu_seconds() -> f64 {
-        let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
-        assert_eq!(
-            // SAFETY: getrusage receives writable rusage storage. The successful return
-            // initializes it before the read.
-            unsafe { libc::getrusage(libc::RUSAGE_THREAD, usage.as_mut_ptr()) },
-            0
-        );
-        // SAFETY: getrusage receives writable rusage storage. The successful return initializes it
-        // before the read.
-        let usage = unsafe { usage.assume_init() };
-        (usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) as f64
-            + (usage.ru_utime.tv_usec + usage.ru_stime.tv_usec) as f64 / 1_000_000.0
-    }
+fn parallel_completion_driver_parks_until_work_finishes() {
     let _guard = isolated_runtime();
-    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
-    // or subsequent access relies on the discarded heap.
+    let _watchdog = crate::test_sync::Watchdog::new("parallel driver completion");
+    // SAFETY: The test owns this isolated runtime before starting any tasks.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
     replace_global_scheduler_for_test(2);
-    // SAFETY: The callback accepts a null frame and uses no frame storage.
-    unsafe { willow_sched_spawn(poll_one_second_of_work, std::ptr::null_mut()) };
+    // SAFETY: The callback does not use its frame pointer.
+    unsafe { willow_sched_spawn(poll_until_driver_parks, std::ptr::null_mut()) };
     let mutator = crate::gc::MutatorRegistration::new();
-    let cpu_start = thread_cpu_seconds();
-    let start = Instant::now();
-    let completed = willow_sched_run_parallel(None, 2, None);
-    let wall = start.elapsed().as_secs_f64();
-    let cpu = thread_cpu_seconds() - cpu_start;
+    assert_eq!(willow_sched_run_parallel(None, 2, None), 1);
     drop(mutator);
-    assert_eq!(completed, 1);
-    eprintln!("parallel driver: cpu={cpu:.6}s wall={wall:.6}s");
-    assert!(
-        cpu < wall * 0.05,
-        "driver CPU {cpu}s exceeds 5% of wall {wall}s"
+    assert_eq!(
+        crate::runtime::current().parking.registered_for_test(true),
+        0
     );
-    // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
-    // or subsequent access relies on the discarded heap.
+    // SAFETY: All tasks and the driver have completed.
     unsafe { reset_internal_for_test() };
 }
 
@@ -1246,12 +1219,9 @@ static WAKE_RACE_WAITER_REGISTERED: crate::runtime::PerRuntime<TestAtomicUsize> 
     crate::runtime::PerRuntime::new(|| TestAtomicUsize::new(0));
 
 unsafe extern "C" fn poll_complete_after_waiter_registered(_frame: *mut c_void) -> i32 {
-    let start = Instant::now();
-    while WAKE_RACE_WAITER_REGISTERED.load(TestOrdering::SeqCst) == 0
-        && start.elapsed() < Duration::from_millis(200)
-    {
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    crate::test_sync::until("awaiter never registered", || {
+        WAKE_RACE_WAITER_REGISTERED.load(TestOrdering::SeqCst) != 0
+    });
     RUNTIME_POLL_READY
 }
 
@@ -1265,7 +1235,9 @@ unsafe extern "C" fn poll_await_with_running_wake_race(frame: *mut c_void) -> i3
     if *state == 1 {
         assert_eq!(willow_sched_await(b_id), 0);
         WAKE_RACE_WAITER_REGISTERED.store(1, TestOrdering::SeqCst);
-        std::thread::sleep(Duration::from_millis(30));
+        crate::test_sync::until("awaitee never completed while waiter was running", || {
+            willow_sched_task_state(b_id) == -1
+        });
         RUNTIME_POLL_PENDING
     } else {
         RUNTIME_POLL_READY
@@ -2437,6 +2409,8 @@ fn park_with_sleep(scheduler: &mut RuntimeScheduler, id: RuntimeTaskId, millis: 
 
 #[test]
 fn scheduler_timer_heap_selects_earliest_deadline() {
+    let _guard = isolated_runtime();
+    let _clock = crate::test_sync::SchedulerClock::new();
     let mut scheduler = RuntimeScheduler::default();
     let slow = scheduler.spawn_placeholder();
     let fast = scheduler.spawn_placeholder();
@@ -2674,6 +2648,8 @@ fn t9ha4_timer_wake_rechecks_identity_under_task_lock() {
 
 #[test]
 fn t9ha4_07_re_armed_sleep_supersedes_the_earlier_entry() {
+    let _guard = isolated_runtime();
+    let _clock = crate::test_sync::SchedulerClock::new();
     let mut s = RuntimeScheduler::with_worker_count(1);
     let id = s.spawn_placeholder();
     let stale = park_with_sleep(&mut s, id, 50);
@@ -3061,12 +3037,16 @@ fn t8hq4_19_pending_drain_still_takes_the_list() {
     reset_global_scheduler_for_test();
     complete_executable_without_drain();
     let held = global_components().retirements.hold_cleanup_list_for_test();
+    let before = crate::test_sync::count("terminal_cleanup_lock");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let drainer = std::thread::spawn(crate::runtime::serving(move || {
         drain_terminal_cleanups();
         done_tx.send(()).unwrap();
     }));
-    let early = done_rx.recv_timeout(Duration::from_millis(100)).is_ok();
+    crate::test_sync::until("cleanup drain never attempted list lock", || {
+        crate::test_sync::count("terminal_cleanup_lock") > before
+    });
+    let early = done_rx.try_recv().is_ok();
     drop(held);
     done_rx
         .recv_timeout(Duration::from_secs(5))
@@ -3497,27 +3477,19 @@ fn t9ha4_20_blocking_completion_wake_releases_the_idle_waiter_without_spinning()
     assert_eq!(global_timers().len(), 0);
 
     let generation = current_wake_generation();
-    let start = Instant::now();
     std::thread::scope(|scope| {
         scope.spawn(crate::runtime::serving(move || {
-            std::thread::sleep(Duration::from_millis(30));
+            crate::test_sync::until("idle waiter never registered", || {
+                crate::runtime::current().parking.registered_for_test(false) >= 1
+            });
             assert!(try_wake_parked_task(id));
         }));
         assert!(
-            wait_for_wake_since(generation, Duration::from_secs(5)),
-            "the completion wake must release the waiter before the fallback timeout"
+            wait_for_wake_since(generation, Duration::from_secs(30)),
+            "completion must signal the registered waiter"
         );
     });
-    let waited = start.elapsed();
 
-    assert!(
-        waited >= Duration::from_millis(15),
-        "the waiter returned before the completion could arrive: {waited:?}"
-    );
-    assert!(
-        waited < Duration::from_secs(2),
-        "the waiter sat through the fallback instead of being signalled: {waited:?}"
-    );
     assert_eq!(global_task_table().blocked_syscall_count(), 0);
     assert_eq!(global_run_queues().len(), 1);
     reset_global_scheduler_for_test();
@@ -3530,6 +3502,7 @@ fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
     // immediately — otherwise the worker sleeps out the 50ms fallback with
     // runnable work already queued.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     reset_global_scheduler_for_test();
     let id = with_global_for_test(RuntimeScheduler::spawn_placeholder);
     assert_eq!(
@@ -3540,12 +3513,12 @@ fn t9ha4_21_wake_between_snapshot_and_wait_is_not_lost() {
 
     let generation = current_wake_generation();
     assert!(try_wake_parked_task(id));
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     assert!(wait_for_wake_since(generation, Duration::from_secs(5)));
 
-    assert!(
-        start.elapsed() < Duration::from_secs(1),
-        "a wake that already happened must return from the wait at once"
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
     );
     reset_global_scheduler_for_test();
 }
@@ -3610,18 +3583,18 @@ fn t9ha4_23_run_until_returns_when_the_sleeping_target_completes() {
 #[test]
 fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() {
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     let single = single_worker_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
+    let _ = willow_monotonic_millis();
+    let clock = crate::test_sync::SchedulerClock::new();
     let id = spawn_parked_long_sleeper(&single);
     // A short bounded drive finds nothing ready and returns at its deadline
-    // without waiting the 2s sleep out.
-    assert_eq!(
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 30),
-        0
-    );
+    // without waiting the frozen sleep out.
+    assert_eq!(run_until_virtual_deadline(&clock, 30, 30), 0);
     assert_eq!(willow_sched_task_state(id), 2);
     assert_eq!(global_timers().len(), 1);
 
@@ -3634,12 +3607,11 @@ fn t9ha4_24_cancelling_a_sleeper_clears_its_deadline_and_the_drive_terminates() 
         None,
         "cancellation must clear the deadline so the entry is stale"
     );
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     assert_eq!(willow_sched_run(), 0, "a cancelled task never completes");
-    assert!(
-        start.elapsed() < Duration::from_millis(1_500),
-        "the drive waited out the cancelled 2s sleep: {:?}",
-        start.elapsed()
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
     );
     assert_eq!(willow_sched_task_state(id), -1);
     assert_eq!(global_timers().len(), 0);
@@ -3654,24 +3626,18 @@ fn t9ha4_25_drive_deadline_still_wins_over_a_far_off_sleeper() {
     // The idle wait is computed from the timer queue; clamping it to the
     // caller's deadline must survive the move to the separate lock.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     let single = single_worker_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
+    let _ = willow_monotonic_millis();
+    let clock = crate::test_sync::SchedulerClock::new();
     let id = spawn_parked_long_sleeper(&single);
 
-    let start = Instant::now();
-    assert_eq!(
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 30),
-        0
-    );
-    let elapsed = start.elapsed();
+    assert_eq!(run_until_virtual_deadline(&clock, 30, 30), 0);
 
-    assert!(
-        elapsed < Duration::from_millis(1_500),
-        "the 2s timer outranked the 30ms drive deadline: {elapsed:?}"
-    );
     assert_eq!(willow_sched_task_state(id), 2, "the sleeper stays parked");
     assert_eq!(global_timers().len(), 1, "its timer stays registered");
     reset_global_scheduler_for_test();
@@ -3720,10 +3686,15 @@ fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clear();
 
-    // Spawn order deliberately disagrees with deadline order. Deadlines are
-    // absolute from one start and 500ms apart, so a preempted runner that
-    // polls the sleepers late cannot reorder them.
+    // Freeze registration time, then advance each deadline only after the
+    // previous target has completed. Host scheduling cannot reorder deadlines.
+    let _single = single_worker_for_test();
+    reset_global_scheduler_for_test();
+    let _watchdog = crate::test_sync::Watchdog::new("ordered timer completion");
+    let _ = willow_monotonic_millis();
+    let clock = crate::test_sync::SchedulerClock::new();
     let start = willow_monotonic_millis();
+    let mut targets = Vec::new();
     for (tag, offset) in [(1i64, 1_000i64), (2, 0), (3, 500)] {
         let frame = willow_async_frame_alloc(3, 0) as *mut c_void;
         // SAFETY: The test frame reserves the accessed slots at word-aligned ABI offsets.
@@ -3734,10 +3705,20 @@ fn t9ha4_26_staggered_sleepers_complete_in_deadline_order() {
         }
         // SAFETY: The supplied callback matches this frame layout; the frame storage remains
         // live across scheduling and callback execution.
-        unsafe { willow_sched_spawn(poll_tagged_sleep_then_ready, frame) };
+        targets.push(unsafe { willow_sched_spawn(poll_tagged_sleep_then_ready, frame) });
     }
-
-    assert_eq!(willow_sched_run(), 3);
+    // A marker after all sleepers establishes that every first poll registered.
+    // SAFETY: ready marker uses no frame storage.
+    let marker = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
+    assert!((1..=2).contains(&willow_sched_run_until(marker)));
+    assert!((0..=1).contains(&willow_sched_run_until(targets[1])));
+    assert_eq!(*T9HA4_COMPLETION_ORDER.lock().unwrap(), vec![2]);
+    // The zero deadline has completed; the others remain parked.
+    clock.advance(Duration::from_millis(500));
+    assert_eq!(willow_sched_run_until(targets[2]), 1);
+    clock.advance(Duration::from_millis(500));
+    assert_eq!(willow_sched_run_until(targets[0]), 1);
+    assert_eq!(willow_sched_run(), 0);
 
     assert_eq!(
         *T9HA4_COMPLETION_ORDER
@@ -3844,13 +3825,32 @@ unsafe extern "C" fn poll_long_sleep_then_ready(frame: *mut c_void) -> i32 {
     if *state >= 2 {
         RUNTIME_POLL_READY
     } else {
-        willow_sched_sleep(2_000);
+        willow_sched_sleep(60_000);
         RUNTIME_POLL_PENDING
     }
 }
 
+fn run_until_virtual_deadline(
+    clock: &crate::test_sync::SchedulerClock,
+    millis: i64,
+    advance: u64,
+) -> i64 {
+    let deadline = willow_monotonic_millis() + millis;
+    let parked_before = crate::runtime::current().parking.park_calls_for_test();
+    std::thread::scope(|scope| {
+        scope.spawn(crate::runtime::serving(move || {
+            crate::test_sync::until("bounded drive registered its timer wait", || {
+                crate::runtime::current().parking.park_calls_for_test() > parked_before
+                    && global_timers().len() > 0
+            });
+            clock.advance(Duration::from_millis(advance));
+        }));
+        willow_sched_run_until_deadline(deadline)
+    })
+}
+
 /// Spawn a `poll_long_sleep_then_ready` task and give it its first poll, so it
-/// is parked on its 2s timer when this returns.
+/// is parked on its frozen timer when this returns.
 ///
 /// A deadline-bounded drive cannot do this reliably: it checks its deadline
 /// before claiming work, and the drive runs on the runtime's worker threads.
@@ -3873,7 +3873,7 @@ fn spawn_parked_long_sleeper(_single: &SingleWorkerForTest) -> u64 {
     assert_eq!(willow_sched_run_until(marker), 1);
     assert_eq!(willow_sched_task_state(marker), -1);
     assert_eq!(willow_sched_task_state(sleeper), 2, "the sleeper is parked");
-    assert_eq!(global_timers().len(), 1, "on its 2s timer");
+    assert_eq!(global_timers().len(), 1, "on its frozen timer");
     sleeper
 }
 
@@ -3882,18 +3882,19 @@ fn deadline_01_empty_scheduler_returns_immediately() {
     // The deadline is a CEILING, not a sleep: with nothing to run the drive
     // must return at once so the caller can decide how to wait.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     assert_eq!(
         willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
         0
     );
-    assert!(
-        start.elapsed() < Duration::from_millis(500),
-        "an idle scheduler must not sleep out the deadline"
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
     );
     reset_global_scheduler_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -3908,6 +3909,8 @@ fn deadline_02_ready_work_still_runs_before_the_deadline() {
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
+    let _ = willow_monotonic_millis();
+    let _clock = crate::test_sync::SchedulerClock::new();
     // SAFETY: The callback accepts a null frame and uses no frame storage.
     let id = unsafe { willow_sched_spawn(poll_ready_now, std::ptr::null_mut()) };
     assert_eq!(
@@ -3927,23 +3930,19 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
     // The bug this guards: an unbounded `willow_sched_run` inside sync
     // select drains a 2s task before ever re-checking a 30ms timeout.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     let single = single_worker_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
+    let _ = willow_monotonic_millis();
+    let clock = crate::test_sync::SchedulerClock::new();
     let long = spawn_parked_long_sleeper(&single);
-    let start = Instant::now();
-    willow_sched_run_until_deadline(willow_monotonic_millis() + 30);
-    let elapsed = start.elapsed();
-    assert!(
-        elapsed >= Duration::from_millis(20),
-        "drive returned before the deadline: {elapsed:?}"
-    );
-    assert!(
-        elapsed < Duration::from_millis(1_500),
-        "drive waited for the 2s task instead of the 30ms deadline: {elapsed:?}"
-    );
+    let start = willow_monotonic_millis();
+    run_until_virtual_deadline(&clock, 30, 30);
+    assert_eq!(willow_monotonic_millis() - start, 30);
+
     assert_eq!(
         willow_sched_task_state(long),
         2,
@@ -3958,6 +3957,7 @@ fn deadline_03_run_returns_at_deadline_not_after_long_task() {
 #[test]
 fn deadline_04_past_deadline_returns_promptly() {
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
@@ -3966,11 +3966,11 @@ fn deadline_04_past_deadline_returns_promptly() {
     // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
     // across scheduling and callback execution.
     unsafe { willow_sched_spawn(poll_long_sleep_then_ready, frame) };
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     willow_sched_run_until_deadline(willow_monotonic_millis() - 1);
-    assert!(
-        start.elapsed() < Duration::from_millis(1_500),
-        "an already-expired deadline must not block on unrelated tasks"
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
     );
     reset_global_scheduler_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -3983,6 +3983,7 @@ fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
     // The bound is caller-local: it must not register timers or tasks that
     // a later unbounded drive would then wait on.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
@@ -3992,11 +3993,11 @@ fn deadline_05_bounded_drive_leaves_no_scheduler_state_behind() {
         with_global(|sched| sched.next_timer_deadline()).is_none(),
         "a bounded drive must leave no timer behind"
     );
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     assert_eq!(willow_sched_run(), 0);
-    assert!(
-        start.elapsed() < Duration::from_millis(200),
-        "an empty scheduler must go idle immediately after a bounded drive"
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
     );
     reset_global_scheduler_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -4009,18 +4010,19 @@ fn deadline_06_parked_task_timer_still_fires_before_a_far_deadline() {
     // Clamping idle waits must not SKIP a nearer task timer: a 5ms sleeper
     // still runs to completion under a 5s drive deadline.
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("near timer before drive deadline");
+    let _single = single_worker_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
     reset_global_scheduler_for_test();
+    let _ = willow_monotonic_millis();
+    let clock = crate::test_sync::SchedulerClock::new();
     let frame = willow_async_frame_alloc(0, 0) as *mut c_void;
     // SAFETY: The supplied callback matches this frame layout; the frame storage remains live
     // across scheduling and callback execution.
     let id = unsafe { willow_sched_spawn(poll_sleep_then_ready, frame) };
-    assert_eq!(
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 5_000),
-        1
-    );
+    assert_eq!(run_until_virtual_deadline(&clock, 5_000, 5), 1);
     assert_eq!(willow_sched_task_state(id), -1); // terminal record reaped
     reset_global_scheduler_for_test();
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
@@ -5009,20 +5011,19 @@ fn fst_16_terminal_transition_holds_shard_through_frame_publication() {
         "the barrier must hold the historical state/status race point"
     );
 
-    let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+    let blocked_before = crate::test_sync::count("scheduler_task_shard");
     let (registered_tx, registered_rx) = std::sync::mpsc::channel();
     let observer_tasks = Arc::clone(&tasks);
     let observer = std::thread::spawn(crate::runtime::serving(move || {
-        attempted_tx.send(()).unwrap();
         registered_tx
             .send(register_waiter_sharded(&observer_tasks, awaitee, waiter))
             .unwrap();
     }));
-    attempted_rx.recv().unwrap();
+    crate::test_sync::until("await observer blocks behind terminal publisher", || {
+        crate::test_sync::count("scheduler_task_shard") > blocked_before
+    });
     assert!(
-        registered_rx
-            .recv_timeout(Duration::from_millis(20))
-            .is_err(),
+        registered_rx.try_recv().is_err(),
         "the await slow path must remain behind the terminal publisher's shard lock"
     );
 
@@ -5728,18 +5729,14 @@ fn sched_wake_16_select_idle_wait_raises_on_real_deadlock() {
 #[test]
 fn sched_wake_17_select_idle_wait_is_bounded() {
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { crate::gc::willow_gc_init() };
     reset_global_scheduler_for_test();
     let _context = install_test_panic_context(104);
-    let started = Instant::now();
     willow_select_idle_wait();
-    assert!(
-        started.elapsed() < Duration::from_secs(2),
-        "idle wait must stay bounded, took {:?}",
-        started.elapsed()
-    );
+    assert_eq!(crate::panic_context::willow_panic_active(), 1);
     take_test_panic_message();
 }
 
@@ -5814,13 +5811,14 @@ fn sched_wake_20_repeated_parallel_drives_settle_at_zero() {
 #[test]
 fn idle_timer_wait_observes_work_published_after_empty_probe() {
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("scheduler deadline/notification");
     reset_global_scheduler_for_test();
     let timer = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     with_current_task_for_test(timer, || set_global_wake_after_millis(5_000));
     let task = with_global_for_test(RuntimeScheduler::spawn_parked_placeholder);
     let generation = current_wake_generation();
     assert!(try_wake_parked_task(task));
-    let start = Instant::now();
+    let parks_before = crate::runtime::current().parking.park_calls_for_test();
     assert!(scheduler_idle_step(
         crate::runtime::current(),
         global_components(),
@@ -5830,7 +5828,10 @@ fn idle_timer_wait_observes_work_published_after_empty_probe() {
         None,
         generation
     ));
-    assert!(start.elapsed() < Duration::from_secs(1));
+    assert_eq!(
+        crate::runtime::current().parking.park_calls_for_test(),
+        parks_before
+    );
     assert!(global_run_queues().contains(task));
     reset_global_scheduler_for_test();
 }

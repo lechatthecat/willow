@@ -144,12 +144,13 @@ fn idle_resume_waits_for_active_stop() {
     }));
     ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |_, _| {
+        let before = crate::test_sync::count("idle_resume_blocked");
         resume_tx.send(()).unwrap();
         dropping_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        assert_eq!(
-            done_rx.recv_timeout(Duration::from_millis(20)),
-            Err(mpsc::RecvTimeoutError::Timeout)
-        );
+        crate::test_sync::until("idle resume did not reach the active stop", || {
+            crate::test_sync::count("idle_resume_blocked") > before
+        });
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     });
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
@@ -320,8 +321,12 @@ fn assert_blocked_call_leaves_collections_running(
     willow_gc_collect();
     with_stw(crate::gc_telemetry::stops::StopReason::Minor, |coord, _| {
         assert!(coord.parked.contains(&id));
+        let before = crate::test_sync::count("idle_resume_blocked");
         release();
-        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        crate::test_sync::until("blocked call did not attempt reentry", || {
+            crate::test_sync::count("idle_resume_blocked") > before
+        });
+        assert_eq!(done_rx.try_recv(), Err(mpsc::TryRecvError::Empty));
     });
     done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     worker.join().unwrap();
@@ -433,8 +438,11 @@ fn collection_requested_during_a_stop_keeps_the_foreign_region() {
         while !runtime().stop_requested.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
+        let before = crate::test_sync::count("idle_resume_blocked");
         collect_tx.send(()).unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        crate::test_sync::until("foreign collection did not meet pending stop", || {
+            crate::test_sync::count("idle_resume_blocked") > before
+        });
         park_tx.send(()).unwrap();
         collector.join().unwrap();
         straggler.join().unwrap();

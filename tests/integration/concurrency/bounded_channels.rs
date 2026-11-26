@@ -55,8 +55,9 @@ fn bch_02_fifo_order_under_backpressure() {
 
 #[test]
 fn bch_03_fast_producer_slow_consumer_delivers_all() {
-    let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 10 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); let p = produce(ch); let mut total = 0; let mut n = 0; while n < 10 { total = total + ch.recv(); await sleep(2); n = n + 1; } await p; println(total); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 10 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(2); test_observe_next_task(); let p = produce(ch); let id = test_observed_task(); let mut total = 0; let mut n = 0; let mut next_park = 1; while n < 10 { if n < 8 { while test_task_parks(id) < next_park || !test_task_parked(id) { await yield(); } next_park = test_task_parks(id) + 1; } total = total + ch.recv(); n = n + 1; } await p; println(total); }",
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "55\n");
@@ -84,8 +85,9 @@ fn bch_05_capacity_above_traffic_never_parks() {
 fn bch_06_parked_producer_resumes_after_drain() {
     // The producer fills the 1-slot buffer, parks, and only finishes once the
     // consumer has drained both values.
-    let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) -> i64 { ch.send(1); ch.send(2); return 9; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(30); println(ch.recv()); println(ch.recv()); println(await p); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn produce(ch: Channel<i64>) -> i64 { ch.send(1); ch.send(2); return 9; }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); test_observe_next_task(); let p = produce(ch); let id = test_observed_task(); while !test_task_parked(id) { await yield(); } println(ch.recv()); println(ch.recv()); println(await p); }",
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n9\n");
@@ -103,9 +105,9 @@ fn bch_07_multiple_producers_conserve_total() {
 
 #[test]
 fn bch_08_close_wakes_parked_producer() {
-    // The first value is the explicit signal that the producer is running.
-    // Close rejects its next send whether it has already parked or is about to.
-    let (out, ok) = compile_and_run_with_runtime_env(
+    // Observe both full-buffer parks: draining the first value releases the
+    // second send, and close must wake the third send after it parks again.
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 async fn produce(ch: Channel<i64>) {
     defer match recover() { Some(info) => println(info.message), None => {} }
@@ -116,15 +118,19 @@ async fn produce(ch: Channel<i64>) {
 }
 async fn main() {
     let ch = Channel<i64>::with_capacity(1);
+    test_observe_next_task();
     let p = produce(ch);
+    let id = test_observed_task();
+    while test_task_parks(id) < 1 || !test_task_parked(id) { await yield(); }
+    let second_park = test_task_parks(id) + 1;
     println(ch.recv());
+    while test_task_parks(id) < second_park || !test_task_parked(id) { await yield(); }
     ch.close();
     await p;
     println("done");
 }
 "#,
         &[("WILLOW_WORKERS", "1")],
-        std::time::Duration::from_secs(60),
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\nsend on closed channel\ndone\n");
@@ -180,8 +186,9 @@ fn bch_13_string_elements() {
 fn bch_14_gc_stress_with_parked_producer() {
     // The producer parks holding a String in its frame slot; a collection while
     // it is parked must not free the queued or the pending value.
-    let (out, ok) = compile_and_run_gc_stress(
-        "async fn produce(ch: Channel<String>) { let mut i = 0; while i < 6 { ch.send(\"x\" + \"y\"); i = i + 1; } }\nasync fn main() { let ch = Channel<String>::with_capacity(1); let p = produce(ch); let mut s = \"\"; let mut n = 0; while n < 6 { s = s + ch.recv(); n = n + 1; } await p; println(s); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn produce(ch: Channel<String>) { let mut i = 0; while i < 6 { ch.send(\"x\" + \"y\"); i = i + 1; } }\nasync fn main() { let ch = Channel<String>::with_capacity(1); test_observe_next_task(); let p = produce(ch); let id = test_observed_task(); let mut s = \"\"; let mut n = 0; let mut next_park = 1; while n < 6 { if n < 5 { while test_task_parks(id) < next_park || !test_task_parked(id) { await yield(); } next_park = test_task_parks(id) + 1; gc_collect(); } s = s + ch.recv(); n = n + 1; } await p; println(s); }",
+        &[("WILLOW_WORKERS", "5"), ("WILLOW_GC_STRESS", "1")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "xyxyxyxyxyxy\n");
@@ -229,8 +236,9 @@ fn bch_18_select_send_value_evaluated_once() {
 fn bch_19_coop_send_value_evaluated_once_per_send() {
     // A cooperative send parks and re-enters its check block on each wakeup.
     // The value is frame-backed, so `tick` runs 3 times, not once per park.
-    let (out, ok) = compile_and_run(
-        "fn tick(v: i64) -> i64 { println(99); return v; }\nasync fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 3 { ch.send(tick(i)); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); let mut total = 0; let mut n = 0; while n < 3 { total = total + ch.recv(); await sleep(5); n = n + 1; } await p; println(total); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "fn tick(v: i64) -> i64 { println(99); return v; }\nasync fn produce(ch: Channel<i64>) { let mut i = 1; while i <= 3 { ch.send(tick(i)); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); test_observe_next_task(); let p = produce(ch); let id = test_observed_task(); let mut total = 0; let mut n = 0; let mut next_park = 1; while n < 3 { if n < 2 { while test_task_parks(id) < next_park || !test_task_parked(id) { await yield(); } next_park = test_task_parks(id) + 1; } total = total + ch.recv(); n = n + 1; } await p; println(total); }",
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "99\n99\n99\n6\n");
@@ -259,8 +267,9 @@ fn bch_21_sync_main_drives_spawned_producer() {
 fn bch_22_cancel_parked_producer_leaves_channel_usable() {
     // Cancelling a task parked on a full send must purge its send-waiter
     // registration; the channel keeps working for a later producer.
-    let (out, ok) = compile_and_run(
-        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); let p = produce(ch); await sleep(20); p.cancel(); await sleep(20); println(p.is_cancelled()); println(ch.recv()); ch.send(42); println(ch.recv()); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn produce(ch: Channel<i64>) { let mut i = 0; while i < 50 { ch.send(i); i = i + 1; } }\nasync fn main() { let ch = Channel<i64>::with_capacity(1); test_observe_next_task(); let p = produce(ch); let id = test_observed_task(); while !test_task_parked(id) { await yield(); } p.cancel(); await p.result(); println(p.is_cancelled()); println(ch.recv()); ch.send(42); println(ch.recv()); }",
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n0\n42\n");

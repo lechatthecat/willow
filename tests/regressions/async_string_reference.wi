@@ -5,15 +5,15 @@ class Box {
 }
 
 async fn update(text: &mut String) {
-    await sleep(1);
+    await yield();
     text = "moved " + "string";
     gc_minor_collect();
-    await sleep(1);
+    await yield();
     gc_collect();
 }
 
 async fn replace(box: &mut Box) {
-    await sleep(1);
+    await yield();
     box = new Box("replacement");
     gc_collect();
 }

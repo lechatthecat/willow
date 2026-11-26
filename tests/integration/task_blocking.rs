@@ -39,12 +39,108 @@ fn full_stdout_pipe_with_many_writers_does_not_block_other_tasks() {
     }
 }
 
+// Observe kernel pipe capacity without consuming any writer output.
+#[cfg(unix)]
+fn stdout_pipe_full(_: &std::io::PipeReader, writer: &std::io::PipeWriter) -> bool {
+    use std::os::fd::AsRawFd;
+    #[repr(C)]
+    struct PollFd {
+        fd: std::ffi::c_int,
+        events: std::ffi::c_short,
+        revents: std::ffi::c_short,
+    }
+    #[cfg(target_os = "macos")]
+    type Count = std::ffi::c_uint;
+    #[cfg(not(target_os = "macos"))]
+    type Count = std::ffi::c_ulong;
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, count: Count, timeout: std::ffi::c_int) -> std::ffi::c_int;
+    }
+    let mut fd = PollFd {
+        fd: writer.as_raw_fd(),
+        events: 4,
+        revents: 0,
+    };
+    // SAFETY: the writer owns this live descriptor and fd is one writable pollfd.
+    let result = unsafe { poll(&raw mut fd, 1, 0) };
+    if result < 0 {
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::Interrupted
+        );
+        return false;
+    }
+    assert_eq!(
+        fd.revents & !4,
+        0,
+        "stdout pipe poll failed: {}",
+        fd.revents
+    );
+    result == 0
+}
+
+#[cfg(windows)]
+fn stdout_pipe_full(reader: &std::io::PipeReader, _: &std::io::PipeWriter) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetNamedPipeInfo(
+            handle: *mut std::ffi::c_void,
+            flags: *mut u32,
+            output_size: *mut u32,
+            input_size: *mut u32,
+            instances: *mut u32,
+        ) -> i32;
+        fn PeekNamedPipe(
+            handle: *mut std::ffi::c_void,
+            buffer: *mut std::ffi::c_void,
+            size: u32,
+            read: *mut u32,
+            available: *mut u32,
+            remaining: *mut u32,
+        ) -> i32;
+    }
+    let (mut flags, mut outbound, mut inbound, mut available) = (0, 0, 0, 0);
+    // SAFETY: reader owns the pipe handle; output pointers are live and all
+    // optional unused outputs are null. Peek does not consume pipe data.
+    unsafe {
+        assert_ne!(
+            GetNamedPipeInfo(
+                reader.as_raw_handle(),
+                &raw mut flags,
+                &raw mut outbound,
+                &raw mut inbound,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+        assert_ne!(
+            PeekNamedPipe(
+                reader.as_raw_handle(),
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &raw mut available,
+                std::ptr::null_mut()
+            ),
+            0
+        );
+    }
+    // Pipe quotas are named from the server's direction. A server reader
+    // receives inbound data; a client reader receives outbound data.
+    let capacity = if flags & 1 != 0 { inbound } else { outbound };
+    assert!(capacity > 0);
+    available >= capacity
+}
+
 fn assert_full_stdout_progress(writers: usize) {
     let id = unique_test_id();
     let source_path = temp_path(format!("willow_stdout_{id}.wi"));
     let binary = temp_path(format!("willow_stdout_{id}"));
     let marker = temp_path(format!("willow_stdout_progress_{id}"));
     let marker_literal = format!("{marker:?}");
+    let release = temp_path(format!("willow_stdout_release_{id}"));
+    let release_literal = format!("{release:?}");
     let starts: String = (0..writers)
         .map(|i| format!("let w{i} = writer();"))
         .collect();
@@ -57,7 +153,7 @@ async fn writer() {{
     while i < 4096 {{ println("{}"); i = i + 1; }}
 }}
 async fn progress() {{
-    await sleep(100);
+    while !fs::exists({release_literal}) {{ await yield(); }}
     gc_collect();
     match fs::write_string({}, "progress") {{ Ok(_) => {{}}, Err(_) => {{}} }}
 }}
@@ -76,29 +172,51 @@ async fn main() {{ {starts} let p = progress(); await p; {joins} }}
         "{}",
         String::from_utf8_lossy(&compiled.stderr)
     );
+    let (mut stdout, writer) = std::io::pipe().unwrap();
     let mut child = Command::new(&binary)
         .env("WILLOW_WORKERS", "1")
         .env("WILLOW_BLOCKING_THREADS", "1")
         .env("WILLOW_BLOCKING_QUEUE", "1")
-        .stdout(Stdio::piped())
+        .stdout(writer.try_clone().unwrap())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    // Deliberately do not drain stdout until the other task makes progress.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !Path::new(&marker).exists() && Instant::now() < deadline {
+    // Admit the progress task only after the kernel confirms that stdout
+    // cannot accept another atomic write. Never drain the pipe before this.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut full = false;
+    while Instant::now() < deadline {
         if child.try_wait().unwrap().is_some() {
             break;
         }
-        std::thread::sleep(Duration::from_millis(5));
+        if stdout_pipe_full(&stdout, &writer) {
+            full = true;
+            fs::write(&release, "full").unwrap();
+            break;
+        }
+        std::thread::yield_now();
+    }
+    while full
+        && fs::read_to_string(&marker).ok().as_deref() != Some("progress")
+        && Instant::now() < deadline
+    {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::yield_now();
     }
     let progressed = fs::read_to_string(&marker).ok().as_deref() == Some("progress");
     let _ = child.kill();
     let output = child.wait_with_output().unwrap();
+    drop(writer);
+    let mut printed = Vec::new();
+    std::io::Read::read_to_end(&mut stdout, &mut printed).unwrap();
     let _ = fs::remove_file(&source_path);
     let _ = fs::remove_file(&marker);
+    let _ = fs::remove_file(&release);
     remove_output_artifacts(&binary);
-    assert!(output.stdout.len() >= 4096, "writer never reached stdout");
+    assert!(full, "writer never filled stdout ({writers} writers)");
+    assert!(printed.len() >= 4096, "writer never reached stdout");
     assert!(
         progressed,
         "worker stalled behind stdout ({writers} writers): {}",
@@ -137,12 +255,18 @@ fn concurrent_stdout_writers_complete_without_losing_lines() {
 #[test]
 fn task_print_completion_does_not_complete_the_next_await() {
     let source = r#"
-async fn value(n: i64) -> i64 { await sleep(1); return n; }
+async fn value(n: i64, printed: AtomicBool, waiter: i64) -> i64 {
+    while !printed.load() { await yield(); }
+    while !test_task_parked(waiter) { await yield(); }
+    return n;
+}
 async fn main() {
     let mut i = 1;
     while i <= 256 {
-        let task = value(i);
+        let printed = AtomicBool::new(false);
+        let task = value(i, printed, test_current_task());
         println(i);
+        printed.store(true);
         println(await task);
         i = i + 1;
     }
@@ -150,12 +274,10 @@ async fn main() {
 "#;
     let expected: String = (1..=256).map(|i| format!("{i}\n{i}\n")).collect();
     for workers in ["1", "5"] {
-        let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+        let (out, ok) = compile_and_run_with_test_sync(
             source,
             &[("WILLOW_WORKERS", workers), ("WILLOW_BLOCKING_QUEUE", "1")],
-            Duration::from_secs(30),
         );
-        assert!(!timed_out, "workers={workers}: {out}");
         assert!(ok, "workers={workers}: {out}");
         assert_eq!(out, expected, "workers={workers}");
     }

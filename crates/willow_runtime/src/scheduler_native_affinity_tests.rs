@@ -226,6 +226,7 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
     // covered by the claim-word epoch.
     let gate = state.claim_gate.lock().unwrap();
     state.stop_intent.store(true, Ordering::SeqCst);
+    let before = crate::test_sync::count("scheduler_claim_gate");
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let claim_state = Arc::clone(&state);
     let claimer = std::thread::spawn(crate::runtime::serving(move || {
@@ -243,7 +244,10 @@ fn affinity_reroute_keeps_claim_visible_until_idle_snapshot_finishes() {
         }
         std::thread::yield_now();
     }
-    let escaped = escaped.or_else(|| done_rx.recv_timeout(Duration::from_millis(100)).ok());
+    crate::test_sync::until("reroute never attempted decision gate", || {
+        crate::test_sync::count("scheduler_claim_gate") > before || escaped.is_some()
+    });
+    let escaped = escaped.or_else(|| done_rx.try_recv().ok());
     let visible = claims_in_flight();
     state.stop_intent.store(false, Ordering::SeqCst);
     drop(gate);

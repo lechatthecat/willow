@@ -41,7 +41,7 @@ fn close_aware_01_async_drain_until_closed() {
 async fn producer(ch: Channel<i64>) -> i64 {
     let mut i = 1;
     while i <= 3 {
-        await sleep(1);
+        await yield();
         ch.send(i * 10);
         i = i + 1;
     }
@@ -238,7 +238,7 @@ fn close_aware_09_string_payload_under_gc_stress() {
 async fn producer(ch: Channel<String>) -> i64 {
     let mut i = 0;
     while i < 4 {
-        await sleep(1);
+        await yield();
         ch.send("item" + i.to_string());
         i = i + 1;
     }
@@ -264,19 +264,23 @@ async fn main() {
 
 #[test]
 fn close_aware_10_parked_receiver_woken_by_close() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn consumer(ch: Channel<i64>) -> bool {
+async fn consumer(ch: Channel<i64>, ready: Channel<i64>) -> bool {
+    ready.send(test_current_task());
     return ch.recv_opt().is_none();
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let c = consumer(ch);
-    await sleep(10);
+    let ready = Channel<i64>::new();
+    let c = consumer(ch, ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
     ch.close();
     println(await c);
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -284,13 +288,14 @@ async fn main() {
 
 #[test]
 fn close_aware_11_every_parked_receiver_woken_by_close() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn consumer(ch: Channel<i64>) -> i64 {
+async fn consumer(ch: Channel<i64>, ready: Channel<i64>, consumed: AtomicI64) -> i64 {
+    ready.send(test_current_task());
     let mut n = 0;
     while true {
         match ch.recv_opt() {
-            Some(v) => { n = n + v; }
+            Some(v) => { n = n + v; consumed.add(1); }
             None => { break; }
         }
     }
@@ -298,18 +303,25 @@ async fn consumer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let a = consumer(ch);
-    let b = consumer(ch);
-    let c = consumer(ch);
-    await sleep(5);
+    let ready = Channel<i64>::new();
+    let consumed = AtomicI64::new(0);
+    let a = consumer(ch, ready, consumed);
+    let b = consumer(ch, ready, consumed);
+    let c = consumer(ch, ready, consumed);
+    let first = ready.recv();
+    let second = ready.recv();
+    let third = ready.recv();
+    while !test_task_parked(first) || !test_task_parked(second) || !test_task_parked(third) { await yield(); }
     ch.send(1);
     ch.send(1);
     ch.send(1);
-    await sleep(5);
+    while consumed.load() < 3 { await yield(); }
+    while !test_task_parked(first) || !test_task_parked(second) || !test_task_parked(third) { await yield(); }
     ch.close();
     println(await a + await b + await c);
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n");
@@ -317,9 +329,10 @@ async fn main() {
 
 #[test]
 fn close_aware_12_bounded_channel_drain() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn producer(ch: Channel<i64>) -> i64 {
+async fn producer(ch: Channel<i64>, ready: Channel<i64>) -> i64 {
+    ready.send(test_current_task());
     let mut i = 1;
     while i <= 5 {
         ch.send(i);
@@ -330,7 +343,12 @@ async fn producer(ch: Channel<i64>) -> i64 {
 }
 async fn main() {
     let ch = Channel<i64>::with_capacity(1);
-    let p = producer(ch);
+    let ready = Channel<i64>::new();
+    ch.send(0);
+    let p = producer(ch, ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
+    ch.recv();
     let mut total = 0;
     while true {
         match ch.recv_opt() {
@@ -342,6 +360,7 @@ async fn main() {
     println(total);
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "15\n");
@@ -349,27 +368,34 @@ async fn main() {
 
 #[test]
 fn close_aware_13_recv_opt_as_call_argument() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 fn or_zero(v: Option<i64>, bias: i64) -> i64 {
     return match v { Some(x) => x + bias, None => bias };
 }
-async fn feed(ch: Channel<i64>) -> i64 {
-    await sleep(5);
+async fn feed(ch: Channel<i64>, rounds: Channel<i64>) -> i64 {
+    let first = rounds.recv();
+    while !test_task_parked(first) { await yield(); }
     ch.send(40);
-    await sleep(5);
+    let second = rounds.recv();
+    while !test_task_parked(second) { await yield(); }
     ch.close();
     return 0;
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let f = feed(ch);
+    let rounds = Channel<i64>::new();
+    let id = test_current_task();
+    let f = feed(ch, rounds);
     let bias = 2;
+    rounds.send(id);
     println(or_zero(ch.recv_opt(), bias));
+    rounds.send(id);
     println(or_zero(ch.recv_opt(), bias));
     await f;
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n2\n");
@@ -384,7 +410,7 @@ async fn main() {
     ch.close();
     select {
         let v = ch.recv_opt() => { println(v.is_none()); }
-        sleep(1000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -437,16 +463,16 @@ async fn main() {
 
 #[test]
 fn close_aware_17_select_waits_for_close() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn closer(ch: Channel<i64>) -> i64 {
-    await sleep(10);
+async fn closer(ch: Channel<i64>, selecting: i64) -> i64 {
+    while !test_task_parked(selecting) { await yield(); }
     ch.close();
     return 0;
 }
 async fn main() {
     let ch = Channel<i64>::new();
-    let c = closer(ch);
+    let c = closer(ch, test_current_task());
     let mut seen = 0;
     while true {
         let mut done = false;
@@ -467,6 +493,7 @@ async fn main() {
     println("closed");
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\nclosed\n");
@@ -481,7 +508,7 @@ async fn main() {
     ch.close();
     select {
         ch.recv_opt() => { println("closed-or-value"); }
-        sleep(1000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -526,7 +553,7 @@ async fn main() {
     ch.close();
     select {
         let v = ch.recv() => { println(v); }
-        sleep(1000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,

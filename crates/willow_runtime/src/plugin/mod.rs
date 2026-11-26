@@ -36,8 +36,15 @@ pub struct ResourceId {
     number: u64,
 }
 #[derive(Clone)]
-pub struct Cancellation(Arc<AtomicU8>);
+pub struct Cancellation(Arc<AtomicU8>, #[cfg(test)] Arc<tests::CheckControl>);
 impl Cancellation {
+    fn new() -> Self {
+        Self(
+            Arc::new(AtomicU8::new(0)),
+            #[cfg(test)]
+            Arc::new(tests::CheckControl::default()),
+        )
+    }
     /// Returns true only for the transition that wins against response delivery.
     pub fn cancel(&self) -> bool {
         self.0
@@ -45,9 +52,15 @@ impl Cancellation {
             .is_ok()
     }
     fn check(&self, deadline: Instant) -> Result<(), Error> {
+        #[cfg(test)]
+        self.1.checkpoint();
+        #[cfg(test)]
+        let now = || self.1.now();
+        #[cfg(not(test))]
+        let now = Instant::now;
         if self.0.load(Ordering::Acquire) == 1 {
             Err(Error::Cancelled)
-        } else if Instant::now() >= deadline {
+        } else if now() >= deadline {
             Err(Error::Timeout)
         } else {
             Ok(())
@@ -260,7 +273,7 @@ impl Session {
             number: self.next_request,
         };
         self.next_request = next;
-        let cancellation = Cancellation(Arc::new(AtomicU8::new(0)));
+        let cancellation = Cancellation::new();
         self.pending.insert(
             id,
             Pending {

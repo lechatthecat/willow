@@ -632,7 +632,7 @@ fn runtime_cached_card_still_publishes_during_active_marking() {
         runtime().write_barrier_calls.load(Ordering::Relaxed),
         before + 1
     );
-    crate::gc::preemption_tolerant_remark_budget_for_test();
+    crate::gc::deterministic_remark_clock_for_test();
     let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now())
         .expect("native array tracing closes concurrently");
     assert!(cycle.is_marked(child as usize));

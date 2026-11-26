@@ -192,21 +192,21 @@ fn coord_register_makes_multi_mutator_active_from_other_thread() {
     reset_gc();
     assert!(!multi_mutator_active(), "no mutators registered yet");
     // A second registered thread makes this thread see a foreign mutator.
-    let handle = std::thread::spawn(crate::runtime::serving(|| {
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(crate::runtime::serving(move || {
         willow_gc_register_mutator();
-        // Keep the registration alive until the main thread observes it.
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        ready_tx.send(()).unwrap();
+        release_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
         willow_gc_unregister_mutator();
     }));
-    // Spin briefly until the worker has registered.
-    let mut saw = false;
-    for _ in 0..200 {
-        if multi_mutator_active() {
-            saw = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    ready_rx
+        .recv_timeout(std::time::Duration::from_secs(30))
+        .unwrap();
+    let saw = multi_mutator_active();
+    release_tx.send(()).unwrap();
     handle.join().unwrap();
     assert!(
         saw,
@@ -376,7 +376,7 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
             if unsafe { &*stop.cast::<AtomicBool>() }.load(Ordering::Acquire) {
                 crate::preempt::willow_sync_safepoint();
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
         // SAFETY: The removed shadow-stack entries belong to this operation and their slot
         // storage is still live.
@@ -384,9 +384,9 @@ fn multi_mutator_stw_keeps_other_thread_roots_alive_through_generated_gate() {
         drop(mutator);
     }));
 
-    while !ready.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    crate::test_sync::until("mutator registration reached", || {
+        ready.load(Ordering::SeqCst)
+    });
 
     let before = willow_gc_allocated_bytes();
     // Stop-the-world collection: scans main's A AND the worker's published B.
@@ -457,13 +457,13 @@ fn multi_mutator_stw_frees_unrooted_object() {
         r2.store(true, Ordering::SeqCst);
         while !d2.load(Ordering::SeqCst) {
             willow_gc_safepoint();
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::yield_now();
         }
         drop(mutator);
     }));
-    while !ready.load(Ordering::SeqCst) {
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    crate::test_sync::until("mutator registration reached", || {
+        ready.load(Ordering::SeqCst)
+    });
     // An unrooted object must be collected even under multi-mutator STW.
     // SAFETY: The requested layout describes the initialized words of this object and its
     // type’s tracing or finalization contract.

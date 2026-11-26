@@ -1,0 +1,16 @@
+// A synchronous select may drive a producer on another scheduler worker.
+// Receiving the published value must succeed even when that producer has finished.
+async fn produce(channel: Channel<i64>) {
+    await yield();
+    channel.send(42);
+}
+fn receive(channel: Channel<i64>) -> i64 {
+    select { let value = channel.recv() => { return value; } }
+    return -1;
+}
+async fn main() {
+    let channel = Channel<i64>::new();
+    let producer = produce(channel);
+    println(receive(channel));
+    await producer;
+}

@@ -9,6 +9,8 @@ struct State {
     finished: Arc<AtomicU64>,
     running: bool,
     shutdown: bool,
+    #[cfg(test)]
+    retry_clock: Option<Arc<tests::RetryClock>>,
 }
 
 pub(super) struct Coordinator {
@@ -216,6 +218,51 @@ fn run(
     });
 }
 
+// The same deadline policy serves real condvar waits and test-controlled
+// clock/wake steps. It owns no roots and does not run on a mutator hot path.
+fn retry_backoff_with<'a>(
+    mut state: std::sync::MutexGuard<'a, State>,
+    mut now: impl FnMut() -> std::time::Duration,
+    mut wait: impl FnMut(
+        std::sync::MutexGuard<'a, State>,
+        std::time::Duration,
+    ) -> std::sync::MutexGuard<'a, State>,
+) -> std::sync::MutexGuard<'a, State> {
+    let began = now();
+    let budget = std::time::Duration::from_millis(10);
+    while !state.shutdown {
+        let remaining = budget.saturating_sub(now().saturating_sub(began));
+        if remaining.is_zero() {
+            break;
+        }
+        state = wait(state, remaining);
+    }
+    state
+}
+
+fn retry_backoff<'a>(
+    state: std::sync::MutexGuard<'a, State>,
+    cv: &Condvar,
+) -> std::sync::MutexGuard<'a, State> {
+    #[cfg(test)]
+    if let Some(clock) = state.retry_clock.clone() {
+        return retry_backoff_with(
+            state,
+            || std::time::Duration::from_nanos(clock.now.load(Ordering::Acquire)),
+            |state, _| {
+                clock.waits.fetch_add(1, Ordering::Release);
+                cv.wait(state).unwrap()
+            },
+        );
+    }
+    let began = std::time::Instant::now();
+    retry_backoff_with(
+        state,
+        || began.elapsed(),
+        |state, remaining| cv.wait_timeout(state, remaining).unwrap().0,
+    )
+}
+
 fn run_loop(service_owner: &Owner, shared: Arc<(Mutex<State>, Condvar)>) {
     let (lock, cv) = &*shared;
     loop {
@@ -248,12 +295,7 @@ fn run_loop(service_owner: &Owner, shared: Arc<(Mutex<State>, Condvar)>) {
                 // notification edge. Retry at most once per 10ms while fully
                 // unregistered; shutdown interrupts this wait. New requests and
                 // spurious wakes cannot shorten the backoff into a busy loop.
-                state = cv
-                    .wait_timeout_while(state, std::time::Duration::from_millis(10), |state| {
-                        !state.shutdown
-                    })
-                    .unwrap()
-                    .0;
+                state = retry_backoff(state, cv);
             } else {
                 drop(state);
                 cycle_wait::wait_for_current_cycle_in(&owner);
@@ -316,6 +358,23 @@ pub(super) fn shutdown_in(owner: &crate::runtime::Runtime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    pub(super) struct RetryClock {
+        pub(super) now: AtomicU64,
+        pub(super) waits: AtomicU64,
+    }
+
+    fn await_retry_wait(shared: &(Mutex<State>, Condvar), clock: &RetryClock, target: u64) {
+        crate::test_sync::until("coordinator did not enter retry wait", || {
+            willow_gc_safepoint();
+            clock.waits.load(Ordering::Acquire) >= target
+        });
+        // The wait counter is raised under the predicate lock. Taking it
+        // proves the worker crossed the atomic condvar wait boundary.
+        drop(shared.0.lock().unwrap());
+    }
+
     #[derive(Default)]
     struct TracePause {
         entered: std::sync::atomic::AtomicBool,
@@ -801,6 +860,15 @@ mod tests {
                 }));
                 ready_rx.recv().unwrap();
                 let registration = asynchronous.then(MutatorRegistration::new);
+                let controlled = asynchronous.then(|| {
+                    let clock = Arc::new(RetryClock::default());
+                    let coordinator =
+                        Coordinator::new(Owner::Static(crate::runtime::current())).unwrap();
+                    coordinator.shared.0.lock().unwrap().retry_clock = Some(clock.clone());
+                    let shared = coordinator.shared.clone();
+                    *runtime().coordinator.lock().unwrap() = Some(coordinator);
+                    (shared, clock)
+                });
                 let before = gc_progress();
                 let receipt = opportunity::request_tracked(opportunity::Priority::Required, None);
                 let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -812,23 +880,37 @@ mod tests {
                         assert!(std::time::Instant::now() < deadline);
                         std::thread::yield_now();
                     }
-                    let began = std::time::Instant::now();
+                    let (shared, clock) = controlled.as_ref().unwrap();
+                    await_retry_wait(shared, clock, 1);
                     let skips = gc_progress().skipped_collections;
-                    while began.elapsed() < std::time::Duration::from_millis(35) {
+                    for _ in 0..4 {
+                        // Notifications at fixed virtual time must re-enter
+                        // the same backoff without a new collection attempt.
+                        let state = shared.0.lock().unwrap();
+                        let waits = clock.waits.load(Ordering::Acquire) + 1;
+                        shared.1.notify_all();
+                        drop(state);
+                        await_retry_wait(shared, clock, waits);
                         assert!(!receipt.is_complete());
-                        willow_gc_safepoint();
-                        // Exercise spurious wakeups during the timed backoff.
-                        if let Some(coordinator) = runtime().coordinator.lock().unwrap().as_ref() {
-                            coordinator.shared.1.notify_all();
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        assert_eq!(gc_progress().skipped_collections, skips);
                     }
-                    // Count attempts, not CPU timing: even spurious wakes cannot
-                    // turn the foreign-owner retry path into an unbounded loop.
-                    assert!(
-                        gc_progress().skipped_collections - skips
-                            <= began.elapsed().as_millis() as u64 / 10 + 2
-                    );
+                    for round in 1..=3 {
+                        let state = shared.0.lock().unwrap();
+                        let waits = clock.waits.load(Ordering::Acquire) + 1;
+                        clock.now.store(round * 10_000_000 - 1, Ordering::Release);
+                        shared.1.notify_all();
+                        drop(state);
+                        await_retry_wait(shared, clock, waits);
+                        assert!(gc_progress().skipped_collections < skips + round);
+                        let state = shared.0.lock().unwrap();
+                        let waits = clock.waits.load(Ordering::Acquire) + 1;
+                        clock.now.store(round * 10_000_000, Ordering::Release);
+                        shared.1.notify_all();
+                        drop(state);
+                        await_retry_wait(shared, clock, waits);
+                        assert!(gc_progress().skipped_collections >= skips + round);
+                        assert!(!receipt.is_complete());
+                    }
                 } else {
                     assert!(
                         receipt.is_none(),
@@ -855,6 +937,12 @@ mod tests {
                     std::thread::yield_now();
                 }
                 owner.join().unwrap();
+                if let Some((shared, clock)) = &controlled {
+                    let state = shared.0.lock().unwrap();
+                    clock.now.fetch_add(10_000_000, Ordering::Release);
+                    shared.1.notify_all();
+                    drop(state);
+                }
                 let receipt = receipt.unwrap_or_else(|| {
                     opportunity::request_tracked(opportunity::Priority::Required, None).unwrap()
                 });

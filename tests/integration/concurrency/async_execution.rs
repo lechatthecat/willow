@@ -137,7 +137,7 @@ fn async_frame_narrowing_drops_locals_that_are_dead_at_every_suspension() {
 fn coop_shadow_roots_unwind_on_scope_and_terminal_ready() {
     let source = r#"
 async fn leak_root() {
-    await sleep(0);
+    await yield();
     if true {
         let branch_dead = "branch" + " root";
     }
@@ -180,7 +180,7 @@ fn coop_shadow_roots_unwind_and_restore_across_poll_returns() {
     }
     source.push_str(
         r#"
-    await sleep(0);
+    await yield();
     let after = "still" + " alive";
     println(after);
 }
@@ -217,7 +217,7 @@ async fn matched() {
         _ => {}
     }
 
-    await sleep(0);
+    await yield();
     let after = "match" + " ok";
     println(after);
 }
@@ -252,7 +252,7 @@ async fn deferred() {
     defer {
         let dead = "defer" + " root";
     }
-    await sleep(0);
+    await yield();
     return;
 }
 
@@ -338,8 +338,9 @@ async fn main() {
 #[test]
 fn preempt_async_spin_does_not_starve_timer_task() {
     let source = r#"
-async fn spin(done: AtomicBool) -> i64 {
+async fn spin(done: AtomicBool, started: AtomicBool) -> i64 {
     while !done.load() {
+        started.store(true);
     }
     return 0;
 }
@@ -351,13 +352,18 @@ async fn delayed(done: AtomicBool) -> i64 {
 }
 async fn main() {
     let done = AtomicBool::new(false);
-    let background = spin(done);
+    let started = AtomicBool::new(false);
+    let background = spin(done, started);
+    while !started.load() { await yield(); }
     await delayed(done);
     await background;
 }
 "#;
 
-    let (out, ok) = compile_and_run_with_env(source, &[("WILLOW_TASK_BUDGET", "1")]);
+    let (out, ok) = compile_and_run_with_env(
+        source,
+        &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_WORKERS", "1")],
+    );
     assert!(ok, "background CPU spin must not starve the timer task");
     assert_eq!(out, "42\n");
 }
@@ -446,26 +452,29 @@ async fn main() {
 #[test]
 fn preempt_await_channel_and_allocation_statements_resume() {
     let source = r#"
-async fn producer(ch: Channel<String>) -> i64 {
-    await sleep(1);
+async fn producer(ch: Channel<String>, ready: Channel<i64>) -> i64 {
+    let consumer = ready.recv();
+    while !test_task_parked(consumer) { await yield(); }
     let value = "pre" + "empt";
     ch.send(value);
     return 0;
 }
-async fn consumer(ch: Channel<String>) -> String {
+async fn consumer(ch: Channel<String>, ready: Channel<i64>) -> String {
+    ready.send(test_current_task());
     let value = ch.recv();
     return value;
 }
 async fn main() {
     let ch = Channel<String>::new();
-    let p = producer(ch);
-    let c = consumer(ch);
+    let ready = Channel<i64>::new();
+    let p = producer(ch, ready);
+    let c = consumer(ch, ready);
     println(await c);
     await p;
 }
 "#;
 
-    let (out, ok) = compile_and_run_with_env(
+    let (out, ok) = compile_and_run_with_test_sync(
         source,
         &[("WILLOW_TASK_BUDGET", "1"), ("WILLOW_GC_STRESS", "alloc")],
     );

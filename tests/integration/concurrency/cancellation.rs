@@ -11,8 +11,8 @@ use super::*;
 // 9 other tasks are unaffected, 10 cancelled task's post-await side effects
 // never run, 11 fan-out with one cancelled member, 12 cancel in a loop over
 // handles, 13 program exits cleanly with a cancelled task never awaited,
-// 14 is_cancelled after finalization stays true, 15 sleeping 10s task
-// cancelled -> program finishes fast (parked-wake path), 16 cancel + GC
+// 14 is_cancelled after finalization stays true, 15 parked far-future timer
+// cancelled -> program terminates (parked-wake path), 16 cancel + GC
 // stress (frame root released for Cancelled), 17 void-returning task cancel,
 // 18 is_cancelled on completed-then-cancel-requested stays false-ish (no-op),
 // 19 checker rejects cancel with arguments, 20 checker rejects cancel on a
@@ -20,11 +20,10 @@ use super::*;
 
 #[test]
 fn cancel_01_request_visible_immediately() {
-    // The task must still be in flight when cancel() lands, so it sleeps; a
-    // no-await task can legitimately COMPLETE before main cancels under the
-    // multi-worker scheduler (that no-op case is cancel_06/cancel_18).
+    // An unsent channel prevents completion before cancel even if another
+    // worker runs the entire body before main resumes.
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(200); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -32,8 +31,29 @@ fn cancel_01_request_visible_immediately() {
 
 #[test]
 fn cancel_02_while_parked_on_timer() {
-    let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); await sleep(1); h.cancel(); println(h.is_cancelled()); }",
+    // The virtual clock stays at zero; only cancellation can release this timer.
+    let (out, ok) = compile_and_run_with_virtual_time(
+        r#"
+async fn t(ready: Channel<i64>) -> i64 {
+    ready.send(test_current_task());
+    await sleep(30);
+    return 1;
+}
+async fn main() {
+    test_set_time(0);
+    let ready = Channel<i64>::new();
+    let h = t(ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
+    h.cancel();
+    println(h.is_cancelled());
+    match await h.result() {
+        Ok(value) => println("unexpected completion"),
+        Err(Cancelled) => {},
+    }
+}
+"#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -42,7 +62,7 @@ fn cancel_02_while_parked_on_timer() {
 #[test]
 fn cancel_03_is_cancelled_after_request() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(20); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -60,7 +80,7 @@ fn cancel_04_untouched_task_not_cancelled() {
 #[test]
 fn cancel_05_idempotent() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(20); return 1; }\nfn main() { let h = t(); h.cancel(); h.cancel(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nfn main() { let h = t(); h.cancel(); h.cancel(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -78,7 +98,7 @@ fn cancel_06_after_completion_noop() {
 #[test]
 fn cancel_07_await_cancelled_panics_with_id() {
     let (out, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nasync fn main() { let h = t(); h.cancel(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains("awaited a cancelled task (task"), "{out}");
@@ -87,7 +107,7 @@ fn cancel_07_await_cancelled_panics_with_id() {
 #[test]
 fn cancel_08_await_cancelled_aborts() {
     let (_, ok) = compile_and_run_check_exit(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nasync fn main() { let h = t(); h.cancel(); await h; }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nasync fn main() { let h = t(); h.cancel(); await h; }",
     );
     assert!(!ok);
 }
@@ -95,7 +115,7 @@ fn cancel_08_await_cancelled_aborts() {
 #[test]
 fn cancel_09_other_tasks_unaffected() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(5); return n * 10; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); b.cancel(); println(await a); println(await c); }",
+        "async fn t(n: i64) -> i64 { if n == 2 { let gate = Channel<i64>::new(); gate.recv(); } await yield(); return n * 10; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); b.cancel(); println(await a); println(await c); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "10\n30\n");
@@ -103,9 +123,9 @@ fn cancel_09_other_tasks_unaffected() {
 
 #[test]
 fn cancel_10_post_await_side_effects_never_run() {
-    // The cancelled task must NOT print after its sleep resumes.
+    // Cancellation completes before checking that the gated side effect never ran.
     let (out, ok) = compile_and_run(
-        "async fn noisy() -> i64 { await sleep(10); println(999); return 1; }\nasync fn main() { let h = noisy(); h.cancel(); await sleep(40); println(0); }",
+        "async fn noisy(ready: AtomicBool) -> i64 { await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); println(999); return 1; }\nasync fn main() { let ready = AtomicBool::new(false); let h = noisy(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n");
@@ -114,7 +134,7 @@ fn cancel_10_post_await_side_effects_never_run() {
 #[test]
 fn cancel_11_fan_out_with_one_cancelled() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(5); return n; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); let d = t(4); c.cancel(); println(await a + await b + await d); }",
+        "async fn t(n: i64) -> i64 { if n == 3 { let gate = Channel<i64>::new(); gate.recv(); } await yield(); return n; }\nasync fn main() { let a = t(1); let b = t(2); let c = t(3); let d = t(4); c.cancel(); println(await a + await b + await d); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -123,7 +143,7 @@ fn cancel_11_fan_out_with_one_cancelled() {
 #[test]
 fn cancel_12_loop_over_handles() {
     let (out, ok) = compile_and_run(
-        "async fn t(n: i64) -> i64 { await sleep(20); return n; }\nfn main() { let a = t(1); let b = t(2); a.cancel(); b.cancel(); println(a.is_cancelled()); println(b.is_cancelled()); }",
+        "async fn t(n: i64) -> i64 { let gate = Channel<i64>::new(); gate.recv(); return n; }\nfn main() { let a = t(1); let b = t(2); a.cancel(); b.cancel(); println(a.is_cancelled()); println(b.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\ntrue\n");
@@ -132,7 +152,7 @@ fn cancel_12_loop_over_handles() {
 #[test]
 fn cancel_13_program_exits_with_unawaited_cancelled() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(30); return 1; }\nfn main() { let h = t(); h.cancel(); println(7); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nfn main() { let h = t(); h.cancel(); println(7); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -141,7 +161,7 @@ fn cancel_13_program_exits_with_unawaited_cancelled() {
 #[test]
 fn cancel_14_stays_cancelled_after_finalization() {
     let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(5); return 1; }\nasync fn main() { let h = t(); h.cancel(); await sleep(30); println(h.is_cancelled()); }",
+        "async fn t() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }\nasync fn main() { let h = t(); h.cancel(); await h.result(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -149,10 +169,29 @@ fn cancel_14_stays_cancelled_after_finalization() {
 
 #[test]
 fn cancel_15_long_sleeper_finishes_fast() {
-    // A 10-second sleeper cancelled immediately: the run must finish well
-    // within the harness timeout because cancel re-queues the parked task.
-    let (out, ok) = compile_and_run(
-        "async fn t() -> i64 { await sleep(10000); return 1; }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+    // The timer is the behavior under test. Observe its parked state before
+    // cancelling. Virtual time stays frozen, so completion must come from cancel.
+    let (out, ok) = compile_and_run_with_virtual_time(
+        r#"
+async fn t(ready: Channel<i64>) -> i64 {
+    ready.send(test_current_task());
+    await sleep(30);
+    return 1;
+}
+async fn main() {
+    test_set_time(0);
+    let ready = Channel<i64>::new();
+    let h = t(ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
+    h.cancel();
+    match await h.result() {
+        Ok(value) => println("unexpected completion"),
+        Err(Cancelled) => println(h.is_cancelled()),
+    }
+}
+"#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");
@@ -160,36 +199,39 @@ fn cancel_15_long_sleeper_finishes_fast() {
 
 #[test]
 fn cancel_16_gc_stress() {
-    // GC stress can delay the caller beyond the timer. An unsent channel
-    // prevents normal completion before cancellation, regardless of scheduling.
-    for delay in [0, 80] {
+    // Exercise immediate cancellation and cancellation after a definite yield.
+    // The unsent gate prevents normal completion in either schedule.
+    for started in [false, true] {
         let source = format!(
             r#"
-async fn t(gate: Channel<i64>) -> String {{
-    await sleep(20);
+async fn t(ready: AtomicBool, gate: Channel<i64>) -> String {{
+    await yield();
+    ready.store(true);
     gate.recv();
     return "kept";
 }}
 async fn main() {{
     let gate = Channel<i64>::new();
-    let h = t(gate);
-    await sleep({delay});
+    let ready = AtomicBool::new(false);
+    let h = t(ready, gate);
+    if {started} {{ while !ready.load() {{ await yield(); }} }}
     h.cancel();
-    await sleep(40);
+    await h.result();
+    gc_collect();
     println(h.is_cancelled());
 }}
 "#
         );
         let (out, ok) = compile_and_run_gc_stress(&source);
-        assert!(ok, "delay={delay}: {out}");
-        assert_eq!(out, "true\n", "delay={delay}");
+        assert!(ok, "started={started}: {out}");
+        assert_eq!(out, "true\n", "started={started}");
     }
 }
 
 #[test]
 fn cancel_17_void_task() {
     let (out, ok) = compile_and_run(
-        "async fn t() { await sleep(20); }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
+        "async fn t() { let gate = Channel<i64>::new(); gate.recv(); }\nfn main() { let h = t(); h.cancel(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");

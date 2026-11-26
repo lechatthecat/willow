@@ -1846,3 +1846,292 @@ pub(super) fn compile_and_collect_panic_events(source: &str, env: &[(&str, &str)
     events.dedup();
     events
 }
+
+/// Runtime protocol fixtures use existing ABI state through a test-only bridge.
+/// No scheduling delay is used to infer that another task has parked.
+pub(super) fn compile_and_run_with_test_sync(
+    source: &str,
+    environment: &[(&str, &str)],
+) -> (String, bool) {
+    protocol_output(compile_and_run_protocol_fixture(
+        source,
+        environment,
+        false,
+        false,
+    ))
+}
+
+pub(super) fn compile_and_run_with_virtual_time(
+    source: &str,
+    environment: &[(&str, &str)],
+) -> (String, bool) {
+    protocol_output(compile_and_run_protocol_fixture(
+        source,
+        environment,
+        true,
+        false,
+    ))
+}
+
+pub(super) fn compile_and_run_with_virtual_time_output(
+    source: &str,
+    environment: &[(&str, &str)],
+) -> (String, String, bool) {
+    compile_and_run_protocol_fixture(source, environment, true, false)
+}
+
+pub(super) fn compile_and_run_with_test_sync_release(
+    source: &str,
+    environment: &[(&str, &str)],
+) -> (String, bool) {
+    protocol_output(compile_and_run_protocol_fixture(
+        source,
+        environment,
+        false,
+        true,
+    ))
+}
+
+pub(super) fn compile_and_run_with_test_sync_output(
+    source: &str,
+    environment: &[(&str, &str)],
+) -> (String, String, bool) {
+    compile_and_run_protocol_fixture(source, environment, false, false)
+}
+
+fn protocol_output((stdout, stderr, ok): (String, String, bool)) -> (String, bool) {
+    (
+        if ok {
+            stdout
+        } else {
+            format!("{stdout}{stderr}")
+        },
+        ok,
+    )
+}
+
+const RUNTIME_PROTOCOL_BRIDGE: &str = r#"
+unsafe extern "C" {
+    fn willow_sched_current_task() -> u64;
+    fn willow_sched_task_state(id: u64) -> i32;
+    fn willow_sched_wake(id: u64);
+    fn willow_runtime_set_event_hook_v1(hook: Option<unsafe extern "C" fn(*const Event, *mut std::ffi::c_void)>, context: *mut std::ffi::c_void);
+}
+#[repr(C)]
+struct Event {
+    version: u32, struct_size: u32, kind: u32, worker: u32,
+    task_id: u64, value: i64, timestamp_ns: u64,
+}
+static PARKS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u64, i64>>> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+static CHANNEL_WAITS: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+pub fn test_task_parks(id: i64) -> i64 { PARKS.lock().unwrap().get(&(id as u64)).copied().unwrap_or(0) }
+pub fn test_channel_waits() -> i64 { CHANNEL_WAITS.load(std::sync::atomic::Ordering::SeqCst) }
+pub fn test_wake_task(id: i64) {
+    // SAFETY: wake accepts any numeric task identifier.
+    unsafe { willow_sched_wake(id as u64) };
+}
+static OBSERVED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+unsafe extern "C" fn spawned(event: *const Event, _: *mut std::ffi::c_void) {
+    // SAFETY: the runtime supplies its live versioned record for this call.
+    let event = unsafe { &*event };
+    if event.version == 1 && event.kind == 4 {
+        *PARKS.lock().unwrap().entry(event.task_id).or_default() += 1;
+    }
+    if event.version == 1 && event.kind == 14 {
+        CHANNEL_WAITS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    if event.version == 1 && event.kind == 1 {
+        let _ = OBSERVED.compare_exchange(0, event.task_id, std::sync::atomic::Ordering::SeqCst, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+pub fn test_observe_next_task() {
+    OBSERVED.store(0, std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: callback/context have static lifetime. The callback updates
+    // atomic observations and the briefly locked per-task park counter map.
+    unsafe { willow_runtime_set_event_hook_v1(Some(spawned), std::ptr::null_mut()) };
+}
+pub fn test_observed_task() -> i64 { OBSERVED.load(std::sync::atomic::Ordering::SeqCst) as i64 }
+pub fn test_task_finished(id: i64) -> bool {
+    // SAFETY: task-state lookup accepts any numeric task identifier.
+    unsafe { willow_sched_task_state(id as u64) == -1 }
+}
+pub fn test_current_task() -> i64 {
+    // SAFETY: querying the current task requires no borrowed storage.
+    unsafe { willow_sched_current_task() as i64 }
+}
+pub fn test_task_parked(id: i64) -> bool {
+    // SAFETY: task-state lookup accepts any numeric task identifier.
+    unsafe { willow_sched_task_state(id as u64) == 2 }
+}
+pub fn test_task_blocked_syscall(id: i64) -> bool {
+    // SAFETY: task-state lookup accepts any numeric task identifier; the ABI
+    // maps the scheduler's BlockedSyscall lifecycle to 7.
+    unsafe { willow_sched_task_state(id as u64) == 7 }
+}
+"#;
+
+fn compile_and_run_protocol_fixture(
+    source: &str,
+    environment: &[(&str, &str)],
+    virtual_time: bool,
+    release: bool,
+) -> (String, String, bool) {
+    let root = std::path::PathBuf::from(temp_path(format!(
+        "willow_protocol_test_{}",
+        unique_test_id()
+    )));
+    fs::create_dir_all(root.join("src")).unwrap();
+    fs::write(
+        root.join("project.toml"),
+        r#"
+[project]
+name = "runtime_protocol_fixture"
+version = "0.1.0"
+[rust]
+bridge = "bridge.rs"
+[rust-dependencies]
+willow_bridge_native = { path = "native", default-features = false, features = ["answer"] }
+"#,
+    )
+    .unwrap();
+    let bridge_fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_bridge/path");
+    for file in ["native/Cargo.toml", "native/src/lib.rs"] {
+        fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
+        fs::copy(bridge_fixture.join(file), root.join(file)).unwrap();
+    }
+    fs::write(root.join("bridge.rs"), RUNTIME_PROTOCOL_BRIDGE).unwrap();
+    if virtual_time {
+        use std::io::Write;
+        let mut bridge = fs::OpenOptions::new()
+            .append(true)
+            .open(root.join("bridge.rs"))
+            .unwrap();
+        bridge
+            .write_all(
+                br#"
+unsafe extern "C" {
+    fn willow_test_clock_set_millis(millis: i64);
+    fn willow_test_sync_send_waits() -> i64;
+    fn willow_test_sync_recv_waits() -> i64;
+    fn willow_test_frames_reclaimed() -> i64;
+}
+pub fn test_frames_reclaimed() -> i64 { unsafe { willow_test_frames_reclaimed() } }
+pub fn test_sync_send_waits() -> i64 { unsafe { willow_test_sync_send_waits() } }
+pub fn test_sync_recv_waits() -> i64 { unsafe { willow_test_sync_recv_waits() } }
+pub fn test_set_time(millis: i64) {
+    // SAFETY: fixture advances monotonically after observing protocol states.
+    unsafe { willow_test_clock_set_millis(millis) };
+}
+"#,
+            )
+            .unwrap();
+    }
+    let clock_declaration = if virtual_time {
+        "nonblocking(\"REVIEW\") fn test_set_time(millis: i64); nonblocking(\"REVIEW\") fn test_sync_send_waits() -> i64; nonblocking(\"REVIEW\") fn test_sync_recv_waits() -> i64; nonblocking(\"REVIEW\") fn test_frames_reclaimed() -> i64;"
+    } else {
+        ""
+    };
+    // Bridge calls read task/TLS state or update bounded test coordination;
+    // none performs an I/O wait. Bind the test-only nonblocking assertion to
+    // exactly the bridge source and project inputs.
+    let fixture = format!(
+        "{source}\nextern rust {{ nonblocking(\"REVIEW\") fn test_current_task() -> i64; nonblocking(\"REVIEW\") fn test_task_parked(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_task_blocked_syscall(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_task_finished(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_observe_next_task(); nonblocking(\"REVIEW\") fn test_observed_task() -> i64; nonblocking(\"REVIEW\") fn test_task_parks(id: i64) -> i64; nonblocking(\"REVIEW\") fn test_channel_waits() -> i64; nonblocking(\"REVIEW\") fn test_wake_task(id: i64); {clock_declaration} }}\n"
+    );
+    fs::write(
+        root.join("src/main.wi"),
+        fixture.replace("REVIEW", &"0".repeat(64)),
+    )
+    .unwrap();
+    let review = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .current_dir(&root)
+        .args(["query", "rust-bridge", "--offline", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(
+        review.status.success(),
+        "{}",
+        String::from_utf8_lossy(&review.stderr)
+    );
+    let review: serde_json::Value = serde_json::from_slice(&review.stdout).unwrap();
+    fs::write(
+        root.join("rust-review.toml"),
+        format!(
+            "fingerprint = \"{}\"\n",
+            review["review_fingerprint"].as_str().unwrap()
+        ),
+    )
+    .unwrap();
+    fs::write(
+        root.join("src/main.wi"),
+        fixture.replace(
+            "REVIEW",
+            review["legacy_review_fingerprint"].as_str().unwrap(),
+        ),
+    )
+    .unwrap();
+    let binary = root.join(if cfg!(windows) {
+        "program.exe"
+    } else {
+        "program"
+    });
+    let mut compiler = Command::new(env!("CARGO_BIN_EXE_willow"));
+    compiler.arg("build").arg(&root).arg("-o").arg(&binary);
+    if release {
+        compiler.arg("--release");
+    }
+    if virtual_time {
+        static RUNTIME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        let library = RUNTIME.get_or_init(|| {
+            let target = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("target/deterministic-test-clock");
+            let output = Command::new("cargo")
+                .current_dir(env!("CARGO_MANIFEST_DIR"))
+                .args([
+                    "build",
+                    "-p",
+                    "willow_runtime",
+                    "--features",
+                    "deterministic-test-clock",
+                    "--target-dir",
+                ])
+                .arg(&target)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            target.join("debug").join(if cfg!(windows) {
+                "willow_runtime.lib"
+            } else {
+                "libwillow_runtime.a"
+            })
+        });
+        compiler.arg("--runtime-lib").arg(library);
+    }
+    let compiled = compiler.envs(environment.iter().copied()).output().unwrap();
+    if !compiled.status.success() {
+        let diagnostic = format!(
+            "{}{}",
+            String::from_utf8_lossy(&compiled.stdout),
+            String::from_utf8_lossy(&compiled.stderr)
+        );
+        let _ = fs::remove_dir_all(&root);
+        return (String::new(), diagnostic, false);
+    }
+    let child = Command::new(binary)
+        .envs(environment.iter().copied())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (output, timed_out) = wait_with_timeout(child, Duration::from_secs(60));
+    let _ = fs::remove_dir_all(&root);
+    (
+        String::from_utf8_lossy(&output.stdout).into_owned(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+        output.status.success() && !timed_out,
+    )
+}

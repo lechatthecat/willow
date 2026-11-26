@@ -3577,24 +3577,19 @@ pub unsafe fn reset_internal_for_test() {
     crate::frame_lifetime::reset();
     runtime()
         .remark_observation
-        .work_ns
+        .elapsed_ns
         .store(0, Ordering::Relaxed);
 }
 
-/// Give this runtime's remark stops a 100ms wall-clock work budget until the
-/// next [`reset_internal_for_test`], instead of the 1ms default.
-///
-/// A remark stop that exceeds its work budget correctly abandons the
-/// concurrent closure for the stopped fallback, so `mark_closure::finish`
-/// returns `None`. A test that requires the concurrent closure to succeed
-/// must not depend on the collector thread staying scheduled for a whole
-/// millisecond: a preempted CI runner exceeds that without any GC fault.
+/// Freeze the remark clock while retaining the production slot/byte limits.
+/// Tests advance `elapsed_ns` explicitly to exercise exhaustion. This observer
+/// is compiled out of production, including the clock-selection branch.
 #[cfg(test)]
-pub(crate) fn preemption_tolerant_remark_budget_for_test() {
+pub(crate) fn deterministic_remark_clock_for_test() {
     runtime()
         .remark_observation
-        .work_ns
-        .store(100_000_000, Ordering::Relaxed);
+        .elapsed_ns
+        .store(0, Ordering::Relaxed);
 }
 
 /// A fresh, empty generated-TLS block for tests in sibling modules that need a

@@ -15,7 +15,7 @@ use super::*;
 // 10 async METHOD defer, 11 string operand + GC stress across cancel,
 // 12 print form, 13 two flagged sites run reverse-lexically on cancel,
 // 14 await after cancel still panics AFTER cleanup ran, 15 cancel of a
-// sleep-parked task runs defers promptly (10s sleeper), 16 defer in async
+// sleep-parked task runs defers on cancellation (far-future timer), 16 defer in async
 // loop body registers and flushes once per lexical iteration, 17 await inside
 // defer rejected,
 // 18 async callee inside defer rejected (async context too), 19 args
@@ -33,7 +33,7 @@ use super::*;
 #[test]
 fn adfr_01_normal_return_lifo() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { defer c(1); defer c(2); await sleep(1); return 7; }\nasync fn main() { println(await w()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { defer c(1); defer c(2); await yield(); return 7; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\n7\n");
@@ -42,7 +42,7 @@ fn adfr_01_normal_return_lifo() {
 #[test]
 fn adfr_02_fallthrough_flushes() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(3); }\nasync fn w() { defer c(); await sleep(1); println(1); }\nasync fn main() { await w(); println(9); }",
+        "fn c() { println(3); }\nasync fn w() { defer c(); await yield(); println(1); }\nasync fn main() { await w(); println(9); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n3\n9\n");
@@ -51,7 +51,7 @@ fn adfr_02_fallthrough_flushes() {
 #[test]
 fn adfr_03_return_position_await_flushes() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(5); }\nasync fn inner() -> i64 { await sleep(1); return 4; }\nasync fn w() -> i64 { defer c(); return await inner(); }\nasync fn main() { println(await w()); }",
+        "fn c() { println(5); }\nasync fn inner() -> i64 { await yield(); return 4; }\nasync fn w() -> i64 { defer c(); return await inner(); }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "5\n4\n");
@@ -60,7 +60,7 @@ fn adfr_03_return_position_await_flushes() {
 #[test]
 fn adfr_04_cancel_runs_pending() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(42); }\nasync fn w(ready: AtomicBool) { defer c(); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(h.is_cancelled()); }",
+        "fn c() { println(42); }\nasync fn w(ready: AtomicBool) { defer c(); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(h.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\ntrue\n");
@@ -70,7 +70,7 @@ fn adfr_04_cancel_runs_pending() {
 fn adfr_05_cancel_only_registered_sites() {
     // Site 2 sits AFTER the suspension the cancel interrupts: never registered.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(10); ready.store(true); await sleep(5000); defer c(20); await sleep(1); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(10); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); defer c(20); await yield(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "10\n0\n");
@@ -89,7 +89,7 @@ fn adfr_06_cancel_before_registration() {
 #[test]
 fn adfr_07_no_double_run_after_completion() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(8); }\nasync fn w() -> i64 { defer c(); await sleep(1); return 1; }\nasync fn main() { let h = w(); println(await h); h.cancel(); await h.result(); println(0); }",
+        "fn c() { println(8); }\nasync fn w() -> i64 { defer c(); await yield(); return 1; }\nasync fn main() { let h = w(); println(await h); h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "8\n1\n0\n");
@@ -98,7 +98,7 @@ fn adfr_07_no_double_run_after_completion() {
 #[test]
 fn adfr_08_operand_survives_suspension() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(x: i64, ready: AtomicBool) { defer c(x * 7); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(6, ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(x: i64, ready: AtomicBool) { defer c(x * 7); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(6, ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n0\n");
@@ -107,7 +107,7 @@ fn adfr_08_operand_survives_suspension() {
 #[test]
 fn adfr_09_method_receiver_stash() {
     let (out, ok) = compile_and_run(
-        "class R { pub v: i64; pub fn show(self) { println(self.v); } }\nasync fn w(ready: AtomicBool) { let r = new R(5); defer r.show(); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
+        "class R { pub v: i64; pub fn show(self) { println(self.v); } }\nasync fn w(ready: AtomicBool) { let r = new R(5); defer r.show(); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "5\n0\n");
@@ -116,7 +116,7 @@ fn adfr_09_method_receiver_stash() {
 #[test]
 fn adfr_10_async_method_defer() {
     let (out, ok) = compile_and_run(
-        "fn c() { println(4); }\nclass W { pub async fn go(self) -> i64 { defer c(); await sleep(1); return 6; } }\nasync fn main() { let w = new W(); println(await w.go()); }",
+        "fn c() { println(4); }\nclass W { pub async fn go(self) -> i64 { defer c(); await yield(); return 6; } }\nasync fn main() { let w = new W(); println(await w.go()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "4\n6\n");
@@ -125,7 +125,7 @@ fn adfr_10_async_method_defer() {
 #[test]
 fn adfr_11_string_operand_gc_stress_cancel() {
     let (out, ok) = compile_and_run_gc_stress(
-        "fn c(s: String) { println(s); }\nasync fn w(ready: AtomicBool) { let name = \"a\" + \"b\"; defer c(name + \"!\"); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(\"end\"); }",
+        "fn c(s: String) { println(s); }\nasync fn w(ready: AtomicBool) { let name = \"a\" + \"b\"; defer c(name + \"!\"); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(\"end\"); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "ab!\nend\n");
@@ -134,7 +134,7 @@ fn adfr_11_string_operand_gc_stress_cancel() {
 #[test]
 fn adfr_12_print_form() {
     let (out, ok) = compile_and_run(
-        "async fn w() -> i64 { let x = 3; defer println(x); await sleep(1); return 1; }\nasync fn main() { println(await w()); }",
+        "async fn w() -> i64 { let x = 3; defer println(x); await yield(); return 1; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n1\n");
@@ -143,7 +143,7 @@ fn adfr_12_print_form() {
 #[test]
 fn adfr_13_cancel_two_sites_reverse() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); defer c(2); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); defer c(2); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(0); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\n0\n");
@@ -152,7 +152,7 @@ fn adfr_13_cancel_two_sites_reverse() {
 #[test]
 fn adfr_14_await_after_cancel_panics_after_cleanup() {
     let (out, ok) = compile_and_run_check_exit(
-        "fn c() { println(7); }\nasync fn w(ready: AtomicBool) -> i64 { defer c(); ready.store(true); await sleep(5000); return 1; }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); println(await h); }",
+        "fn c() { println(7); }\nasync fn w(ready: AtomicBool) -> i64 { defer c(); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); return 1; }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); println(await h); }",
     );
     assert!(!ok);
     assert!(out.contains('7'), "{out}");
@@ -161,8 +161,29 @@ fn adfr_14_await_after_cancel_panics_after_cleanup() {
 
 #[test]
 fn adfr_15_long_sleeper_cleanup_prompt() {
-    let (out, ok) = compile_and_run(
-        "fn c() { println(1); }\nasync fn w(ready: AtomicBool) { defer c(); ready.store(true); await sleep(10000); }\nasync fn main() { let ready = AtomicBool::new(false); let h = w(ready); while !ready.load() { await yield(); } h.cancel(); await h.result(); println(2); }",
+    // Freeze the clock before spawning: cleanup cannot be caused by timer expiry.
+    let (out, ok) = compile_and_run_with_virtual_time(
+        r#"
+fn c() { println(1); }
+async fn w(ready: Channel<i64>) {
+    defer c();
+    ready.send(test_current_task());
+    await sleep(30);
+}
+async fn main() {
+    test_set_time(0);
+    let ready = Channel<i64>::new();
+    let h = w(ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
+    h.cancel();
+    match await h.result() {
+        Ok(value) => println("unexpected completion"),
+        Err(Cancelled) => println(2),
+    }
+}
+"#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n2\n");
@@ -171,7 +192,7 @@ fn adfr_15_long_sleeper_cleanup_prompt() {
 #[test]
 fn adfr_16_loop_defer_flushes_each_lexical_iteration() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await sleep(1); } println(8); }\nasync fn main() { await w(); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() { for i in 0..3 { defer c(i); await yield(); } println(8); }\nasync fn main() { await w(); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n1\n2\n8\n");
@@ -200,7 +221,7 @@ fn adfr_18_async_callee_rejected_in_async_too() {
 #[test]
 fn adfr_19_args_registration_time_async() {
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { let mut x = 1; defer c(x); x = 50; await sleep(1); return x; }\nasync fn main() { println(await w()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w() -> i64 { let mut x = 1; defer c(x); x = 50; await yield(); return x; }\nasync fn main() { println(await w()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "1\n50\n");
@@ -209,7 +230,7 @@ fn adfr_19_args_registration_time_async() {
 #[test]
 fn adfr_20_unawaited_cancelled_defers_run() {
     let (out, ok) = compile_and_run(
-        "fn c(done: AtomicBool) { println(3); done.store(true); }\nasync fn w(ready: AtomicBool, done: AtomicBool) { defer c(done); ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let done = AtomicBool::new(false); let h = w(ready, done); while !ready.load() { await yield(); } h.cancel(); while !done.load() { await yield(); } println(4); }",
+        "fn c(done: AtomicBool) { println(3); done.store(true); }\nasync fn w(ready: AtomicBool, done: AtomicBool) { defer c(done); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let done = AtomicBool::new(false); let h = w(ready, done); while !ready.load() { await yield(); } h.cancel(); while !done.load() { await yield(); } println(4); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "3\n4\n");
@@ -255,7 +276,7 @@ fn adfr_24_break_flushes_iteration_before_function_scope() {
 fn adfr_25_cancel_unwinds_active_nested_scopes() {
     // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); ready.store(true); await sleep(5000); } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\ntrue\n");
@@ -265,7 +286,7 @@ fn adfr_25_cancel_unwinds_active_nested_scopes() {
 fn adfr_26_cancel_does_not_rerun_completed_inner_scope() {
     // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); } ready.store(true); await sleep(5000); }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { defer c(1); if true { defer c(2); } await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "2\n1\ntrue\n");
@@ -274,7 +295,7 @@ fn adfr_26_cancel_does_not_rerun_completed_inner_scope() {
 #[test]
 fn adfr_27_block_capture_survives_gc_and_preemption_stress() {
     let (out, ok) = compile_and_run_with_env(
-        "async fn w() { if true { let label = \"lex\" + \"ical\"; defer { println(label); } println(0); } await sleep(0); println(1); }\nasync fn main() { await w(); }",
+        "async fn w() { if true { let label = \"lex\" + \"ical\"; defer { println(label); } println(0); } await yield(); println(1); }\nasync fn main() { await w(); }",
         &[("WILLOW_GC_STRESS", "alloc"), ("WILLOW_TASK_BUDGET", "1")],
     );
     assert!(ok, "{out}");
@@ -285,7 +306,7 @@ fn adfr_27_block_capture_survives_gc_and_preemption_stress() {
 fn adfr_28_repeated_site_is_consumed_then_cancellable() {
     // Synchronize on registered defers and terminal cleanup, not wall-clock sleeps.
     let (out, ok) = compile_and_run(
-        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { for i in 0..3 { defer c(i); if i == 1 { ready.store(true); await sleep(5000); } } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
+        "fn c(n: i64) { println(n); }\nasync fn w(ready: AtomicBool) { for i in 0..3 { defer c(i); if i == 1 { await yield(); ready.store(true); let gate = Channel<i64>::new(); gate.recv(); } } }\nasync fn main() { let ready = AtomicBool::new(false); let task = w(ready); while !ready.load() { await yield(); } task.cancel(); await task.result(); println(task.is_cancelled()); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "0\n1\ntrue\n");

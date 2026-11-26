@@ -49,6 +49,8 @@ impl Termination {
     pub(super) fn wait_for_change(&self, sample: u64, timeout: std::time::Duration) {
         let guard = self.1.lock().unwrap();
         self.3.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        crate::test_sync::reached("mark_termination_wait");
         let (_guard, _) = self
             .2
             .wait_timeout_while(guard, timeout, |_| self.sample() == sample)

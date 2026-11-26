@@ -1462,7 +1462,7 @@ fn publication_during_concurrent_mark_close_and_sweep_loses_nothing() {
     store(owner, holder, 1, std::ptr::null_mut());
     minor::collect_owned();
 
-    crate::gc::preemption_tolerant_remark_budget_for_test();
+    crate::gc::deterministic_remark_clock_for_test();
     let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
     // Sweeping: an old object marked through the holder, and a young one
     // allocated now.

@@ -17,8 +17,11 @@ static STALE_RETRIES: crate::runtime::PerRuntime<AtomicUsize> =
 static PROBE: crate::runtime::PerRuntime<Mutex<Option<Arc<Probe>>>> =
     crate::runtime::PerRuntime::new(|| Mutex::new(None));
 thread_local! {
-    static LAST_STALE: Cell<Option<Instant>> = const { Cell::new(None) };
+    static LAST_STALE: Cell<Option<u64>> = const { Cell::new(None) };
 }
+
+static ORDER: crate::runtime::PerRuntime<AtomicU64> =
+    crate::runtime::PerRuntime::new(|| AtomicU64::new(0));
 
 pub(super) fn record_failed_probe(owner: &crate::runtime::Runtime) {
     if !ACTIVE.load(Ordering::Relaxed) {
@@ -33,8 +36,11 @@ pub(super) fn record_failed_probe(owner: &crate::runtime::Runtime) {
         let deadline = Instant::now() + Duration::from_secs(10);
         while PUBLISHED_ROUND.load(Ordering::Acquire) == round
             && !PRODUCER_DONE.load(Ordering::Acquire)
-            && Instant::now() < deadline
         {
+            assert!(
+                Instant::now() < deadline,
+                "producer never released failed probe gate"
+            );
             crate::gc::relocatable_safepoint_in(owner);
             std::hint::spin_loop();
         }
@@ -44,12 +50,13 @@ pub(super) fn record_failed_probe(owner: &crate::runtime::Runtime) {
 pub(super) fn record_stale_retry(_: &crate::runtime::Runtime) {
     if ACTIVE.load(Ordering::Relaxed) {
         STALE_RETRIES.fetch_add(1, Ordering::Relaxed);
-        LAST_STALE.set(Some(Instant::now()));
+        LAST_STALE.set(Some(ORDER.fetch_add(1, Ordering::SeqCst) + 1));
     }
 }
 
 struct Sample {
     published: AtomicU64,
+    publication_order: AtomicU64,
     latency: AtomicU64,
     crossed_stale_retry: AtomicBool,
 }
@@ -87,12 +94,11 @@ unsafe extern "C" fn consumer(frame: *mut c_void) -> i32 {
     // retry, so comparing against this task's own timestamp would make the
     // check depend on which task it happens to claim first.
     let round_start = probe.samples[index - index % probe.burst]
-        .published
+        .publication_order
         .load(Ordering::Acquire);
-    sample.crossed_stale_retry.store(
-        stale.is_some_and(|s| s.duration_since(probe.start).as_nanos() >= u128::from(round_start)),
-        Ordering::Release,
-    );
+    sample
+        .crossed_stale_retry
+        .store(stale.is_some_and(|s| s > round_start), Ordering::Release);
     RUNTIME_POLL_READY
 }
 
@@ -119,6 +125,9 @@ unsafe extern "C" fn producer(_: *mut c_void) -> i32 {
             probe.samples[batch * probe.burst + offset]
                 .published
                 .store(probe.start.elapsed().as_nanos() as u64, Ordering::Release);
+            probe.samples[batch * probe.burst + offset]
+                .publication_order
+                .store(ORDER.fetch_add(1, Ordering::SeqCst) + 1, Ordering::Release);
             willow_sched_wake(id);
         }
         let force_round = forced && !crossed;
@@ -200,6 +209,7 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
         samples: (0..count)
             .map(|_| Sample {
                 published: AtomicU64::new(0),
+                publication_order: AtomicU64::new(0),
                 latency: AtomicU64::new(0),
                 crossed_stale_retry: AtomicBool::new(false),
             })
@@ -208,6 +218,7 @@ fn run_probe(workers: usize, count: usize, burst: usize, forced: bool) {
         timed_out: AtomicBool::new(false),
     });
     *PROBE.lock().unwrap() = Some(Arc::clone(&probe));
+    ORDER.store(0, Ordering::Relaxed);
     FAILED_PROBES.store(0, Ordering::Relaxed);
     PUBLISHED_ROUND.store(0, Ordering::Relaxed);
     STALE_RETRIES.store(0, Ordering::Relaxed);

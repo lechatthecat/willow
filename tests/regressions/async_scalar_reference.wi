@@ -1,29 +1,29 @@
 async fn read_i64(value: &i64) -> i64 {
-    await sleep(1);
+    await yield();
     return value;
 }
 async fn read_f64(value: &f64) -> f64 {
-    await sleep(1);
+    await yield();
     return value;
 }
 async fn read_bool(value: &bool) -> bool {
-    await sleep(1);
+    await yield();
     return value;
 }
 async fn update_i64(value: &mut i64) {
-    await sleep(1);
+    await yield();
     value = value + 1;
 }
 async fn update_f64(value: &mut f64) {
-    await sleep(1);
+    await yield();
     value = 4.25;
 }
 async fn update_bool(value: &mut bool) {
-    await sleep(1);
+    await yield();
     value = false;
 }
 async fn forward_i64(value: &mut i64) {
-    await sleep(1);
+    await yield();
     await update_i64(&value);
 }
 async fn main() {

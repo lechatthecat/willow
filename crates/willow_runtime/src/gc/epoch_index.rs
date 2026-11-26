@@ -598,14 +598,14 @@ mod tests {
                     .stderr(std::process::Stdio::piped())
                     .spawn()
                     .unwrap();
-                let deadline = Instant::now() + Duration::from_secs(10);
+                let deadline = Instant::now() + Duration::from_secs(60);
                 while child.try_wait().unwrap().is_none() {
                     if Instant::now() >= deadline {
                         child.kill().unwrap();
                         let output = child.wait_with_output().unwrap();
                         panic!("{mode} drain/publisher deadlocked: {output:?}");
                     }
-                    std::thread::sleep(Duration::from_millis(5));
+                    std::thread::yield_now();
                 }
                 let output = child.wait_with_output().unwrap();
                 assert!(output.status.success(), "{mode}: {output:?}");
@@ -645,7 +645,7 @@ mod tests {
         let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
         let publisher_cycle = cycle.clone();
         let publisher = std::thread::spawn(crate::runtime::serving(move || {
-            start_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            start_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             // The generated-object reader is already held: this publication
             // cannot acquire its write lock until that reader is released.
             assert!(matches!(
@@ -659,24 +659,19 @@ mod tests {
         cycle.objects.1.set_hook(move || {
             let reader_cycle = reader_cycle.upgrade().expect("drain retains the cycle");
             start_tx.send(()).unwrap();
-            waiting_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            waiting_rx.recv_timeout(Duration::from_secs(30)).unwrap();
             // Linux's writer-preferring lock exposes the queued writer by
             // denying a fresh read. Other OS policies may allow new readers.
-            let deadline = Instant::now() + Duration::from_millis(100);
-            let mut writer_queued = false;
-            while Instant::now() < deadline {
-                if matches!(
-                    reader_cycle.objects.0.try_read(),
-                    Err(std::sync::TryLockError::WouldBlock)
-                ) {
-                    writer_queued = true;
-                    break;
-                }
-                std::thread::yield_now();
-            }
             if cfg!(target_os = "linux") {
-                assert!(writer_queued, "publisher did not queue");
+                crate::test_sync::until("publisher did not queue behind its reader", || {
+                    matches!(
+                        reader_cycle.objects.0.try_read(),
+                        Err(std::sync::TryLockError::WouldBlock)
+                    )
+                });
             }
+            // Other lock policies need not reject new readers. The publisher's
+            // failed try_write above still proves it meets the held reader.
         });
         let mut worker = cycle.queue.register_assist();
         let (scanned, _) = cycle.drain_worker(8, &mut Vec::new(), &mut worker);
@@ -790,7 +785,7 @@ mod tests {
             unsafe { reset_internal_for_test() };
             // Thirty-two remark stops per run: a preempted 1ms stop would
             // take the stopped fallback this test does not exercise.
-            crate::gc::preemption_tolerant_remark_budget_for_test();
+            crate::gc::deterministic_remark_clock_for_test();
             runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
             let collector = cycle_wait::CollectorGuard::try_acquire().unwrap();
             let mut root = willow_alloc_typed(8, 1);
@@ -913,7 +908,7 @@ mod tests {
         );
         cycle.publish_late(late);
         assert!(cycle.unindexed.lock().unwrap().is_empty());
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         assert!(cycle.is_marked(late_root as usize));
         sweep::concurrent(plan);
@@ -988,7 +983,7 @@ mod tests {
         };
         assert!(!cycle.objects.contains_extent(chunk_base));
         assert!(cycle.objects.retains_allocated(young as usize));
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         sweep::concurrent(plan);
         let object = HeapObject::from_payload(GcPayload::from_raw(young).unwrap());
@@ -1053,7 +1048,7 @@ mod tests {
         assert!(cycle.unindexed.lock().unwrap().contains(&(child as usize)));
         cycle.publish_late(late);
         assert!(cycle.unindexed.lock().unwrap().is_empty());
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, std::time::Instant::now()).unwrap();
         assert!(cycle.is_marked(child as usize));
         sweep::concurrent(plan);

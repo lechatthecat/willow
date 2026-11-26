@@ -555,6 +555,7 @@ mod tests {
 
     #[test]
     fn generated_stack_keeps_affinity_across_implicit_preemption() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         unsafe extern "C" fn helper(_: *mut c_void) -> i32 {
             // A runtime entry may hold !Send state and call generated code.
             // Its guard pins the entire extent, including nested callbacks.
@@ -621,6 +622,10 @@ mod tests {
             RUNTIME_POLL_READY
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog =
+            crate::test_sync::Watchdog::new("blocking_work_parks_without_stalling_the_scheduler");
+        let _ = willow_monotonic_millis();
+        let clock = crate::test_sync::SchedulerClock::new();
         for cancel in [false, true] {
             reset_global_scheduler_for_test();
             COMPLETED.store(999, std::sync::atomic::Ordering::SeqCst);
@@ -628,7 +633,9 @@ mod tests {
             *GATE.lock().unwrap() = Some(receive);
             // SAFETY: The callback accepts a null frame and uses no frame storage.
             let task = unsafe { willow_sched_spawn(blocked, std::ptr::null_mut()) };
-            willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+            crate::test_sync::drive_until("owned job parked", &clock, || {
+                willow_sched_task_state(task) == 7
+            });
             assert_eq!(willow_sched_task_state(task), 7);
             assert_eq!(COMPLETED.load(std::sync::atomic::Ordering::SeqCst), 999);
             if cancel {
@@ -673,6 +680,11 @@ mod tests {
             RUNTIME_POLL_READY
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new(
+            "owned_work_backpressure_cancellation_drops_unsubmitted_jobs",
+        );
+        let _ = willow_monotonic_millis();
+        let clock = crate::test_sync::SchedulerClock::new();
         for count in [1, 16, 64] {
             reset_global_scheduler_for_test();
             DROPS.store(0, Ordering::SeqCst);
@@ -683,7 +695,10 @@ mod tests {
                 // SAFETY: The callback accepts a null frame and uses no frame storage.
                 .map(|_| unsafe { willow_sched_spawn(blocked, std::ptr::null_mut()) })
                 .collect();
-            willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
+            crate::test_sync::drive_until("all owned jobs wait for slots", &clock, || {
+                crate::blocking::willow_blocking_slot_waiters() == count
+                    && ids.iter().all(|&id| willow_sched_task_state(id) == 7)
+            });
             assert_eq!(crate::blocking::willow_blocking_slot_waiters(), count);
             for &id in ids.iter().rev() {
                 willow_sched_cancel(id);
@@ -727,9 +742,16 @@ mod tests {
             result
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new("legacy cooperative timer completion");
+        let clock = crate::test_sync::SchedulerClock::new();
         reset_global_scheduler_for_test();
         // SAFETY: The callback accepts a null frame and uses no frame storage.
         let task = (unsafe { willow_sched_spawn_cooperative(poll, std::ptr::null_mut()) }) as u64;
+        crate::test_sync::drive_until("cooperative legacy timer parked", &clock, || {
+            willow_sched_task_state(task) == 2
+        });
+        assert_eq!(willow_sched_task_state(task), 2);
+        clock.advance(std::time::Duration::from_millis(4));
         willow_sched_run_until(task);
         reset_global_scheduler_for_test();
     }
@@ -739,17 +761,24 @@ mod tests {
         use crate::scheduler::*;
         unsafe extern "C" fn sleeper(_: *mut c_void) -> i32 {
             let future = crate::future::LegacyFutureOwner::new(
-                crate::future::WillowFutureVoid::sleep_after_millis(60_000),
+                crate::future::WillowFutureVoid::sleep_after_millis(30),
             );
             future.get().block_until_ready();
             assert_ne!(cancelled(), 0);
             RUNTIME_POLL_READY
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new(
+            "legacy_timer_wait_parks_and_cancels_without_sleeping_worker",
+        );
+        let _ = willow_monotonic_millis();
+        let clock = crate::test_sync::SchedulerClock::new();
         reset_global_scheduler_for_test();
         // SAFETY: The callback accepts a null frame and uses no frame storage.
         let task = unsafe { willow_sched_spawn(sleeper, std::ptr::null_mut()) };
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+        crate::test_sync::drive_until("native timer parked", &clock, || {
+            willow_sched_task_state(task) == 2
+        });
         assert_eq!(willow_sched_task_state(task), 2);
         willow_sched_cancel(task);
         willow_sched_run_until(task);
@@ -760,16 +789,23 @@ mod tests {
     fn timer_value_wait_parks_and_cancels_without_sleeping_worker() {
         use crate::scheduler::*;
         unsafe extern "C" fn sleeper(_: *mut c_void) -> i32 {
-            let value = crate::timer::willow_timer_value_sleep(i64::MAX);
+            let value = crate::timer::willow_timer_value_sleep(30);
             crate::timer::willow_timer_value_await(value);
             assert_ne!(cancelled(), 0);
             RUNTIME_POLL_READY
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new(
+            "timer_value_wait_parks_and_cancels_without_sleeping_worker",
+        );
+        let _ = willow_monotonic_millis();
+        let clock = crate::test_sync::SchedulerClock::new();
         reset_global_scheduler_for_test();
         // SAFETY: The callback accepts a null frame and uses no frame storage.
         let task = unsafe { willow_sched_spawn(sleeper, std::ptr::null_mut()) };
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
+        crate::test_sync::drive_until("native timer parked", &clock, || {
+            willow_sched_task_state(task) == 2
+        });
         assert_eq!(willow_sched_task_state(task), 2);
         willow_sched_cancel(task);
         willow_sched_run_until(task);
@@ -1042,6 +1078,7 @@ mod tests {
 
     #[test]
     fn inline_countdown_bounds_runtime_calls_and_keeps_budget_trip_points() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         use crate::preempt::{SYNC_POLL_STRIDE, SYNC_POLL_STRIDE_MAX};
         let _guard = crate::gc::isolated_runtime();
         for (budget, safepoints) in [(1000, 10_000), (1000, 100_000), (1, 50), (64, 640)] {
@@ -1121,6 +1158,7 @@ mod tests {
     }
 
     unsafe extern "C" fn boundary_budget_cooperative_poll(frame: *mut c_void) -> i32 {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         use crate::scheduler::{willow_task_stack_enter, willow_task_stack_leave};
         let state = boundary_budget_state(frame);
         // Keep the real cooperative task/ABI boundary but use deterministic,
@@ -1316,6 +1354,7 @@ mod tests {
 
     #[test]
     fn native_batched_no_preempt_preserves_partial_debt() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         for prefix in [0u64, 1, 20, 63, 64, 65, 99] {
             for suppressed in [0u64, 5, 63, 64, 65, 200] {
@@ -1346,6 +1385,7 @@ mod tests {
 
     #[test]
     fn batched_async_and_sync_share_exact_budget() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         for budget in [1u64, 2, 3, 63, 64, 65, 127, 1024] {
             for sync_run in [0, 1, 2, 7, 63, 64, 100] {
@@ -1410,6 +1450,7 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_safepoints_share_exact_budget() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         for budget in [1u64, 3, 8, 64, 65, 1024] {
             for sync_run in [0, 1, 2, 7, 63, 64, 100] {
@@ -1465,6 +1506,7 @@ mod tests {
 
     #[test]
     fn sync_inline_grant_is_invalidated_after_runtime_wait() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         let mut finished = false;
         let mut stack = NativeStack::new(
@@ -1529,6 +1571,7 @@ mod tests {
 
     #[test]
     fn sync_inline_grant_is_invalidated_after_nested_quantum() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         let mut finished = false;
         let mut stack = NativeStack::new(
@@ -1596,6 +1639,7 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_no_preempt_region_preserves_budget() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         let mut checks = [-1; 2];
         let mut stack = NativeStack::new(
@@ -1620,11 +1664,13 @@ mod tests {
 
     struct MixedDeadline {
         sync_last: bool,
+        expires: bool,
         reached_end: bool,
     }
 
     unsafe extern "C" fn mixed_deadline_poll(frame: *mut c_void) -> i32 {
         let state = frame.cast::<MixedDeadline>();
+        crate::preempt::test_clock::TestClock::advance(std::time::Duration::from_millis(6));
         // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
         // retains it through suspension.
         if unsafe { (*state).sync_last } {
@@ -1632,7 +1678,11 @@ mod tests {
         } else {
             willow_sync_safepoint();
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        // Crossing the original 10ms deadline must trip even though the first
+        // check ran 6ms into the quantum; rearming there would incorrectly wait.
+        // SAFETY: The fixture retains this typed state through suspension.
+        let remaining = if unsafe { (*state).expires } { 4 } else { 3 };
+        crate::preempt::test_clock::TestClock::advance(std::time::Duration::from_millis(remaining));
         // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
         // retains it through suspension.
         if unsafe { (*state).sync_last } {
@@ -1650,15 +1700,16 @@ mod tests {
 
     #[test]
     fn mixed_sync_async_share_deadline_without_rearming() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         let _guard = crate::gc::isolated_runtime();
         for sync_last in [false, true] {
-            for quantum_ms in ["1", "100000"] {
+            for expires in [false, true] {
                 let mut state = MixedDeadline {
                     sync_last,
+                    expires,
                     reached_end: false,
                 };
-                let config =
-                    PreemptConfig::from_env_values(Some("1000000000000"), Some(quantum_ms));
+                let config = PreemptConfig::from_env_values(Some("1000000000000"), Some("10"));
                 let mut stack =
                     NativeStack::new(mixed_deadline_poll, std::ptr::from_mut(&mut state).cast());
                 // SAFETY: A null flag binds no storage and is explicitly supported.
@@ -1676,7 +1727,7 @@ mod tests {
                     resumed = unsafe { NativeStack::resume(&mut *stack) };
                     willow_preempt_end();
                 }
-                if quantum_ms == "1" {
+                if expires {
                     assert_eq!(result, RUNTIME_POLL_PREEMPTED);
                     assert!(!reached_end);
                 } else {
@@ -1695,9 +1746,15 @@ mod tests {
         // SAFETY: The test passes its appropriately typed, aligned state as the callback frame and
         // retains it through suspension.
         unsafe {
-            while (*state).resumes == 0 {
+            // Fifty virtual 20us steps reach the deadline. Even the largest
+            // inline grant must check within one further batch. A missing
+            // time check returns READY and fails rather than hanging the test.
+            let limit = 50 + crate::preempt::SYNC_POLL_STRIDE_MAX;
+            while (*state).resumes == 0 && (*state).safepoints < limit {
                 (*state).safepoints += 1;
-                std::thread::sleep(std::time::Duration::from_micros(20));
+                crate::preempt::test_clock::TestClock::advance(std::time::Duration::from_micros(
+                    20,
+                ));
                 *counter -= 1;
                 if *counter <= 0 {
                     (*state).runtime_calls += 1;
@@ -1710,6 +1767,7 @@ mod tests {
 
     #[test]
     fn inline_countdown_still_honors_the_time_quantum() {
+        let _clock = crate::preempt::test_clock::TestClock::new();
         use crate::preempt::SYNC_POLL_STRIDE;
         let _guard = crate::gc::isolated_runtime();
         let mut state = CountedLoop {

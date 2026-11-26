@@ -468,12 +468,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let future = self.emit_lir_operand(function, future);
                 self.emit_flat_await_future(future, result)
             }
-            LirRvalue::SelectIdleWait { deadlines } => {
+            LirRvalue::SelectIdleWait {
+                deadlines,
+                quiescent,
+            } => {
                 let deadlines: Vec<_> = deadlines
                     .iter()
                     .map(|deadline| self.emit_lir_operand(function, deadline))
                     .collect();
-                self.emit_flat_select_idle_wait(&deadlines)
+                {
+                    let quiescent = self.emit_lir_operand(function, quiescent);
+                    self.emit_flat_select_idle_wait(&deadlines, quiescent)
+                }
             }
             LirRvalue::EnumMethod {
                 receiver,

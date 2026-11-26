@@ -230,6 +230,7 @@ pub enum LirRvalue {
     },
     SelectIdleWait {
         deadlines: Vec<LirOperand>,
+        quiescent: LirOperand,
     },
     Coerce {
         value: LirOperand,
@@ -499,7 +500,7 @@ impl LirRvalue {
             Self::Use(operand) => plain_ty(operand) == Some(&destination.ty),
             Self::StartTask { args, params, output, .. } => matches!(&destination.ty, Type::Generic(name, payloads) if builtin_types::resolve_name(name) == Some(Builtin::Task) && payloads == std::slice::from_ref(output)) && args.len() == params.len() && args.iter().zip(params).all(|(arg, param)| arg.ty(locals).as_ref() == Some(param)),
             Self::AwaitFuture { future, result } => destination.ty == *result && matches!(plain_ty(future), Some(Type::Generic(name, payloads)) if builtin_types::resolve_name(name) == Some(Builtin::Future) && payloads == std::slice::from_ref(result)),
-            Self::SelectIdleWait { deadlines } => destination.ty == Type::Void && deadlines.iter().all(|operand| plain_ty(operand) == Some(&Type::I64)),
+            Self::SelectIdleWait { deadlines, quiescent } => destination.ty == Type::Bool && plain_ty(quiescent) == Some(&Type::Bool) && deadlines.iter().all(|operand| plain_ty(operand) == Some(&Type::I64)),
             Self::Coerce { value, source, target } => plain_ty(value) == Some(source) && destination.ty == *target,
             Self::ArrayAlloc { element, .. } => matches!(&destination.ty, Type::Array(inner) if inner.as_ref() == element),
             Self::ArrayStore { array, index, value, element } => matches!(plain_ty(array), Some(Type::Array(inner)) if inner.as_ref() == element) && plain_ty(index) == Some(&Type::I64) && plain_ty(value).is_some() && destination.ty == Type::Void,
@@ -633,7 +634,10 @@ impl LirRvalue {
             | Self::BuiltinCall { args, .. }
             | Self::StaticCall { args, .. }
             | Self::DirectCall { args, .. } => (None, None, args),
-            Self::SelectIdleWait { deadlines } => (None, None, deadlines),
+            Self::SelectIdleWait {
+                deadlines,
+                quiescent,
+            } => (Some(quiescent), None, deadlines),
             Self::Closure { captures, .. } => (None, None, captures),
             Self::StringConcat { parts, .. } => (None, None, parts),
             Self::ConstructorCall { object, args, .. } => (Some(object), None, args),

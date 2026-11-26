@@ -159,10 +159,7 @@ impl RemarkBudget {
         Self::with_observation(
             positive("WILLOW_GC_REMARK_MAX_SLOTS", 4096, 1_000_000),
             positive("WILLOW_GC_REMARK_MAX_BYTES", 1024 * 1024, 16 * 1024 * 1024),
-            match observation.work_ns() {
-                0 => positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
-                ns => ns,
-            },
+            positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
             now,
             observation,
         )
@@ -213,6 +210,7 @@ impl RemarkBudget {
     }
 
     pub(super) fn reserve(&mut self, slots: u64, bytes: u64, now: u64) -> bool {
+        let now = self.observation.sample(self.start, now);
         self.last_ns = now;
         self.checks += 1;
         self.observation.checked();
@@ -243,20 +241,33 @@ mod budget_tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    #[derive(Default)]
     pub(crate) struct Counters {
         pub(crate) checks: AtomicU64,
         pub(crate) yields: AtomicU64,
-        pub(crate) work_ns: AtomicU64,
+        // u64::MAX selects the real clock; other values are virtual elapsed ns.
+        pub(crate) elapsed_ns: AtomicU64,
+    }
+
+    impl Default for Counters {
+        fn default() -> Self {
+            Self {
+                checks: AtomicU64::new(0),
+                yields: AtomicU64::new(0),
+                elapsed_ns: AtomicU64::new(u64::MAX),
+            }
+        }
     }
 
     #[test]
     fn remark_budget_observations_follow_the_captured_owner() {
         let first = super::super::GcRuntime::default();
         let second = super::super::GcRuntime::default();
-        first.remark_observation.work_ns.store(7, Ordering::Relaxed);
-        assert_eq!(first.remark_observation.work_ns(), 7);
-        assert_eq!(second.remark_observation.work_ns(), 0);
+        first
+            .remark_observation
+            .elapsed_ns
+            .store(0, Ordering::Relaxed);
+        assert_eq!(first.remark_observation.sample(100, 900), 100);
+        assert_eq!(second.remark_observation.sample(100, 900), 900);
         let a = RuntimeBudgetObservation::capture(|| &first.remark_observation);
         let b = RuntimeBudgetObservation::capture(|| &second.remark_observation);
         std::thread::scope(|scope| {
@@ -287,7 +298,25 @@ mod budget_tests {
         assert!(!budget.reserve(1, 0, 0));
         assert_eq!(retained.checks.load(Ordering::Relaxed), 130);
         NoBudgetObservation::capture(|| panic!("production observer resolved an owner"));
-        assert_eq!(NoBudgetObservation.work_ns(), 0);
+        assert_eq!(NoBudgetObservation.sample(100, 900), 900);
+    }
+
+    #[test]
+    fn virtual_remark_samples_ignore_host_delay_but_preserve_every_limit() {
+        for delayed_sample in [100, 1_000_100, u64::MAX] {
+            let observation = RuntimeBudgetObservation::default();
+            observation.elapsed_ns.store(0, Ordering::Relaxed);
+            let mut budget = RemarkBudget::with_observation(2, 16, 7, 100, observation.clone());
+            assert!(budget.reserve(1, 8, delayed_sample));
+            assert!(!budget.reserve(2, 0, delayed_sample));
+            assert!(!budget.reserve(0, 9, delayed_sample));
+            observation.elapsed_ns.store(7, Ordering::Relaxed);
+            assert!(!budget.reserve(0, 0, 100));
+            assert_eq!((budget.slots, budget.bytes), (1, 8));
+            observation.elapsed_ns.store(6, Ordering::Relaxed);
+            assert!(budget.reserve(1, 8, delayed_sample));
+            assert_eq!((budget.slots, budget.bytes), (2, 16));
+        }
     }
 
     #[test]
@@ -333,8 +362,8 @@ pub(super) trait BudgetObservation: Default {
     {
         Self::default()
     }
-    fn work_ns(&self) -> u64 {
-        0
+    fn sample(&self, _start: u64, now: u64) -> u64 {
+        now
     }
     fn checked(&self) {}
     fn yielded(&self) {}
@@ -351,8 +380,11 @@ impl BudgetObservation for RuntimeBudgetObservation {
     fn capture<'a>(owner: impl FnOnce() -> &'a Self) -> Self {
         owner().clone()
     }
-    fn work_ns(&self) -> u64 {
-        self.work_ns.load(std::sync::atomic::Ordering::Relaxed)
+    fn sample(&self, start: u64, now: u64) -> u64 {
+        match self.elapsed_ns.load(std::sync::atomic::Ordering::Relaxed) {
+            u64::MAX => now,
+            elapsed => start.saturating_add(elapsed),
+        }
     }
     fn checked(&self) {
         self.checks

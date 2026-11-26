@@ -76,6 +76,8 @@ struct IdleWaiters {
     generation: AtomicU64,
     registered: AtomicUsize,
     list: Mutex<WaitList>,
+    #[cfg(test)]
+    park_calls: AtomicUsize,
 }
 
 impl IdleWaiters {
@@ -183,6 +185,8 @@ impl IdleWaiters {
         };
         let deadline = timeout.map(|duration| Instant::now() + duration);
         loop {
+            #[cfg(test)]
+            self.park_calls.fetch_add(1, Ordering::Relaxed);
             if let Some(deadline) = deadline {
                 std::thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
             } else {
@@ -216,6 +220,21 @@ pub(crate) struct Parking {
 }
 
 impl Parking {
+    #[cfg(test)]
+    pub(super) fn park_calls_for_test(&self) -> usize {
+        self.idle.park_calls.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(super) fn registered_for_test(&self, completion: bool) -> usize {
+        let waiters = if completion {
+            &self.completion
+        } else {
+            &self.idle
+        };
+        waiters.registered.load(Ordering::SeqCst)
+    }
+
     pub(super) fn completion_generation(&self) -> u64 {
         self.completion.generation()
     }

@@ -19,8 +19,9 @@ fn chgc_01_channel_churn_bounded_under_stress() {
 
 #[test]
 fn chgc_02_live_channels_survive_stress_across_tasks() {
-    let (out, ok) = compile_and_run_gc_stress(
-        "async fn produce(ch: Channel<String>) { await sleep(10); ch.send(\"a\" + \"b\"); }\nasync fn main() { let ch = Channel<String>::new(); let p = produce(ch); let v = ch.recv(); println(v); await p; }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn produce(ch: Channel<String>, caller: i64) { while !test_task_parked(caller) { await yield(); } ch.send(\"a\" + \"b\"); }\nasync fn main() { let ch = Channel<String>::new(); let p = produce(ch, test_current_task()); let v = ch.recv(); println(v); await p; }",
+        &[("WILLOW_GC_STRESS", "alloc")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "ab\n");
@@ -30,8 +31,9 @@ fn chgc_02_live_channels_survive_stress_across_tasks() {
 fn chgc_03_cancel_after_channel_churn_is_fast() {
     // Cancellation walks only the task's own registrations — churning 2000
     // channels beforehand must not slow (or break) a subsequent cancel.
-    let (out, ok) = compile_and_run(
-        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let mut i = 0; while i < 2000 { let tmp = Channel<i64>::new(); tmp.send(i); tmp.recv(); i = i + 1; } let ch = Channel<i64>::new(); let h = c(ch); await sleep(20); h.cancel(); await sleep(20); println(h.is_cancelled()); }",
+    let (out, ok) = compile_and_run_with_test_sync(
+        "async fn c(ch: Channel<i64>) -> i64 { return ch.recv(); }\nasync fn main() { let mut i = 0; while i < 2000 { let tmp = Channel<i64>::new(); tmp.send(i); tmp.recv(); i = i + 1; } let ch = Channel<i64>::new(); test_observe_next_task(); let h = c(ch); let id = test_observed_task(); while !test_task_parked(id) { await yield(); } h.cancel(); let result = await h.result(); println(h.is_cancelled()); }",
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "true\n");

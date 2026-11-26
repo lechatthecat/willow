@@ -1083,10 +1083,18 @@ impl ShardedTaskTable {
 
     fn lock_shard(&self, index: usize) -> std::sync::MutexGuard<'_, TaskShard> {
         self.lock_observation.acquired();
-        self.shards[index]
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        #[cfg(test)]
+        {
+            crate::test_sync::lock(&self.shards[index].0, "scheduler_task_shard")
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+        #[cfg(not(test))]
+        {
+            self.shards[index]
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
     }
 
     fn with<R>(&self, id: RuntimeTaskId, read: impl FnOnce(&RuntimeTask) -> R) -> Option<R> {
@@ -1386,7 +1394,7 @@ fn timer_matches_task(task: &RuntimeTask, deadline: Instant) -> bool {
 /// the lock order is timer heap -> task shard, so taking the heap while holding
 /// a shard would invert it.
 fn set_wake_after_millis_in(tasks: &ShardedTaskTable, timers: &TimerQueue, millis: i64) {
-    let deadline = Instant::now() + Duration::from_millis(millis.max(0) as u64);
+    let deadline = crate::timer::scheduler_now() + Duration::from_millis(millis.max(0) as u64);
     let Some(id) = current_task_id() else { return };
     if tasks
         .with_mut(id, |task| task.wake_deadline = Some(deadline))
@@ -2586,7 +2594,7 @@ fn next_timer_deadline_in(components: &SchedulerComponents) -> Option<(RuntimeTa
 /// can conclude that the scheduler has nothing to do.
 fn wake_due_timers_now_in(components: &SchedulerComponents) -> usize {
     if components.timers.maybe_armed() {
-        wake_due_timers_in(components, Instant::now())
+        wake_due_timers_in(components, crate::timer::scheduler_now())
     } else {
         0
     }
@@ -3786,8 +3794,24 @@ pub unsafe extern "C" fn willow_frame_await_check(frame: *mut c_void, id: u64) {
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_monotonic_millis() -> i64 {
+    #[cfg(test)]
+    if let Some(elapsed) = crate::test_sync::scheduler_elapsed() {
+        return elapsed.as_millis().min(i64::MAX as u128) as i64;
+    }
+    #[cfg(feature = "deterministic-test-clock")]
+    {
+        crate::test_clock::elapsed()
+            .as_millis()
+            .min(i64::MAX as u128) as i64
+    }
+    #[cfg(not(feature = "deterministic-test-clock"))]
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
-    START.elapsed().as_millis() as i64
+    #[cfg(not(feature = "deterministic-test-clock"))]
+    {
+        crate::timer::scheduler_now()
+            .saturating_duration_since(*START)
+            .as_millis() as i64
+    }
 }
 
 /// Sleep the CALLING OS THREAD until the monotonic deadline (sync select's
@@ -3939,7 +3963,7 @@ pub extern "C" fn willow_sched_run_main(target: u64) -> i64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
     let remaining = (deadline_ms - willow_monotonic_millis()).max(0) as u64;
-    let deadline = Instant::now() + Duration::from_millis(remaining);
+    let deadline = crate::timer::scheduler_now() + Duration::from_millis(remaining);
     sched_run_with_mutator(None, Some(deadline))
 }
 
@@ -3952,22 +3976,55 @@ pub extern "C" fn willow_sched_run_until_deadline(deadline_ms: i64) -> i64 {
 /// deadline. Callers that turn quiescence into a blocking-forever diagnostic
 /// must consult this first.
 pub(crate) fn scheduler_has_wake_source() -> bool {
-    // Read producers before their destination queues, then claims and polls,
-    // just as the parallel idle snapshot does. A deadline-limited nested drive
-    // can return while another worker is still polling a producer.
-    global_next_timer_deadline().is_some()
-        || global_task_table().blocked_syscall_count() > 0
-        || global_run_queues().len() > 0
-        || claims_in_flight()
-        || CURRENT_RUN_STATE.with(|slot| {
+    scheduler_has_wake_source_with_peer_probe(|| {
+        CURRENT_RUN_STATE.with(|slot| {
             slot.borrow().as_ref().is_some_and(|state| {
-                // This caller may itself be a running task blocked in recv or
-                // send. Counting it would turn genuine deadlocks into spins.
+                // The calling task may itself be blocked in a synchronous operation.
                 let caller = usize::from(current_task_id().is_some());
-                state.has_active_peer(caller)
+                state.active_polls() > caller
             })
         })
+    })
+}
+
+fn scheduler_has_wake_source_with_peer_probe(peer_poll: impl FnOnce() -> bool) -> bool {
+    let claims = global_claim_words();
+    let before = claims.snapshot();
+    // Match IDLE_READ_ORDER: a poll publishes its continuation before ending,
+    // so inspect polls before queues. The surrounding claim epochs cover a
+    // poll starting or moving across accounting shards during this scan.
+    peer_poll()
+        || global_next_timer_deadline().is_some()
+        || global_task_table().blocked_syscall_count() > 0
+        || global_run_queues().len() > 0
+        || claims.changed_or_in_flight(&before)
         || crate::netpoll::has_waiters()
+}
+
+/// Report drive quiescence without diagnosing select failure. A peer may have
+/// published a ready case before becoming quiescent, so generated code must
+/// re-probe its cases after this returns true and before its final idle step.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_select_drive_is_quiescent() -> i8 {
+    i8::from(!scheduler_has_wake_source())
+}
+
+/// Wait for an idle select's absolute deadline or a newly published event.
+/// Generated code has already re-probed after its scheduler drive. A source
+/// appearing since the quiescence observation requires another drive instead
+/// of sleeping through a channel or task becoming ready.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_select_wait_until(deadline_ms: i64) {
+    let generation = current_wake_generation();
+    if scheduler_has_wake_source() {
+        return;
+    }
+    let remaining = deadline_ms.saturating_sub(willow_monotonic_millis());
+    if remaining > 0 {
+        wait_for_wake_since(generation, Duration::from_millis(remaining as u64));
+    }
 }
 
 /// Park a synchronous caller briefly while it waits for a wake source to fire.
@@ -3995,12 +4052,8 @@ pub extern "C" fn willow_select_idle_wait() {
         wait_for_any_wake_briefly();
         return;
     }
-    // Re-check once after a grace wait: a wake source can be published by
-    // another worker in the window between its drive returning and this check.
-    wait_for_any_wake_briefly();
-    if scheduler_has_wake_source() {
-        return;
-    }
+    // The caller re-probed all cases after observing drive quiescence. No
+    // elapsed grace period can substitute for that readiness observation.
     crate::panic_context::raise_language_message(
         "select would block forever: no case can become ready and there is no default case",
     );
@@ -4302,10 +4355,12 @@ impl ParallelRunState {
     /// under a claim; pause/resume transfers use the same epoch protocol.
     /// Retain these epochs through the count scan and retry on a change.
     /// The caller's own active poll is excluded for deadlock checks.
+    #[cfg(test)]
     fn has_active_peer(&self, caller: usize) -> bool {
         self.has_active_peer_during(caller, || self.active_polls())
     }
 
+    #[cfg(test)]
     fn has_active_peer_during(&self, caller: usize, scan: impl FnOnce() -> usize) -> bool {
         let before = self.claims.snapshot();
         scan() > caller || self.claims.changed_or_in_flight(&before)
@@ -4849,10 +4904,11 @@ fn claim_ready_for_worker_in(
         let claim_guard = shared
             .filter(|state| state.stop_decision_pending())
             .map(|state| {
-                state
-                    .claim_gate
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                #[cfg(test)]
+                let lock = crate::test_sync::lock(&state.claim_gate, "scheduler_claim_gate");
+                #[cfg(not(test))]
+                let lock = state.claim_gate.lock();
+                lock.unwrap_or_else(|poisoned| poisoned.into_inner())
             });
         if shared.is_some_and(|state| state.stop.load(Ordering::Acquire)) {
             drop(claim_guard);
@@ -5060,7 +5116,7 @@ fn task_should_spread(
 
 fn duration_until(deadline: Instant) -> Duration {
     deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(crate::timer::scheduler_now())
         .unwrap_or_default()
 }
 
@@ -5233,7 +5289,7 @@ fn scheduler_idle_step(
                     parking::wait_for_owner_event(owner, generation, Some(wait));
                 }
             }
-            let woken = wake_due_timers_in(components, Instant::now());
+            let woken = wake_due_timers_in(components, crate::timer::scheduler_now());
             for _ in 0..woken {
                 crate::gc::stress_collect_in(owner, "scheduler");
             }
@@ -5444,7 +5500,7 @@ fn scheduler_run_loop_in(
         // `sleep(ms)` case), not to any task: give the caller its turn back on
         // time instead of running unrelated tasks to quiescence first.
         //
-        if deadline.is_some_and(|d| Instant::now() >= d) {
+        if deadline.is_some_and(|d| crate::timer::scheduler_now() >= d) {
             break;
         }
         // Stop as soon as the TARGET task (an `await` of a concrete
@@ -6254,3 +6310,12 @@ pub fn gc_metrics_v1() -> GcMetricsV1 {
 ))]
 #[path = "scheduler_switch_lock_tests.rs"]
 pub(crate) mod switch_lock_tests;
+
+#[cfg(any(test, feature = "deterministic-test-clock"))]
+pub(crate) fn test_clock_advanced() {
+    parking::notify_all_idle_waiters();
+}
+
+#[cfg(test)]
+#[path = "scheduler_select_tests.rs"]
+mod select_tests;

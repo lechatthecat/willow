@@ -899,8 +899,8 @@ mod tests {
         }
         assert_eq!(order, (0..capacity).collect::<Vec<_>>(), "FIFO");
         assert_eq!(
-            receiver.recv_timeout(Duration::from_millis(50)),
-            Err(mpsc::RecvTimeoutError::Timeout),
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty),
             "refused jobs must not have run"
         );
         drop(refused);

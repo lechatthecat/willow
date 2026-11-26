@@ -338,6 +338,8 @@ fn unregister_mutator_in(owner: &crate::runtime::Runtime) {
             .is_some_and(|collector| collector != id)
         {
             let generation = coord.cycle_generation;
+            #[cfg(test)]
+            crate::test_sync::reached("unregister_waiting_for_foreign_cycle");
             super::cycle_wait::wait_for_cycle_in(owner, coord, generation);
             coord = lock.lock().unwrap();
         }
@@ -747,8 +749,14 @@ impl Drop for IdleMutator<'_> {
         }
         // This also runs while foreign code unwinds; a second panic would abort.
         let (lock, cv) = &self.owner.gc.coord;
-        let mut coord = lock.lock().unwrap_or_else(|poison| poison.into_inner());
+        #[cfg(test)]
+        let locked = crate::test_sync::lock(lock, "idle_resume_blocked");
+        #[cfg(not(test))]
+        let locked = lock.lock();
+        let mut coord = locked.unwrap_or_else(|poison| poison.into_inner());
         while coord.stop_requested {
+            #[cfg(test)]
+            crate::test_sync::reached("idle_resume_blocked");
             coord = cv.wait(coord).unwrap_or_else(|poison| poison.into_inner());
         }
         let id = std::thread::current().id();

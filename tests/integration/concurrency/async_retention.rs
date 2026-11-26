@@ -434,7 +434,7 @@ async fn main() {
 #[test]
 fn async_retention_cancelled_select_commit() {
     let source = r#"
-async fn slow() -> i64 { await sleep(1000); return 1; }
+async fn slow() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }
 async fn main() {
     let t = slow();
     t.cancel();

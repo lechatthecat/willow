@@ -6,11 +6,11 @@ const EXAMPLE: &str = include_str!("../../../tests/regressions/async_string_refe
 fn dispatch_reference_source(interface: bool, mode: &str, ty: &str, body: &str) -> String {
     let declarations = if interface {
         format!("interface Reading extends Sync {{ fn read(self, text: {mode} {ty}) -> Task<String>; }}
-            open class Parent {{ pub async fn read(self, text: {mode} {ty}) -> String {{ await sleep(1); return \"done\"; }} }}
+            open class Parent {{ pub async fn read(self, text: {mode} {ty}) -> String {{ await yield(); return \"done\"; }} }}
             class Reader extends Parent implements Reading {{}}")
     } else {
         format!("open class Reading {{ pub open fn read(self, text: {mode} {ty}) -> Task<String> {{ return value(); }} }}
-            class Reader extends Reading {{ pub override async fn read(self, text: {mode} {ty}) -> String {{ await sleep(1); return \"done\"; }} }}")
+            class Reader extends Reading {{ pub override async fn read(self, text: {mode} {ty}) -> String {{ await yield(); return \"done\"; }} }}")
     };
     format!(
         "fn inspect(x: &String) {{}} fn replace(x: &mut String) {{ x = \"changed\"; }} fn consume(t: Task<String>) {{}} async fn value() -> String {{ return \"done\"; }} {declarations}
@@ -39,7 +39,7 @@ fn importer_dispatch_project(
     let modifier = if interface { "" } else { "override" };
     let result = if ty == "String" { "text" } else { "\"done\"" };
     let main = format!("import api::Reading; import api::use_reader;
-        class Reader {relation} Reading {{ pub {modifier} async fn read(self, text: {mode} {ty}) -> String {{ await sleep(1); gc_minor_collect(); gc_collect(); return {result}; }} }}
+        class Reader {relation} Reading {{ pub {modifier} async fn read(self, text: {mode} {ty}) -> String {{ await yield(); gc_minor_collect(); gc_collect(); return {result}; }} }}
         async fn main() {{ await use_reader(new Reader()); }}");
     (api, main)
 }
@@ -217,7 +217,7 @@ fn async_gc_reference_dispatch_independent_tasks() {
             "let mut text = \"local\"; let task = reader.read(&text); inspect(&text); replace(&text); println(text); consume(task);",
         );
         let source = source.replace(
-            "async fn read(self, text: &mut String) -> String { await sleep(1); return \"done\"; }",
+            "async fn read(self, text: &mut String) -> String { await yield(); return \"done\"; }",
             "fn read(self, text: &mut String) -> Task<String> { return value(); }",
         );
         let (out, ok) = compile_and_run_gc_stress_mode(&source, "relocate");
@@ -266,10 +266,10 @@ fn async_gc_reference_method_without_later_caller_read() {
             let source = format!(
                 "open class Reader {{
                 pub {declaration}: {mode} String, unused: i64) -> String {{
-                    await sleep(1); gc_minor_collect(); gc_collect(); return text;
+                    await yield(); gc_minor_collect(); gc_collect(); return text;
                 }}
             }} class Child extends Reader {{}}
-            async fn token() -> i64 {{ await sleep(1); return 0; }}
+            async fn token() -> i64 {{ await yield(); return 0; }}
             async fn main() {{
                 {receiver} let mut text = \"borrowed\" + \" string\";
                 let task = {call}; let result = await task; println(result);
@@ -284,7 +284,7 @@ fn async_gc_reference_method_without_later_caller_read() {
         &[
             (
                 "reader.wi",
-                "module reader; pub async fn read(text: &String) -> String { await sleep(1); gc_minor_collect(); gc_collect(); return text; }",
+                "module reader; pub async fn read(text: &String) -> String { await yield(); gc_minor_collect(); gc_collect(); return text; }",
             ),
             (
                 "main.wi",
@@ -302,7 +302,7 @@ fn async_gc_reference_method_without_later_caller_read() {
         }
         class Reader extends Base {
             pub override async fn read(self, text: &String) -> String {
-                await sleep(1); gc_collect(); return text;
+                await yield(); gc_collect(); return text;
             }
         }
         async fn main() {
@@ -317,7 +317,7 @@ fn async_gc_reference_method_without_later_caller_read() {
         interface Reading extends Sync { fn read(self, text: &String) -> Task<String>; }
         open class AsyncParent {
             pub async fn read(self, text: &String) -> String {
-                await sleep(1); gc_collect(); return text;
+                await yield(); gc_collect(); return text;
             }
         }
         class Child extends AsyncParent implements Reading {}
@@ -365,7 +365,7 @@ fn async_gc_reference_paths() {
         for shape in 0..8 {
             let body = match shape {
                 0 => "await update(&x);",
-                1 => "let t = update(&x); await sleep(1); await t;",
+                1 => "let t = update(&x); await yield(); await t;",
                 2 => "await forward(&x);",
                 3 => "await sync_forward(&x);",
                 4 => "await deferred(&x);",
@@ -383,12 +383,12 @@ fn async_gc_reference_paths() {
             };
             let source = format!("import std::collections::Array;
                 class Box {{ pub value: String; }}
-                async fn update(x: &mut {ty}) {{ await sleep(1); x = {updated}; gc_collect(); await sleep(1); }}
-                async fn forward(x: &mut {ty}) {{ await sleep(1); await update(&x); }}
+                async fn update(x: &mut {ty}) {{ await yield(); x = {updated}; gc_collect(); await yield(); }}
+                async fn forward(x: &mut {ty}) {{ await yield(); await update(&x); }}
                 fn sync_update(x: &mut {ty}) {{ x = {updated}; gc_collect(); }}
-                async fn sync_forward(x: &mut {ty}) {{ await sleep(1); sync_update(&x); }}
-                async fn deferred(x: &mut {ty}) {{ defer {{ sync_update(&x); }} await sleep(1); }}
-                async fn read(x: &{ty}) {{ await sleep(1); gc_collect(); println({print}); }}
+                async fn sync_forward(x: &mut {ty}) {{ await yield(); sync_update(&x); }}
+                async fn deferred(x: &mut {ty}) {{ defer {{ sync_update(&x); }} await yield(); }}
+                async fn read(x: &{ty}) {{ await yield(); gc_collect(); println({print}); }}
                 async fn main() {{ {main} }}");
             let (out, ok) = compile_and_run_gc_stress_mode(&source, "relocate");
             assert!(ok, "{ty}/{shape}/element={element}: {out}");
@@ -411,10 +411,10 @@ fn async_gc_reference_moving_writeback() {
         };
         let source = format!(
             "async fn update(x: &mut String) {{
-            await sleep(1); x = \"fresh\" + \" string\";
+            await yield(); x = \"fresh\" + \" string\";
             let before = {counter}(); {collect}();
             println({counter}() > before); println(x);
-            await sleep(1); println(x);
+            await yield(); println(x);
         }} async fn main() {{ let mut x = \"old\"; await update(&x); println(x); }}"
         );
         let project = TestProject::new("gc_ref_writeback", &[("main.wi", &source)]);
@@ -446,7 +446,7 @@ fn async_gc_reference_moving_writeback() {
 fn async_gc_reference_heap_places_and_aliases() {
     let source = r#"import std::collections::Array;
         class Box { pub value: String; }
-        async fn update(x: &mut String) { await sleep(1); x = "new" + " value"; gc_collect(); }
+        async fn update(x: &mut String) { await yield(); x = "new" + " value"; gc_collect(); }
         fn mutate(x: Box) { x.value = "aliased"; }
         async fn main() {
             let b = new Box("old"); let alias = b;
@@ -473,14 +473,14 @@ fn async_gc_reference_diagnostics() {
         ),
     ] {
         let out = compile_error_stderr(&format!(
-            "async fn update(x: &mut String) {{ await sleep(1); }} async fn main() {{ {body} }}"
+            "async fn update(x: &mut String) {{ await yield(); }} async fn main() {{ {body} }}"
         ));
         assert!(out.contains(code), "{body}: {out}");
         assert!(!out.contains("E1707"), "{out}");
     }
     for mode in ["&", "&mut"] {
         let source = format!(
-            "import std::collections::Array; async fn use_array(x: {mode} Array<String>) {{ await sleep(1); }} async fn main() {{ let mut x: Array<String> = [\"old\"]; await use_array(&x); }}"
+            "import std::collections::Array; async fn use_array(x: {mode} Array<String>) {{ await yield(); }} async fn main() {{ let mut x: Array<String> = [\"old\"]; await use_array(&x); }}"
         );
         let out = compile_error_stderr(&source);
         assert!(out.contains("E2402") && out.contains("not `Sync`"), "{out}");
@@ -498,7 +498,7 @@ fn async_gc_reference_methods_and_imports() {
         &[
             (
                 "model.wi",
-                "module model; pub class Box { pub value: String; pub async fn update(self, x: &mut String) { await sleep(1); x = self.value; gc_collect(); } } pub async fn replace(x: &mut Box) { await sleep(1); x = new Box(\"replaced\"); gc_collect(); }",
+                "module model; pub class Box { pub value: String; pub async fn update(self, x: &mut String) { await yield(); x = self.value; gc_collect(); } } pub async fn replace(x: &mut Box) { await yield(); x = new Box(\"replaced\"); gc_collect(); }",
             ),
             (
                 "main.wi",
@@ -517,7 +517,7 @@ fn async_gc_reference_methods_and_imports() {
             ),
             (
                 "main.wi",
-                "import model; async fn replace(x: &mut model::Box) { await sleep(1); x = new model::Box(\"qualified\"); gc_collect(); } async fn main() { let mut b = new model::Box(\"old\"); await replace(&b); println(b.value); }",
+                "import model; async fn replace(x: &mut model::Box) { await yield(); x = new model::Box(\"qualified\"); gc_collect(); } async fn main() { let mut b = new model::Box(\"old\"); await replace(&b); println(b.value); }",
             ),
         ],
         "main.wi",
@@ -531,9 +531,9 @@ fn async_gc_reference_shared_aliases() {
     let source = r#"
         class Box { pub value: String; }
         async fn replace(x: &mut Box, alias: Box) {
-            await sleep(1); x = new Box("new"); gc_collect(); println(alias.value);
+            await yield(); x = new Box("new"); gc_collect(); println(alias.value);
         }
-        async fn read(x: &String) -> String { await sleep(1); gc_collect(); return x; }
+        async fn read(x: &String) -> String { await yield(); gc_collect(); return x; }
         async fn main() {
             let mut b = new Box("old"); let alias = b;
             await replace(&b, alias); println(b.value); println(alias.value);
@@ -551,11 +551,11 @@ fn async_gc_reference_shared_aliases() {
 fn async_gc_reference_forwarding_scaling() {
     for depth in [1, 8, 32] {
         let mut source = String::from(
-            "async fn f0(x: &mut String) { await sleep(1); x = \"new\" + \" value\"; gc_collect(); }",
+            "async fn f0(x: &mut String) { await yield(); x = \"new\" + \" value\"; gc_collect(); }",
         );
         for i in 1..depth {
             source.push_str(&format!(
-                "async fn f{i}(x: &mut String) {{ await sleep(1); await f{}(&x); gc_collect(); }}",
+                "async fn f{i}(x: &mut String) {{ await yield(); await f{}(&x); gc_collect(); }}",
                 i - 1
             ));
         }
@@ -573,7 +573,7 @@ fn async_gc_reference_forwarding_scaling() {
 fn async_gc_reference_panic_and_cancel() {
     for cancel in [false, true] {
         let trigger = if cancel {
-            "ready.send(1); await sleep(10000);"
+            "ready.send(1); let hold_until_cancel = Channel<i64>::new(); hold_until_cancel.recv();"
         } else {
             "panic(\"stop\");"
         };
@@ -586,7 +586,7 @@ fn async_gc_reference_panic_and_cancel() {
             "async fn work(x: &mut String, ready: Channel<i64>) {{
             defer match recover() {{ Some(_) => {{}}, None => {{}} }};
             defer {{ x = \"cleanup\" + \" value\"; gc_collect(); println(x); }}
-            await sleep(1); {trigger}
+            await yield(); {trigger}
         }} async fn main() {{ let mut x = \"old\"; let ready = Channel<i64>::new();
             let s = TaskScope::new(); s.add(work(&x, ready)); {join} println(x); }}"
         );

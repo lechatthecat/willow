@@ -26,19 +26,19 @@ fn async_scalar_reference_release() {
 fn async_scalar_reference_paths() {
     for (ty, _, value, expected) in SCALARS {
         for shape in 0..8 {
-            let read = format!("async fn read(x: &{ty}) -> {ty} {{ await sleep(1); return x; }}");
+            let read = format!("async fn read(x: &{ty}) -> {ty} {{ await yield(); return x; }}");
             let source = match shape {
                 0 => format!(
-                    "{read} async fn main() {{ let x = {value}; let task = read(&x); await sleep(1); let y = await task; println(y); }}"
+                    "{read} async fn main() {{ let x = {value}; let task = read(&x); await yield(); let y = await task; println(y); }}"
                 ),
                 1 => format!(
-                    "{read} async fn forward(x: &{ty}) -> {ty} {{ await sleep(1); return await read(&x); }} async fn main() {{ let x = {value}; let y = await forward(&x); println(y); }}"
+                    "{read} async fn forward(x: &{ty}) -> {ty} {{ await yield(); return await read(&x); }} async fn main() {{ let x = {value}; let y = await forward(&x); println(y); }}"
                 ),
                 2 => format!(
-                    "fn sync_read(x: &{ty}) -> {ty} {{ return x; }} async fn read(x: &{ty}) -> {ty} {{ await sleep(1); return sync_read(&x); }} async fn main() {{ let x = {value}; let y = await read(&x); println(y); }}"
+                    "fn sync_read(x: &{ty}) -> {ty} {{ return x; }} async fn read(x: &{ty}) -> {ty} {{ await yield(); return sync_read(&x); }} async fn main() {{ let x = {value}; let y = await read(&x); println(y); }}"
                 ),
                 3 => format!(
-                    "async fn read(x: &{ty}) {{ defer {{ println(x); }} await sleep(1); }} async fn main() {{ let x = {value}; await read(&x); }}"
+                    "async fn read(x: &{ty}) {{ defer {{ println(x); }} await yield(); }} async fn main() {{ let x = {value}; await read(&x); }}"
                 ),
                 4 => format!(
                     "{read} async fn main() {{ let x = {value}; let mut i = 0; while i < 3 {{ let y = await read(&x); if i == 2 {{ println(y); }} i = i + 1; }} }}"
@@ -47,7 +47,7 @@ fn async_scalar_reference_paths() {
                     "{read} async fn main() {{ let x = {value}; if true {{ let z = await read(&x); println(z); }} else {{ println(x); }} }}"
                 ),
                 6 => format!(
-                    "async fn read(a: i64, x: &{ty}, b: String, y: &{ty}) -> {ty} {{ await sleep(1); println(a); println(b); return y; }} async fn main() {{ let x = {value}; let y = await read(7, &x, \"kept\", &x); println(y); }}"
+                    "async fn read(a: i64, x: &{ty}, b: String, y: &{ty}) -> {ty} {{ await yield(); println(a); println(b); return y; }} async fn main() {{ let x = {value}; let y = await read(7, &x, \"kept\", &x); println(y); }}"
                 ),
                 _ => format!(
                     "{read} async fn main() {{ let x = {value}; let first = read(&x); let second = read(&x); let a = await first; let b = await second; println(b); }}"
@@ -71,7 +71,7 @@ fn async_scalar_reference_observes_caller_storage() {
         // The gate orders the caller's mutation before the callee's second
         // read. No timing assumptions or concurrent read/write race.
         let source = format!(
-            "async fn read(x: &{ty}, ready: Channel<i64>, gate: Channel<i64>) -> {ty} {{ let before = x; ready.send(1); gate.recv(); await sleep(1); return x; }} async fn main() {{ let mut x = {initial}; let ready = Channel<i64>::new(); let gate = Channel<i64>::new(); let task = read(&x, ready, gate); ready.recv(); x = {updated}; gate.send(1); let result = await task; println(result); }}"
+            "async fn read(x: &{ty}, ready: Channel<i64>, gate: Channel<i64>) -> {ty} {{ let before = x; ready.send(1); gate.recv(); await yield(); return x; }} async fn main() {{ let mut x = {initial}; let ready = Channel<i64>::new(); let gate = Channel<i64>::new(); let task = read(&x, ready, gate); ready.recv(); x = {updated}; gate.send(1); let result = await task; println(result); }}"
         );
         for release in [false, true] {
             let (out, ok) = if release {
@@ -116,7 +116,7 @@ fn async_scalar_reference_diagnostics() {
             (String::new(), format!("await read(&({value}));"), "E1704"),
         ] {
             let source = format!(
-                "async fn read(x: &{ty}) {{ await sleep(1); {body} }} async fn main() {{ {call} }}"
+                "async fn read(x: &{ty}) {{ await yield(); {body} }} async fn main() {{ {call} }}"
             );
             let diagnostics = compile_error_stderr(&source);
             assert!(diagnostics.contains(code), "{source}\n{diagnostics}");
@@ -127,7 +127,7 @@ fn async_scalar_reference_diagnostics() {
 
 #[test]
 fn async_scalar_reference_methods_and_imports() {
-    let source = "class Reader { pub async fn read(self, x: &f64) -> f64 { await sleep(1); return x; } pub static async fn flag(x: &bool) -> bool { await sleep(1); return x; } } async fn main() { let reader = new Reader(); let x = 2.5; let flag = true; let y = await reader.read(&x); println(y); let z = await Reader::flag(&flag); println(z); }";
+    let source = "class Reader { pub async fn read(self, x: &f64) -> f64 { await yield(); return x; } pub static async fn flag(x: &bool) -> bool { await yield(); return x; } } async fn main() { let reader = new Reader(); let x = 2.5; let flag = true; let y = await reader.read(&x); println(y); let z = await Reader::flag(&flag); println(z); }";
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
     assert_eq!(out, "2.5\ntrue\n");
@@ -135,7 +135,7 @@ fn async_scalar_reference_methods_and_imports() {
         &[
             (
                 "reader.wi",
-                "module reader; pub async fn read(x: &i64) -> i64 { await sleep(1); return x; }",
+                "module reader; pub async fn read(x: &i64) -> i64 { await yield(); return x; }",
             ),
             (
                 "main.wi",
@@ -150,7 +150,7 @@ fn async_scalar_reference_methods_and_imports() {
 
 #[test]
 fn async_scalar_reference_heap_places_relocate() {
-    let source = "import std::collections::Array; class Box { pub value: i64; } async fn read(x: &i64) -> i64 { await sleep(1); gc_collect(); return x; } async fn main() { let b = new Box(42); let values: Array<i64> = [81]; let a = await read(&b.value); println(a); let v = await read(&values[0]); println(v); }";
+    let source = "import std::collections::Array; class Box { pub value: i64; } async fn read(x: &i64) -> i64 { await yield(); gc_collect(); return x; } async fn main() { let b = new Box(42); let values: Array<i64> = [81]; let a = await read(&b.value); println(a); let v = await read(&values[0]); println(v); }";
     for mode in ["all", "relocate"] {
         let (out, ok) = compile_and_run_gc_stress_mode(source, mode);
         assert!(ok, "{mode}: {out}");
@@ -161,10 +161,10 @@ fn async_scalar_reference_heap_places_relocate() {
 #[test]
 fn async_scalar_reference_forwarding_chain() {
     for depth in [1, 8, 32] {
-        let mut source = String::from("async fn f0(x: &i64) -> i64 { await sleep(1); return x; }");
+        let mut source = String::from("async fn f0(x: &i64) -> i64 { await yield(); return x; }");
         for i in 1..depth {
             source.push_str(&format!(
-                "async fn f{i}(x: &i64) -> i64 {{ await sleep(1); return await f{}(&x); }}",
+                "async fn f{i}(x: &i64) -> i64 {{ await yield(); return await f{}(&x); }}",
                 i - 1
             ));
         }
@@ -182,7 +182,7 @@ fn async_scalar_reference_forwarding_chain() {
 fn async_scalar_reference_preserves_reference_errors() {
     for (source, code) in [
         (
-            "fn update(x: &mut i64) {} async fn read(x: &i64) { await sleep(1); update(&x); } fn main() {}",
+            "fn update(x: &mut i64) {} async fn read(x: &i64) { await yield(); update(&x); } fn main() {}",
             "E1701",
         ),
         (
@@ -205,10 +205,10 @@ fn async_mut_scalar_reference_paths() {
     for (ty, initial, updated, expected) in SCALARS {
         for shape in 0..8 {
             let update =
-                format!("async fn update(x: &mut {ty}) {{ await sleep(1); x = {updated}; }}");
+                format!("async fn update(x: &mut {ty}) {{ await yield(); x = {updated}; }}");
             let body = match shape {
                 0 => "await update(&x);".to_string(),
-                1 => "let task = update(&x); await sleep(1); await task;".to_string(),
+                1 => "let task = update(&x); await yield(); await task;".to_string(),
                 2 => "await forward(&x);".to_string(),
                 3 => "await sync_forward(&x);".to_string(),
                 4 => "await deferred(&x);".to_string(),
@@ -218,10 +218,10 @@ fn async_mut_scalar_reference_paths() {
             };
             let source = format!(
                 "{update}
-                async fn forward(x: &mut {ty}) {{ await sleep(1); await update(&x); }}
+                async fn forward(x: &mut {ty}) {{ await yield(); await update(&x); }}
                 fn sync_update(x: &mut {ty}) {{ x = {updated}; }}
-                async fn sync_forward(x: &mut {ty}) {{ await sleep(1); sync_update(&x); }}
-                async fn deferred(x: &mut {ty}) {{ defer {{ x = {updated}; }} await sleep(1); }}
+                async fn sync_forward(x: &mut {ty}) {{ await yield(); sync_update(&x); }}
+                async fn deferred(x: &mut {ty}) {{ defer {{ x = {updated}; }} await yield(); }}
                 async fn immediate(x: &mut {ty}) {{ x = {updated}; }}
                 async fn main() {{ let mut x = {initial}; {body} println(x); }}"
             );
@@ -245,7 +245,7 @@ fn async_mut_scalar_reference_alias_diagnostics() {
             let a = if modes.0.is_empty() { "x" } else { "&x" };
             let b = if modes.1.is_empty() { "x" } else { "&x" };
             let source = format!(
-                "async fn update(a: {} {ty}, b: {} {ty}) {{ await sleep(1); }} async fn main() {{ let mut x = {initial}; await update({a}, {b}); }}",
+                "async fn update(a: {} {ty}, b: {} {ty}) {{ await yield(); }} async fn main() {{ let mut x = {initial}; await update({a}, {b}); }}",
                 modes.0, modes.1
             );
             let errors = compile_error_stderr(&source);
@@ -258,8 +258,8 @@ fn async_mut_scalar_reference_alias_diagnostics() {
 #[test]
 fn async_mut_scalar_reference_heap_places_and_methods() {
     let source = "import std::collections::Array;
-        class Box { pub value: i64; pub async fn update(self, x: &mut f64) { await sleep(1); gc_collect(); x = 4.25; } pub static async fn flag(x: &mut bool) { await sleep(1); x = true; } }
-        async fn update(x: &mut i64) { await sleep(1); gc_collect(); x = 81; }
+        class Box { pub value: i64; pub async fn update(self, x: &mut f64) { await yield(); gc_collect(); x = 4.25; } pub static async fn flag(x: &mut bool) { await yield(); x = true; } }
+        async fn update(x: &mut i64) { await yield(); gc_collect(); x = 81; }
         async fn main() { let b = new Box(42); let values: Array<i64> = [42]; let mut f = 2.5; let mut flag = false; await update(&b.value); await update(&values[0]); await b.update(&f); await Box::flag(&flag); println(b.value); println(values[0]); println(f); println(flag); }";
     for mode in ["minor", "all", "relocate"] {
         let (out, ok) = compile_and_run_gc_stress_mode(source, mode);
@@ -272,7 +272,7 @@ fn async_mut_scalar_reference_heap_places_and_methods() {
 fn async_mut_scalar_reference_pending_conflicts() {
     for place in ["x", "b.value", "values[0]"] {
         let source = format!(
-            "import std::collections::Array; class Box {{ pub value: i64; }} async fn update(x: &mut i64) {{ await sleep(1); x = 2; }} async fn main() {{ let mut x = 1; let b = new Box(1); let values: Array<i64> = [1]; let a = update(&{place}); let second = update(&{place}); await a; await second; }}"
+            "import std::collections::Array; class Box {{ pub value: i64; }} async fn update(x: &mut i64) {{ await yield(); x = 2; }} async fn main() {{ let mut x = 1; let b = new Box(1); let values: Array<i64> = [1]; let a = update(&{place}); let second = update(&{place}); await a; await second; }}"
         );
         let errors = compile_error_stderr(&source);
         assert!(errors.contains("E1706"), "{source}\n{errors}");
@@ -285,7 +285,7 @@ fn async_mut_scalar_reference_import_and_distinct_places() {
         &[
             (
                 "update.wi",
-                "module update; pub async fn update(a: &mut i64, b: &mut i64) { await sleep(1); a = a + 1; b = b + 2; }",
+                "module update; pub async fn update(a: &mut i64, b: &mut i64) { await yield(); a = a + 1; b = b + 2; }",
             ),
             (
                 "main.wi",
@@ -301,10 +301,10 @@ fn async_mut_scalar_reference_import_and_distinct_places() {
 #[test]
 fn async_mut_scalar_reference_forwarding_chain() {
     for depth in [1, 8, 32] {
-        let mut source = String::from("async fn f0(x: &mut i64) { await sleep(1); x = x + 1; }");
+        let mut source = String::from("async fn f0(x: &mut i64) { await yield(); x = x + 1; }");
         for i in 1..depth {
             source.push_str(&format!(
-                "async fn f{i}(x: &mut i64) {{ await sleep(1); await f{}(&x); x = x + 1; }}",
+                "async fn f{i}(x: &mut i64) {{ await yield(); await f{}(&x); x = x + 1; }}",
                 i - 1
             ));
         }
@@ -331,7 +331,7 @@ fn async_mut_scalar_reference_preserves_diagnostics() {
             (format!("await update(&({initial}));"), "E1704"),
         ] {
             let errors = compile_error_stderr(&format!(
-                "async fn update(x: &mut {ty}) {{ await sleep(1); }} async fn main() {{ {body} }}"
+                "async fn update(x: &mut {ty}) {{ await yield(); }} async fn main() {{ {body} }}"
             ));
             assert!(errors.contains(code), "{body}: {errors}");
             assert!(!errors.contains("E1707"), "{errors}");
@@ -344,7 +344,7 @@ fn async_mut_scalar_reference_sync_overlap_diagnostics() {
     for (ty, initial, _, _) in SCALARS {
         for (async_mode, sync_mode) in [("&mut", "&mut"), ("&mut", "&"), ("&", "&mut")] {
             let source = format!(
-                "async fn borrow(x: {async_mode} {ty}) {{ await sleep(1); }} fn sync_use(x: {sync_mode} {ty}) {{}} async fn main() {{ let mut x = {initial}; let t = borrow(&x); sync_use(&x); await t; }}"
+                "async fn borrow(x: {async_mode} {ty}) {{ await yield(); }} fn sync_use(x: {sync_mode} {ty}) {{}} async fn main() {{ let mut x = {initial}; let t = borrow(&x); sync_use(&x); await t; }}"
             );
             let errors = compile_error_stderr(&source);
             assert!(errors.contains("E1706"), "{source}\n{errors}");
@@ -360,7 +360,7 @@ fn async_mut_scalar_reference_sync_overlap_diagnostics() {
 fn async_mut_scalar_reference_sync_after_discharge_and_distinct_places() {
     for (ty, initial, updated, expected) in SCALARS {
         let source = format!(
-            "async fn update(x: &mut {ty}) {{ await sleep(1); x = {updated}; }} fn sync_update(x: &mut {ty}) {{ x = {updated}; }} fn sync_read(x: &{ty}) -> {ty} {{ return x; }} async fn main() {{ let mut x = {initial}; let mut y = {initial}; let task = update(&x); sync_update(&y); let before = sync_read(&y); await task; sync_update(&x); let after = sync_read(&x); println(after); println(y); }}"
+            "async fn update(x: &mut {ty}) {{ await yield(); x = {updated}; }} fn sync_update(x: &mut {ty}) {{ x = {updated}; }} fn sync_read(x: &{ty}) -> {ty} {{ return x; }} async fn main() {{ let mut x = {initial}; let mut y = {initial}; let task = update(&x); sync_update(&y); let before = sync_read(&y); await task; sync_update(&x); let after = sync_read(&x); println(after); println(y); }}"
         );
         let (out, ok) = compile_and_run(&source);
         assert!(ok, "{source}\n{out}");
@@ -377,7 +377,7 @@ fn async_mut_scalar_reference_sync_import_overlap() {
             "await t; sync_update(&x);"
         };
         let main = format!(
-            "import writer::sync_update; async fn update(x: &mut i64) {{ await sleep(1); x = 2; }} async fn main() {{ let mut x = 1; let t = update(&x); {middle} println(x); }}"
+            "import writer::sync_update; async fn update(x: &mut i64) {{ await yield(); x = 2; }} async fn main() {{ let mut x = 1; let t = update(&x); {middle} println(x); }}"
         );
         let files = [
             (
@@ -434,7 +434,7 @@ fn async_scoped_borrow_scalar_paths() {
                 "await c.finish();"
             };
             let source = format!(
-                "async fn update(x: &mut {ty}) {{ await sleep(1); x = {updated}; }} async fn read(x: &{ty}) -> {ty} {{ await sleep(1); return x; }} async fn main() {{ let mut x = {initial}; let s = TaskScope::new(); {scope} c.add(update(&x)); {finish} let y = await read(&x); println(y); }}"
+                "async fn update(x: &mut {ty}) {{ await yield(); x = {updated}; }} async fn read(x: &{ty}) -> {ty} {{ await yield(); return x; }} async fn main() {{ let mut x = {initial}; let s = TaskScope::new(); {scope} c.add(update(&x)); {finish} let y = await read(&x); println(y); }}"
             );
             let (out, ok) = compile_and_run(&source);
             assert!(ok, "{source}\n{out}");
@@ -460,8 +460,8 @@ fn async_scoped_borrow_return_rejected() {
 #[test]
 fn async_scoped_borrow_heap_and_imported_forwarding() {
     let source = "import std::collections::Array;
-        class Box { pub value: i64; pub async fn read(self, x: &i64) -> i64 { await sleep(1); gc_collect(); return x; } }
-        async fn update(x: &mut i64) { await sleep(1); gc_collect(); x = x + 1; }
+        class Box { pub value: i64; pub async fn read(self, x: &i64) -> i64 { await yield(); gc_collect(); return x; } }
+        async fn update(x: &mut i64) { await yield(); gc_collect(); x = x + 1; }
         async fn main() { let b = new Box(40); let values: Array<i64> = [41]; let s = TaskScope::new(); let c = s.child(); c.add(update(&values[0])); let t = s.add(b.read(&b.value)); await s.finish(); println(await t); println(values[0]); }";
     let (out, ok) = compile_and_run_gc_stress_mode(source, "relocate");
     assert!(ok, "{out}");
@@ -470,7 +470,7 @@ fn async_scoped_borrow_heap_and_imported_forwarding() {
         &[
             (
                 "worker.wi",
-                "module worker; async fn update(x: &mut i64) { await sleep(1); x = x + 1; } pub async fn scoped(x: &mut i64) { let s = TaskScope::new(); let c = s.child(); c.add(update(&x)); await s.finish(); }",
+                "module worker; async fn update(x: &mut i64) { await yield(); x = x + 1; } pub async fn scoped(x: &mut i64) { let s = TaskScope::new(); let c = s.child(); c.add(update(&x)); await s.finish(); }",
             ),
             (
                 "main.wi",
@@ -497,8 +497,10 @@ fn async_borrow_unwind_scalar_matrix() {
                 };
                 let trigger = match exit {
                     "panic" => "panic(\"borrow-unwind\");",
-                    "cancel" => "ready.send(1); await sleep(10000);",
-                    _ => "await sleep(1);",
+                    "cancel" => {
+                        "ready.send(1); let hold_until_cancel = Channel<i64>::new(); hold_until_cancel.recv();"
+                    }
+                    _ => "await yield();",
                 };
                 let join = if exit == "cancel" {
                     "ready.recv(); scope.cancel(); let _ = await scope.finish();"
@@ -550,7 +552,7 @@ fn async_borrow_unwind_heap_and_forwarding() {
             let trigger = if exit == "panic" {
                 "panic(\"unwind\");"
             } else {
-                "ready.send(1); await sleep(10000);"
+                "ready.send(1); let hold_until_cancel = Channel<i64>::new(); hold_until_cancel.recv();"
             };
             let join = if exit == "panic" {
                 "await s.finish();"
@@ -565,7 +567,7 @@ fn async_borrow_unwind_heap_and_forwarding() {
                     defer match recover() {{ Some(_) => {{}}, None => {{}} }};
                     defer {{ gc_collect(); println(x); }}
                     defer {{ cleanup(&x); }}
-                    x = 40; await sleep(1); {trigger}
+                    x = 40; await yield(); {trigger}
                 }}
                 async fn main() {{ let b = new Box(0); let values: Array<i64> = [0];
                     let ready = Channel<i64>::new(); let s = TaskScope::new();
@@ -584,7 +586,7 @@ fn async_borrow_unwind_unhandled_panic_keeps_older_defers() {
         "async fn worker(x: &mut i64) {
             defer { gc_collect(); println(x); }
             defer { x = 42; panic(\"cleanup-panic\"); }
-            await sleep(1); panic(\"body-panic\");
+            await yield(); panic(\"body-panic\");
         }
         async fn main() { let mut x = 0; await worker(&x); }",
     );
@@ -649,7 +651,7 @@ fn async_mut_sync_preemption_example_modes() {
 
 #[test]
 fn async_mut_sync_preemption_fairness_and_storage() {
-    // A sleeper is the only way out of the synchronous loop. A missing poll
+    // The controller is the only way out of the synchronous loop. A missing poll
     // deterministically times out on one worker, regardless of machine speed.
     for (ty, initial, update, expected) in [
         ("i64", "0", "x + 1", "true"),
@@ -666,11 +668,11 @@ fn async_mut_sync_preemption_fairness_and_storage() {
             while !done.load() {{ x = {update}; }}
         }}
         async fn work(x: &mut {ty}, started: AtomicBool, done: AtomicBool) -> bool {{
-            heavy(&x, started, done); await sleep(1); return {check};
+            heavy(&x, started, done); await yield(); return {check};
         }}
         async fn main() {{ let mut x = {initial}; let started = AtomicBool::new(false); let done = AtomicBool::new(false);
             let t = work(&x, started, done); while !started.load() {{ await yield(); }}
-            await sleep(1); done.store(true); let result = await t; println(result); println({check}); }}");
+            done.store(true); let result = await t; println(result); println({check}); }}");
         let project = TestProject::new("mut_sync_fair", &[("main.wi", &source)]);
         let compiled = project.compile("main.wi");
         assert!(
@@ -720,7 +722,7 @@ fn async_mut_sync_preemption_cancel_releases_lock_and_borrow() {
             let mut x = 0; let m = Mutex::new(0); let started = AtomicBool::new(false);
             let scope = TaskScope::new(); scope.add(work(&x, started, m));
             while !started.load() { await yield(); }
-            await sleep(1); scope.cancel(); await scope.finish();
+            scope.cancel(); await scope.finish();
             println(x); lock m as value { println(value); }
         }
     "#;
@@ -768,7 +770,7 @@ fn async_mut_sync_preemption_nested_heap_and_repeated_calls() {
                     gc_collect();
                 }}
                 async fn work(x: &mut i64) {{
-                    let mut i = 0; while i < {count} {{ heavy(&x, {count}); await sleep(1); i = i + 1; }}
+                    let mut i = 0; while i < {count} {{ heavy(&x, {count}); await yield(); i = i + 1; }}
                 }}
                 async fn main() {{ let mut x = 0; let b = new Box(0); let values: Array<i64> = [0];
                     await work(&{place}); println({place}); }}");

@@ -716,6 +716,8 @@ unsafe fn willow_channel_send_value(raw: *mut c_void, value: WillowChannelValue)
         // SAFETY: The channel element ABI supplies the initialized union representation read by
         // this operation.
         is_ref.then(|| crate::gc::GcRootHandle::new(unsafe { value.ptr_value }.cast()));
+    #[cfg(feature = "deterministic-test-clock")]
+    crate::test_clock::sync_send_wait();
     // Bounded channel is FULL in a synchronous context: help drive the
     // scheduler so consumers can free space (mirror of sync recv). If no
     // task can progress and the buffer is still full/open, abort with a
@@ -1130,6 +1132,8 @@ fn wait_for_value(
     current: u64,
 ) -> Option<WillowChannelValue> {
     let root = crate::gc::GcRootHandle::new(raw.cast());
+    #[cfg(feature = "deterministic-test-clock")]
+    crate::test_clock::sync_recv_wait();
     loop {
         let completed = crate::scheduler::willow_sched_run_until_deadline(
             crate::scheduler::willow_monotonic_millis().saturating_add(1),

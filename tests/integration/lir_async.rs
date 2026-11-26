@@ -2118,7 +2118,7 @@ async fn slow(entered: Channel<i64>) -> i64 {
             None => println("d: cancelled path")
         }
         entered.send(1);
-        await sleep(10000);
+        let hold_until_cancel = Channel<i64>::new(); hold_until_cancel.recv();
         println("never");
     }
     return 1;

@@ -1889,8 +1889,8 @@ fn assert_sweep_retains_new_allocations(recovery: bool) {
         if recovery {
             runtime()
                 .remark_observation
-                .work_ns
-                .store(1, Ordering::Relaxed);
+                .elapsed_ns
+                .store(1_000_000, Ordering::Relaxed);
             *runtime().marker_workers.lock().unwrap() = Some(mark_workers::Pool::new(0).unwrap());
         }
         SWEEP_MUTATOR_READY.store(false, Ordering::Relaxed);
@@ -2649,7 +2649,7 @@ fn array_shrink_between_slices_preserves_unscanned_deleted_references() {
         );
     }
     drop(consumer);
-    crate::gc::preemption_tolerant_remark_budget_for_test();
+    crate::gc::deterministic_remark_clock_for_test();
     let (_, plan) =
         mark_closure::finish(&cycle, Instant::now()).expect("native slices close concurrently");
     assert!(cycle.is_marked(deleted as usize));
@@ -3055,7 +3055,7 @@ fn satb_phase_flip_stops_owners_before_activation_and_remark() {
         while !deleted.load(Ordering::Acquire) {
             std::thread::yield_now();
         }
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
         assert_eq!(
             crate::runtime::current()
@@ -3189,6 +3189,8 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
     // publication round: it keeps using its roots, so dropping them from the
     // snapshot freed its live object (chroot_01 hang on ubuntu CI).
     let _guard = isolated_runtime();
+    let _watchdog = crate::test_sync::Watchdog::new("legacy owner unregister during activation");
+    let unregister_waits = crate::test_sync::count("unregister_waiting_for_foreign_cycle");
     // SAFETY: The test controls its isolated runtime at this reset boundary; no other mutator
     // or subsequent access relies on the discarded heap.
     unsafe { reset_internal_for_test() };
@@ -3205,16 +3207,16 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
             // popped; collection may rewrite it there.
             unsafe { willow_push_root(&raw mut object) };
             willow_gc_register_mutator();
-            while !runtime().poll_requested.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            crate::test_sync::until("collection never requested activation", || {
+                runtime().poll_requested.load(Ordering::Acquire)
+            });
             // Acknowledge the activation round only; roots are not taken yet.
             willow_gc_safepoint();
             leaving.store(true, Ordering::Release);
             willow_gc_unregister_mutator();
-            while !collected.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            crate::test_sync::until("collection did not finish after unregister", || {
+                collected.load(Ordering::Acquire)
+            });
             assert_eq!(willow_gc_allocated_bytes(), (GC_HEADER_SIZE + 8) as i64);
             // SAFETY: The removed shadow-stack entries belong to this operation and their
             // slot storage is still live.
@@ -3225,24 +3227,28 @@ fn legacy_owner_unregistering_during_activation_still_publishes_its_roots() {
         let leaving = leaving.clone();
         std::thread::spawn(crate::runtime::serving(move || {
             willow_gc_register_mutator();
-            while !leaving.load(Ordering::Acquire) {
+            crate::test_sync::until("owner never acknowledged activation", || {
+                if leaving.load(Ordering::Acquire) {
+                    return true;
+                }
                 willow_gc_safepoint();
-                std::thread::yield_now();
-            }
-            // Hold the activation round open until the owner has left the
-            // registry; with the owner held back, give up after a bound.
-            let owner_left = || runtime().coord.0.lock().unwrap().mutators.len() == 1;
-            let deadline = Instant::now() + Duration::from_millis(200);
-            while !owner_left() && Instant::now() < deadline {
-                std::thread::yield_now();
-            }
+                false
+            });
+            // Hold activation open until unregister either removed the owner
+            // or reached the foreign-cycle wait while keeping its roots registered.
+            // Only this owner can reach unregister before the blocker is released.
+            crate::test_sync::until("owner never reached the unregister boundary", || {
+                runtime().coord.0.lock().unwrap().mutators.len() == 1
+                    || crate::test_sync::count("unregister_waiting_for_foreign_cycle")
+                        > unregister_waits
+            });
             willow_gc_safepoint();
             willow_gc_unregister_mutator();
         }))
     };
-    while runtime().coord.0.lock().unwrap().mutators.len() != 2 {
-        std::thread::yield_now();
-    }
+    crate::test_sync::until("owner and blocker did not register", || {
+        runtime().coord.0.lock().unwrap().mutators.len() == 2
+    });
     willow_gc_collect();
     assert_eq!(
         willow_gc_allocated_bytes(),
@@ -3495,7 +3501,7 @@ fn concurrent_closure_waits_for_batched_work_exceptions_and_unwind_publication()
             std::thread::yield_now();
         }
         assert!(cycle.queue.snapshot().is_drained());
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let finished = mark_closure::finish(&cycle, Instant::now());
         assist.join().unwrap();
         assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
@@ -3543,6 +3549,9 @@ fn m3_real_closure_last_work_latency_and_cpu() {
         let mut cpu_valid = true;
         for sample in 0..100 {
             let (last_tx, last_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_phase = sample % 4;
+            let owner_done = Arc::new(AtomicBool::new(false));
             // SAFETY: The test controls its isolated runtime at this reset boundary; no other
             // mutator or subsequent access relies on the discarded heap.
             unsafe { reset_internal_for_test() };
@@ -3568,7 +3577,7 @@ fn m3_real_closure_last_work_latency_and_cpu() {
             };
             let ready = Arc::new(AtomicBool::new(false));
             let assist = {
-                let (cycle, ready) = (cycle.clone(), ready.clone());
+                let (cycle, ready, owner_done) = (cycle.clone(), ready.clone(), owner_done.clone());
                 std::thread::spawn(crate::runtime::serving(move || {
                     {
                         // Model a drain that has completed its queue item but still
@@ -3608,26 +3617,56 @@ fn m3_real_closure_last_work_latency_and_cpu() {
                         }
                         assert!(!runtime().stop_requested.load(Ordering::Acquire));
                         assert!(runtime().heap.lock().unwrap().concurrent_cycle.is_some());
-                        // Complete real accounting after closure has observed an
-                        // unfinished drain. Vary completion relative to its wait.
-                        std::thread::sleep(Duration::from_micros([0, 100, 500, 1500][sample % 4]));
+                        // Release relative to observed wait stages, never a delay
+                        // chosen in hopes of reaching a particular interleaving.
+                        let registration = release_rx
+                            .recv_timeout(Duration::from_secs(30))
+                            .expect("closure did not release the final owner");
+                        if notification && release_phase >= 2 {
+                            crate::test_sync::until("closure never registered its wait", || {
+                                crate::test_sync::count("mark_termination_wait") > registration
+                            });
+                        }
                         drop(batch);
                         let last_work = Instant::now();
                         drop(owner);
+                        owner_done.store(true, Ordering::Release);
                         last_tx.send(last_work).unwrap();
                     }
                 }))
             };
-            while !ready.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            crate::test_sync::until("final marking owner did not enter", || {
+                ready.load(Ordering::Acquire)
+            });
             assert!(cycle.queue.snapshot().is_drained());
             let cpu_start = crate::gc_telemetry::workers::thread_cpu_ns();
-            crate::gc::preemption_tolerant_remark_budget_for_test();
+            crate::gc::deterministic_remark_clock_for_test();
+            let mut release_tx = Some(release_tx);
+            let mut wait_calls = 0;
+            let release_at = if release_phase == 3 { 2 } else { 1 };
             let finished = mark_closure::finish_with_policy(
                 &cycle,
                 Instant::now(),
-                std::thread::sleep,
+                |delay| {
+                    wait_calls += 1;
+                    // Keep the actual timed-vs-notified pacing behavior under
+                    // measurement. Only owner-release ordering is controlled.
+                    if !notification && release_phase >= 2 {
+                        std::thread::sleep(delay);
+                    }
+                    if wait_calls == release_at {
+                        let registration = crate::test_sync::count("mark_termination_wait");
+                        release_tx.take().unwrap().send(registration).unwrap();
+                        if release_phase == 0 {
+                            crate::test_sync::until("owner did not finish before wait", || {
+                                owner_done.load(Ordering::Acquire)
+                            });
+                        }
+                    }
+                    if notification || release_phase < 2 {
+                        std::thread::sleep(delay);
+                    }
+                },
                 || {},
                 notification,
             );
@@ -3647,8 +3686,10 @@ fn m3_real_closure_last_work_latency_and_cpu() {
             );
             assist.join().unwrap();
             assert_eq!(cycle.active_drains.load(Ordering::Acquire), 0);
-            // A loaded host can exhaust the remark budget after the last owner;
-            // production then completes the cycle with a stopped recovery.
+            assert!(wait_calls >= release_at);
+            assert!(release_tx.is_none());
+            // Bounded closure can transfer to stopped recovery while the final
+            // owner is still scheduled; either path must retain its accounting.
             let (work, plan) = match finished {
                 Some((work, plan)) => (work, Some(plan)),
                 None => {
@@ -3901,7 +3942,7 @@ fn closing_phase_deletions_publish_directly_until_seal_then_buffer_for_recheck()
     while !ready.load(Ordering::Acquire) {
         std::thread::yield_now();
     }
-    crate::gc::preemption_tolerant_remark_budget_for_test();
+    crate::gc::deterministic_remark_clock_for_test();
     // A deletion buffered after the first seal reopened the shards may reach
     // the recheck stop unpublished (the producer parks there before
     // unregistering). The reseal then transfers the unmarked child, rejects
@@ -4089,12 +4130,11 @@ fn concurrent_closure_paces_contention_and_retains_work_until_release() {
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
         // mutator or subsequent access relies on the discarded heap.
         unsafe { reset_internal_for_test() };
-        // The remark stop's 1ms wall-clock budget can expire on a preempted CI
-        // runner, which correctly takes the stopped fallback this test excludes.
+        // Advance remark time only explicitly; scheduling cannot select fallback.
         runtime()
             .remark_observation
-            .work_ns
-            .store(100_000_000, Ordering::Relaxed);
+            .elapsed_ns
+            .store(0, Ordering::Relaxed);
         BUDGET_RETRY_CALLS.store(0, Ordering::Relaxed);
         // Finite on the old spin loop too, so regression fails without hanging.
         BUDGET_RETRY_LIMIT.store(waits_before_release * 1024, Ordering::Relaxed);
@@ -4726,7 +4766,7 @@ fn satb_remark_cap_preserves_rendezvous_deletions_through_stopped_completion() {
             };
             ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
             let mut rechecks = 0;
-            crate::gc::preemption_tolerant_remark_budget_for_test();
+            crate::gc::deterministic_remark_clock_for_test();
             let finished = mark_closure::finish_with_hooks(
                 &cycle,
                 Instant::now(),
@@ -4844,7 +4884,7 @@ fn satb_closure_wave_cap_resumes_retrying_work_with_bounded_recovery() {
             cycle
         };
         let mut waits = 0;
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         assert!(
             mark_closure::finish_with_wait(&cycle, Instant::now(), |_| {
                 waits += 1;
@@ -4945,28 +4985,77 @@ fn closure_cycle_with_queued_objects(count: usize) -> Arc<ConcurrentCycle> {
 }
 
 #[test]
+fn virtual_remark_clock_selects_concurrent_and_recovery_completion() {
+    let _guard = isolated_runtime();
+    for count in [1, 257, 4096] {
+        for expire in [false, true] {
+            // SAFETY: Each preceding cycle was swept and no mutators retain roots.
+            unsafe { reset_internal_for_test() };
+            let cycle = closure_cycle_with_queued_objects(count);
+            runtime()
+                .remark_observation
+                .elapsed_ns
+                .store(if expire { 1_000_000 } else { 0 }, Ordering::Relaxed);
+            let result = mark_closure::finish_with_wave_budget(
+                &cycle,
+                Instant::now(),
+                Duration::MAX,
+                |_| {},
+            );
+            assert_eq!(result.is_none(), expire, "objects={count}");
+            assert_eq!(
+                cycle.stopped_completion_required.load(Ordering::Acquire),
+                expire
+            );
+            let (work, plan) = if let Some(result) = result {
+                result
+            } else {
+                // Permit recovery work explicitly, independently of host scheduling.
+                runtime()
+                    .remark_observation
+                    .elapsed_ns
+                    .store(0, Ordering::Relaxed);
+                let (work, plan, freed) =
+                    mark_closure::finish_recovery_with_wait(&cycle, Instant::now(), |_| {});
+                assert_eq!(freed, 0);
+                (work, plan.expect("recovery publishes the sweep plan"))
+            };
+            assert_eq!(work.marked_bytes, (count * (GC_HEADER_SIZE + 8)) as u64);
+            assert!(cycle.queue.snapshot().is_drained());
+            sweep::concurrent(plan);
+            assert_eq!(
+                willow_gc_allocated_bytes(),
+                (count * (GC_HEADER_SIZE + 8)) as i64
+            );
+            willow_gc_collect();
+            assert_eq!(willow_gc_allocated_bytes(), 0);
+        }
+    }
+    // SAFETY: Every cycle has completed and no root refers to the discarded heap.
+    unsafe { reset_internal_for_test() };
+}
+
+#[test]
 fn closure_wave_keeps_draining_productive_batches_until_its_budget() {
     let _guard = isolated_runtime();
     for count in [1usize, 255, 256, 257, 4096, 20_000] {
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
         // mutator or subsequent access relies on the discarded heap.
         unsafe { reset_internal_for_test() };
-        // A loaded host must not exhaust the remark stop budget either.
+        // Keep remark time fixed while testing the independent wave policy.
         runtime()
             .remark_observation
-            .work_ns
-            .store(100_000_000, Ordering::Relaxed);
+            .elapsed_ns
+            .store(0, Ordering::Relaxed);
         let cycle = closure_cycle_with_queued_objects(count);
         let mut waits = 0;
         // An unlimited wave budget fixes the wave count independent of how
         // fast the host traces; closure paces only between unfinished waves.
-        let (work, plan) = mark_closure::finish_with_wave_budget(
-            &cycle,
-            Instant::now(),
-            Duration::from_secs(3600),
-            |_| waits += 1,
-        )
-        .expect("queued work completes concurrently");
+        let (work, plan) =
+            mark_closure::finish_with_wave_budget(&cycle, Instant::now(), Duration::MAX, |_| {
+                waits += 1
+            })
+            .expect("queued work completes concurrently");
         let waves = *cycle.closure_waves.lock().unwrap();
         // The old 256-item wave needed ceil(count / 256) waves and waits.
         assert_eq!(waits, 0, "count={count} {waves:?}");
@@ -5006,8 +5095,8 @@ fn closure_wave_budget_bounds_one_wave_and_repays_before_the_next() {
     unsafe { reset_internal_for_test() };
     runtime()
         .remark_observation
-        .work_ns
-        .store(100_000_000, Ordering::Relaxed);
+        .elapsed_ns
+        .store(0, Ordering::Relaxed);
     let count = 64;
     let cycle = closure_cycle_with_queued_objects(count);
     let mut delays = Vec::new();
@@ -5063,7 +5152,7 @@ fn closure_counts_zero_slot_native_continuations_as_progress() {
     // (slice calls, wave budget). Zero budget: one item per wave, so more
     // byte-free waves than the stall bound. Unlimited budget: zero-byte drains
     // must not end the wave after one 256-item batch.
-    let unlimited = Duration::from_secs(3600);
+    let unlimited = Duration::MAX;
     for (steps, budget) in [
         (4 * mark_closure::MAX_STALLED_DRAIN_WAVES, Duration::ZERO),
         (255, unlimited),
@@ -5075,8 +5164,8 @@ fn closure_counts_zero_slot_native_continuations_as_progress() {
         unsafe { reset_internal_for_test() };
         runtime()
             .remark_observation
-            .work_ns
-            .store(100_000_000, Ordering::Relaxed);
+            .elapsed_ns
+            .store(0, Ordering::Relaxed);
         EMPTY_SLICE_STEPS.store(steps, Ordering::Relaxed);
         // SAFETY: The requested layout describes the initialized words of this object and its
         // type’s tracing or finalization contract.
@@ -5156,25 +5245,21 @@ fn closure_escalates_after_bounded_waves_without_progress() {
         unsafe { reset_internal_for_test() };
         runtime()
             .remark_observation
-            .work_ns
-            .store(100_000_000, Ordering::Relaxed);
+            .elapsed_ns
+            .store(0, Ordering::Relaxed);
         let cycle = closure_cycle_with_queued_objects(0);
         // A publication owner that never publishes: every source is drained
         // and no drain is active, yet each remark election is rejected.
         let mut owner = Some(cycle.termination.enter());
         let mut waits = 0;
-        let finished = mark_closure::finish_with_wave_budget(
-            &cycle,
-            Instant::now(),
-            Duration::from_secs(3600),
-            |delay| {
+        let finished =
+            mark_closure::finish_with_wave_budget(&cycle, Instant::now(), Duration::MAX, |delay| {
                 assert!(delay >= Duration::from_millis(1));
                 waits += 1;
                 if Some(waits) == release_after {
                     owner.take();
                 }
-            },
-        );
+            });
         let waves = *cycle.closure_waves.lock().unwrap();
         drop(owner);
         match release_after {
@@ -5337,7 +5422,7 @@ fn satb_bounded_native_and_retry_slice_complete_with_snapshot_retention() {
         assert_eq!(calls == 0, !predrain);
         let mut waits = 0;
         if predrain {
-            crate::gc::preemption_tolerant_remark_budget_for_test();
+            crate::gc::deterministic_remark_clock_for_test();
             assert!(
                 mark_closure::finish_with_wait(&cycle, Instant::now(), |_| waits += 1).is_none()
             );
@@ -5985,7 +6070,7 @@ fn closing_phase_store_publication_batches_per_mutator() {
         unsafe { willow_push_root(&raw mut parent) };
         let children: Vec<_> = (0..count).map(|_| willow_alloc(8)).collect();
         let (_, cycle) = root_handshake::begin().unwrap();
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         assert!(mark_closure::seal_closing_sources_in(
             crate::runtime::current(),
             &cycle
@@ -6136,7 +6221,7 @@ fn closing_recheck_stop_reseals_reopened_buffers_before_election() {
         // SAFETY: The live object's trace layout reserves these aligned pointer slots.
         unsafe { store_gc_reference(parent.cast(), first) };
         let (_, cycle) = root_handshake::begin().unwrap();
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let mut rechecks = 0;
         let finished = mark_closure::finish_with_hooks(
             &cycle,
@@ -7349,7 +7434,7 @@ fn reference_array_growth_during_marking_preserves_copied_edges() {
         // SAFETY: The destination is the live fixture array; the element word matches its
         // declared storage and tracing layout.
         unsafe { crate::array::willow_array_push(array, old as i64) };
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now())
             .expect("native array tracing closes concurrently");
         assert!(cycle.is_marked(old as usize));

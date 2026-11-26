@@ -368,6 +368,8 @@ pub unsafe extern "C" fn willow_runtime_set_event_hook_v1(
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         while previous.active_callbacks.load(Ordering::Acquire) != 0 {
+            #[cfg(test)]
+            crate::test_sync::reached("event_hook_quiescence");
             wait = previous
                 .quiescent
                 .wait(wait)
@@ -555,13 +557,16 @@ mod tests {
             while !context.entered.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
+            let before = crate::test_sync::count("event_hook_quiescence");
             scope.spawn(crate::runtime::serving(|| {
                 // SAFETY: The registration retains its callback context through delivery and
                 // unregisters before the storage expires.
                 unsafe { willow_runtime_set_event_hook_v1(None, std::ptr::null_mut()) };
                 cleared.store(true, Ordering::Release);
             }));
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            crate::test_sync::until("hook unregister did not await its active callback", || {
+                crate::test_sync::count("event_hook_quiescence") > before
+            });
             assert!(!cleared.load(Ordering::Acquire));
             context.release.store(true, Ordering::Release);
         });

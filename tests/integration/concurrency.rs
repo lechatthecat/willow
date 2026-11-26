@@ -97,8 +97,8 @@ async fn main() {
 // ── Scheduler stays alive for BlockedSyscall-only workloads ─
 // With no ready tasks, no timers, and no netpoll waiters, a pending blocking-
 // pool job must still keep the scheduler waiting: run_until returning early
-// would hand the awaiter an unfinished result. A FIFO makes the I/O genuinely
-// slow (the writer arrives 300ms later from the test harness).
+// would hand the awaiter an unfinished result. The harness releases the FIFO
+// writer only after observing the task in BlockedSyscall.
 #[cfg(target_os = "linux")]
 fn libc_o_nonblock() -> i32 {
     // O_NONBLOCK on Linux; avoids a libc dev-dependency for one flag.

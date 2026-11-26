@@ -6,23 +6,36 @@ fn bsys_01_slow_blocking_io_keeps_scheduler_alive() {
     use std::io::Write;
     let id = unique_test_id();
     let fifo = format!("/tmp/willow_bsys_{id}");
+    let marker = format!("/tmp/willow_bsys_blocked_{id}");
     let status = std::process::Command::new("mkfifo")
         .arg(&fifo)
         .status()
         .expect("mkfifo");
     assert!(status.success(), "mkfifo failed");
     let source = format!(
-        "async fn main() {{ let t = fs::read_to_string_async(\"{fifo}\"); match await t {{ Ok(text) => println(text), Err(e) => println(\"err\"), }} }}"
+        r#"
+async fn main() {{
+    test_observe_next_task();
+    let t = fs::read_to_string_async("{fifo}");
+    let reader = test_observed_task();
+    if reader <= 0 {{ panic("missing FIFO reader task"); }}
+    while !test_task_blocked_syscall(reader) {{ await yield(); }}
+    match fs::write_string("{marker}", "blocked-syscall") {{
+        Ok(_) => {{}}, Err(_) => {{ panic("cannot publish blocked reader"); }},
+    }}
+    match await t {{ Ok(text) => println(text), Err(e) => println("err"), }}
+}}
+"#
     );
     let writer_path = fifo.clone();
+    let writer_marker = marker.clone();
     let writer = std::thread::spawn(move || {
         // A blocking FIFO open would wedge forever if the reader never
         // appears (e.g. the program failed to compile) — and the join below
         // would hang CI with it. Open NON-BLOCKING and retry until a reader
         // connects or a deadline passes (review fix).
         use std::os::unix::fs::OpenOptionsExt;
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
         loop {
             match std::fs::OpenOptions::new()
                 .write(true)
@@ -30,20 +43,32 @@ fn bsys_01_slow_blocking_io_keeps_scheduler_alive() {
                 .open(&writer_path)
             {
                 Ok(mut f) => {
-                    let _ = f.write_all(b"slow-io");
+                    // Connection alone does not prove scheduler detachment.
+                    // The child publishes this marker only after observing
+                    // its reader's actual BlockedSyscall lifecycle.
+                    while std::fs::read_to_string(&writer_marker).ok().as_deref()
+                        != Some("blocked-syscall")
+                    {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "FIFO reader never reached BlockedSyscall"
+                        );
+                        std::thread::yield_now();
+                    }
+                    f.write_all(b"slow-io").unwrap();
                     break;
                 }
                 Err(_) if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::yield_now();
                 }
-                Err(_) => break,
+                Err(error) => panic!("FIFO reader did not connect: {error}"),
             }
         }
     });
-    let (out, ok) =
-        compile_and_run_with_runtime_env(&source, &[], std::time::Duration::from_secs(15));
+    let (out, ok) = compile_and_run_with_test_sync(&source, &[("WILLOW_WORKERS", "1")]);
     writer.join().unwrap();
     let _ = std::fs::remove_file(&fifo);
+    let _ = std::fs::remove_file(&marker);
     assert!(ok, "{out}");
     assert_eq!(out, "slow-io\n");
 }

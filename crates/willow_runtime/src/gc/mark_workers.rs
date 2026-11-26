@@ -58,6 +58,8 @@ pub(super) struct Pool {
     telemetry: Arc<crate::gc_telemetry::workers::WorkerTelemetry>,
     shared: Arc<(Mutex<State>, Condvar)>,
     threads: Vec<JoinHandle<()>>,
+    #[cfg(test)]
+    stop_now: Option<std::time::Instant>,
 }
 
 // Sample once per runtime, without initializing its collector or scheduler.
@@ -131,6 +133,8 @@ impl Pool {
                 Condvar::new(),
             )),
             threads: Vec::with_capacity(count),
+            #[cfg(test)]
+            stop_now: None,
         };
         for index in 0..count {
             let shared = pool.shared.clone();
@@ -224,9 +228,13 @@ impl Pool {
         assert_eq!(state.remaining, 0, "cannot shut down active heap readers");
         state.shutdown = true;
         cv.notify_all();
-        let deadline = std::time::Instant::now() + timeout;
+        #[cfg(test)]
+        let now = || self.stop_now.unwrap_or_else(std::time::Instant::now);
+        #[cfg(not(test))]
+        let now = std::time::Instant::now;
+        let deadline = now() + timeout;
         while state.remaining_workers != 0 {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let remaining = deadline.saturating_duration_since(now());
             if remaining.is_zero() {
                 // Idle workers hold no epoch. One shared deadline bounds the
                 // whole pool, including partial construction after spawn failure.
@@ -450,8 +458,10 @@ mod termination_tests {
     fn private_service_shutdown_preserves_other_idle_marker_pool() {
         let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
         let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
-        let first_pool = Pool::new_in(1, &first.telemetry.workers).unwrap();
-        let second_pool = Pool::new_in(2, &second.telemetry.workers).unwrap();
+        let mut first_pool = Pool::new_in(1, &first.telemetry.workers).unwrap();
+        let mut second_pool = Pool::new_in(2, &second.telemetry.workers).unwrap();
+        first_pool.stop_now = Some(std::time::Instant::now());
+        second_pool.stop_now = Some(std::time::Instant::now());
         let first_state = first_pool.shared.clone();
         let second_state = second_pool.shared.clone();
         *first.gc.marker_workers.lock().unwrap() = Some(first_pool);
@@ -475,7 +485,7 @@ mod termination_tests {
     fn private_collector_drop_stops_only_its_idle_marker_pool() {
         let first = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
         let second = crate::runtime::Runtime::new(crate::scheduler::environment_worker_config);
-        let (first_pool, second_pool) = std::thread::scope(|scope| {
+        let (mut first_pool, mut second_pool) = std::thread::scope(|scope| {
             let first = scope.spawn(crate::runtime::serving(|| {
                 Pool::new_in(1, &first.telemetry.workers).unwrap()
             }));
@@ -484,6 +494,8 @@ mod termination_tests {
             }));
             (first.join().unwrap(), second.join().unwrap())
         });
+        first_pool.stop_now = Some(std::time::Instant::now());
+        second_pool.stop_now = Some(std::time::Instant::now());
         let first_telemetry = Arc::downgrade(&first.telemetry.workers);
         let second_telemetry = Arc::downgrade(&second.telemetry.workers);
         let first_state = first_pool.shared.clone();
@@ -521,7 +533,10 @@ mod termination_tests {
         unsafe { reset_internal_for_test() };
         for count in [0, 1, 4, 16, 64] {
             for used in [false, true] {
-                let pool = Pool::new(count).unwrap();
+                let mut pool = Pool::new(count).unwrap();
+                // This test covers completion, not the timeout-detach policy.
+                // Freeze the budget so host load cannot select that other path.
+                pool.stop_now = Some(std::time::Instant::now());
                 let shared = pool.shared.clone();
                 let cycle = Arc::new(ConcurrentCycle::new(
                     [],
@@ -533,19 +548,22 @@ mod termination_tests {
                     pool.run(crate::runtime::current(), &cycle, 0);
                 }
                 assert_eq!(Arc::strong_count(&cycle), 1);
-                let start = std::time::Instant::now();
-                drop(pool);
+                let (done, completed) = std::sync::mpsc::channel();
+                let stopper = std::thread::spawn(crate::runtime::serving(move || {
+                    drop(pool);
+                    done.send(()).unwrap();
+                }));
+                completed
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("marker pool shutdown did not complete");
+                stopper.join().unwrap();
                 let state = shared.0.lock().unwrap();
                 assert_eq!(state.remaining_workers, 0);
                 assert_eq!(state.observation.completions, count);
                 assert_eq!(state.observation.notifications, usize::from(count != 0));
                 assert_eq!(state.remaining, 0);
                 assert!(state.job.is_none());
-                assert!(start.elapsed() < std::time::Duration::from_secs(2));
-                println!(
-                    "shutdown workers={count} used={used} completions={count} elapsed_us={}",
-                    start.elapsed().as_micros()
-                );
+                println!("shutdown workers={count} used={used} completions={count}");
             }
         }
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
@@ -581,9 +599,22 @@ mod termination_tests {
                     })));
             }
             let before = telemetry.snapshot().join_timeouts;
-            let start = std::time::Instant::now();
-            pool.stop(std::time::Duration::from_millis(10));
-            assert!(start.elapsed() < std::time::Duration::from_secs(1));
+            let (stopped, stopping) = std::sync::mpsc::channel();
+            let stopper = std::thread::spawn(crate::runtime::serving(move || {
+                let timeout = std::time::Duration::from_millis(10);
+                let began = std::time::Instant::now();
+                pool.stop(timeout);
+                assert!(
+                    began.elapsed() >= timeout,
+                    "idle workers detached before deadline"
+                );
+                stopped.send(()).unwrap();
+                pool
+            }));
+            stopping
+                .recv_timeout(std::time::Duration::from_secs(30))
+                .expect("marker timeout did not detach idle workers");
+            let pool = stopper.join().unwrap();
             assert_eq!(shared.0.lock().unwrap().remaining_workers, count);
             assert_eq!(telemetry.snapshot().join_timeouts - before, count as u64);
             drop(pool);
@@ -592,8 +623,8 @@ mod termination_tests {
             }
             for _ in 0..count {
                 completed
-                    .recv_timeout(std::time::Duration::from_secs(2))
-                    .unwrap();
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .expect("detached marker did not acknowledge release");
             }
             assert_eq!(shared.0.lock().unwrap().remaining_workers, 0);
         }

@@ -25,6 +25,81 @@ use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+// Production resolves this name directly to Instant. The virtual clock and
+// its TLS lookup exist only in unit-test builds.
+#[cfg(not(test))]
+use std::time::Instant as QuantumClock;
+#[cfg(test)]
+use test_clock::TestClock as QuantumClock;
+
+#[cfg(test)]
+pub(crate) mod test_clock {
+    use super::{Cell, Duration, Instant};
+
+    thread_local! {
+        static NOW: Cell<Option<Instant>> = const { Cell::new(None) };
+    }
+
+    /// Scoped clock for tests that run a quantum directly on their own thread.
+    /// Keep the guard on that thread; nesting restores the previous clock.
+    pub(crate) struct TestClock {
+        previous: Option<Instant>,
+        _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+    }
+
+    impl TestClock {
+        pub(crate) fn new() -> Self {
+            Self {
+                previous: NOW.replace(Some(Instant::now())),
+                _thread_bound: std::marker::PhantomData,
+            }
+        }
+
+        pub(super) fn now() -> Instant {
+            NOW.get().unwrap_or_else(Instant::now)
+        }
+
+        pub(crate) fn advance(duration: Duration) {
+            NOW.set(Some(
+                NOW.get().expect("virtual quantum clock is not installed") + duration,
+            ));
+        }
+    }
+
+    impl Drop for TestClock {
+        fn drop(&mut self) {
+            NOW.set(self.previous);
+        }
+    }
+
+    #[test]
+    fn virtual_quantum_clock_is_thread_local_and_restores_nested_scope() {
+        let original = NOW.get();
+        let outer = TestClock::new();
+        let start = TestClock::now();
+        TestClock::advance(Duration::from_secs(10));
+        let advanced = TestClock::now();
+        assert_eq!(advanced.duration_since(start), Duration::from_secs(10));
+        {
+            let _nested = TestClock::new();
+            TestClock::advance(Duration::from_secs(20));
+        }
+        assert_eq!(TestClock::now(), advanced);
+        std::thread::spawn(|| {
+            assert!(NOW.get().is_none());
+            let _peer = TestClock::new();
+            let start = TestClock::now();
+            TestClock::advance(Duration::from_secs(30));
+            assert_eq!(TestClock::now() - start, Duration::from_secs(30));
+        })
+        .join()
+        .unwrap();
+        assert_eq!(TestClock::now(), advanced);
+        drop(outer);
+        assert_eq!(NOW.get(), original);
+    }
+}
+
 /// Production fairness is time-based. Explicit WILLOW_TASK_BUDGET values
 /// retain exact deterministic safepoint budgets for tests and tuning.
 /// A small default turns fast arithmetic into repeated scheduler round trips.
@@ -257,7 +332,7 @@ pub unsafe extern "C" fn willow_preempt_begin(flag: *const c_void) {
 /// its address and allocation live throughout the bound quantum, including suspension and
 /// restoration, until unbound.
 pub(crate) unsafe fn begin_quantum(config: PreemptConfig, flag: *const c_void) {
-    let now = Instant::now();
+    let now = QuantumClock::now();
     let quantum = Duration::from_millis(config.time_quantum_ms());
     let deadline = now.checked_add(quantum);
     QUANTUM.with(|q| {
@@ -497,7 +572,7 @@ pub(crate) fn charge_safepoints(count: u64) -> i32 {
 
         // (3) Wall-clock time quantum.
         if let Some(deadline) = q.deadline.get() {
-            let now = Instant::now();
+            let now = QuantumClock::now();
             if now >= deadline {
                 if let Some(flag) = flag {
                     flag.store(true, Ordering::Release);
@@ -759,6 +834,7 @@ mod tests {
 
     #[test]
     fn production_budget_uses_deadline_and_bounds_runtime_checks() {
+        let _clock = test_clock::TestClock::new();
         for safepoints in [1024usize, 4096, 16384] {
             // SAFETY: A null flag binds no storage and is explicitly supported.
             unsafe {
@@ -778,7 +854,7 @@ mod tests {
             let most = 1 + (safepoints - 1) / SYNC_POLL_STRIDE as usize;
             let least = 1 + (safepoints - 1) / SYNC_POLL_STRIDE_MAX as usize;
             assert!((least..=most).contains(&calls), "{safepoints}: {calls}");
-            QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
+            QUANTUM.with(|q| q.deadline.set(Some(QuantumClock::now())));
             let mut until_preempt = 0;
             while direct_check() == 0 {
                 until_preempt += 1;
@@ -790,6 +866,7 @@ mod tests {
 
     #[test]
     fn direct_async_batches_preserve_exact_budgets_and_bound_checks() {
+        let _clock = test_clock::TestClock::new();
         for budget in [
             1, 2, 3, 63, 64, 65, 127, 255, 256, 257, 1000, 4096, 8191, 8192, 8193, 20000,
         ] {
@@ -859,6 +936,7 @@ mod tests {
 
     #[test]
     fn fast_quantum_grows_the_grant_and_new_quantum_resets_it() {
+        let _clock = test_clock::TestClock::new();
         // An unreachable check interval makes every check early, so the
         // stride doubles once per runtime check regardless of timing.
         // SAFETY: A null flag binds no storage and is explicitly supported.
@@ -889,6 +967,7 @@ mod tests {
 
     #[test]
     fn direct_async_partial_batch_settles_before_helper_checks() {
+        let _clock = test_clock::TestClock::new();
         // SAFETY: A null flag binds no storage and is explicitly supported.
         unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
@@ -901,6 +980,7 @@ mod tests {
 
     #[test]
     fn direct_async_request_and_deadline_trip_within_one_batch() {
+        let _clock = test_clock::TestClock::new();
         for explicit in [false, true] {
             let flag = AtomicBool::new(false);
             // SAFETY: The fixture keeps the flag at its registered address throughout this
@@ -910,7 +990,7 @@ mod tests {
             if explicit {
                 flag.store(true, Ordering::Release);
             } else {
-                QUANTUM.with(|q| q.deadline.set(Some(Instant::now())));
+                QUANTUM.with(|q| q.deadline.set(Some(QuantumClock::now())));
             }
             // The pending request is seen at the end of the current grant.
             let grant = QUANTUM.with(|q| q.direct_granted.get()) as u64;
@@ -930,6 +1010,7 @@ mod tests {
 
     #[test]
     fn direct_async_suppressed_work_does_not_consume_budget() {
+        let _clock = test_clock::TestClock::new();
         // SAFETY: A null flag binds no storage and is explicitly supported.
         unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
@@ -948,6 +1029,7 @@ mod tests {
 
     #[test]
     fn direct_async_new_quantum_discards_old_grant() {
+        let _clock = test_clock::TestClock::new();
         // SAFETY: A null flag binds no storage and is explicitly supported.
         unsafe { begin_quantum(cfg(100, 100000), std::ptr::null()) };
         for _ in 0..20 {
@@ -1062,6 +1144,7 @@ mod tests {
     // 10. Budget exhaustion forces preemption after exactly `budget` checks.
     #[test]
     fn budget_exhaustion_preempts() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
@@ -1084,6 +1167,7 @@ mod tests {
     // 11. begin clears a stale request from a prior quantum.
     #[test]
     fn begin_clears_stale_request() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture retains the initialized AtomicBool through this access,
         // including concurrent requests.
@@ -1104,6 +1188,7 @@ mod tests {
     // 12. An explicit request mid-quantum trips the very next check.
     #[test]
     fn explicit_request_preempts_immediately() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
@@ -1122,15 +1207,15 @@ mod tests {
     // 13. Time quantum trips even with budget remaining.
     #[test]
     fn time_quantum_preempts() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
         unsafe { begin_quantum(cfg(1_000_000, 1), flag) };
-        // Spin past the 1ms deadline, then a check must trip on time.
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(3) {
-            std::hint::spin_loop();
-        }
+        // Time, not safepoint count, must trip exactly at the deadline.
+        test_clock::TestClock::advance(Duration::from_micros(999));
+        assert_eq!(willow_preempt_check(), 0);
+        test_clock::TestClock::advance(Duration::from_micros(1));
         assert_eq!(willow_preempt_check(), 1);
         willow_preempt_end();
         // SAFETY: This test owns the standalone flag and all accesses and bound quanta have
@@ -1141,6 +1226,7 @@ mod tests {
     // 14. No-preempt region overrides an explicit request.
     #[test]
     fn no_preempt_region_overrides_request() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
@@ -1161,6 +1247,7 @@ mod tests {
     // 15. No-preempt nesting requires matching leaves.
     #[test]
     fn no_preempt_region_nests() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
@@ -1183,6 +1270,7 @@ mod tests {
     // 16. end() unbinds: a later check (no new begin) never preempts.
     #[test]
     fn end_unbinds_quantum() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.
@@ -1199,6 +1287,7 @@ mod tests {
     // 17. begin with a null flag still enforces budget (no per-task flag).
     #[test]
     fn null_flag_quantum_still_counts_budget() {
+        let _clock = test_clock::TestClock::new();
         // SAFETY: A null flag binds no storage and is explicitly supported.
         unsafe { begin_quantum(cfg(2, 60_000), std::ptr::null()) };
         assert_eq!(willow_preempt_check(), 0);
@@ -1209,6 +1298,7 @@ mod tests {
     // 18. budget=1 trips on the first check.
     #[test]
     fn budget_one_trips_immediately() {
+        let _clock = test_clock::TestClock::new();
         // SAFETY: A null flag binds no storage and is explicitly supported.
         unsafe { begin_quantum(cfg(1, 60_000), std::ptr::null()) };
         assert_eq!(willow_preempt_check(), 1);
@@ -1218,6 +1308,7 @@ mod tests {
     // 19. A new begin re-arms the budget after a prior exhaustion.
     #[test]
     fn rearm_after_exhaustion() {
+        let _clock = test_clock::TestClock::new();
         let flag = willow_preempt_flag_new();
         // SAFETY: The fixture keeps the flag at its registered address throughout this
         // quantum and unbinds it before release.

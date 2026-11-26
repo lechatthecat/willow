@@ -30,7 +30,7 @@ fn frame_status_33_finished_status_is_stable() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(n: i64) -> i64 {
-    await sleep(2);
+    await yield();
     return n + 1;
 }
 
@@ -58,7 +58,7 @@ fn frame_status_34_repeated_await_does_not_rerun() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(runs: Channel<i64>) -> i64 {
-    await sleep(2);
+    await yield();
     runs.send(1);
     return 7;
 }
@@ -93,7 +93,8 @@ fn frame_status_35_cancel_is_visible_immediately() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn slow() -> i64 {
-    await sleep(5000);
+    let gate = Channel<i64>::new();
+    gate.recv();
     return 1;
 }
 
@@ -145,7 +146,8 @@ fn frame_status_37_task_result_reads_the_terminal_code() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(n: i64) -> i64 {
-    await sleep(n);
+    if n == 5000 { let gate = Channel<i64>::new(); gate.recv(); }
+    await yield();
     return n;
 }
 
@@ -178,7 +180,8 @@ fn frame_status_38_statuses_are_independent_per_handle() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(n: i64) -> i64 {
-    await sleep(2);
+    if n % 2 == 0 { let gate = Channel<i64>::new(); gate.recv(); }
+    await yield();
     return n;
 }
 
@@ -222,7 +225,7 @@ fn frame_status_39_status_survives_task_churn() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
 async fn work(n: i64) -> i64 {
-    await sleep(1);
+    await yield();
     return n;
 }
 
@@ -255,22 +258,23 @@ async fn main() {
 fn frame_status_40_status_is_stable_under_gc_stress() {
     let (out, ok, timed_out) = compile_and_run_with_env_timeout(
         r#"
-async fn work(n: i64, ms: i64) -> i64 {
-    await sleep(ms);
+async fn work(n: i64, pending: bool) -> i64 {
+    if pending { let gate = Channel<i64>::new(); gate.recv(); }
+    await yield();
     return n * 2;
 }
 
 async fn main() {
-    let done = work(4, 1);
+    let done = work(4, false);
     println(await done);
 
-    let stopped = work(5000, 600000);
+    let stopped = work(5000, true);
     stopped.cancel();
 
     let mut spawned = 0;
     let mut sum = 0;
     while spawned < 20 {
-        let t = work(spawned, 1);
+        let t = work(spawned, false);
         sum = sum + await t;
         spawned = spawned + 1;
     }
@@ -297,7 +301,8 @@ fn frame_status_41_eager_await_of_cancelled_task_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
 async fn slow() -> i64 {
-    await sleep(5000);
+    let gate = Channel<i64>::new();
+    gate.recv();
     return 7;
 }
 
@@ -323,7 +328,8 @@ fn frame_status_42_cooperative_await_of_cancelled_task_aborts() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
 async fn slow() -> i64 {
-    await sleep(5000);
+    let gate = Channel<i64>::new();
+    gate.recv();
     return 7;
 }
 

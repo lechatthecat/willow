@@ -198,37 +198,37 @@ fn async_deadlock_preserves_wake_sources_and_detached_exit() {
         ("async fn main() { await yield(); println(42); }", "42\n"),
         (include_str!("../../../example/async_sleep.wi"), "42\n"),
         // Returning main never waits for detached blocked, sleeping, or
-        // runnable tasks to finish. Yield first to let the peer start.
+        // runnable tasks to finish. Observe the actual peer state before returning.
         (
             r#"
-async fn blocked(c: Channel<i64>) { c.recv(); }
+async fn blocked(c: Channel<i64>, ready: Channel<i64>) { ready.send(test_current_task()); c.recv(); }
 async fn main() {
-    let c = Channel<i64>::new(); let t = blocked(c);
-    await yield(); println(42);
+    let c = Channel<i64>::new(); let ready = Channel<i64>::new(); let t = blocked(c, ready);
+    let id = ready.recv(); while !test_task_parked(id) { await yield(); } println(42);
 }
 "#,
             "42\n",
         ),
         (
             r#"
-async fn later() { await sleep(60000); println("UNREACHABLE"); }
-async fn main() { let t = later(); await yield(); println(42); }
+async fn later(ready: Channel<i64>) { ready.send(test_current_task()); await sleep(30); println("UNREACHABLE"); }
+async fn main() { test_set_time(0); let ready = Channel<i64>::new(); let t = later(ready); let id = ready.recv(); while !test_task_parked(id) { await yield(); } println(42); }
 "#,
             "42\n",
         ),
         (
             r#"
-async fn spin() { while true { await yield(); } }
-async fn main() { let t = spin(); await yield(); println(42); }
+async fn spin(started: AtomicBool) { started.store(true); while true { await yield(); } }
+async fn main() { let started = AtomicBool::new(false); let t = spin(started); while !started.load() { await yield(); } println(42); }
 "#,
             "42\n",
         ),
         // A timer can make another task runnable, which then wakes main.
         (
             r#"
-async fn producer(c: Channel<i64>) { await sleep(10); c.send(42); }
+async fn producer(c: Channel<i64>, caller: i64) { while !test_task_parked(caller) { await yield(); } await sleep(10); c.send(42); }
 async fn main() {
-    let c = Channel<i64>::new(); let t = producer(c);
+    let c = Channel<i64>::new(); let t = producer(c, test_current_task());
     println(c.recv()); await t;
 }
 "#,
@@ -254,6 +254,23 @@ async fn main() {
         ),
     ];
     for (case, (source, expected)) in cases.iter().enumerate() {
+        if matches!(case, 3 | 4 | 6) {
+            for workers in ["1", "4"] {
+                let run = if case == 4 {
+                    compile_and_run_with_virtual_time_output
+                } else {
+                    compile_and_run_with_test_sync_output
+                };
+                let (out, stderr, ok) = run(
+                    source,
+                    &[("WILLOW_WORKERS", workers), ("WILLOW_GC_STRESS", "alloc")],
+                );
+                assert!(ok, "case={case}, workers={workers}: {stderr}");
+                assert_eq!(out, *expected, "case={case}");
+                assert!(!stderr.contains("deadlock"), "{stderr}");
+            }
+            continue;
+        }
         let project = TestProject::new("async_main_progress", &[("main.wi", source)]);
         let compiled = project.compile("main.wi");
         assert!(

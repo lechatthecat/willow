@@ -304,7 +304,7 @@ impl WillowFutureVoid {
     pub fn sleep_after_millis(ms: i64) -> Self {
         let millis = ms.max(0) as u64;
         WillowFutureVoid::Sleep {
-            deadline: Instant::now() + Duration::from_millis(millis),
+            deadline: crate::timer::scheduler_now() + Duration::from_millis(millis),
         }
     }
 
@@ -312,7 +312,7 @@ impl WillowFutureVoid {
         match self {
             WillowFutureVoid::Ready => true,
             WillowFutureVoid::Pending => false,
-            WillowFutureVoid::Sleep { deadline } => Instant::now() >= *deadline,
+            WillowFutureVoid::Sleep { deadline } => crate::timer::scheduler_now() >= *deadline,
         }
     }
 
@@ -320,6 +320,8 @@ impl WillowFutureVoid {
     /// interrupts it. Ready/pending legacy variants keep their no-wait behavior.
     pub fn block_until_ready(&self) -> bool {
         if let WillowFutureVoid::Sleep { deadline } = self {
+            #[cfg(test)]
+            crate::test_sync::reached("legacy_future_sleep_await");
             #[cfg(any(
                 all(
                     target_os = "linux",
@@ -337,7 +339,10 @@ impl WillowFutureVoid {
                 // hold no managed pointer in their runtime frames, so the
                 // parked task's root slots may be rewritten.
                 let _relocation = crate::gc::RelocationSafeScope::enter();
-                while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+                while let Some(remaining) = deadline
+                    .checked_duration_since(crate::timer::scheduler_now())
+                    .filter(|remaining| !remaining.is_zero())
+                {
                     if crate::native_stack::cancelled() != 0 {
                         return false;
                     }
@@ -350,7 +355,7 @@ impl WillowFutureVoid {
                 }
                 return true;
             }
-            let remaining = deadline.checked_duration_since(Instant::now());
+            let remaining = deadline.checked_duration_since(crate::timer::scheduler_now());
             if let Some(remaining) = remaining {
                 // SAFETY: the sleep touches no runtime state, and neither this
                 // frame nor its callers keep a managed pointer across the wait.
@@ -712,7 +717,10 @@ mod tests {
             wait(60_000)
         }
         let _guard = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new("legacy ABI timer ownership");
         reset_global_scheduler_for_test();
+        let _ = willow_monotonic_millis();
+        let clock = crate::test_sync::SchedulerClock::new();
         DROPS.store(0, Ordering::SeqCst);
         for (index, callback) in [finish as crate::task::RuntimePollFn, cancel]
             .into_iter()
@@ -720,8 +728,10 @@ mod tests {
         {
             // SAFETY: The callback accepts a null frame and uses no frame storage.
             let task = unsafe { willow_sched_spawn(callback, std::ptr::null_mut()) };
+            crate::test_sync::drive_until("legacy ABI timer parked", &clock, || {
+                willow_sched_task_state(task) == 2
+            });
             if index == 1 {
-                willow_sched_run_until_deadline(willow_monotonic_millis() + 20);
                 assert_eq!(willow_sched_task_state(task), 2);
                 let token = TOKEN.load(Ordering::SeqCst);
                 assert!(handles().lock().unwrap().live.contains_key(&token));
@@ -1061,11 +1071,16 @@ mod tests {
 
     #[test]
     fn release_sleep_does_not_await_its_deadline() {
-        let raw = void_future_into_raw(WillowFutureVoid::sleep_after_millis(3_600_000));
+        let _runtime = crate::gc::isolated_runtime();
+        let _watchdog = crate::test_sync::Watchdog::new("release frozen pending future");
+        let _clock = crate::test_sync::SchedulerClock::new();
+        let raw = void_future_into_raw(WillowFutureVoid::sleep_after_millis(50));
         assert_eq!(willow_future_is_ready_void(raw), 0);
+        let awaits = crate::test_sync::count("legacy_future_sleep_await");
         // SAFETY: The constructor gave this test sole ownership; all synchronous borrows have
         // ended.
         unsafe { willow_future_release_void(raw) };
+        assert_eq!(crate::test_sync::count("legacy_future_sleep_await"), awaits);
     }
 
     #[test]

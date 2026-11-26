@@ -3568,6 +3568,26 @@ impl<'r> Builder<'r> {
                 operations: operations.clone(),
             });
         }
+        // A slow-path quiescence observation must precede the final probe.
+        // A peer can publish a ready case while the local drive completes zero tasks.
+        let quiescent = if !self.is_async
+            && !operations
+                .iter()
+                .any(|op| matches!(op, LirSelectOp::Default))
+        {
+            let name = self.synthetic_name("select_quiescent");
+            Some(self.push_synth_let(
+                &name,
+                true,
+                HirExpr {
+                    kind: HirExprKind::Bool(false),
+                    ty: Type::Bool,
+                    span,
+                },
+            ))
+        } else {
+            None
+        };
         let probe = self.new_block();
         let idle = self.new_block();
         let dispatch = self.new_block();
@@ -3641,16 +3661,7 @@ impl<'r> Builder<'r> {
                 resume: probe,
             });
         } else {
-            let name = self.synthetic_name("select_idle");
-            let local = self.declare_local(
-                name,
-                Type::Void,
-                None,
-                LocalOptions {
-                    synthetic: true,
-                    parameter: false,
-                },
-            );
+            let local = quiescent.expect("synchronous blocking select has a phase local");
             let deadlines = operations
                 .iter()
                 .filter_map(|operation| match operation {
@@ -3663,7 +3674,10 @@ impl<'r> Builder<'r> {
                 .collect();
             self.push(SourceInst::Compute {
                 local,
-                value: LirRvalue::SelectIdleWait { deadlines },
+                value: LirRvalue::SelectIdleWait {
+                    deadlines,
+                    quiescent: LirOperand::Local(local),
+                },
                 span,
             });
             self.terminate(SourceTerminator::Jump(probe));

@@ -111,7 +111,7 @@ async fn bump(m: Mutex<i64>, n: i64) -> i64 {
     let mut i = 0;
     while i < n {
         lock m as mut cell { cell = cell + 1; }
-        await sleep(1);
+        await yield();
         i = i + 1;
     }
     return n;
@@ -217,7 +217,7 @@ fn test_async_return_plain_value_allowed() {
     // The awaited-value annotation (`-> i64`) is fine and yields an awaitable task.
     let (out, ok) = compile_and_run(
         r#"
-async fn f() -> i64 { await sleep(1); return 7; }
+async fn f() -> i64 { await yield(); return 7; }
 async fn main() { println(await f()); }
 "#,
     );
@@ -229,7 +229,7 @@ async fn main() { println(await f()); }
 fn test_async_call_is_awaitable_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
-async fn work(x: i64) -> i64 { await sleep(1); return x * 2; }
+async fn work(x: i64) -> i64 { await yield(); return x * 2; }
 async fn main() {
     let t = work(21);
     println(await t);
@@ -246,7 +246,7 @@ fn test_async_call_concurrent_awaits_without_spawn() {
         r#"
 async fn work(id: i64, ticks: i64) -> i64 {
     let mut i = 0;
-    while i < ticks { await sleep(1); i = i + 1; }
+    while i < ticks { await yield(); i = i + 1; }
     return id * 100 + i;
 }
 async fn main() {
@@ -265,7 +265,7 @@ async fn main() {
 fn test_async_call_await_inline_without_spawn() {
     let (out, ok) = compile_and_run(
         r#"
-async fn square(x: i64) -> i64 { await sleep(1); return x * x; }
+async fn square(x: i64) -> i64 { await yield(); return x * x; }
 async fn main() {
     println(await square(5));
 }
@@ -279,20 +279,24 @@ async fn main() {
 // drains.
 #[test]
 fn test_await_returns_when_target_completes_not_draining_all() {
-    // a completes immediately; b is unrelated and never awaited. With five
-    // workers b may start concurrently, but awaiting a must not wait for b's
-    // timer.
-    let (out, ok) = compile_and_run(
+    // b is confirmed parked on an unreleased channel. Awaiting a must finish
+    // even though b is unrelated and never awaited.
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 async fn a_task() -> i64 { return 1; }
-async fn b_task() -> i64 { println(91); await sleep(200); println(92); return 2; }
+async fn b_task(gate: Channel<i64>, ready: Channel<i64>) -> i64 { println(91); ready.send(test_current_task()); gate.recv(); println(92); return 2; }
 async fn main() {
     let a = a_task();
-    let b = b_task();
+    let gate = Channel<i64>::new();
+    let ready = Channel<i64>::new();
+    let b = b_task(gate, ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
     println(await a);
     println(99);
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok);
     let lines: Vec<_> = out.lines().collect();
@@ -311,7 +315,7 @@ fn test_unrelated_task_is_still_awaitable_afterwards() {
     let (out, ok) = compile_and_run(
         r#"
 async fn a_task() -> i64 { return 1; }
-async fn b_task() -> i64 { println(91); await sleep(1); println(92); return 2; }
+async fn b_task() -> i64 { println(91); await yield(); println(92); return 2; }
 async fn main() {
     let a = a_task();
     let b = b_task();
@@ -341,7 +345,7 @@ fn test_await_drives_target_dependencies() {
     // a awaits c, so awaiting a must still drive c to completion.
     let (out, ok) = compile_and_run(
         r#"
-async fn c_task() -> i64 { await sleep(1); return 5; }
+async fn c_task() -> i64 { await yield(); return 5; }
 async fn a_task() -> i64 { let c = c_task(); return await c + 1; }
 async fn main() { let a = a_task(); println(await a); }
 "#,
@@ -352,23 +356,27 @@ async fn main() { let a = a_task(); println(await a); }
 
 #[test]
 fn test_await_does_not_hang_on_unrelated_long_task() {
-    // b would run far longer than a; `await a` must return promptly and the
-    // program must exit (main awaited only a) rather than draining b.
-    let (out, ok) = compile_and_run(
+    // The unrelated task is parked on an unreleased channel before awaiting
+    // the target, so completion cannot rely on a long workload finishing.
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn quick() -> i64 { await sleep(1); return 42; }
-async fn slow() -> i64 {
-    let mut i = 0;
-    while i < 100000 { await sleep(1); i = i + 1; }
-    return i;
+async fn quick() -> i64 { await yield(); return 42; }
+async fn slow(gate: Channel<i64>, ready: Channel<i64>) -> i64 {
+    ready.send(test_current_task());
+    return gate.recv();
 }
 async fn main() {
     let a = quick();
-    let b = slow();
+    let gate = Channel<i64>::new();
+    let ready = Channel<i64>::new();
+    let b = slow(gate, ready);
+    let id = ready.recv();
+    while !test_task_parked(id) { await yield(); }
     println(await a);
     println(777);
 }
 "#,
+        &[("WILLOW_WORKERS", "5")],
     );
     assert!(ok);
     assert_eq!(out, "42\n777\n");
@@ -397,7 +405,7 @@ import std::collections::Array;
 async fn worker(id: i64) -> i64 {
     let mut i = 0;
     let ticks = id % 5 + 1;
-    while i < ticks { await sleep(1); i = i + 1; }
+    while i < ticks { await yield(); i = i + 1; }
     return id;
 }
 async fn main() {
@@ -449,7 +457,7 @@ async fn main() {
     let mut sum = 0;
     let mut i = 1;
     while i <= 3 {
-        await sleep(1);
+        await yield();
         sum = sum + i;
         i = i + 1;
     }
@@ -466,7 +474,7 @@ fn test_async_suspension_nested_await_passes_values() {
     let (stdout, ok) = compile_and_run(
         r#"
 async fn inner(x: i64) -> i64 {
-    await sleep(1);
+    await yield();
     return x + 1;
 }
 async fn outer(x: i64) -> i64 {
@@ -491,7 +499,7 @@ fn test_async_suspension_panic_renders_async_chain() {
     let (out, ok) = compile_and_run_check_exit(
         r#"
 async fn inner(x: i64) -> i64 {
-    await sleep(1);
+    await yield();
     panic("boom in inner");
     return x;
 }

@@ -1,5 +1,9 @@
 use super::*;
 
+// Nonwinning 60s timeout arms are hang guards: the existing expected-output
+// assertions fail if one fires. Readiness/order comes from explicit state;
+// timer-order regressions use a clock advanced only by the test driver.
+
 // ---------------------------------------------------------------------------
 // select hardening. Perspectives covered here:
 //   1. `t.join(x)` inside select is an arity error, not a silently dropped arg
@@ -121,7 +125,7 @@ async fn main() {
     let t = work();
     select {
         let v = await t => { println(v); }
-        sleep(5000) => { println(0); }
+        sleep(60000) => { println(0); }
     }
 }
 "#,
@@ -132,13 +136,12 @@ async fn main() {
 
 #[test]
 fn sel_to_01_near_timeout_beats_far_off_task() {
-    // The drive inside a sync select must be bounded by the nearest deadline.
-    // An unbounded `willow_sched_run` runs the 800ms task to completion first,
-    // so the task-await arm would win a 30ms timeout.
+    // A pending task cannot outrank the select deadline. Cancellation after
+    // the timer wins also proves the test did not let the task finish early.
     let (out, ok) = compile_and_run(
         r#"
 async fn slow() -> i64 {
-    await sleep(800);
+    let gate = Channel<i64>::new(); gate.recv();
     return 1;
 }
 
@@ -148,6 +151,8 @@ async fn main() {
         let v = await t => { println(v); }
         sleep(30) => { println("timeout"); }
     }
+    t.cancel();
+    await t.result();
 }
 "#,
     );
@@ -157,21 +162,22 @@ async fn main() {
 
 #[test]
 fn sel_to_02_task_that_finishes_first_beats_the_timeout() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn quick() -> i64 {
-    await sleep(5);
+async fn quick(owner: i64) -> i64 {
+    while !test_task_parked(owner) { await yield(); }
     return 42;
 }
 
 async fn main() {
-    let t = quick();
+    let t = quick(test_current_task());
     select {
         let v = await t => { println(v); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "42\n");
@@ -179,22 +185,29 @@ async fn main() {
 
 #[test]
 fn sel_to_03_nearest_of_several_timeouts_fires() {
-    let (out, ok) = compile_and_run(
+    let (out, ok) = compile_and_run_with_virtual_time(
         r#"
-async fn slow() -> i64 {
-    await sleep(800);
-    return 1;
+async fn slow() -> i64 { let gate = Channel<i64>::new(); gate.recv(); return 1; }
+async fn advance(owner: i64) {
+    while !test_task_parked(owner) { await yield(); }
+    test_set_time(30);
+    test_wake_task(owner);
 }
-
 async fn main() {
+    test_set_time(0);
     let t = slow();
+    let driver = advance(test_current_task());
     select {
         let v = await t => { println(v); }
         sleep(3000) => { println("late"); }
         sleep(30) => { println("early"); }
     }
+    t.cancel();
+    await t.result();
+    await driver;
 }
 "#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "early\n");
@@ -209,7 +222,7 @@ fn main() {
     ch.send(9);
     select {
         let v = ch.recv() => { println(v); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -239,25 +252,25 @@ fn main() {
 
 #[test]
 fn sel_to_06_timeout_fires_while_other_tasks_keep_progressing() {
-    // A task that keeps waking (short sleeps) makes every drive "progress", so
-    // the loop re-probes repeatedly; the deadline must still win.
+    // The worker makes progress until the timeout owner explicitly stops it.
+    // Its lifetime is independent of how quickly the host runs a fixed loop.
     let (out, ok) = compile_and_run(
         r#"
-async fn chatty() -> i64 {
-    let mut i = 0;
-    while i < 200 {
-        await sleep(3);
-        i = i + 1;
-    }
-    return i;
+async fn chatty(stop: AtomicBool, ticks: AtomicI64) -> i64 {
+    while !stop.load() { ticks.add(1); await yield(); }
+    return ticks.load();
 }
-
 async fn main() {
-    let t = chatty();
+    let stop = AtomicBool::new(false);
+    let ticks = AtomicI64::new(0);
+    let t = chatty(stop, ticks);
+    while ticks.load() < 1 { await yield(); }
     select {
         let v = await t => { println(v); }
         sleep(40) => { println("timeout"); }
     }
+    stop.store(true);
+    if await t < 1 { panic("worker made no progress"); }
 }
 "#,
     );
@@ -269,24 +282,29 @@ async fn main() {
 fn sel_gc_01_send_value_survives_collection_during_the_probe_loop() {
     // The send value is evaluated ONCE at select entry and then held across
     // every probe iteration — including the scheduler drives that collect.
-    let (out, ok) = compile_and_run_gc_stress(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn drainer(ch: Channel<String>) -> String {
-    await sleep(10);
+async fn drainer(ch: Channel<String>, owner: i64) -> String {
+    while !test_task_parked(owner) { await yield(); }
+    gc_collect();
     return ch.recv();
 }
 
+fn value(calls: AtomicI64) -> String { calls.add(1); return "second" + "!"; }
 async fn main() {
+    let calls = AtomicI64::new(0);
     let ch = Channel<String>::with_capacity(1);
     ch.send("first");
-    let d = drainer(ch);
+    let d = drainer(ch, test_current_task());
     select {
-        ch.send("second" + "!") => { println("sent"); }
+        ch.send(value(calls)) => { println("sent"); }
     }
+    if calls.load() != 1 { panic("send operand evaluated again"); }
     println(await d);
     println(ch.recv());
 }
 "#,
+        &[("WILLOW_GC_STRESS", "alloc")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "sent\nfirst\nsecond!\n");
@@ -330,7 +348,7 @@ async fn main() {
             gc_collect();
             println(v);
         }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -343,20 +361,22 @@ async fn main() {
 fn sel_gc_04_temporary_task_handle_stays_alive_across_the_probe_loop() {
     // The handle is never bound to a local, so the select's own stash is the
     // only thing keeping the async frame (and its result) reachable.
-    let (out, ok) = compile_and_run_gc_stress(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn slow() -> String {
-    await sleep(15);
+async fn slow(owner: i64) -> String {
+    while !test_task_parked(owner) { await yield(); }
+    gc_collect();
     return "late" + "-value";
 }
 
 async fn main() {
     select {
-        let v = await slow() => { println(v); }
-        sleep(5000) => { println("timeout"); }
+        let v = await slow(test_current_task()) => { println(v); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
+        &[("WILLOW_GC_STRESS", "alloc")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "late-value\n");
@@ -370,7 +390,7 @@ fn sel_gc_05_cooperative_await_binding_survives_allocation_pressure() {
     let (out, ok) = compile_and_run_gc_stress_all(
         r#"
 async fn work() -> String {
-    await sleep(1);
+    await yield();
     return "awaited" + "-ok";
 }
 
@@ -386,7 +406,7 @@ async fn main() {
             gc_collect();
             println(v);
         }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -400,7 +420,7 @@ fn sel_gc_06_reference_bindings_round_trip_under_gc_stress() {
     let (out, ok) = compile_and_run_gc_stress_all(
         r#"
 async fn producer(ch: Channel<String>) -> String {
-    await sleep(2);
+    await yield();
     ch.send("payload" + "-1");
     return "produced";
 }
@@ -410,7 +430,7 @@ async fn main() {
     let p = producer(ch);
     select {
         let v = ch.recv() => { println(v); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
     println(await p);
 }
@@ -422,33 +442,38 @@ async fn main() {
 
 #[test]
 fn sel_cancel_01_cancelled_task_waiter_does_not_strand_the_awaitee() {
-    // A cancelled task that was registered as a select task waiter must be
-    // removed from its awaitee's waiter list; the awaitee still completes and
-    // its work is still observed.
-    let (out, ok) = compile_and_run(
+    // Cancel only after the select waiter is registered. The target remains
+    // gated until cancellation cleanup finishes, then still delivers its value.
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn target(ch: Channel<i64>) -> i64 {
-    await sleep(60);
+async fn target(ch: Channel<i64>, gate: Channel<i64>) -> i64 {
+    gate.recv();
     ch.send(7);
     return 7;
 }
-
-async fn watcher(ch: Channel<i64>) -> i64 {
-    let t = target(ch);
+async fn watcher(ch: Channel<i64>, gate: Channel<i64>) -> i64 {
+    let t = target(ch, gate);
     select {
         let v = await t => { return v; }
-        sleep(5000) => { return 0 - 1; }
+        sleep(60000) => { panic("select waiter timed out"); }
     }
+    return -1;
 }
-
 async fn main() {
     let ch = Channel<i64>::new();
-    let w = watcher(ch);
-    await sleep(10);
+    let gate = Channel<i64>::new();
+    test_observe_next_task();
+    let w = watcher(ch, gate);
+    let id = test_observed_task();
+    if id <= 0 { panic("watcher did not spawn"); }
+    while !test_task_parked(id) { await yield(); }
     w.cancel();
+    await w.result();
+    gate.send(1);
     println(ch.recv());
 }
 "#,
+        &[],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
@@ -510,7 +535,7 @@ fn selref_02_select_sleep_reference_argument_is_rejected() {
         r#"
 fn main() {
     let ch = Channel<i64>::new();
-    let ms = 5;
+    let ms = 60000;
     select {
         let v = ch.recv() => { println(v); }
         sleep(&ms) => { println(1); }
@@ -597,7 +622,7 @@ fn selref_08_value_forms_still_compile_and_run() {
 fn main() {
     let ch = Channel<i64>::with_capacity(2);
     let v = 7;
-    let ms = 5;
+    let ms = 60000;
     select {
         ch.send(v) => { println("sent"); }
         sleep(ms) => { println("timeout"); }
@@ -661,10 +686,11 @@ fn main() {
 fn selroot_02_temporary_channel_still_delivers_its_value() {
     // The factory keeps the channel reachable through the feeder task too, but
     // the select must probe the SAME object it stashed for the value to arrive.
-    let (out, ok) = compile_and_run_gc_stress_all(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
 async fn feed(ch: Channel<String>) -> i64 {
-    await sleep(5);
+    while test_channel_waits() < 1 { await yield(); }
+    gc_collect();
     ch.send("fed" + "-value");
     return 0;
 }
@@ -675,13 +701,15 @@ fn make() -> Channel<String> {
     return ch;
 }
 
-fn main() {
+fn exercise() {
     select {
         let v = make().recv() => { println(v); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
+async fn main() { test_observe_next_task(); exercise(); }
 "#,
+        &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "fed-value\n");
@@ -698,7 +726,7 @@ fn make() -> Channel<String> {
 fn main() {
     select {
         make().send("payload" + "-1") => { println("sent"); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -723,7 +751,7 @@ fn main() {
     select {
         let v = empty().recv() => { println(v); }
         make().send(5) => { println("sent"); }
-        sleep(5000) => { println("timeout"); }
+        sleep(60000) => { println("timeout"); }
     }
 }
 "#,
@@ -792,7 +820,7 @@ fn make() -> Channel<String> {
 fn pick() -> String {
     select {
         make().send("early" + "-exit") => { return "sent"; }
-        sleep(5000) => { return "timeout"; }
+        sleep(60000) => { return "timeout"; }
     }
     return "fell through";
 }
@@ -837,15 +865,20 @@ fn main() {
 
 #[test]
 fn chroot_01_sync_send_of_a_computed_string_into_a_full_bounded_channel() {
-    // Capacity 1 with a slow consumer: every send after the first parks and
-    // drives the scheduler, so the freshly built string must be rooted across
+    // Capacity 1: each blocked send installs roots before its consumer proceeds
+    // and collects, so the freshly built string must be rooted across
     // the runtime call.
-    let (out, ok) = compile_and_run_gc_stress_all(
+    let (out, ok) = compile_and_run_with_virtual_time(
         r#"
 async fn drain(ch: Channel<String>, done: Channel<i64>) -> i64 {
     let mut n = 0;
     while n < 3 {
-        await sleep(5);
+        if n < 2 {
+            while test_sync_send_waits() < n + 1 { await yield(); }
+        } else {
+            while test_sync_recv_waits() < 1 { await yield(); }
+        }
+        gc_collect();
         println(ch.recv());
         n = n + 1;
     }
@@ -865,6 +898,7 @@ fn main() {
     println(done.recv());
 }
 "#,
+        &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "item-x\nitem-x\nitem-x\n3\n");
@@ -890,10 +924,11 @@ fn main() {
 
 #[test]
 fn chroot_03_sync_recv_that_blocks_keeps_a_temporary_channel_alive() {
-    let (out, ok) = compile_and_run_gc_stress_all(
+    let (out, ok) = compile_and_run_with_virtual_time(
         r#"
 async fn feed(ch: Channel<String>) -> i64 {
-    await sleep(10);
+    while test_sync_recv_waits() < 1 { await yield(); }
+    gc_collect();
     ch.send("late" + "-payload");
     return 0;
 }
@@ -908,6 +943,7 @@ fn main() {
     println(make().recv());
 }
 "#,
+        &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "late-payload\n");
@@ -917,13 +953,18 @@ fn main() {
 fn chroot_04_i64_elements_round_trip_through_the_same_blocking_path() {
     // The non-GC element path pushes one root (the channel) instead of two:
     // an unbalanced pop here would corrupt the shadow stack.
-    let (out, ok) = compile_and_run_gc_stress_all(
+    let (out, ok) = compile_and_run_with_virtual_time(
         r#"
 async fn drain(ch: Channel<i64>, done: Channel<i64>) -> i64 {
     let mut total = 0;
     let mut n = 0;
     while n < 4 {
-        await sleep(2);
+        if n < 3 {
+            while test_sync_send_waits() < n + 1 { await yield(); }
+        } else {
+            while test_sync_recv_waits() < 1 { await yield(); }
+        }
+        gc_collect();
         total = total + ch.recv();
         n = n + 1;
     }
@@ -946,6 +987,7 @@ fn main() {
     println(s);
 }
 "#,
+        &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "10\nafter-loop\n");
@@ -953,7 +995,7 @@ fn main() {
 
 #[test]
 fn chroot_05_class_instances_round_trip_through_a_full_bounded_channel() {
-    let (out, ok) = compile_and_run_gc_stress_all(
+    let (out, ok) = compile_and_run_with_virtual_time(
         r#"
 class Item {
     pub label: String;
@@ -966,7 +1008,12 @@ class Item {
 async fn drain(ch: Channel<Item>, done: Channel<i64>) -> i64 {
     let mut n = 0;
     while n < 2 {
-        await sleep(5);
+        if n < 1 {
+            while test_sync_send_waits() < n + 1 { await yield(); }
+        } else {
+            while test_sync_recv_waits() < 1 { await yield(); }
+        }
+        gc_collect();
         let item = ch.recv();
         println(item.label);
         n = n + 1;
@@ -987,6 +1034,7 @@ fn main() {
     println(done.recv());
 }
 "#,
+        &[("WILLOW_GC_STRESS", "all")],
     );
     assert!(ok, "{out}");
     assert_eq!(out, "boxed-item\nboxed-item\n2\n");

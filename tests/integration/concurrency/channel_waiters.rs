@@ -11,9 +11,10 @@ use super::*;
 ///     exactly once, whichever consumer wins it.
 #[test]
 fn manywait_29_hundreds_of_consumers_share_one_channel() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn consume(work: Channel<i64>, done: Channel<i64>) {
+async fn consume(work: Channel<i64>, done: Channel<i64>, ready: Channel<i64>) {
+    ready.send(test_current_task());
     let mut total = 0;
     let mut value = work.recv();
     while value != 0 {
@@ -27,12 +28,19 @@ async fn main() {
     let work = Channel<i64>::new();
     let done = Channel<i64>::new();
 
+    let ready = Channel<i64>::new();
     let mut spawned = 0;
     while spawned < 200 {
-        consume(work, done);
+        consume(work, done, ready);
         spawned = spawned + 1;
     }
 
+    let mut registered = 0;
+    while registered < 200 {
+        let id = ready.recv();
+        while !test_task_parked(id) { await yield(); }
+        registered = registered + 1;
+    }
     let mut i = 1;
     while i <= 500 {
         work.send(i);
@@ -55,9 +63,7 @@ async fn main() {
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
-        std::time::Duration::from_secs(30),
     );
-    assert!(!timed_out, "many-consumer fan-out hung:\n{out}");
     assert!(ok, "{out}");
     assert_eq!(out, "125250\n"); // 1 + 2 + ... + 500
 }
@@ -67,13 +73,15 @@ async fn main() {
 ///     wake).
 #[test]
 fn manywait_30_cancelled_waiters_do_not_swallow_wakes() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn park_forever(work: Channel<i64>) {
+async fn park_forever(work: Channel<i64>, ready: Channel<i64>) {
+    ready.send(test_current_task());
     work.recv();
 }
 
-async fn take_one(work: Channel<i64>, done: Channel<i64>) {
+async fn take_one(work: Channel<i64>, done: Channel<i64>, ready: Channel<i64>) {
+    ready.send(test_current_task());
     done.send(work.recv());
 }
 
@@ -81,32 +89,38 @@ async fn main() {
     let work = Channel<i64>::new();
     let done = Channel<i64>::new();
 
-    // 100 tasks park on `work` and are then cancelled while still parked.
-    let mut parked = [park_forever(work)];
+    // Observe every registration before cancellation, even on a loaded host.
+    let ready = Channel<i64>::new();
+    let mut parked = [park_forever(work, ready)];
     let mut spawned = 1;
     while spawned < 100 {
-        parked.push(park_forever(work));
+        parked.push(park_forever(work, ready));
         spawned = spawned + 1;
     }
-    await sleep(5);
+    let mut registered = 0;
+    while registered < 100 {
+        let id = ready.recv();
+        while !test_task_parked(id) { await yield(); }
+        registered = registered + 1;
+    }
     let mut i = 0;
     while i < 100 {
         parked[i].cancel();
+        await parked[i].result();
         i = i + 1;
     }
 
     // One live consumer must still be woken by the send.
-    let live = take_one(work, done);
-    await sleep(5);
+    let live = take_one(work, done, ready);
+    let live_id = ready.recv();
+    while !test_task_parked(live_id) { await yield(); }
     work.send(7);
     println(done.recv());
     await live;
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
-        std::time::Duration::from_secs(30),
     );
-    assert!(!timed_out, "cancelled-waiter fan-out hung:\n{out}");
     assert!(ok, "{out}");
     assert_eq!(out, "7\n");
 }
@@ -115,21 +129,34 @@ async fn main() {
 ///     one producer until the queue drains, with no loss or duplication.
 #[test]
 fn manywait_31_many_producers_park_on_one_bounded_channel() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn produce(work: Channel<i64>, value: i64) {
+async fn produce(work: Channel<i64>, ready: Channel<i64>, value: i64) {
+    ready.send(test_current_task());
     work.send(value);
 }
 
 async fn main() {
     let work = Channel<i64>::with_capacity(2);
+    let ready = Channel<i64>::new();
+    work.send(0);
+    work.send(0);
 
     let mut spawned = 0;
     while spawned < 150 {
-        produce(work, 1);
+        produce(work, ready, 1);
         spawned = spawned + 1;
     }
 
+    let mut registered = 0;
+    while registered < 150 {
+        let id = ready.recv();
+        while !test_task_parked(id) { await yield(); }
+        registered = registered + 1;
+    }
+    // Drain the two setup values only after every producer is parked.
+    work.recv();
+    work.recv();
     let mut total = 0;
     let mut received = 0;
     while received < 150 {
@@ -140,9 +167,7 @@ async fn main() {
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
-        std::time::Duration::from_secs(30),
     );
-    assert!(!timed_out, "bounded producer fan-in hung:\n{out}");
     assert!(ok, "{out}");
     assert_eq!(out, "150\n");
 }
@@ -152,13 +177,14 @@ async fn main() {
 ///     dropping wakes.
 #[test]
 fn manywait_32_repeated_select_registration_stays_correct() {
-    let (out, ok, timed_out) = compile_and_run_with_env_timeout(
+    let (out, ok) = compile_and_run_with_test_sync(
         r#"
-async fn feed(ch: Channel<i64>, count: i64) {
+async fn feed(ch: Channel<i64>, rounds: Channel<i64>, count: i64) {
     let mut i = 0;
     while i < count {
+        let selecting = rounds.recv();
+        while !test_task_parked(selecting) { await yield(); }
         ch.send(1);
-        await sleep(1);
         i = i + 1;
     }
     ch.close();
@@ -168,12 +194,15 @@ async fn main() {
     let live = Channel<i64>::new();
     let idle = Channel<i64>::new();
 
-    let feeder = feed(live, 200);
+    let rounds = Channel<i64>::new();
+    let selecting = test_current_task();
+    let feeder = feed(live, rounds, 200);
 
     // Every loser iteration re-registers on `idle` and unregisters again.
     let mut taken = 0;
     let mut spins = 0;
     while taken < 200 {
+        rounds.send(selecting);
         select {
             let v = live.recv() => { taken = taken + v; }
             let v = idle.recv() => { spins = spins + v; }
@@ -185,9 +214,7 @@ async fn main() {
 }
 "#,
         &[("WILLOW_WORKERS", "5")],
-        std::time::Duration::from_secs(30),
     );
-    assert!(!timed_out, "select registration loop hung:\n{out}");
     assert!(ok, "{out}");
     assert_eq!(out, "200\n0\n");
 }

@@ -6,6 +6,10 @@ use super::*;
 use crate::gc_telemetry::workers;
 use std::sync::TryLockError;
 use std::time::Instant;
+#[cfg(not(test))]
+use std::time::Instant as ActionClock;
+#[cfg(test)]
+use tests::ActionClock;
 
 const BACKGROUND: Limits = Limits {
     objects: 256,
@@ -511,7 +515,7 @@ impl Cursor {
             Action::Drop(hook, payload, observed_type) => {
                 // Only background batches admit hooks. The live index no longer
                 // names the object, but its quarantined extent still owns it.
-                let began = Instant::now();
+                let began = ActionClock::now();
                 // SAFETY: The registered hook matches the allocation's type and runs while the
                 // collector retains its payload.
                 unsafe { run_drop_hook(&owner.gc, hook, payload, observed_type) };
@@ -537,7 +541,7 @@ impl Cursor {
                 true
             }
             Action::ReleaseOld(region, excess) => {
-                let began = Instant::now();
+                let began = ActionClock::now();
                 owner.gc.active_sweep.release.pause();
                 if let Some(base) = excess {
                     // SAFETY: storage the cache declined is owned here.
@@ -548,7 +552,7 @@ impl Cursor {
                 true
             }
             Action::ReleaseChunk(chunk) => {
-                let began = Instant::now();
+                let began = ActionClock::now();
                 owner.gc.active_sweep.release.pause();
                 let layout =
                     Layout::from_size_align(chunk.capacity, std::mem::align_of::<GcHeader>())
@@ -1121,9 +1125,56 @@ mod tests {
     use super::super::assist;
     use super::*;
 
+    // One per-runtime virtual clock drives batch deadlines and action charging.
+    // The production alias remains Instant: no clock branch or storage is added.
+    static VIRTUAL_NS: crate::runtime::PerRuntime<std::sync::atomic::AtomicU64> =
+        crate::runtime::PerRuntime::new(|| std::sync::atomic::AtomicU64::new(u64::MAX));
+
+    pub(super) enum ActionClock {
+        Real(Instant),
+        Virtual(u64),
+    }
+
+    impl ActionClock {
+        pub(super) fn now() -> Self {
+            match VIRTUAL_NS.load(Ordering::Acquire) {
+                u64::MAX => Self::Real(Instant::now()),
+                now => Self::Virtual(now),
+            }
+        }
+
+        pub(super) fn elapsed(&self) -> std::time::Duration {
+            match self {
+                Self::Real(began) => began.elapsed(),
+                Self::Virtual(began) => std::time::Duration::from_nanos(
+                    VIRTUAL_NS.load(Ordering::Acquire).saturating_sub(*began),
+                ),
+            }
+        }
+    }
+
+    struct VirtualTime(u64);
+    impl VirtualTime {
+        fn new() -> Self {
+            Self(VIRTUAL_NS.swap(0, Ordering::AcqRel))
+        }
+    }
+    impl Drop for VirtualTime {
+        fn drop(&mut self) {
+            VIRTUAL_NS.store(self.0, Ordering::Release);
+        }
+    }
+
+    fn batch_timestamp() -> u64 {
+        match VIRTUAL_NS.load(Ordering::Acquire) {
+            u64::MAX => crate::gc_telemetry::timestamp_ns(),
+            now => now,
+        }
+    }
+
     impl Cursor {
         fn batch(&mut self, limits: Limits, assist: bool) {
-            self.batch_with_clock(limits, assist, crate::gc_telemetry::timestamp_ns);
+            self.batch_with_clock(limits, assist, batch_timestamp);
         }
 
         fn batch_with_clock(&mut self, limits: Limits, assist: bool, now: impl FnMut() -> u64) {
@@ -1195,7 +1246,7 @@ mod tests {
 
     fn closed_cursor() -> Cursor {
         let (_, cycle) = root_handshake::begin().unwrap();
-        crate::gc::preemption_tolerant_remark_budget_for_test();
+        crate::gc::deterministic_remark_clock_for_test();
         let (_, plan) = mark_closure::finish(&cycle, Instant::now()).unwrap();
         Cursor::new(plan)
     }
@@ -1642,7 +1693,7 @@ mod tests {
             assert!(Instant::now() < deadline, "allocator stalled behind hook");
             std::thread::yield_now();
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        VIRTUAL_NS.fetch_add(2_000_000, Ordering::AcqRel);
     }
 
     #[test]
@@ -1651,6 +1702,7 @@ mod tests {
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
         // mutator or subsequent access relies on the discarded heap.
         unsafe { reset_internal_for_test() };
+        let _clock = VirtualTime::new();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         HOOK_CALLS.store(0, Ordering::Relaxed);
         HOOK_ENTERED.store(false, Ordering::Relaxed);
@@ -1668,9 +1720,9 @@ mod tests {
         assert_eq!(cursor.lock().unwrap().report.objects, 0);
         let worker = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
-            while !HOOK_ENTERED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            crate::test_sync::until("sweep action did not enter", || {
+                HOOK_ENTERED.load(Ordering::Acquire)
+            });
             let pointer = willow_alloc(8);
             // SAFETY: This GC allocation reserves an aligned word for the fixture's scalar value.
             unsafe {
@@ -1682,6 +1734,7 @@ mod tests {
         let mut guard = cursor.lock().unwrap();
         finish(&mut guard);
         assert_eq!(HOOK_CALLS.load(Ordering::Relaxed), 1);
+        assert!(guard.report.hook_ns >= 2_000_000);
         assert!(guard.report.overshoots > 0, "slow hook must be charged");
         drop(guard);
         set_active(None);
@@ -1834,7 +1887,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        std::thread::sleep(std::time::Duration::from_millis(2));
+        VIRTUAL_NS.fetch_add(2_000_000, Ordering::AcqRel);
     }
 
     #[test]
@@ -1843,6 +1896,7 @@ mod tests {
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
         // mutator or subsequent access relies on the discarded heap.
         unsafe { reset_internal_for_test() };
+        let _clock = VirtualTime::new();
         runtime().heap.lock().unwrap().threshold_bytes = usize::MAX;
         willow_alloc((GC_LARGE_OBJECT_THRESHOLD + 8) as i64);
         HOOK_ENTERED.store(false, Ordering::Relaxed);
@@ -1852,9 +1906,9 @@ mod tests {
         *runtime().active_sweep.release.lock().unwrap() = Some(delayed_release);
         let worker = std::thread::spawn(crate::runtime::serving(|| {
             let _mutator = MutatorRegistration::new();
-            while !HOOK_ENTERED.load(Ordering::Acquire) {
-                std::thread::yield_now();
-            }
+            crate::test_sync::until("sweep action did not enter", || {
+                HOOK_ENTERED.load(Ordering::Acquire)
+            });
             let pointer = willow_alloc(8);
             ALLOCATED_DURING_HOOK.store(true, Ordering::Release);
             pointer as usize
@@ -2350,8 +2404,22 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(runtime().active_sweep.flag.load(Ordering::Acquire));
-        let releaser = std::thread::spawn(crate::runtime::serving(|| {
-            std::thread::sleep(std::time::Duration::from_millis(2));
+        let waits = runtime()
+            .wait_observation
+            .coordinator_waits
+            .load(Ordering::Acquire);
+        let releaser = std::thread::spawn(crate::runtime::serving(move || {
+            crate::test_sync::until("coordinator shutdown did not wait for cleanup", || {
+                runtime()
+                    .wait_observation
+                    .coordinator_waits
+                    .load(Ordering::Acquire)
+                    > waits
+            });
+            // The observation is raised with the predicate lock held. Acquiring
+            // it proves shutdown entered the condvar wait before cleanup resumes.
+            let _coord = runtime().coord.0.lock().unwrap();
+            assert!(runtime().active_sweep.flag.load(Ordering::Acquire));
             SHUTDOWN_RESUME.store(true, Ordering::Release);
         }));
         coordinator::shutdown();

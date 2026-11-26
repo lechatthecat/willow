@@ -1,11 +1,11 @@
 // Borrowed tasks join before their owning lexical block ends.
 async fn read(value: &i64) -> i64 {
-    await sleep(1);
+    await yield();
     return value;
 }
 
 async fn increment(value: &mut i64) {
-    await sleep(1);
+    await yield();
     value = value + 1;
 }
 

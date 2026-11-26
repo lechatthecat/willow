@@ -460,6 +460,8 @@ runtime_abi_schema! {
     NONE; willow_sched_run_main => ([I64] -> Some(I64));
     NONE; willow_sched_run_until_deadline => ([I64] -> Some(I64));
     BLOCK_PANIC_ALLOC; willow_select_idle_wait => ([] -> None);
+    NONE; willow_select_drive_is_quiescent => ([] -> Some(I8));
+    BLOCK; willow_select_wait_until => ([I64] -> None);
     NONE; willow_sched_wake => ([I64] -> None);
     NONE; willow_sched_cancel => ([I64] -> None);
     NONE; willow_sched_is_cancelled => ([I64] -> Some(I64));

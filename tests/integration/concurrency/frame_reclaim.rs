@@ -11,6 +11,7 @@ use super::*;
 // batch, await its scope, then explicitly yield; do not rely on an await of an
 // already-ready task suspending, or on a fixed sleep draining a loaded runner.
 const LONG_AWAIT_LOOP: &str = r#"
+import std::time;
 async fn make(i: i64) -> i64 { return i; }
 async fn label(i: i64) -> String { return format("v{}", i); }
 async fn batch(start: i64, end: i64) -> i64 {
@@ -34,12 +35,15 @@ async fn main() {
         await yield();
         i = end;
     }
-    let mut attempts = 0;
+    let deadline = time::now_ns() + 30000000000;
     gc_collect();
-    while gc_allocated_bytes() >= 200000 && attempts < 1000 {
+    while test_frames_reclaimed() < 3 * 20000 + 2 * ((20000 + BATCH - 1) / BATCH) {
+        if time::now_ns() >= deadline {
+            gc_task_frame_diagnostics();
+            panic("terminal frame reclamation did not complete");
+        }
         await yield();
         gc_collect();
-        attempts = attempts + 1;
     }
     println(n);
     let bytes = gc_allocated_bytes();
@@ -54,7 +58,8 @@ fn frame_reclaim_int_01_parallel_workers_keep_heap_bounded() {
     for workers in ["1", "4", "8"] {
         for batch in [1, 7, 65, 257] {
             let source = LONG_AWAIT_LOOP.replace("BATCH", &batch.to_string());
-            let (out, ok) = compile_and_run_with_env(&source, &[("WILLOW_WORKERS", workers)]);
+            let (out, ok) =
+                compile_and_run_with_virtual_time(&source, &[("WILLOW_WORKERS", workers)]);
             assert!(ok, "workers={workers} batch={batch}: {out}");
             assert_eq!(
                 out, "200098890\ntrue\n",
@@ -79,6 +84,7 @@ fn frame_reclaim_int_02_released_frames_survive_minor_gc_stress() {
 }
 
 const REPEATED_RESULT_AWAIT: &str = r#"
+import std::time;
 async fn value(i: i64) -> i64 { return i; }
 async fn pending(ready: AtomicBool) -> i64 {
     ready.store(true);
@@ -113,10 +119,15 @@ async fn main() {
     let mut i = 0;
     let mut n = 0;
     while i < 128 { n = n + await batch(i); await yield(); i = i + 1; }
-    let mut attempts = 0;
+    let deadline = time::now_ns() + 30000000000;
     gc_collect();
-    while gc_allocated_bytes() >= 16384 && attempts < 1000 {
-        await yield(); gc_collect(); attempts = attempts + 1;
+    while test_frames_reclaimed() < 4 * 128 {
+        if time::now_ns() >= deadline {
+            gc_task_frame_diagnostics();
+            panic("terminal result frame reclamation did not complete");
+        }
+        await yield();
+        gc_collect();
     }
     println(n);
     println(gc_allocated_bytes() < 16384);
@@ -127,8 +138,10 @@ async fn main() {
 #[test]
 fn m2_int_repeated_result_await_and_scope_handles_do_not_retain_batches() {
     for workers in ["1", "4", "8"] {
-        let (out, ok) =
-            compile_and_run_with_env(REPEATED_RESULT_AWAIT, &[("WILLOW_WORKERS", workers)]);
+        let (out, ok) = compile_and_run_with_virtual_time(
+            REPEATED_RESULT_AWAIT,
+            &[("WILLOW_WORKERS", workers)],
+        );
         assert!(ok, "workers={workers}: {out}");
         assert_eq!(out, "520192\ntrue\n", "workers={workers}: {out}");
     }
@@ -136,9 +149,9 @@ fn m2_int_repeated_result_await_and_scope_handles_do_not_retain_batches() {
 
 #[test]
 fn m2_int_reclamation_failure_outputs_process_local_lifecycle_fields() {
-    // Exercise the actual two subprocess failure branches. Only these fault
-    // fixtures use an impossible predicate and one drain attempt; the normal
-    // thresholds, workload sizes and bounded waits above remain unchanged.
+    // Exercise both real subprocess failure branches after the same absolute
+    // lifecycle target as the success fixtures. Only the reported heap bound
+    // becomes impossible; drain completion and exact lifecycle checks remain.
     let failures = [
         (
             "long_await",
@@ -150,9 +163,9 @@ fn m2_int_reclamation_failure_outputs_process_local_lifecycle_fields() {
         ),
     ];
     for (case, source) in failures {
-        let source = source.replace("attempts < 1000", "attempts < 1");
         for workers in ["1", "4", "8"] {
-            let (out, ok) = compile_and_run_with_env(&source, &[("WILLOW_WORKERS", workers)]);
+            let (out, ok) =
+                compile_and_run_with_virtual_time(&source, &[("WILLOW_WORKERS", workers)]);
             assert!(ok, "case={case} workers={workers}: {out}");
             assert!(
                 out.contains("\nfalse\n"),

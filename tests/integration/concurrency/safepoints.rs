@@ -13,10 +13,10 @@ use super::*;
 
 #[test]
 fn psp_01_await_free_while_is_preemptible() {
-    // Busy while-true task must not starve the sleeping task (tiny quantum).
+    // One worker must preempt the entered busy loop so main can cancel it.
     let (out, ok) = compile_and_run_with_runtime_env(
-        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let t = spin(); await sleep(30); println(1); }",
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        "async fn spin(started: AtomicBool) -> i64 { let mut i = 0; while true { i = i + 1; started.store(true); } return i; }\nasync fn main() { let started = AtomicBool::new(false); let t = spin(started); while !started.load() { await yield(); } t.cancel(); await t.result(); println(1); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
         std::time::Duration::from_secs(20),
     );
     assert!(ok, "{out}");
@@ -26,8 +26,8 @@ fn psp_01_await_free_while_is_preemptible() {
 #[test]
 fn psp_02_await_free_for_is_preemptible() {
     let (out, ok) = compile_and_run_with_runtime_env(
-        "async fn spin() -> i64 { let mut s = 0; for i in 0..1000000000 { s = s + i; } return s; }\nasync fn main() { let t = spin(); await sleep(30); println(2); }",
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        "async fn spin(started: AtomicBool, done: AtomicBool) -> i64 { let mut s = 0; for i in 0..9223372036854775807 { started.store(true); if done.load() { return s; } s = i; } panic(\"for loop exhausted before release\"); return s; }\nasync fn main() { let started = AtomicBool::new(false); let done = AtomicBool::new(false); let t = spin(started, done); while !started.load() { await yield(); } done.store(true); await t; println(2); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
         std::time::Duration::from_secs(20),
     );
     assert!(ok, "{out}");
@@ -37,8 +37,8 @@ fn psp_02_await_free_for_is_preemptible() {
 #[test]
 fn psp_03_nested_busy_loops_preemptible() {
     let (out, ok) = compile_and_run_with_runtime_env(
-        "async fn spin() -> i64 { let mut s = 0; while true { for i in 0..1000 { s = s + i; } } return s; }\nasync fn main() { let t = spin(); await sleep(30); println(3); }",
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        "async fn spin(started: AtomicBool) -> i64 { let mut s = 0; while true { for i in 0..1000 { started.store(true); s = i; } } return s; }\nasync fn main() { let started = AtomicBool::new(false); let t = spin(started); while !started.load() { await yield(); } t.cancel(); await t.result(); println(3); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
         std::time::Duration::from_secs(20),
     );
     assert!(ok, "{out}");
@@ -61,7 +61,7 @@ fn psp_03_nested_busy_loops_preemptible() {
 fn psp_04_fn_value_can_enter_task() {
     // A pointer to a looping sync helper must still yield on native task stacks.
     let (out, ok) = compile_and_run_with_runtime_env(
-        "fn spin(done: AtomicBool) -> i64 { while !done.load() {} return 42; }\nasync fn worker(f: fn(AtomicBool) -> i64, done: AtomicBool) -> i64 { return f(done); }\nasync fn main() { let done = AtomicBool::new(false); let t = worker(spin, done); await sleep(5); done.store(true); println(await t); }",
+        "fn spin(done: AtomicBool, started: AtomicBool) -> i64 { while !done.load() { started.store(true); } return 42; }\nasync fn worker(f: fn(AtomicBool, AtomicBool) -> i64, done: AtomicBool, started: AtomicBool) -> i64 { return f(done, started); }\nasync fn main() { let done = AtomicBool::new(false); let started = AtomicBool::new(false); let t = worker(spin, done, started); while !started.load() { await yield(); } done.store(true); println(await t); }",
         &[("WILLOW_WORKERS", "1"), ("WILLOW_TASK_BUDGET", "1")],
         std::time::Duration::from_secs(20),
     );
@@ -93,12 +93,10 @@ fn psp_05_sync_helper_loop_rejected() {
 
 #[test]
 fn psp_06_busy_tasks_exceed_worker_count() {
-    // SIX busy spinners on five workers (review fix: three spinners never
-    // exhausted the pool): the sleeper still runs, so preemption must be
-    // rotating workers off busy tasks, not just parking spare workers.
+    // All six tasks must enter while five workers remain occupied until release.
     let (out, ok) = compile_and_run_with_runtime_env(
-        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let a = spin(); let b = spin(); let c = spin(); let d = spin(); let e = spin(); let f = spin(); await sleep(50); println(6); }",
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        "async fn spin(started: AtomicI64, done: AtomicBool) { started.add(1); while !done.load() {} }\nasync fn main() { let started = AtomicI64::new(0); let done = AtomicBool::new(false); let a = spin(started, done); let b = spin(started, done); let c = spin(started, done); let d = spin(started, done); let e = spin(started, done); let f = spin(started, done); while started.load() < 6 { await yield(); } done.store(true); await a; await b; await c; await d; await e; await f; println(6); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "5")],
         std::time::Duration::from_secs(25),
     );
     assert!(ok, "{out}");
@@ -119,17 +117,17 @@ fn psp_06_busy_tasks_exceed_worker_count() {
 ))]
 #[test]
 fn psp_07_call_boundary_safepoints() {
-    // Recursive, loop-free synchronous workload. Native sync-stack preemption
-    // accepts it; other targets reject it (psp_07b).
-    // One worker and a tiny quantum require the sleeper to run while churn
-    // remains busy; every recursive call has a generated boundary safepoint.
-    let chain = "s = s + chunk(24);".repeat(10);
-    let source = format!(
-        "fn chunk(n: i64) -> i64 {{ if n <= 1 {{ return 1; }} return chunk(n - 1) + chunk(n - 2); }}\nasync fn churn(done: AtomicBool) -> i64 {{ let mut s = 0; {chain} done.store(true); return s; }}\nasync fn main() {{ let done = AtomicBool::new(false); let t = churn(done); await sleep(10); println(7); println(done.load()); await t; }}"
-    );
+    // The recursion remains bounded and loop-free. Its leaf publishes inside=true;
+    // the synchronous wrapper clears it before outer driver loop safepoints.
+    // One worker can therefore observe true only after a sync call-boundary yield.
+    let source = "fn chunk(n: i64, inside: AtomicBool, release: AtomicBool) -> i64 { if release.load() { return 0; } if n <= 1 { inside.store(true); return 1; } return chunk(n - 1, inside, release) + chunk(n - 2, inside, release); }\nfn round(inside: AtomicBool, release: AtomicBool) -> i64 { let result = chunk(8, inside, release); inside.store(false); return result; }\nasync fn churn(inside: AtomicBool, release: AtomicBool, done: AtomicBool) -> i64 { let mut s = 0; while !release.load() { s = round(inside, release); } done.store(true); return s; }\nasync fn main() { let inside = AtomicBool::new(false); let release = AtomicBool::new(false); let done = AtomicBool::new(false); let t = churn(inside, release, done); while !inside.load() { await yield(); } println(7); println(done.load()); release.store(true); await t; }";
     let (out, ok) = compile_and_run_with_runtime_env(
-        &source,
-        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
+        source,
+        &[
+            ("WILLOW_TIME_QUANTUM_MS", "5"),
+            ("WILLOW_WORKERS", "1"),
+            ("WILLOW_TASK_BUDGET", "1"),
+        ],
         std::time::Duration::from_secs(60),
     );
     assert!(ok, "{out}");
@@ -173,7 +171,7 @@ fn psp_07b_recursive_sync_helper_rejected() {
 #[test]
 fn psp_08_gc_stress_with_busy_loop() {
     let (out, ok) = compile_and_run_gc_stress(
-        "async fn churn() -> String { let mut s = \"\"; for i in 0..50 { s = s + \"x\"; } return s; }\nasync fn main() { let t = churn(); await sleep(20); println(await t == \"\"); }",
+        "async fn churn() -> String { let mut s = \"\"; for i in 0..50 { s = s + \"x\"; } return s; }\nasync fn main() { let t = churn(); println(await t == \"\"); }",
     );
     assert!(ok, "{out}");
     assert_eq!(out, "false\n");
@@ -197,8 +195,8 @@ fn psp_10_cancel_preempted_busy_task() {
     // Preemption + cancellation compose: an await-free busy task is
     // preempted at a backedge safepoint and finalized by cancel.
     let (out, ok) = compile_and_run_with_runtime_env(
-        "async fn spin() -> i64 { let mut i = 0; while true { i = i + 1; } return i; }\nasync fn main() { let t = spin(); await sleep(30); t.cancel(); await sleep(50); println(t.is_cancelled()); }",
-        &[("WILLOW_TIME_QUANTUM_MS", "5")],
+        "async fn spin(started: AtomicBool) -> i64 { let mut i = 0; while true { started.store(true); i = i + 1; } return i; }\nasync fn main() { let started = AtomicBool::new(false); let t = spin(started); while !started.load() { await yield(); } t.cancel(); await t.result(); println(t.is_cancelled()); }",
+        &[("WILLOW_TIME_QUANTUM_MS", "5"), ("WILLOW_WORKERS", "1")],
         std::time::Duration::from_secs(25),
     );
     assert!(ok, "{out}");
@@ -211,21 +209,7 @@ fn psp_11_sync_helper_countdown_preempts_and_cancels() {
     // count safepoints inline and enter the runtime once per granted batch.
     // Budget 1 (a grant per safepoint) and the default budget must both keep
     // a single worker fair, and a sync spinner must still observe cancel.
-    let source = "fn spin(done: AtomicBool) -> i64 { let mut n = 0; while !done.load() { n = n + 1; } return n; }\n\
-        async fn spinner(done: AtomicBool) -> i64 { return spin(done); }\n\
-        async fn delayed(done: AtomicBool) -> i64 { await sleep(5); println(42); done.store(true); return 0; }\n\
-        async fn main() {\n\
-            let done = AtomicBool::new(false);\n\
-            let a = spinner(done); let b = spinner(done); let c = spinner(done);\n\
-            await delayed(done);\n\
-            await a; await b; await c;\n\
-            let never = AtomicBool::new(false);\n\
-            let t = spinner(never);\n\
-            await sleep(5);\n\
-            t.cancel();\n\
-            await sleep(20);\n\
-            println(t.is_cancelled());\n\
-        }";
+    let source = "fn spin(done: AtomicBool, started: AtomicI64) -> i64 { let mut n = 0; started.add(1); while !done.load() { n = n + 1; } return n; }\nasync fn spinner(done: AtomicBool, started: AtomicI64) -> i64 { return spin(done, started); }\nasync fn release_all(done: AtomicBool, started: AtomicI64) { while started.load() < 3 { await yield(); } println(42); done.store(true); }\nasync fn main() { let done = AtomicBool::new(false); let started = AtomicI64::new(0); let a = spinner(done, started); let b = spinner(done, started); let c = spinner(done, started); await release_all(done, started); await a; await b; await c; let never = AtomicBool::new(false); let t = spinner(never, started); while started.load() < 4 { await yield(); } t.cancel(); await t.result(); println(t.is_cancelled()); }";
     for budget in ["1", "1024"] {
         let (out, ok) = compile_and_run_with_runtime_env(
             source,

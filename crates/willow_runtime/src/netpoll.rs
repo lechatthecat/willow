@@ -1327,7 +1327,7 @@ mod tests {
         let token = read_fd as i64;
         let waker = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             assert_eq!(willow_netpoll_wake(token), 1);
         }));
@@ -1404,7 +1404,9 @@ mod tests {
         // live across scheduling and callback execution.
         let id = unsafe { willow_sched_spawn(poll_pipe_readable, frame as *mut c_void) };
         let writer = std::thread::spawn(crate::runtime::serving(move || {
-            std::thread::sleep(Duration::from_millis(10));
+            crate::test_sync::until("pipe reader never registered", || {
+                NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) != i32::MIN
+            });
             let byte = [b'x'];
             // SAFETY: This backend owns the successfully opened descriptor and closes it once
             // after use.
@@ -1480,7 +1482,7 @@ mod tests {
         let id = unsafe { willow_sched_spawn(poll_socket_readable, frame.cast()) };
         let writer = std::thread::spawn(crate::runtime::serving(move || {
             while NETPOLL_TEST_LAST_REGISTER.load(Ordering::SeqCst) == i32::MIN {
-                std::thread::sleep(Duration::from_millis(1));
+                std::thread::yield_now();
             }
             sender.send(b"x").unwrap();
         }));

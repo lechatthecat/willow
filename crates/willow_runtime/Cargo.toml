@@ -9,6 +9,8 @@ name = "willow_runtime"
 crate-type = ["staticlib", "rlib"]
 
 [features]
+# Deterministic integration fixtures only; absent from normal compiler builds.
+deterministic-test-clock = []
 # Explicit acceptance executable only; production compiler builds never enable this.
 gc-acceptance-faults = []
 # Acceptance-test runtime only; never enabled by the compiler's normal build.

@@ -72,9 +72,11 @@ impl TerminalRetirements {
     }
 
     fn lock_cleanups(&self) -> std::sync::MutexGuard<'_, Vec<TerminalCleanup>> {
-        self.cleanups
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        #[cfg(test)]
+        let lock = crate::test_sync::lock(&self.cleanups, "terminal_cleanup_lock");
+        #[cfg(not(test))]
+        let lock = self.cleanups.lock();
+        lock.unwrap_or_else(|poison| poison.into_inner())
     }
 
     #[cfg(test)]

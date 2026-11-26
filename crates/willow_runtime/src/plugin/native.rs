@@ -232,7 +232,7 @@ impl Native {
         };
         nonblocking(native.transport.as_raw_fd())?;
         // The hello is read only after bwrap successfully installs every policy.
-        let cancel = Cancellation(Arc::new(AtomicU8::new(0)));
+        let cancel = Cancellation::new();
         let deadline = Instant::now() + Duration::from_millis(manifest.budgets.deadline_ms.into());
         let mut bytes = [0; HEADER_BYTES];
         native

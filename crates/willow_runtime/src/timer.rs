@@ -1,5 +1,37 @@
 use std::time::{Duration, Instant};
 
+#[inline]
+pub(crate) fn scheduler_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = crate::test_sync::scheduler_time() {
+        return now;
+    }
+    #[cfg(feature = "deterministic-test-clock")]
+    {
+        crate::test_clock::now()
+    }
+    #[cfg(not(feature = "deterministic-test-clock"))]
+    {
+        Instant::now()
+    }
+}
+
+#[inline]
+fn timer_elapsed() -> Duration {
+    #[cfg(test)]
+    if let Some(elapsed) = crate::test_sync::scheduler_elapsed() {
+        return elapsed;
+    }
+    #[cfg(feature = "deterministic-test-clock")]
+    {
+        crate::test_clock::elapsed()
+    }
+    #[cfg(not(feature = "deterministic-test-clock"))]
+    {
+        VALUE_EPOCH.elapsed()
+    }
+}
+
 use crate::future;
 use crate::future::Poll;
 use crate::trace::{GcRootSet, GcTrace, GcVisitor};
@@ -13,16 +45,16 @@ impl RuntimeTimer {
     pub fn after_millis(ms: i64) -> Self {
         let millis = ms.max(0) as u64;
         Self {
-            deadline: Instant::now() + Duration::from_millis(millis),
+            deadline: scheduler_now() + Duration::from_millis(millis),
         }
     }
 
     pub fn is_ready(&self) -> bool {
-        Instant::now() >= self.deadline
+        scheduler_now() >= self.deadline
     }
 
     pub fn remaining(&self) -> Option<Duration> {
-        self.deadline.checked_duration_since(Instant::now())
+        self.deadline.checked_duration_since(scheduler_now())
     }
 }
 
@@ -88,7 +120,7 @@ static VALUE_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Inst
 #[unsafe(no_mangle)]
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_time_now_ns() -> i64 {
-    duration_ns(VALUE_EPOCH.elapsed())
+    duration_ns(timer_elapsed())
 }
 
 fn duration_ns(elapsed: Duration) -> i64 {
@@ -104,7 +136,7 @@ pub extern "C" fn willow_timer_value_sleep(ms: i64) -> u64 {
     if ms <= 0 {
         return 0;
     }
-    let elapsed = VALUE_EPOCH.elapsed();
+    let elapsed = timer_elapsed();
     let now = elapsed.as_millis().min(u64::MAX as u128) as u64;
     now.saturating_add(u64::from(!elapsed.subsec_nanos().is_multiple_of(1_000_000)))
         .saturating_add(ms as u64)
@@ -123,7 +155,7 @@ pub extern "C" fn willow_timer_value_yield() -> u64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_timer_value_await(deadline: u64) -> u8 {
     loop {
-        let now = VALUE_EPOCH.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let now = timer_elapsed().as_millis().min(u64::MAX as u128) as u64;
         let remaining = deadline.saturating_sub(now);
         if remaining == 0 {
             return 0;
@@ -271,8 +303,18 @@ mod tests {
 
     #[test]
     fn timer_unit_04_positive_timer_reports_remaining_duration() {
+        let _runtime = crate::gc::isolated_runtime();
+        let clock = crate::test_sync::SchedulerClock::new();
         let timer = RuntimeTimer::after_millis(50);
-        assert!(timer.remaining().is_some());
+        assert_eq!(timer.remaining(), Some(Duration::from_millis(50)));
+        assert!(!timer.is_ready());
+        clock.advance(Duration::from_millis(49));
+        assert_eq!(timer.remaining(), Some(Duration::from_millis(1)));
+        assert!(!timer.is_ready());
+        clock.advance(Duration::from_millis(1));
+        assert!(timer.is_ready());
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(timer.remaining(), None);
     }
 
     #[test]
@@ -290,9 +332,18 @@ mod tests {
 
     #[test]
     fn timer_unit_07_sleep_future_positive_starts_pending() {
+        let _runtime = crate::gc::isolated_runtime();
+        let clock = crate::test_sync::SchedulerClock::new();
         let mut future = RuntimeSleepFuture::after_millis(50);
         assert_eq!(future.poll(), Poll::Pending);
         assert!(!future.is_completed());
+        clock.advance(Duration::from_millis(49));
+        assert_eq!(future.poll(), Poll::Pending);
+        assert!(!future.is_completed());
+        clock.advance(Duration::from_millis(1));
+        assert_eq!(future.poll(), Poll::Ready(()));
+        assert!(future.is_completed());
+        assert_eq!(future.poll(), Poll::Ready(()));
     }
 
     #[test]
@@ -320,8 +371,12 @@ mod tests {
 
     #[test]
     fn timer_unit_11_sleep_future_reports_remaining_duration() {
+        let _runtime = crate::gc::isolated_runtime();
+        let clock = crate::test_sync::SchedulerClock::new();
         let future = RuntimeSleepFuture::after_millis(50);
-        assert!(future.remaining().is_some());
+        assert_eq!(future.remaining(), Some(Duration::from_millis(50)));
+        clock.advance(Duration::from_millis(51));
+        assert_eq!(future.remaining(), None);
     }
 
     #[test]

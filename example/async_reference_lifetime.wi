@@ -7,7 +7,7 @@
 //
 // E1707 is reserved for unsupported reference types (for example fn pointers).
 async fn read(value: &i64) -> i64 {
-    await sleep(1);
+    await yield();
     return value;
 }
 async fn main() {
