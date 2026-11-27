@@ -504,6 +504,7 @@ runtime_abi_schema! {
     // The mapper is a Willow function value: a managed object whose word 0
     // is the code the runtime calls with the value as trailing environment.
     PANIC_ALLOC; willow_parallel_map_i64 => ([Ptr, Ptr] -> Some(Ptr));
+    NONE; willow_blocking_current_threads => ([] -> Some(I64));
     NONE; willow_blocking_active_jobs => ([] -> Some(I64));
     NONE; willow_blocking_completed_jobs => ([] -> Some(I64));
     // Bounded blocking-pool queue gauges.

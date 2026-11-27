@@ -7,9 +7,15 @@
 //!
 //! The pool is bounded in BOTH dimensions:
 //!
-//! * threads: `WILLOW_BLOCKING_THREADS` (default [`DEFAULT_BLOCKING_THREADS`]);
+//! * thread limit: `WILLOW_BLOCKING_THREADS` (default [`DEFAULT_BLOCKING_THREADS`]);
 //! * queued-but-not-started jobs: `WILLOW_BLOCKING_QUEUE` (default
-//!   [`DEFAULT_BLOCKING_QUEUE_PER_THREAD`] per thread).
+//!   [`DEFAULT_BLOCKING_QUEUE_PER_THREAD`] per allowed thread).
+//!
+//! Threads start on demand and retire after 30 idle seconds, down to zero.
+//! Starting workers count against the limit. The general and foreign pools
+//! have independent limits; stdout keeps its one-thread limit.
+//! `willow_blocking_current_threads` reports general-pool workers (including
+//! reserved starts, excluding workers that have committed to exit).
 //!
 //! # Overload policy: backpressure on the submitting Task
 //!
@@ -47,12 +53,15 @@ use crate::wait_queue::WaitQueue;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub(crate) mod foreign;
 
 pub(crate) type BlockingWork = Box<dyn FnOnce() + Send + 'static>;
 
-pub const DEFAULT_BLOCKING_THREADS: usize = 4;
+/// On-demand thread limit; no threads are allocated just to inspect a pool.
+pub const DEFAULT_BLOCKING_THREADS: usize = 32;
+const BLOCKING_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default queued-job capacity, per pool thread.
 pub const DEFAULT_BLOCKING_QUEUE_PER_THREAD: usize = 16;
 
@@ -63,6 +72,10 @@ struct PoolState {
     waiters: WaitQueue<u64>,
     /// Admitted slot owners may submit out of order without losing fairness.
     reserved: HashSet<u64>,
+    /// Includes reserved starts; changed under the admission/retirement lock.
+    threads: usize,
+    /// Threads executing a job, including its scheduler wakeup.
+    busy: usize,
 }
 
 impl PoolState {
@@ -87,6 +100,11 @@ struct BlockingPool {
     work_ready: Condvar,
     capacity: usize,
     metrics: PoolMetrics,
+    thread_limit: usize,
+    idle_timeout: Duration,
+    name: &'static str,
+    owner: &'static crate::runtime::Runtime,
+    kind: PoolKind,
 }
 
 // A caller-side FFI catch cannot observe a detached thread's panic. Cover
@@ -100,19 +118,17 @@ fn blocking_worker_entry(
         // Completions wake tasks of the runtime that owns this pool.
         owner.select_for_thread();
         initialize();
-        // The creating thread publishes the pool after starting its workers.
+        // The pool is published before admission can reserve a worker start.
         let pool = kind.slot(owner).wait();
-        loop {
-            let (work, freed_slot_for) = pool.dequeue();
+        let mut completed = false;
+        while let Some((work, freed_slot_for)) = pool.dequeue(completed) {
             // Waking takes scheduler locks and can trigger GC: keep it inside
             // the fatal boundary, but outside the pool lock.
             if let Some(task_id) = freed_slot_for {
                 crate::scheduler::willow_sched_wake(task_id);
             }
-            pool.metrics.active.fetch_add(1, Ordering::AcqRel);
             work();
-            pool.metrics.active.fetch_sub(1, Ordering::AcqRel);
-            pool.metrics.completed.fetch_add(1, Ordering::AcqRel);
+            completed = true;
         }
     });
 }
@@ -143,23 +159,53 @@ impl BlockingPool {
     fn with_workers(
         threads: usize,
         capacity: usize,
-        name: &str,
+        name: &'static str,
         owner: &'static crate::runtime::Runtime,
         kind: PoolKind,
     ) -> Self {
-        let pool = Self {
+        Self {
             state: Mutex::new(PoolState {
                 queue: VecDeque::with_capacity(capacity),
                 waiters: WaitQueue::default(),
                 reserved: HashSet::new(),
+                threads: 0,
+                busy: 0,
             }),
             work_ready: Condvar::new(),
             capacity,
             metrics: PoolMetrics::default(),
-        };
-        for index in 0..threads {
+            thread_limit: threads,
+            idle_timeout: BLOCKING_IDLE_TIMEOUT,
+            name,
+            owner,
+            kind,
+        }
+    }
+
+    /// Reserve at most one start per admission. Idle and not-yet-started
+    /// workers already cover that many queued jobs; no queue or waiter scan.
+    fn reserve_worker(&self, state: &mut PoolState) -> bool {
+        #[cfg(test)]
+        self.metrics.growth_checks.fetch_add(1, Ordering::Relaxed);
+        if state.queue.len() <= state.threads - state.busy || state.threads == self.thread_limit {
+            return false;
+        }
+        state.threads += 1;
+        #[cfg(test)]
+        self.metrics.started.fetch_add(1, Ordering::Relaxed);
+        self.metrics.threads.store(state.threads, Ordering::Release);
+        true
+    }
+
+    /// OS thread creation stays outside the pool lock. A reserved start counts
+    /// as available until it dequeues, preventing concurrent oversubscription.
+    fn wake_or_start(&self, start: bool) {
+        self.work_ready.notify_one();
+        if start {
+            let owner = self.owner;
+            let kind = self.kind;
             std::thread::Builder::new()
-                .name(format!("{name}-{index}"))
+                .name(self.name.to_owned())
                 .spawn(move || {
                     blocking_worker_entry(
                         owner,
@@ -173,7 +219,6 @@ impl BlockingPool {
                     ))
                 });
         }
-        pool
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, PoolState> {
@@ -182,19 +227,39 @@ impl BlockingPool {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Block a pool thread until a job is queued, then take it. Returns the
-    /// waiter that gains a reservation on the freed slot, if any, so the
-    /// caller can wake it after unlocking.
-    fn dequeue(&self) -> (BlockingWork, Option<u64>) {
+    /// Finish the previous job and take the next under one lock. Returns the
+    /// waiter gaining the freed slot, to wake outside the lock. An idle worker
+    /// commits its retirement under the same lock as admission: a concurrent
+    /// submit either finds this worker or reserves its replacement.
+    fn dequeue(&self, completed: bool) -> Option<(BlockingWork, Option<u64>)> {
         let mut state = self.lock();
+        if completed {
+            state.busy -= 1;
+            self.metrics.active.fetch_sub(1, Ordering::AcqRel);
+            self.metrics.completed.fetch_add(1, Ordering::AcqRel);
+        }
+        // Only read the clock on the idle path, not once per queued job.
+        let mut idle_since = None;
         loop {
             if let Some(work) = state.queue.pop_front() {
+                state.busy += 1;
+                self.metrics.active.fetch_add(1, Ordering::AcqRel);
                 self.metrics.queued.fetch_sub(1, Ordering::AcqRel);
-                return (work, state.reserve_next());
+                return Some((work, state.reserve_next()));
             }
-            state = self
+            let since = idle_since.get_or_insert_with(Instant::now);
+            let remaining = self.idle_timeout.saturating_sub(since.elapsed());
+            if remaining.is_zero() {
+                state.threads -= 1;
+                #[cfg(test)]
+                self.metrics.retired.fetch_add(1, Ordering::Relaxed);
+                self.metrics.threads.store(state.threads, Ordering::Release);
+                return None;
+            }
+            // Spurious notifications must not restart the idle deadline.
+            (state, _) = self
                 .work_ready
-                .wait(state)
+                .wait_timeout(state, remaining)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
     }
@@ -226,8 +291,9 @@ impl BlockingPool {
     fn try_submit(&self, work: BlockingWork) -> Result<(), BlockingWork> {
         let mut state = self.lock();
         self.admit(&mut state, None, work)?;
+        let start = self.reserve_worker(&mut state);
         drop(state);
-        self.work_ready.notify_one();
+        self.wake_or_start(start);
         Ok(())
     }
 
@@ -237,8 +303,9 @@ impl BlockingPool {
             .then_some(task_id);
         match self.admit(&mut state, registered, work) {
             Ok(()) => {
+                let start = self.reserve_worker(&mut state);
                 drop(state);
-                self.work_ready.notify_one();
+                self.wake_or_start(start);
                 Ok(())
             }
             Err(work) => {
@@ -325,6 +392,13 @@ impl PoolKind {
 
 #[derive(Default)]
 struct PoolMetrics {
+    #[cfg(test)]
+    growth_checks: AtomicUsize,
+    #[cfg(test)]
+    started: AtomicUsize,
+    #[cfg(test)]
+    retired: AtomicUsize,
+    threads: AtomicUsize,
     active: AtomicUsize,
     queued: AtomicUsize,
     waiters: AtomicUsize,
@@ -487,6 +561,16 @@ pub(crate) fn reset_slot_waiters_for_test() {
             pool.metrics.waiters.store(0, Ordering::Release);
         }
     }
+}
+
+/// Current general-pool workers, including reserved starts and excluding
+/// workers committed to exit. Reading this gauge never starts a pool.
+#[unsafe(no_mangle)]
+#[willow_runtime_macros::ffi_boundary]
+pub extern "C" fn willow_blocking_current_threads() -> i64 {
+    PoolKind::General
+        .started()
+        .map_or(0, |pool| pool.metrics.threads.load(Ordering::Acquire)) as i64
 }
 
 /// Jobs currently running on pool threads.
@@ -680,8 +764,7 @@ mod tests {
     use super::*;
     use crate::gc::isolated_runtime;
     use crate::scheduler::{
-        reset_global_scheduler_for_test, willow_monotonic_millis, willow_sched_run_until_deadline,
-        willow_sched_spawn, willow_sched_task_state,
+        reset_global_scheduler_for_test, willow_sched_spawn, willow_sched_task_state,
     };
     use std::ffi::c_void;
     use std::sync::mpsc;
@@ -702,7 +785,11 @@ mod tests {
             // SAFETY: The callback accepts a null frame and uses no frame storage.
             .map(|_| unsafe { willow_sched_spawn(parks_forever, std::ptr::null_mut()) })
             .collect();
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
+        let clock = crate::test_sync::SchedulerClock::new();
+        crate::test_sync::drive_until("slot waiters park", &clock, || {
+            ids.iter()
+                .all(|&id| willow_sched_task_state(id) == BLOCKED_SYSCALL)
+        });
         for id in &ids {
             assert_eq!(willow_sched_task_state(*id), BLOCKED_SYSCALL, "task {id}");
         }
@@ -766,7 +853,18 @@ mod tests {
                 // SAFETY: The callback accepts a null frame and uses no frame storage.
                 .map(|_| unsafe { willow_sched_spawn(writer, std::ptr::null_mut()) })
                 .collect();
-            willow_sched_run_until_deadline(willow_monotonic_millis() + 50);
+            let clock = crate::test_sync::SchedulerClock::new();
+            crate::test_sync::drive_until("stdout writers park", &clock, || {
+                PoolKind::Stdout
+                    .pool()
+                    .metrics
+                    .waiters
+                    .load(Ordering::Acquire)
+                    == count
+                    && ids
+                        .iter()
+                        .all(|&id| willow_sched_task_state(id) == BLOCKED_SYSCALL)
+            });
             assert_eq!(
                 PoolKind::Stdout
                     .pool()
@@ -1102,3 +1200,7 @@ mod tests {
 #[cfg(test)]
 #[path = "blocking_failure_tests.rs"]
 mod failure_tests;
+
+#[cfg(test)]
+#[path = "blocking/elastic_tests.rs"]
+mod elastic_tests;

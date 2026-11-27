@@ -377,7 +377,15 @@ These read process state, so they count as I/O for `@effects(no_io)`.
 
 Each has an `_async` form (`read_to_string_async`, ...) that returns a `Task`
 and runs the operation on a bounded blocking pool instead of a scheduler
-worker.
+worker. The pool starts threads on demand up to `WILLOW_BLOCKING_THREADS`
+(default 32), and each idle thread exits after 30 seconds. The setting is a
+limit, not a number of eagerly started threads. `WILLOW_BLOCKING_QUEUE` bounds
+queued jobs (default 16 per allowed thread). Excess callers park as Tasks;
+FIFO slot reservations and cancellation apply even at the thread limit.
+The runtime gauge `willow_blocking_current_threads` reports general-pool
+workers, including reserved starts and excluding workers committed to exit;
+reading it does not start workers. Rust calls use a separate elastic pool,
+and stdout uses a separate pool limited to one thread and one queued job.
 
 ## `std::net`
 

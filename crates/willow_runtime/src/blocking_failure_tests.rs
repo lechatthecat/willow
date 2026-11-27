@@ -60,7 +60,7 @@ fn detached_worker_panics_terminate_without_hanging() {
                 child.kill().unwrap();
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::yield_now();
         }
         let result = child.wait_with_output().unwrap();
         let stderr = String::from_utf8_lossy(&result.stderr);

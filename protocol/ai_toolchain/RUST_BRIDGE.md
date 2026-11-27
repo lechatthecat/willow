@@ -131,8 +131,9 @@ assertion. Stale assertions remain build errors. All calls retain conservative
 allocation, panic and I/O effects unless an applicable reviewed I/O claim exists.
 
 Rust work uses its own pool, separate from file I/O and stdout. Each Rust pool
-has `WILLOW_BLOCKING_THREADS` workers (default 4) and `WILLOW_BLOCKING_QUEUE`
-queued jobs (default 16 per worker). A full queue parks callers. FIFO reservations
+grows on demand up to `WILLOW_BLOCKING_THREADS` workers (default 32) and `WILLOW_BLOCKING_QUEUE`
+queued jobs (default 16 per allowed worker). Idle workers exit after 30 seconds,
+down to zero; new jobs restart them. A full queue parks callers. FIFO reservations
 serve older waiters before newcomers. The existing exported blocking gauges
 continue to describe the general file-I/O pool. A hung Rust body can delay other
 Rust calls but cannot exhaust the file-I/O pool's threads.

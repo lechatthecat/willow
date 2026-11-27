@@ -841,8 +841,8 @@ mod tests {
             willow_blocking_queued_jobs, willow_blocking_slot_waiters,
         };
         use crate::scheduler::{
-            reset_global_scheduler_for_test, willow_monotonic_millis, willow_sched_cancel,
-            willow_sched_run_until, willow_sched_run_until_deadline, willow_sched_task_state,
+            reset_global_scheduler_for_test, willow_sched_cancel, willow_sched_run_until,
+            willow_sched_task_state,
         };
 
         fn task_id_of(frame: *mut c_void) -> u64 {
@@ -857,6 +857,7 @@ mod tests {
 
         let _guard = isolated_runtime();
         reset_global_scheduler_for_test();
+        let clock = crate::test_sync::SchedulerClock::new();
         let threads = pool_threads();
         let completed_before = willow_blocking_completed_jobs();
         let metric_before = queue_full_metric();
@@ -903,7 +904,9 @@ mod tests {
         );
 
         // Their first poll registers them as waiters; they park BlockedSyscall.
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
+        crate::test_sync::drive_until("filesystem slot waiters park", &clock, || {
+            ids.iter().all(|&id| willow_sched_task_state(id) == 7)
+        });
         for id in &ids {
             assert_eq!(
                 willow_sched_task_state(*id),
@@ -918,7 +921,7 @@ mod tests {
         // Cancel the oldest waiter: its job is dropped unrun and it leaves
         // the list without stranding the next waiter.
         willow_sched_cancel(ids[0]);
-        willow_sched_run_until_deadline(willow_monotonic_millis() + 200);
+        willow_sched_run_until(ids[0]);
         assert_eq!(
             willow_sched_task_state(ids[0]),
             -1,

@@ -22,6 +22,7 @@ pub fn worker_count() -> Option<usize> {
     positive_count(std::env::var("WILLOW_WORKERS").ok().as_deref())
 }
 
+/// Maximum concurrent threads per elastic general/foreign blocking pool.
 pub fn blocking_threads() -> Option<usize> {
     positive_count(std::env::var("WILLOW_BLOCKING_THREADS").ok().as_deref())
 }
