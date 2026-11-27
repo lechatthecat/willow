@@ -42,26 +42,84 @@ access or ownership transfer; RwLock assumes reader sharing, hence its stronger
 payload condition. FrozenArray assumes its contents cannot be replaced through
 a mutable alias; nested elements must themselves satisfy the predicate.
 
-For loans, a heap object has permissions `(P,C)` for parent and child writes.
-Fresh allocation starts at `(1,0)`. `lend` changes `(1,0)` to `(0,1)`;
-completed `join` changes `(0,1)` to `(1,0)`. Parent access requires P; child
-access requires C. An alias denotes the same object and gets no extra
-permission. Read/write does not change permission. Detached transfer never
-restores the parent's permission. Returning permission at task creation,
-cancellation request, or a conditional await would be unsound.
+For loans, each heap object `o` has independent permissions
+`(P_o, C_o,1, C_o,2)` for the parent and two child tasks. Variables map to
+object identities; directed containment edges describe references stored in
+objects. `R(v)` is the reflexive transitive reachable set of variable `v`.
+An alias changes the variable map, not permissions. Fresh allocation gives
+`P_o = 1` and both child bits zero.
 
-**Claim.** Every reachable state of this core satisfies `not(P and C)`.
-Proof: allocation establishes it; the two permission-changing rules preserve
-it; other transitions preserve the state. Thus conflicting parent/child
-accesses cannot both be authorized. This is a safety claim, not a guarantee
-that a child terminates or its parent can join it.
+`lend(t, v)` requires an idle task slot and `P_o = 1` for every `o` in `R(v)`;
+it clears those parent bits and grants them to child `t`. A completed `join(t)`
+returns exactly that child's permissions and clears its bits. Parent access
+requires all parent bits in `R(v)`; child access requires all corresponding
+`C_o,t` bits. Reads and writes preserve permissions and, in these traces, the
+reference topology. A permanent transfer clears the parent's reachable bits
+without a later return. Task creation, cancellation requests, or an await on
+only one possible path do not by themselves return permission.
 
-The machine check explores the entire two-state transition system to a fixed
-point. A second check enumerates all 240 placements of lending and joining
-among four accesses, including every direct/alias choice, translates them to
-Willow, and compares the permission conflict with E2402/E2408. Structural
-classification is compared with the production Send/Sync classifier for all
-800 unary type trees through depth three over both leaves.
+**Claim.** Every reachable state satisfies, for each object `o`,
+`not(P_o and exists t. C_o,t)` and `|{t : C_o,t}| <= 1`.
+Proof by induction on transitions: allocation establishes the property for a
+fresh identity. A lend checks parent permission for its entire reachable set;
+by induction no child owns any of those objects, so replacing their parent
+bits with one child's bits preserves both clauses. A completed join clears
+that child's bits while restoring the parent bits; induction excludes any
+other child's bits on those objects. Alias binding grants no bits. Creating a
+container allocates a fresh identity and records edges to parent-accessible
+payloads without duplicating their permissions; future access and lending
+must check the enlarged reachable set. A transfer removes parent permission;
+reads/writes and rejected operations preserve state. Thus two tasks cannot
+both be authorized to access an overlapping reachable object. This is safety,
+not termination, and requires topology-changing operations to respect the
+same access guards.
+
+The test-only [`loans.rs`](../src/semantic/type_checker/core_models/loans.rs)
+checks all 64 directed containment graphs without self edges (including cycles)
+and all 27 maps of three variables to three allocated objects. Each fixed
+heap is explored to a fixed point, not a trace-depth cutoff. The 1,728 heaps
+reach 7,980 heap/permission states in total; reachable-state counts per heap
+are pinned as `{3: 750, 5: 666, 7: 252, 9: 18, 11: 36, 13: 6}`. Every state
+checks objectwise exclusivity, permission conservation, guarded parent/child
+access and each task's join. All 11,772 successful lend transitions also
+check that an overlapping second lend fails without changing state. Allocation,
+alias and containment choices are represented by the initial heaps; dynamic
+topology mutation is not exhaustively explored.
+
+The independent oracle uses directed graph traversal and permission bitsets,
+without production ownership structures, union-find or loan-interval helpers.
+A source differential checks `rejected iff conflict` for 10,024 two-task
+straight-line programs. The ten binding shapes use `a = [1]`, `b = a | [2]`,
+and `c = a | b | [3] | [a] | [b]`, with `edit(Array<i64>)` and
+`editn(Array<Array<i64>>)` children. All 9 pairs of loan variables and all 100
+pairs of start/join intervals around three parent accesses are enumerated:
+`10 * 9 * 100 = 9,000` cases. Access variables and read/write choices use a
+fixed xorshift seed; 1,024 further samples have five accesses. Events at the
+same point run in task-number order (start then join), followed by parent
+access. The pinned result is 2,552 accepted and 7,472 rejected programs. The
+original 240 single-child/direct-alias cases are retained.
+
+Conservative source corpora check `conflict implies rejected`: 288 cases of
+conditional/unconditional alias or fresh rebinding, 360 two-iteration loop
+cases with inner/outer allocation, and 360 permanent `@sending` transfers
+with access or re-lending before/after transfer. Branch execution follows the
+generated boolean, rather than production's path-insensitive alias union.
+Loop traces additionally assert the language's iteration-origin restriction:
+outer values are rejected even when the finite execution has no conflicting
+access; inner values joined before use are accepted. Accepted, conflicting
+rejection and excess rejection counts are pinned separately for each corpus.
+
+| Conservative corpus | Accepted | Conflicting/rejected | Excess rejection |
+| --- | ---: | ---: | ---: |
+| Branch/rebinding | 216 | 64 | 8 |
+| Loop | 116 | 128 | 116 |
+| Sending | 232 | 128 | 0 |
+
+Only E2402 (array loan) and E2408 (ownership transfer) are allowed; lexical,
+parse or unrelated semantic errors fail the test instead of counting as
+rejection. These are semantic checks of generated programs, not execution.
+Structural classification is independently compared with the production
+Send/Sync classifier for all 800 unary type trees through depth three.
 
 **Connection to full Willow.** The proof assumes alias identity is complete,
 fresh values do not already escape, payloads are Send, and a completed join
@@ -82,11 +140,15 @@ For full structural types, classes combine field predicates and Sync rejects
 post-construction field writes; recursive types require a coinductive argument;
 enums combine payloads; interfaces require declared marker contracts validated
 for implementations. Callable storage analysis distinguishes actual shareable
-environments from unknown closures. These rules, explicit reference lifetimes,
-multiple objects/children, scopes, loops, inheritance, native values and GC
-are **not proved by the two-state model or the unary type enumeration**. Their
-implementation is part of the refinement assumptions, with existing focused
-tests providing additional evidence. Conditional on those assumptions, the
+environments from unknown closures. These rules and explicit reference lifetimes
+are not proved by the unary type enumeration. Multiple objects, aliases,
+containment and two children
+now have bounded fixed-point evidence; finite branch, rebinding, loop and
+transfer traces have differential evidence. This does not prove arbitrary
+heap sizes or task counts, inherited class fields, native values, GC,
+interprocedural escapes, cancellation/scopes, or infinite loops. Their
+implementation remains a refinement assumption, with focused tests providing
+additional evidence. Conditional on these assumptions, the inductive
 capability argument extends object by object; it does not prove the assumptions.
 
 ## E2604: absence of modeled waits while holding a lexical lock
@@ -226,13 +288,15 @@ source-to-runtime refinement in the trusted base.
 
 ## Coverage and cost
 
-The eight named `core_model_` tests cover empty graphs, local waits, pure and
+The twelve named `core_model_` tests cover empty graphs, local waits, pure and
 waiting self recursion, mutual recursion, disconnected waits, transitive paths,
 diamonds, masked edges, missing evidence (three forms), acyclic lock order,
 self acquisition, two/three-lock cycles, unused locks, scalar/closure leaves,
 each of seven wrappers, nested wrappers, access before/during/after a loan,
-direct/alias accesses and exclusive permission restoration. Failing comparisons
-print the generated source or graph/seed/mask for replay.
+direct/alias/contained accesses, disjoint and overlapping child loans, join
+order, read/write accesses, exclusive permission restoration, conditional and
+unconditional rebinding, loop allocation origins and permanent transfers.
+Failing comparisons print the generated source or graph/seed/mask for replay.
 
 All additional computation is test-only; production compilation, generated
 code size and runtime hot paths are unchanged. For V vertices and E edges,
@@ -244,3 +308,27 @@ the production SCC algorithm. The test visits at most 32,768 lock request
 assignments. Type enumeration grows geometrically with a fixed depth of three;
 each type comparison is linear in its nesting depth. Corpus sizes are explicit
 and stable; no wall-clock timing is used as correctness evidence.
+
+The loan checks invoke the compiler 11,272 times (10,024 two-task traces,
+240 retained traces, and 1,008 conservative traces), below a fixed 20,000
+budget. For N objects, V variables, E containment edges, T child slots and
+S reachable permission states, caching each variable's reachability costs
+O(V(N+E)) time. The fixed-point traversal checks V*T lends and T joins per
+state, using a hash set for expected O(1) state membership at the fixed
+N=3, T=2 bounds, rather than repeatedly scanning prior states. Its bounded
+state-processing cost is O(S*T*(V+1)); closure storage is V bitsets and each
+stored state has T+1 bitsets. Generalizing beyond word-sized masks introduces
+the corresponding bitset-width factor; the state space itself is exponential.
+At the actual bounds there are exactly 63,840 candidate lend/join transitions.
+
+Each generated trace computes its three reachability masks once, then visits
+each source event once with constant-sized permission operations. With K
+cases and L events per case, oracle/source construction costs O(K*(V(N+E)+L))
+and retains only one program and its diagnostics at a time. The additional
+compiler cost is K semantic checks of those bounded programs; this statement
+does not assume the full production compiler is linear. The xorshift sample
+bounds the larger access-choice/long-trace product instead of enumerating it.
+The pure graph coverage includes chains, fan-out, cycles and redundant aliases;
+the source corpus deliberately uses the ten stated array shapes, not all
+arbitrary graphs. No production code, generated-code size or runtime cost is
+added by these tests.
