@@ -152,6 +152,7 @@ impl Source {
             .filter(|item| match item {
                 Item::Function(f) => !f.type_params.is_empty(),
                 Item::Class(c) => !c.type_params.is_empty(),
+                Item::Interface(i) => !i.type_params.is_empty(),
                 _ => false,
             })
             .collect();
@@ -197,9 +198,25 @@ impl Source {
                     callables.insert(f.span, (f.name.clone(), f.body.span));
                 }
                 Item::Class(c) => {
-                    for m in &c.methods {
+                    for m in c.methods.iter().filter(|m| c.span.contains(m.span)) {
                         callables
                             .insert(m.span, (QualifiedName::join(&c.name, &m.name), m.body.span));
+                    }
+                }
+                Item::Interface(i) => {
+                    for m in &i.methods {
+                        if let Some(body) = &m.default_body {
+                            callables.insert(
+                                m.span,
+                                (
+                                    QualifiedName::join(
+                                        &i.name,
+                                        format_args!("$default${}", m.name),
+                                    ),
+                                    body.span,
+                                ),
+                            );
+                        }
                     }
                 }
                 _ => {}
@@ -217,7 +234,7 @@ impl Source {
             items: facts
                 .declarations
                 .iter()
-                .filter(|d| matches!(d.kind.as_str(), "function" | "class"))
+                .filter(|d| matches!(d.kind.as_str(), "function" | "class" | "interface"))
                 .map(|d| (d.name.clone(), d.clone()))
                 .collect(),
             declarations: facts.declarations,
@@ -525,16 +542,24 @@ pub(super) fn aggregate(
     let mut ids = HashMap::new();
     for f in functions.iter_mut() {
         let original_name = f.name.clone();
-        let name = f
-            .locations
-            .iter()
-            .find_map(|l| callables.get(&(l.path.as_str(), l.start, l.end)).copied());
-        if let Some(name) = name {
+        let mut module_changed = false;
+        let name = f.locations.iter().find_map(|l| {
+            callables
+                .get(&(l.path.as_str(), l.start, l.end))
+                .map(|name| (*name, &l.path))
+        });
+        if let Some((name, module)) = name {
             f.name.clone_from(name);
+            // Imported default copies belong to the declaring source callable,
+            // even when a consuming unit owns the instantiated class.
+            module_changed = f.module != *module;
+            if module_changed {
+                f.module.clone_from(module);
+            }
         } else {
             f.name = source_spelling(&f.name);
         }
-        let id = if f.name == original_name {
+        let id = if f.name == original_name && !module_changed {
             f.id.clone()
         } else {
             hash(serde_json::to_vec(&(&f.module, &f.name)).unwrap())

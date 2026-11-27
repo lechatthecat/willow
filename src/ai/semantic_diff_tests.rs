@@ -631,6 +631,37 @@ fn main() {}";
 }
 
 #[test]
+fn default_method_effect_edits_match_cold_analysis() {
+    let pure = "interface Shape { fn probe(self) {} }
+class Copy implements Shape {}
+fn invoke(s: Shape) { s.probe(); }
+fn concrete(s: Copy) { s.probe(); }
+fn main() {}";
+    let allocating = pure.replace("fn probe(self) {}", "fn probe(self) { let xs = [1, 2]; }");
+    for (before, after, delta) in [
+        (pure, allocating.as_str(), "added"),
+        (allocating.as_str(), pure, "removed"),
+    ] {
+        let (old, clean) = captures_mode(before, after, false);
+        let expected = compare(&old, &clean, false).unwrap();
+        assert!(
+            expected
+                .changes
+                .iter()
+                .any(|change| change["effects"][delta]
+                    .as_array()
+                    .is_some_and(|bits| bits.iter().any(|bit| bit == "may-allocate"))),
+            "{expected:?}"
+        );
+        let (old, retained) = captures(before, after);
+        assert_eq!(
+            serde_json::to_value(compare(&old, &retained, false).unwrap()).unwrap(),
+            serde_json::to_value(expected).unwrap()
+        );
+    }
+}
+
+#[test]
 fn semantic_diff_virtual_dispatch_target_set_changes() {
     let a = "open class Base { pub open fn run(self) {} } class A extends Base { pub override fn run(self) {} } fn caller(b: Base) { b.run(); } fn main() { let b: Base = new A(); caller(b); }";
     let b = format!("{a} class B extends Base {{ pub override fn run(self) {{ println(1); }} }}");

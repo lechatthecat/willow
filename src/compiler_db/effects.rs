@@ -1293,6 +1293,7 @@ pub(crate) fn solve_unit<N: std::fmt::Display>(
     let mut graphs = solve.connect_copies(graph);
     solve.classify_external_targets(
         graph,
+        callables,
         &import_aliases(program),
         &external,
         &mut graphs.io_callers,
@@ -1971,6 +1972,7 @@ impl<'a> ColdUnitSolve<'a> {
     fn classify_external_targets(
         &mut self,
         graph: &CallGraph,
+        callables: &HashMap<FunctionId, bool>,
         imports: &HashMap<String, String>,
         external: &impl Fn(&FunctionId) -> RuntimeEffects,
         io_callers: &mut HashMap<FunctionId, Vec<FunctionId>>,
@@ -1991,6 +1993,10 @@ impl<'a> ColdUnitSolve<'a> {
                     io_callers.entry(*target).or_default().push(caller);
                 }
                 if self.own.contains(target) || !classified.insert(*target) {
+                    continue;
+                }
+                if complete_dispatch_target(graph, callables, target) {
+                    self.body(*target);
                     continue;
                 }
                 if let Some((queries, unit)) = resolved
@@ -2893,6 +2899,10 @@ impl DeltaSolve<'_> {
             // without a graph entry of its own. A current incoming edge still
             // requires its external equation; it is not a deleted vertex.
             seeds.removed.remove(&target);
+            if complete_dispatch_target(self.graph, self.callables, &target) {
+                seeds.seeds.insert(target, EffectSummary::default());
+                continue;
+            }
             let mut seed = EffectSummary::new(
                 external(&target).intersection(ANY_PANIC),
                 Some(EffectWitness::External(target)),
@@ -3432,6 +3442,19 @@ fn same_seed(a: &EffectSummary<EffectWitness>, b: &EffectSummary<EffectWitness>)
         })
 }
 
+/// A checked dispatch union has no AST body; its edges are its definition.
+/// Empty or incomplete slots still require conservative external evidence.
+fn complete_dispatch_target(
+    graph: &CallGraph,
+    callables: &HashMap<FunctionId, bool>,
+    target: &FunctionId,
+) -> bool {
+    callables.contains_key(target)
+        && graph
+            .get(target)
+            .is_some_and(|sites| !sites.has_unknown && !sites.targets.is_empty())
+}
+
 fn source_callable(index: &super::ids::BodyIndex, body: BodyId) -> FunctionId {
     use super::ids::BodyOwner;
     match index.owner(body).map(|(_, owner)| owner) {
@@ -3956,6 +3979,86 @@ mod tests {
                     effects.facts.iter().count()
                 );
             }
+        }
+    }
+
+    #[test]
+    fn complete_dispatch_effects_scale_and_incomplete_slots_fail_closed() {
+        use crate::query_stats::{Counter, Session, count};
+        use crate::semantic::call_graph::CallSites;
+        let program = program("fn leaf() {} fn caller() {}");
+        let leaf = FunctionId::free("leaf");
+        let caller = FunctionId::free("caller");
+        for chain in [false, true] {
+            for size in [1, 8, 64, 256] {
+                let mut graph = CallGraph::default();
+                let mut callables = HashMap::new();
+                graph.merge(leaf, CallSites::default());
+                let mut targets = Vec::new();
+                for i in 0..size {
+                    let id = FunctionId::method(TypeId::local(format!("I{i}")), "run");
+                    let target = if chain && i > 0 { targets[i - 1] } else { leaf };
+                    graph.merge(id, target_sites([target].into()));
+                    callables.insert(id, false);
+                    targets.push(id);
+                }
+                graph.merge(caller, target_sites(targets.into_iter().collect()));
+                let _session = Session::start(true, false);
+                let effects = solve_unit(
+                    &program,
+                    &graph,
+                    &HashMap::<ExprId, Type>::new(),
+                    None,
+                    &callables,
+                    &HashMap::new(),
+                    |_| panic!("complete local dispatch classified as external"),
+                );
+                assert!(effects.facts.get(&caller).unwrap().is_empty());
+                assert_eq!(effects.facts.iter().count(), size + 2);
+                assert_eq!(count(Counter::EffectEdges), 3 * size);
+                println!(
+                    "dispatch chain={chain} unions={size} facts={} classified_edges={}",
+                    size + 2,
+                    count(Counter::EffectEdges)
+                );
+            }
+        }
+        for (registered, nonempty, unknown) in [
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let target = FunctionId::method(TypeId::local("Missing"), "run");
+            let mut graph = CallGraph::default();
+            graph.merge(leaf, CallSites::default());
+            graph.merge(caller, target_sites([target].into()));
+            graph.merge(
+                target,
+                CallSites {
+                    targets: if nonempty {
+                        [leaf].into()
+                    } else {
+                        Default::default()
+                    },
+                    has_unknown: unknown,
+                    ..Default::default()
+                },
+            );
+            let callables = if registered {
+                [(target, false)].into()
+            } else {
+                HashMap::new()
+            };
+            let effects = solve_unit(
+                &program,
+                &graph,
+                &HashMap::<ExprId, Type>::new(),
+                None,
+                &callables,
+                &HashMap::new(),
+                |_| PANIC,
+            );
+            assert!(effects.facts.get(&caller).unwrap().contains(PANIC));
         }
     }
 

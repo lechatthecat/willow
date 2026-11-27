@@ -626,8 +626,19 @@ pub(super) fn finish(
 ) -> (Vec<Symbol>, Vec<Reference>) {
     let mut callable = HashMap::new();
     for f in functions {
+        // Injected methods share the declaring body's span. Match its source
+        // owner too, so insertion order cannot select an implementing copy.
+        let name = match QualifiedName::new(&f.name).split_last() {
+            Some((owner, method)) if method.starts_with("$default$") => {
+                std::borrow::Cow::Owned(QualifiedName::join(owner, &method[9..]))
+            }
+            _ => std::borrow::Cow::Borrowed(f.name.as_str()),
+        };
         for l in &f.locations {
-            callable.insert((l.path.as_str(), l.start, l.end), f.id.as_str());
+            callable.insert(
+                (l.path.as_str(), l.start, l.end, name.clone()),
+                f.id.as_str(),
+            );
         }
     }
     let ranges: Vec<_> = captures
@@ -724,7 +735,14 @@ pub(super) fn finish(
         // source declarations. Keep their compiler owner/ordinal identities.
         let function = if matches!(d.kind.as_str(), "function" | "method") {
             raw_path
-                .and_then(|p| callable.get(&(p.as_str(), d.span.start, d.span.end)))
+                .and_then(|p| {
+                    callable.get(&(
+                        p.as_str(),
+                        d.span.start,
+                        d.span.end,
+                        std::borrow::Cow::Borrowed(source_names[&declaration_key(d)].as_str()),
+                    ))
+                })
                 .copied()
         } else {
             None

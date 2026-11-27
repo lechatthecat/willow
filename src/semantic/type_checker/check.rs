@@ -836,9 +836,35 @@ impl TypeChecker {
                                 .body_queries
                                 .as_ref()
                                 .map_or(*body, |q| q.index().source_body(*body));
-                            let default = defaults.get(&source).copied().unwrap_or_else(|| {
-                                interface_default_effect_id(&interface.name, method_name)
-                            });
+                            let default = defaults
+                                .get(&source)
+                                .copied()
+                                .or_else(|| {
+                                    let (
+                                        _,
+                                        crate::compiler_db::ids::BodyOwner::InterfaceDefault(id),
+                                    ) = self.body_queries.as_ref()?.index().owner(source)?
+                                    else {
+                                        return None;
+                                    };
+                                    let mut owner = id.owner_type()?;
+                                    // Template prechecks precede module attachment in
+                                    // BodyIndex. Preserve the provider namespace while
+                                    // selecting its concrete interface instance.
+                                    if owner.namespace().is_none()
+                                        && let Some(namespace) =
+                                            TypeId::from_source_name(&interface.name).namespace()
+                                    {
+                                        owner = owner.in_namespace(namespace);
+                                    }
+                                    Some(FunctionId::method(
+                                        owner,
+                                        format!("$default${}", id.name()),
+                                    ))
+                                })
+                                .unwrap_or_else(|| {
+                                    interface_default_effect_id(&interface.name, method_name)
+                                });
                             // Concrete receivers select this same default too.
                             // Its waiting effects must reach C::method as well
                             // as the interface dispatch union (E2604).
@@ -851,7 +877,7 @@ impl TypeChecker {
                                 .edges
                                 .entry(interface_id)
                                 .or_default()
-                                .insert(interface_default_effect_id(&interface.name, method_name));
+                                .insert(default);
                         }
                         Some((false, _, _)) => {
                             self.effect_inputs
@@ -1133,10 +1159,11 @@ impl TypeChecker {
                 for method in &class.methods {
                     if method.is_default_injected {
                         // These bodies are checked under the canonical interface
-                        // identity. Until backend default identities match it,
-                        // never interpret an absent concrete edge as no panic.
+                        // identity. A known edge supplies that body's effects;
+                        // only a missing edge needs an unknown-call seed.
+                        let id = FunctionId::method(TypeId::local(&class.name), &method.name);
                         graph.merge(
-                            FunctionId::method(TypeId::local(&class.name), &method.name),
+                            id,
                             CallSites {
                                 unsupported_initialization: [crate::semantic::call_graph::UnsupportedInitialization::InjectedDefault].into(),
                                 call_spans: Default::default(),
@@ -1145,7 +1172,7 @@ impl TypeChecker {
                                 virtual_spans: Default::default(),
                                 virtual_calls: Default::default(),
                                 targets: Default::default(),
-                                has_unknown: true,
+                                has_unknown: self.effect_inputs.edges.get(&id).is_none_or(|targets| targets.is_empty()),
                             },
                         );
                     }

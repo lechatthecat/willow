@@ -846,6 +846,248 @@ fn imported_interface_defaults_and_overrides_keep_the_selected_wait_effect() {
 }
 
 #[test]
+fn default_method_effects_cover_twenty_body_and_call_perspectives() {
+    // Five bodies through four entry points: declaration, interface dispatch,
+    // concrete inherited method, and transitive wrapper of a deep subclass.
+    for (body, expected, bit) in [
+        ("return true;", "none", 1),
+        ("let xs = [1, 2]; return true;", "may", 1),
+        ("ch.recv(); return true;", "may", 4),
+        ("println(1); return true;", "may", 64),
+        ("return f();", "unknown", 1),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), format!(
+            "interface Shape {{ fn probe(self, ch: Channel<i64>, f: fn() -> bool) -> bool {{ {body} }} }}\n\
+             open class Base implements Shape {{}}\n\
+             open class Middle extends Base {{}}\n\
+             class Child extends Middle {{}}\n\
+             class Other implements Shape {{}}\n\
+             fn through_interface(s: Shape, ch: Channel<i64>, f: fn() -> bool) -> bool {{ return s.probe(ch, f); }}\n\
+             fn through_concrete(s: Other, ch: Channel<i64>, f: fn() -> bool) -> bool {{ return s.probe(ch, f); }}\n\
+             fn deep(s: Child, ch: Channel<i64>, f: fn() -> bool) -> bool {{ return s.probe(ch, f); }}\n\
+             fn relay(s: Child, ch: Channel<i64>, f: fn() -> bool) -> bool {{ return deep(s, ch, f); }}\n\
+             fn main() {{}}\n"
+        )).unwrap();
+        let mut states = None;
+        for selector in [
+            "Shape::probe",
+            "through_interface",
+            "through_concrete",
+            "relay",
+        ] {
+            let selector = format!("main::{selector}");
+            let value = f.json(
+                &["effects", &selector, "--explain"],
+                i32::from(expected == "unknown"),
+            );
+            let result = &value["result"];
+            let effects = result["effects"].as_array().unwrap();
+            assert_eq!(
+                effects.iter().find(|e| e["effect"] == bit).unwrap()["state"],
+                expected,
+                "{selector}: {value}"
+            );
+            let current: Vec<_> = effects.iter().map(|e| e["state"].clone()).collect();
+            if let Some(states) = &states {
+                assert_eq!(&current, states, "{selector}: {value}");
+            } else {
+                states = Some(current);
+            }
+            if body == "return true;" {
+                assert!(effects.iter().all(|e| e["state"] == "none"), "{value}");
+                assert_eq!(result["no_panic"]["status"], "PROVEN", "{value}");
+            }
+            if expected == "unknown" {
+                let output = f.run(&["effects", &selector]);
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    text.contains("Incomplete effect summary: main::Shape::probe"),
+                    "{text}"
+                );
+                for owner in ["Base", "Middle", "Child", "Other"] {
+                    assert!(
+                        !text.contains(&format!("Incomplete effect summary: main::{owner}::probe")),
+                        "{text}"
+                    );
+                }
+                assert!(!text.contains("$default$"), "{text}");
+            }
+        }
+    }
+}
+
+#[test]
+fn default_method_effects_select_canonical_body_independently_of_copy_order() {
+    use willow_compiler::{CompilerOptions, CompilerSession, diagnostics::HumanEmitter};
+    for count in [0, 1, 8, 32] {
+        let f = Fixture::new();
+        let classes: String = (0..count)
+            .map(|i| format!("class Copy{i} implements Shape {{}}\n"))
+            .collect();
+        fs::write(f.0.join("src/main.wi"), format!(
+            "interface Shape {{ fn probe(self) -> bool {{ return true; }} }}\n{classes}\nfn main() {{}}"
+        )).unwrap();
+        let snapshot = CompilerSession::new(
+            f.0.join("src/main.wi").to_str().unwrap(),
+            "",
+            &CompilerOptions::debug(),
+            None,
+        )
+        .analysis_with_emitter(&mut HumanEmitter)
+        .unwrap();
+        let canonical = snapshot
+            .functions
+            .iter()
+            .find(|f| f.name == "Shape::$default$probe")
+            .unwrap();
+        let symbol = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .find(|s| s.source_name.as_deref() == Some("Shape::probe"))
+            .unwrap();
+        assert_eq!(symbol.id, canonical.id, "copies={count}");
+        let result = f.json(&["effects", "main::Shape::probe"], 0);
+        assert!(
+            result["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["state"] == "none"),
+            "{result}"
+        );
+        println!("default copies={count} canonical source declarations=1");
+    }
+}
+
+#[test]
+fn default_method_effects_do_not_union_overrides_into_the_body() {
+    for (default, implementation, default_io, caller_io) in [
+        ("return true;", "println(1); return true;", "none", "may"),
+        ("println(1); return true;", "return true;", "may", "none"),
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("src/main.wi"), format!(
+            "interface Shape {{ fn probe(self) -> bool {{ {default} }} }} class Override implements Shape {{ pub fn probe(self) -> bool {{ {implementation} }} }} fn invoke(s: Shape) -> bool {{ return s.probe(); }} fn main() {{}}"
+        )).unwrap();
+        for (selector, state) in [
+            ("Shape::probe", default_io),
+            ("Override::probe", caller_io),
+            ("invoke", caller_io),
+        ] {
+            let value = f.json(&["effects", &format!("main::{selector}")], 0);
+            let io = value["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["effect"] == 64)
+                .unwrap();
+            assert_eq!(io["state"], state, "{value}");
+        }
+    }
+}
+
+#[test]
+fn default_method_effects_imported_unknowns_name_the_source_declaration() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/shapes.wi"), "pub interface Shape { fn probe(self, f: fn() -> bool) -> bool { return f(); } } pub class Base implements Shape {}\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import shapes; class Local implements shapes::Shape {} fn invoke(s: Local, f: fn() -> bool) -> bool { return s.probe(f); } fn imported(s: shapes::Base, f: fn() -> bool) -> bool { return s.probe(f); } fn main() {}\n").unwrap();
+    for selector in ["shapes::Shape::probe", "main::invoke", "main::imported"] {
+        let result = f.json(&["effects", selector], 1);
+        assert!(
+            result["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["state"] == "unknown"),
+            "{result}"
+        );
+        let output = f.run(&["effects", selector]);
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            text.contains("Incomplete effect summary: shapes::Shape::probe"),
+            "{text}"
+        );
+        assert!(!text.contains("$default$"), "{text}");
+        assert!(
+            !text.contains("::Local::probe") && !text.contains("::Base::probe"),
+            "{text}"
+        );
+    }
+}
+
+#[test]
+fn default_method_effects_imported_edits_and_generic_instances() {
+    use willow_compiler::{CompilerOptions, CompilerSession, diagnostics::HumanEmitter};
+    for local in [false, true] {
+        let f = Fixture::new();
+        let class = if local {
+            "class Box<T> implements shapes::Shape<T> {}"
+        } else {
+            ""
+        };
+        let ty = if local {
+            "Box<i64>"
+        } else {
+            "shapes::Box<i64>"
+        };
+        fs::write(f.0.join("src/main.wi"), format!("import shapes; {class} fn invoke(s: {ty}) -> bool {{ return s.probe(); }} fn main() {{ let s = new {ty}(); invoke(s); }}\n")).unwrap();
+        for body in ["return true;", "println(1); return true;", "return true;"] {
+            let class = if local {
+                ""
+            } else {
+                "pub class Box<T> implements Shape<T> {}"
+            };
+            fs::write(
+                f.0.join("src/shapes.wi"),
+                format!(
+                    "pub interface Shape<T> {{ fn probe(self) -> bool {{ {body} }} }} {class}\n"
+                ),
+            )
+            .unwrap();
+            let snapshot = CompilerSession::new(
+                f.0.join("src/main.wi").to_str().unwrap(),
+                "",
+                &CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut HumanEmitter)
+            .unwrap();
+            let canonical = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "Shape::$default$probe")
+                .unwrap();
+            let symbol = snapshot
+                .semantic
+                .symbols
+                .iter()
+                .find(|s| s.source_name.as_deref() == Some("Shape::probe"))
+                .unwrap();
+            assert_eq!(symbol.id, canonical.id);
+            for selector in ["shapes::Shape::probe", "main::invoke"] {
+                let value = f.json(&["effects", selector], 0);
+                let effects = value["result"]["effects"].as_array().unwrap();
+                assert_eq!(
+                    effects.iter().find(|e| e["effect"] == 64).unwrap()["state"],
+                    if body.contains("println") {
+                        "may"
+                    } else {
+                        "none"
+                    },
+                    "{value}"
+                );
+                if !body.contains("println") {
+                    assert!(effects.iter().all(|e| e["state"] == "none"), "{value}");
+                    assert_eq!(value["result"]["no_panic"]["status"], "PROVEN", "{value}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn condition_diagnostics_preserve_errors_and_do_not_cascade_through_cached_bodies() {
     for (expression, mismatch) in [
         ("\"abc\".missing(\"a\")", false),
@@ -6749,7 +6991,7 @@ fn inherited_method_effects_keep_imported_override_and_std_chain() {
         );
         let output = f.run(&args);
         let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("chain=main::Child::work -> base::Base::charge -> main::Child::cost -> <std>::collections::len"), "{text}");
+        assert!(text.contains("chain=main::Child::work -> base::Base::charge -> main::Child::cost -> <std>::collections::Array::len"), "{text}");
     }
 }
 

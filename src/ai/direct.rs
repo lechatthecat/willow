@@ -226,6 +226,39 @@ impl DirectSession {
             .map(|s| (s.id.clone(), session.selector(s)))
             .collect();
         session.function_names.extend(names);
+        // Copies keep their source declaration's range, including imported
+        // defaults. Display an addressable source selector for each copy.
+        let methods: HashMap<_, _> = session
+            .snapshot()
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| s.kind == "method")
+            .map(|s| (s.id.as_str(), session.selector(s)))
+            .collect();
+        let declarations: HashMap<_, _> = session
+            .snapshot()
+            .functions
+            .iter()
+            .filter_map(|f| methods.get(f.id.as_str()).map(|name| (f, name)))
+            .flat_map(|(f, name)| {
+                f.locations
+                    .iter()
+                    .map(move |l| ((l.path.as_str(), l.start, l.end), name))
+            })
+            .collect();
+        let copies: Vec<_> = session
+            .snapshot()
+            .functions
+            .iter()
+            .filter_map(|f| {
+                f.locations
+                    .iter()
+                    .find_map(|l| declarations.get(&(l.path.as_str(), l.start, l.end)))
+                    .map(|name| (f.id.clone(), (*name).clone()))
+            })
+            .collect();
+        session.function_names.extend(copies);
         Ok(session)
     }
     pub fn workspace(&self) -> &str {
