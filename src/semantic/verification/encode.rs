@@ -954,7 +954,7 @@ impl<'a> Encoder<'a> {
                 value.text.clone(),
                 QualifiedName::join(
                     format_args!("loop@{}:{}", span.line, span.col),
-                    if name.starts_with("$for_index_") {
+                    if annotation_index == Some(name.as_str()) {
                         "iteration"
                     } else {
                         &name
@@ -1576,4 +1576,80 @@ pub(super) fn contract_predicates(
         return Err(Unsupported.error("contract calls require additional comparison summaries"));
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod synthetic_loop_tests {
+    use super::*;
+
+    fn parse(source: &str) -> Program {
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        program
+    }
+
+    #[test]
+    fn range_counter_prefix_does_not_change_its_display_kind() {
+        let mut program = parse("@pure @verified fn f()->i64 {for index in 0..2 {} return 0;}");
+        let Item::Function(function) = &mut program.items[0] else {
+            panic!("function");
+        };
+        let Stmt::For(range) = &mut function.body.stmts[0] else {
+            panic!("range loop");
+        };
+        range.name = "$for_index_source".into();
+        let summary = encode(
+            0,
+            &[function],
+            &HashMap::from([("f", 0)]),
+            &DataTypes::default(),
+        )
+        .unwrap();
+        assert_eq!(summary.loop_symbols.len(), 1);
+        assert!(
+            summary
+                .loop_symbols
+                .values()
+                .all(|name| { QualifiedName::new(name).last_segment() == "$for_index_source" })
+        );
+        assert_eq!(
+            summary.inferred_loop_annotations[0].counter,
+            "$for_index_source"
+        );
+    }
+
+    #[test]
+    fn nested_array_counter_names_and_mutation_labels_scale_linearly() {
+        for count in [8, 16, 32] {
+            let mut source =
+                String::from("@pure @verified fn f(a:FrozenArray<i64>)->i64 {let mut total=0;");
+            for index in 0..count {
+                source += &format!("for value{index} in a {{");
+            }
+            source += "total=total+1;";
+            source += &"}".repeat(count);
+            source += "return total;}";
+            let program = parse(&source);
+            let writes = crate::semantic::field_writes::FieldWrites::from_program(&program);
+            let data = DataTypes::new(&program, &writes);
+            let Item::Function(function) = &program.items[0] else {
+                panic!("function");
+            };
+            let summary = encode(0, &[function], &HashMap::from([("f", 0)]), &data).unwrap();
+            let mut iterations = 0;
+            let mut mutations = 0;
+            for name in summary.loop_symbols.values() {
+                match QualifiedName::new(name).last_segment() {
+                    "iteration" => iterations += 1,
+                    "total" => mutations += 1,
+                    other => panic!("unexpected loop label: {other}"),
+                }
+            }
+            assert_eq!(iterations, count);
+            assert_eq!(mutations, count);
+            assert_eq!(summary.inferred_loop_annotations.len(), count);
+            assert!(summary.nodes < count * 45 + 50);
+        }
+    }
 }

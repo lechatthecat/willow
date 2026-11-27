@@ -118,6 +118,7 @@ fn bucket(
     callees.sort_unstable();
     Function {
         identity: None,
+        source_name: None,
         body_id: None,
         body_location: None,
         rename_calls: vec![],
@@ -131,6 +132,10 @@ fn bucket(
         ),
         locations: vec![],
         synthetic: true,
+        synthetic_kind: crate::qualified_name::SyntheticKind::Indirect {
+            slot: u8::try_from(slot).expect("indirect arity slot"),
+            wildcard: key == Some("*"),
+        },
         fingerprint: String::new(),
         body_fingerprint: String::new(),
         callees,

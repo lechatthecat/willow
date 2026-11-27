@@ -467,7 +467,9 @@ mod tests {
     use super::*;
     fn node(i: usize) -> Function {
         Function {
+            synthetic_kind: crate::qualified_name::SyntheticKind::Source,
             identity: None,
+            source_name: None,
             body_id: None,
             body_location: None,
             rename_calls: vec![],

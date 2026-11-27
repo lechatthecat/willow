@@ -132,91 +132,21 @@ pub(crate) fn source_names(
     text: String,
     packages: &std::collections::HashMap<String, String>,
 ) -> String {
-    if !text.contains("$pkg")
-        && !text.contains("$local")
-        && !text.contains("$receiver")
-        && !text.contains("$mono$")
-        && !text.contains("$std::")
-    {
-        return text;
-    }
-    let mut out = String::with_capacity(text.len());
-    let mut copied = 0;
-    for (start, _) in text.match_indices('$') {
-        if start < copied {
-            continue;
-        }
-        if text[start..].starts_with("$mono$") {
-            let end = start
-                + 6
-                + text[start + 6..]
-                    .bytes()
-                    .take_while(u8::is_ascii_hexdigit)
-                    .count();
-            if end == start + 70 {
-                out.push_str(&text[copied..start]);
-                copied = end;
-                continue;
-            }
-        }
-        if text[start..].starts_with("$local::") || text[start..].starts_with("$local.") {
-            let end = start
-                + if text[start..].starts_with("$local::") {
-                    8
-                } else {
-                    7
-                };
-            out.push_str(&text[copied..start]);
-            copied = end;
-            continue;
-        }
-        // Bundled std items read as their imported spelling (`Array`).
-        if let Some(rest) = text[start..].strip_prefix("$std::")
-            && let Some(module) = rest.find("::")
-        {
-            out.push_str(&text[copied..start]);
-            copied = start + 6 + module + 2;
-            continue;
-        }
-        // A copied default's receiver.
-        if text[start..].starts_with(crate::semantic::ids::FOREIGN_RECEIVER_PREFIX) {
-            out.push_str(&text[copied..start]);
-            copied = start + crate::semantic::ids::FOREIGN_RECEIVER_PREFIX.len();
-            continue;
-        }
-        if !text[start..].starts_with("$pkg") {
-            continue;
-        }
-        let separator = if text.as_bytes().get(start + 36) == Some(&b'.') {
-            "."
-        } else {
-            "::"
-        };
-        let end = start + 36 + separator.len();
-        if text
-            .as_bytes()
-            .get(start + 4..start + 36)
-            .is_some_and(|hash| hash.iter().all(u8::is_ascii_hexdigit))
-            && text.as_bytes().get(start + 36..end) == Some(separator.as_bytes())
-        {
-            out.push_str(&text[copied..start]);
-            if let Some(prefix) = packages.get(&text[start..start + 36]) {
-                out.push_str(prefix);
-            }
-            copied = end;
-        }
-    }
-    out.push_str(&text[copied..]);
-    out
+    crate::semantic::ids::project_source_names(&text, packages)
 }
 
 #[cfg(test)]
 mod source_name_tests {
     use super::*;
+    use crate::qualified_name::SyntheticKind;
+    use crate::semantic::ids::{register_monomorph_name, register_synthetic_name};
 
     #[test]
-    fn monomorph_names_hide_only_complete_hashes() {
+    fn registered_monomorph_names_hide_specializations() {
         let hash = "a".repeat(64);
+        register_synthetic_name("$local", "", SyntheticKind::LocalNamespace);
+        register_monomorph_name(&format!("id$mono${hash}"), "id", &hash);
+        register_monomorph_name(&format!("Box$mono${hash}"), "Box", &hash);
         let text = format!("`$local::boxes::id$mono${hash}` and Box$mono${hash}::get; 日本語");
         assert_eq!(
             source_names(text, &Default::default()),
@@ -229,6 +159,7 @@ mod source_name_tests {
 
     #[test]
     fn standalone_namespace_is_display_only_and_scans_mixed_names() {
+        register_synthetic_name("$local", "", SyntheticKind::LocalNamespace);
         let text = "expected $local::a::Cell, got $local.b.Cell; $localish::Keep; $other";
         assert_eq!(
             source_names(text.into(), &Default::default()),
@@ -241,6 +172,7 @@ mod source_name_tests {
 
     #[test]
     fn copied_default_receiver_shows_its_own_name() {
+        register_synthetic_name("$receiver", "", SyntheticKind::ForeignReceiver);
         let text = "the method `me` on a `$receiver::A`; $receiverish::B";
         assert_eq!(
             source_names(text.into(), &Default::default()),
@@ -251,6 +183,7 @@ mod source_name_tests {
     #[test]
     fn backend_names_hide_package_hashes() {
         let package = "$pkg0123456789abcdef0123456789abcdef";
+        register_synthetic_name(package, "", SyntheticKind::PackageNamespace);
         assert_eq!(
             source_names(
                 format!("function `{package}.graph.empty` has invalid lowered IR"),
@@ -271,6 +204,8 @@ mod source_name_tests {
     fn dependency_names_remain_distinct_from_root_types() {
         let root = "$pkg0123456789abcdef0123456789abcdef";
         let dep = "$pkgfedcba9876543210fedcba9876543210";
+        register_synthetic_name(root, "", SyntheticKind::PackageNamespace);
+        register_synthetic_name(dep, "", SyntheticKind::PackageNamespace);
         let packages = [
             (root.into(), String::new()),
             (dep.into(), "ledger::".into()),
@@ -285,6 +220,11 @@ mod source_name_tests {
 
     #[test]
     fn diagnostic_prose_hides_internal_names_without_changing_fixes() {
+        register_synthetic_name(
+            "$pkg0123456789abcdef0123456789abcdef",
+            "",
+            SyntheticKind::PackageNamespace,
+        );
         let internal = "$pkg0123456789abcdef0123456789abcdef::bank::Bank";
         let message = format!("expected Array<{internal}>, found fn({internal}) -> {internal}");
         let span = Span::new(0, 1, 1, 1);
@@ -308,11 +248,27 @@ mod source_name_tests {
             assert_eq!(source_names(text.into(), &Default::default()), text);
         }
     }
+
+    #[test]
+    fn unregistered_valid_looking_names_are_not_reclassified_by_rendering() {
+        let symbols = crate::semantic::ids::SymbolInterner::new();
+        let _scope = symbols.enter();
+        let hash = "b".repeat(64);
+        let package = "$pkg11111111111111111111111111111111";
+        for text in [
+            format!("expected {package}::Cell"),
+            format!("no method on User$mono${hash}"),
+            format!("{package}.graph.empty"),
+        ] {
+            assert_eq!(source_names(text.clone(), &Default::default()), text);
+        }
+    }
 }
 
 #[cfg(test)]
 mod generic_diagnostic_tests {
     use super::*;
+    use crate::semantic::ids::register_monomorph_name;
 
     fn error() -> Diagnostic {
         Diagnostic::new(Severity::Error, ErrorCode::E0502, "no method on Heap")
@@ -362,7 +318,9 @@ mod generic_diagnostic_tests {
     fn generic_diagnostic_projection_covers_all_prose_preserves_replacements() {
         let original = error();
         let mut first = original.clone();
-        let name = format!("Heap$mono${:064x}", 1);
+        let hash = format!("{:064x}", 1);
+        let name = format!("Heap$mono${hash}");
+        register_monomorph_name(&name, "Heap", &hash);
         first.message = name.clone();
         first.labels[0].message = name.clone();
         first.notes.push(name.clone());
@@ -413,6 +371,8 @@ mod generic_diagnostic_tests {
                 let mut visits = 0;
                 let mut emitted = 0;
                 for instance in 0..instances {
+                    let hash = format!("{instance:064x}");
+                    register_monomorph_name(&format!("Heap$mono${hash}"), "Heap", &hash);
                     for location in 0..locations {
                         let mut diagnostic = error();
                         diagnostic.message = format!("no method on Heap$mono${instance:064x}");

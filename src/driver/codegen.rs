@@ -685,6 +685,11 @@ fn buildgraph_codegen_failure_projects_emitted_and_returned_names() {
         }
     }
     let package = "$pkg0123456789abcdef0123456789abcdef";
+    crate::semantic::ids::register_synthetic_name(
+        package,
+        "",
+        crate::qualified_name::SyntheticKind::PackageNamespace,
+    );
     let packages = [(package.into(), "dep::".into())].into();
     let mut emitter = Capture(Vec::new());
     let map = diagnostics::SourceMap::new("main.wi", "");

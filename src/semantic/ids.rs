@@ -5,7 +5,7 @@
 //! resolve through the owning session and return shared, owned strings.
 
 use crate::module::ModuleId;
-use crate::qualified_name::QualifiedName;
+use crate::qualified_name::{NameMetadata, QualifiedName, SyntheticKind};
 use std::cell::{Ref, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -37,10 +37,71 @@ pub fn package_namespace(package: &crate::package::PackageIdentity) -> String {
     format!("$pkg{hash:032x}")
 }
 
-/// Compiler-only module prefixes cannot be spelled by a source import alias.
-/// Recognize both standalone and package origins when restoring source evidence.
+/// Register provenance at the point a compiler spelling is created.
+pub(crate) fn register_synthetic_name(name: &str, source: &str, kind: SyntheticKind) {
+    SymbolInterner::current().with_table_mut(|table| table.names.register(name, source, kind));
+}
+pub(crate) fn register_monomorph_name(name: &str, source: &str, suffix: &str) {
+    SymbolInterner::current()
+        .with_table_mut(|table| table.names.register_monomorph(name, source, suffix));
+}
+pub(crate) fn synthetic_name_kind(name: &str) -> SyntheticKind {
+    SymbolInterner::try_current().map_or(SyntheticKind::Source, |symbols| {
+        symbols
+            .inner
+            .table
+            .borrow()
+            .names
+            .kind(QualifiedName::new(name).last_segment())
+    })
+}
+pub(crate) fn source_name(name: &str) -> String {
+    SymbolInterner::try_current().map_or_else(
+        || name.to_owned(),
+        |symbols| {
+            let table = symbols.inner.table.borrow();
+            if let Some(source) = table.names.source(name) {
+                return source.to_owned();
+            }
+            match QualifiedName::new(name).split_last() {
+                Some((namespace, item)) => table.names.source(item).map_or_else(
+                    || name.to_owned(),
+                    |source| QualifiedName::join(namespace, source),
+                ),
+                None => name.to_owned(),
+            }
+        },
+    )
+}
+pub(crate) fn specialization_name(name: &str) -> String {
+    SymbolInterner::try_current().map_or_else(String::new, |symbols| {
+        symbols
+            .inner
+            .table
+            .borrow()
+            .names
+            .specialization(QualifiedName::new(name).last_segment())
+            .unwrap_or("")
+            .to_owned()
+    })
+}
+pub(crate) fn project_source_names(text: &str, packages: &HashMap<String, String>) -> String {
+    SymbolInterner::try_current().map_or_else(
+        || text.to_owned(),
+        |symbols| symbols.inner.table.borrow().names.project(text, packages),
+    )
+}
+pub(crate) fn project_generic_names(text: &str) -> String {
+    SymbolInterner::try_current().map_or_else(
+        || text.to_owned(),
+        |symbols| symbols.inner.table.borrow().names.source_spelling(text),
+    )
+}
 pub(crate) fn has_internal_module_prefix(name: &str) -> bool {
-    QualifiedName::new(name).has_qualifier(LOCAL_NAMESPACE) || name.starts_with("$pkg")
+    matches!(
+        synthetic_name_kind(QualifiedName::new(name).first_segment()),
+        SyntheticKind::LocalNamespace | SyntheticKind::PackageNamespace
+    )
 }
 
 /// Namespace that spells a receiving unit's unqualified type inside the scope
@@ -59,6 +120,11 @@ pub(crate) const LOCAL_NAMESPACE: &str = "$local";
 /// `name` as a foreign default's scope spells it: see
 /// [`FOREIGN_RECEIVER_NAMESPACE`].
 pub(crate) fn foreign_receiver_name(name: &str) -> String {
+    register_synthetic_name(
+        FOREIGN_RECEIVER_NAMESPACE,
+        "",
+        SyntheticKind::ForeignReceiver,
+    );
     QualifiedName::join(FOREIGN_RECEIVER_NAMESPACE, name)
 }
 
@@ -68,7 +134,9 @@ pub struct SymbolModule(Handle);
 
 impl SymbolModule {
     pub fn new(package: crate::package::PackageIdentity, path: crate::module::ModulePath) -> Self {
-        let namespace = QualifiedName::join(package_namespace(&package), &path.0);
+        let package_name = package_namespace(&package);
+        register_synthetic_name(&package_name, "", SyntheticKind::PackageNamespace);
+        let namespace = QualifiedName::join(package_name, &path.0);
         let name = SymbolModuleName {
             package,
             path,
@@ -160,6 +228,8 @@ struct FunctionName {
     namespace: Option<Arc<str>>,
     owner: Option<Arc<str>>,
     name: Arc<str>,
+    #[serde(default)]
+    kind: SyntheticKind,
 }
 #[derive(Default)]
 struct SymbolTable {
@@ -177,6 +247,7 @@ struct SymbolTable {
     // canonical symbol once, including when a persisted graph is restored.
     adt_targets: HashMap<FunctionId, crate::semantic::intrinsics::AdtMethod>,
     function_ids: HashMap<FunctionName, FunctionId>,
+    names: NameMetadata,
 }
 /// An index is meaningful only in its owner. Owner IDs are never reused.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -255,6 +326,20 @@ impl SymbolInterner {
         OWNERS.with(|owners| {
             owners.borrow_mut().insert(id, Rc::downgrade(&inner));
         });
+        {
+            let mut table = inner.table.borrow_mut();
+            table
+                .names
+                .register(LOCAL_NAMESPACE, "", SyntheticKind::LocalNamespace);
+            table.names.register(
+                FOREIGN_RECEIVER_NAMESPACE,
+                "",
+                SyntheticKind::ForeignReceiver,
+            );
+            table
+                .names
+                .register("$std", "", SyntheticKind::StdNamespace);
+        }
         Self { inner }
     }
     /// Select the destination of constructor and serde adapters for this scope.
@@ -270,8 +355,19 @@ impl SymbolInterner {
             }
         })
     }
-    pub(crate) fn current() -> Self {
+    fn try_current() -> Option<Self> {
         let current = ACTIVE.with(|active| active.borrow().last().cloned());
+        #[cfg(test)]
+        {
+            current.or_else(|| Some(TEST_SYMBOLS.with(Clone::clone)))
+        }
+        #[cfg(not(test))]
+        {
+            current
+        }
+    }
+    pub(crate) fn current() -> Self {
+        let current = Self::try_current();
         if let Some(current) = current {
             return current;
         }
@@ -361,6 +457,7 @@ impl SymbolTable {
         namespace: Option<&str>,
         owner: Option<&str>,
         name: &str,
+        kind: SyntheticKind,
     ) -> Option<FunctionId> {
         let namespace = match namespace {
             Some(n) => Some(Arc::clone(self.strings.get(n)?)),
@@ -373,6 +470,7 @@ impl SymbolTable {
         self.function_ids
             .get(&FunctionName {
                 module,
+                kind,
                 namespace,
                 owner,
                 name: Arc::clone(self.strings.get(name)?),
@@ -413,9 +511,11 @@ impl SymbolTable {
         namespace: Option<&str>,
         owner: Option<&str>,
         name: &str,
+        kind: SyntheticKind,
     ) -> FunctionId {
         let key = FunctionName {
             module,
+            kind,
             namespace: namespace.map(|n| self.string(n)),
             owner: owner.map(|n| self.string(n)),
             name: self.string(name),
@@ -607,6 +707,15 @@ impl FunctionId {
         owner: Option<&str>,
         name: &str,
     ) -> Self {
+        Self::intern_kind(module, namespace, owner, name, SyntheticKind::Source)
+    }
+    fn intern_kind(
+        module: Option<SymbolModule>,
+        namespace: Option<&str>,
+        owner: Option<&str>,
+        name: &str,
+        kind: SyntheticKind,
+    ) -> Self {
         SymbolInterner::current().with_table_mut(|table| {
             #[cfg(test)]
             {
@@ -616,8 +725,8 @@ impl FunctionId {
                 assert_eq!(module.0.owner, table.owner, "foreign module owner");
             }
             table
-                .find_function(module, namespace, owner, name)
-                .unwrap_or_else(|| table.function_id(module, namespace, owner, name))
+                .find_function(module, namespace, owner, name, kind)
+                .unwrap_or_else(|| table.function_id(module, namespace, owner, name, kind))
         })
     }
     fn spelling(&self) -> FunctionName {
@@ -629,6 +738,28 @@ impl FunctionId {
             .with_table(|table| table.adt_targets.get(&self).copied())
     }
 
+    pub(crate) fn synthetic_free(name: impl AsRef<str>, kind: SyntheticKind) -> Self {
+        Self::intern_kind(None, None, None, name.as_ref(), kind)
+    }
+    pub(crate) fn synthetic_method(
+        owner: TypeId,
+        name: impl AsRef<str>,
+        kind: SyntheticKind,
+    ) -> Self {
+        let _symbols = owner.0.owner().enter();
+        let owner = owner.spelling();
+        Self::intern_kind(
+            owner.module,
+            owner.namespace.as_deref(),
+            Some(&owner.name),
+            name.as_ref(),
+            kind,
+        )
+    }
+    pub(crate) fn synthetic_kind(self) -> SyntheticKind {
+        self.0
+            .with_table(|table| table.functions[self.0.index as usize].kind)
+    }
     pub fn free(name: impl AsRef<str>) -> Self {
         Self::intern(None, None, name.as_ref())
     }
@@ -669,13 +800,34 @@ impl FunctionId {
             return self;
         }
         let name = self.spelling();
-        Self::intern(Some(namespace.as_ref()), name.owner.as_deref(), &name.name)
+        match SymbolModule::for_namespace(namespace.as_ref()) {
+            Some(module) => Self::intern_kind(
+                Some(module),
+                None,
+                name.owner.as_deref(),
+                &name.name,
+                name.kind,
+            ),
+            None => Self::intern_kind(
+                None,
+                Some(namespace.as_ref()),
+                name.owner.as_deref(),
+                &name.name,
+                name.kind,
+            ),
+        }
     }
     /// Attach the declaring module, discarding any consumer-local namespace.
     pub fn in_module(self, module: SymbolModule) -> Self {
         let _symbols = self.0.owner().enter();
         let name = self.spelling();
-        Self::intern_in(Some(module), None, name.owner.as_deref(), &name.name)
+        Self::intern_kind(
+            Some(module),
+            None,
+            name.owner.as_deref(),
+            &name.name,
+            name.kind,
+        )
     }
     pub fn module(&self) -> Option<SymbolModule> {
         self.spelling().module
@@ -719,16 +871,20 @@ impl FunctionId {
     pub fn remap_imported_item(&self, item: &str, local: &str) -> Option<Self> {
         let _symbols = self.0.owner().enter();
         if self.is_free_named(item) {
-            Some(Self::free(local))
+            Some(Self::synthetic_free(local, self.synthetic_kind()))
         } else if self.is_method_of(item) {
-            Some(Self::method(TypeId::local(local), self.name()))
+            Some(Self::synthetic_method(
+                TypeId::local(local),
+                self.name(),
+                self.synthetic_kind(),
+            ))
         } else {
             None
         }
     }
     pub fn resolve_self_owner(self, owner: &TypeId) -> Self {
         if matches!(self.owner().as_deref(), Some("Self" | "self")) {
-            Self::method(*owner, self.name())
+            Self::synthetic_method(*owner, self.name(), self.synthetic_kind())
         } else {
             self
         }
@@ -801,13 +957,16 @@ impl<'de> serde::Deserialize<'de> for FunctionId {
             namespace: Option<String>,
             owner: Option<String>,
             name: String,
+            #[serde(default)]
+            kind: SyntheticKind,
         }
         let name = <Name as serde::Deserialize>::deserialize(deserializer)?;
-        Ok(Self::intern_in(
+        Ok(Self::intern_kind(
             name.module,
             name.namespace.as_deref(),
             name.owner.as_deref(),
             &name.name,
+            name.kind,
         ))
     }
 }
@@ -1493,7 +1652,13 @@ mod package_symbol_tests {
                         let ty = TypeId::local("Formatter").in_module(module);
                         symbols.insert(FunctionId::method(ty, "format"));
                         table.type_id(Some(module), None, "Formatter");
-                        table.function_id(Some(module), None, Some("Formatter"), "format");
+                        table.function_id(
+                            Some(module),
+                            None,
+                            Some("Formatter"),
+                            "format",
+                            SyntheticKind::Source,
+                        );
                         requests += 1;
                     }
                 }
@@ -1539,5 +1704,106 @@ mod codegen_scope_tests {
         assert_eq!(detached.get("local"), Some(&2));
         assert_eq!(decoded.get("local"), Some(&2));
         assert_eq!(base.lookup_id("local"), FunctionId::free("A"));
+    }
+}
+
+#[cfg(test)]
+mod synthetic_identity_tests {
+    use super::*;
+
+    #[test]
+    fn synthetic_identity_twenty_creation_and_rebinding_perspectives() {
+        let owner = TypeId::local("Owner");
+        let cases = [
+            ("$default$run", SyntheticKind::InterfaceDefault),
+            ("$contract$arity2", SyntheticKind::ContractArity),
+            ("$contract$into$value", SyntheticKind::ContractInto),
+            ("$static$field", SyntheticKind::StaticInitializer),
+            ("ordinary", SyntheticKind::Dispatch),
+        ];
+        for (name, kind) in cases {
+            let source = FunctionId::free(name);
+            let generated = FunctionId::synthetic_free(name, kind);
+            assert_ne!(source, generated);
+            assert_eq!(source.synthetic_kind(), SyntheticKind::Source);
+            assert_eq!(generated.synthetic_kind(), kind);
+            assert_eq!(source.to_string(), generated.to_string());
+            assert_eq!(generated.in_namespace("module").synthetic_kind(), kind);
+            let method = FunctionId::synthetic_method(owner, name, kind);
+            assert_eq!(method.synthetic_kind(), kind);
+            assert_ne!(method, FunctionId::method(owner, name));
+            assert_eq!(
+                method
+                    .remap_imported_item("Owner", "Alias")
+                    .unwrap()
+                    .synthetic_kind(),
+                kind
+            );
+            let bytes = serde_json::to_vec(&method).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<FunctionId>(&bytes).unwrap(),
+                method
+            );
+        }
+        assert_eq!(std::mem::size_of::<FunctionId>(), 8);
+    }
+
+    #[test]
+    fn synthetic_identity_package_namespace_and_module_are_equal() {
+        let module = SymbolModule::new(
+            crate::package::PackageIdentity {
+                name: "utility".into(),
+                version: "1.0.0".into(),
+                source: crate::package::PackageSourceIdentity::Git {
+                    url: "https://example.test/utility".into(),
+                },
+                revision: Some("abc".into()),
+            },
+            crate::module::ModulePath("nested::unit".into()),
+        );
+        for kind in [
+            SyntheticKind::Source,
+            SyntheticKind::InterfaceDefault,
+            SyntheticKind::ContractArity,
+        ] {
+            let id = FunctionId::synthetic_method(TypeId::local("Owner"), "method", kind);
+            assert_eq!(id.in_namespace(module.namespace()), id.in_module(module));
+            let json = serde_json::to_vec(&id.in_module(module)).unwrap();
+            let restored: FunctionId = serde_json::from_slice(&json).unwrap();
+            assert_eq!(restored.synthetic_kind(), kind);
+            assert_eq!(restored.module(), Some(module));
+        }
+    }
+
+    #[test]
+    fn synthetic_identity_kind_queries_do_not_intern_or_allocate_names() {
+        let symbols = SymbolInterner::new();
+        let _scope = symbols.enter();
+        for count in [1, 16, 256, 4096] {
+            let ids: Vec<_> = (0..count)
+                .map(|i| {
+                    FunctionId::synthetic_free(format!("node{i}"), SyntheticKind::ContractArity)
+                })
+                .collect();
+            let requests = symbols.inner.table.borrow().requests;
+            for id in ids {
+                assert_eq!(id.synthetic_kind(), SyntheticKind::ContractArity);
+            }
+            assert_eq!(symbols.inner.table.borrow().requests, requests);
+        }
+    }
+
+    #[test]
+    fn synthetic_identity_qualified_generic_provenance() {
+        register_monomorph_name("Box$mono$a", "Box", "a");
+        register_monomorph_name("Box$mono$b", "Box", "b");
+        for namespace in ["$local::module", "alias", "other"] {
+            for suffix in ["a", "b"] {
+                let name = format!("{namespace}::Box$mono${suffix}");
+                assert_eq!(synthetic_name_kind(&name), SyntheticKind::Monomorph);
+                assert_eq!(specialization_name(&name), suffix);
+                assert_eq!(source_name(&name), format!("{namespace}::Box"));
+            }
+        }
     }
 }

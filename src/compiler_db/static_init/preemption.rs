@@ -198,7 +198,10 @@ impl StaticInitQueries {
                     // module-local abstract slot is not itself an executed body.
                     // BodyIndex identifies the actual instantiated default;
                     // unit-local effect unions can still name its template.
-                    if copies.contains(&id) && target.name().starts_with("$default$") {
+                    if copies.contains(&id)
+                        && target.synthetic_kind()
+                            == crate::qualified_name::SyntheticKind::InterfaceDefault
+                    {
                         continue;
                     }
                     if calls.virtual_calls.contains(target) {

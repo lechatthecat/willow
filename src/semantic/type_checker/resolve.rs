@@ -784,7 +784,7 @@ impl TypeChecker {
                     ENUM_IDENTITY_LOOKUPS.with(|count| count.set(count.get() + 1));
                     // A carried nominal alias remains resolvable in the provider;
                     // its caller-local enum name need not be in that scope.
-                    if name.starts_with("$type$mono$") {
+                    if self.generics.nominal_aliases.contains_key(name) {
                         name.clone()
                     } else {
                         self.symbols
@@ -1736,8 +1736,15 @@ impl TypeChecker {
             crate::semantic::builtin_types::BuiltinTypeId::Option,
         ) {
             // A missing Option member can still be available on its payload.
-            let payload_has_method =
-                !method_name.starts_with("__abi_") && method_name != "init" && {
+            let payload_has_method = !matches!(
+                crate::semantic::intrinsics::MethodName::classify(method_name),
+                crate::semantic::intrinsics::MethodName::AbiConcat
+                    | crate::semantic::intrinsics::MethodName::AbiCopy
+                    | crate::semantic::intrinsics::MethodName::AbiDebug
+                    | crate::semantic::intrinsics::MethodName::AbiLen
+                    | crate::semantic::intrinsics::MethodName::AbiResize
+            ) && method_name != "init"
+                && {
                     let name = classified.unwrap_or(call.method.kind());
                     name.has_method_on(inner) || self.type_declares_method(inner, method_name)
                 };

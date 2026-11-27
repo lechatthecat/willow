@@ -134,7 +134,9 @@ impl Forest {
         callees.dedup();
         let missing = inherited.is_none();
         Function {
+            synthetic_kind: crate::qualified_name::SyntheticKind::Dispatch,
             identity: None,
+            source_name: Some(QualifiedName::join(&self.classes[class].name, method)),
             body_id: None,
             body_location: None,
             rename_calls: vec![],

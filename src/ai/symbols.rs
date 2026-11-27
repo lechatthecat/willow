@@ -802,7 +802,9 @@ pub(super) fn finish(
         // Injected methods share the declaring body's span. Match its source
         // owner too, so insertion order cannot select an implementing copy.
         let name = match QualifiedName::new(&f.name).split_last() {
-            Some((owner, method)) if method.starts_with("$default$") => {
+            Some((owner, method))
+                if f.synthetic_kind == crate::qualified_name::SyntheticKind::InterfaceDefault =>
+            {
                 std::borrow::Cow::Owned(QualifiedName::join(owner, &method[9..]))
             }
             _ => std::borrow::Cow::Borrowed(f.name.as_str()),

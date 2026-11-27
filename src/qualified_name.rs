@@ -16,6 +16,10 @@
 
 use std::fmt::Display;
 
+mod synthetic;
+pub(crate) use synthetic::NameMetadata;
+pub use synthetic::SyntheticKind;
+
 /// The separator between the segments of a qualified name.
 pub(crate) const SEPARATOR: &str = "::";
 

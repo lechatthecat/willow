@@ -70,6 +70,7 @@ impl Parser {
                 if let Some(ty) = ty {
                     let name = format!("$tuple_binding{}", tuple_scopes.len());
                     stmts.push(Stmt::Let(LetStmt {
+                        synthetic_kind: crate::qualified_name::SyntheticKind::Source,
                         type_span: Some(span),
                         name: name.clone(),
                         mutable: false,
@@ -559,6 +560,7 @@ impl Parser {
         self.expect(TokenKind::Semicolon)?;
         self.default_import_usage.bind(&name);
         Ok(Stmt::Let(LetStmt {
+            synthetic_kind: crate::qualified_name::SyntheticKind::Source,
             name,
             mutable,
             type_span,
@@ -1045,8 +1047,9 @@ impl Parser {
             }))
         };
         let temp_var = |name: &str| Expr::Var(name.to_owned(), span, ExprId::fresh());
-        let temp_let = |name: &str, init| {
+        let temp_let = |name: &str, init, synthetic_kind| {
             Stmt::Let(LetStmt {
+                synthetic_kind,
                 name: name.to_owned(),
                 mutable: false,
                 type_span: None,
@@ -1097,7 +1100,14 @@ impl Parser {
                 if is_self {
                     Ok(assignment)
                 } else {
-                    Ok(scoped(vec![temp_let(&receiver, object.take()), assignment]))
+                    Ok(scoped(vec![
+                        temp_let(
+                            &receiver,
+                            object.take(),
+                            crate::qualified_name::SyntheticKind::Source,
+                        ),
+                        assignment,
+                    ]))
                 }
             }
             Expr::Index(array, index, target_span, _) => {
@@ -1116,8 +1126,16 @@ impl Parser {
                     span,
                 });
                 Ok(scoped(vec![
-                    temp_let(&receiver, array.take()),
-                    temp_let(&subscript, index.take()),
+                    temp_let(
+                        &receiver,
+                        array.take(),
+                        crate::qualified_name::SyntheticKind::CompoundArray,
+                    ),
+                    temp_let(
+                        &subscript,
+                        index.take(),
+                        crate::qualified_name::SyntheticKind::Source,
+                    ),
                     assignment,
                 ]))
             }

@@ -1870,7 +1870,9 @@ mod tests {
                     .map(|i| {
                         let start = i * "日|| 1;\r\n".len() + "日".len();
                         Function {
+                            synthetic_kind: crate::qualified_name::SyntheticKind::Source,
                             identity: None,
+                            source_name: None,
                             body_id: None,
                             body_location: None,
                             rename_calls: vec![],

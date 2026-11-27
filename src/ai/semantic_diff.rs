@@ -197,6 +197,8 @@ fn serialize_wire<S: serde::Serializer, T: Serialize>(
 #[derive(Debug, Serialize)]
 #[serde(bound(serialize = "C: Serialize, S: Serialize"))]
 pub struct SemanticDiff<C = SymbolChange, S = ReportSummary> {
+    #[serde(skip)]
+    display_names: DisplayNames,
     pub schema: &'static str,
     pub status: ReportStatus,
     pub base: Option<RevisionDescription>,
@@ -220,6 +222,7 @@ impl<C, S: SummaryCounts> SemanticDiff<C, S> {
 impl SemanticDiff {
     pub fn incomplete(reason: String) -> Self {
         Self {
+            display_names: Default::default(),
             schema: "willow.semantic-diff.v3",
             status: ReportStatus::Incomplete,
             base: None,
@@ -232,10 +235,13 @@ impl SemanticDiff {
         }
     }
     pub fn human(&self, explain: bool) -> String {
-        fn list<'a>(items: impl IntoIterator<Item = &'a String>) -> String {
+        fn list<'a>(
+            items: impl IntoIterator<Item = &'a String>,
+            display_names: &DisplayNames,
+        ) -> String {
             let text = items
                 .into_iter()
-                .map(|item| matching::human_name(item))
+                .map(|item| matching::human_name(item, display_names))
                 .collect::<Vec<_>>()
                 .join(", ");
             if text.is_empty() { "none".into() } else { text }
@@ -256,7 +262,7 @@ impl SemanticDiff {
                     if proof.status == crate::semantic::type_checker::PanicStatus::Proven {
                         text.push_str(&format!(
                             "no_panic {side} {}: {}\n",
-                            matching::human_name(name),
+                            matching::human_name(name, &self.display_names),
                             proof.basis.as_str()
                         ));
                     }
@@ -272,7 +278,7 @@ impl SemanticDiff {
                     for (contract, evidence) in contracts {
                         text.push_str(&format!(
                             "{contract} {side} {}: assumption at {}:{}\n",
-                            matching::human_name(function),
+                            matching::human_name(function, &self.display_names),
                             evidence
                                 .location
                                 .as_ref()
@@ -290,16 +296,25 @@ impl SemanticDiff {
         for change in &self.changes {
             text.push_str(&format!(
                 "{}: {}\n",
-                matching::human_name(&change.symbol),
+                matching::human_name(&change.symbol, &self.display_names),
                 change.matching
             ));
             if let Some(Some(target)) = &change.renamed_to {
-                text.push_str(&format!("  Renamed to: {}\n", matching::human_name(target)));
+                text.push_str(&format!(
+                    "  Renamed to: {}\n",
+                    matching::human_name(target, &self.display_names)
+                ));
             }
             text.push_str(&format!(
                 "  Effects added: {}; removed: {}\n",
-                list(change.effects.iter().flat_map(|effects| &effects.added)),
-                list(change.effects.iter().flat_map(|effects| &effects.removed)),
+                list(
+                    change.effects.iter().flat_map(|effects| &effects.added),
+                    &self.display_names
+                ),
+                list(
+                    change.effects.iter().flat_map(|effects| &effects.removed),
+                    &self.display_names
+                ),
             ));
             let contract_change = change
                 .contract
@@ -307,8 +322,14 @@ impl SemanticDiff {
                 .map_or_else(|| "unknown".into(), |contract| contract.change.to_string());
             text.push_str(&format!(
                 "  Contract {contract_change}: {} -> {}\n",
-                list(change.contract.iter().flat_map(|contract| &contract.base)),
-                list(change.contract.iter().flat_map(|contract| &contract.target)),
+                list(
+                    change.contract.iter().flat_map(|contract| &contract.base),
+                    &self.display_names
+                ),
+                list(
+                    change.contract.iter().flat_map(|contract| &contract.target),
+                    &self.display_names
+                ),
             ));
             text.push_str(&format!(
                 "  Contract violations: base {}; target {}\n",
@@ -316,13 +337,15 @@ impl SemanticDiff {
                     change
                         .contract
                         .iter()
-                        .flat_map(|contract| &contract.base_violations)
+                        .flat_map(|contract| &contract.base_violations),
+                    &self.display_names,
                 ),
                 list(
                     change
                         .contract
                         .iter()
-                        .flat_map(|contract| &contract.target_violations)
+                        .flat_map(|contract| &contract.target_violations),
+                    &self.display_names,
                 ),
             ));
             if change.public_api != PublicApiChange::Unchanged {
@@ -333,8 +356,8 @@ impl SemanticDiff {
             {
                 text.push_str(&format!(
                     "  Call targets: {} -> {}\n",
-                    list(targets.base.iter().flatten()),
-                    list(targets.target.iter().flatten()),
+                    list(targets.base.iter().flatten(), &self.display_names),
+                    list(targets.target.iter().flatten(), &self.display_names),
                 ));
             }
             if explain {
@@ -342,7 +365,7 @@ impl SemanticDiff {
                     let chain = cause
                         .chain
                         .iter()
-                        .map(|name| matching::human_name(name))
+                        .map(|name| matching::human_name(name, &self.display_names))
                         .collect::<Vec<_>>()
                         .join(" -> ");
                     let side = cause
@@ -350,7 +373,7 @@ impl SemanticDiff {
                         .map_or_else(|| "?".into(), |side| side.to_string());
                     text.push_str(&format!(
                         "  cause: {side} {} via {chain} ({})\n",
-                        list(&cause.effect),
+                        list(&cause.effect, &self.display_names),
                         cause.certainty
                     ));
                     if let Some(location) = &cause.location {
@@ -362,7 +385,7 @@ impl SemanticDiff {
                 }
                 text.push_str(&format!(
                     "  Impacted callers: {}\n",
-                    list(&change.impacted_callers)
+                    list(&change.impacted_callers, &self.display_names)
                 ));
             }
         }
@@ -372,16 +395,35 @@ impl SemanticDiff {
             self.summary.policy_violations(),
         ));
         for reason in &self.summary.uncertainty {
-            text.push_str(&format!("Incomplete: {}\n", matching::human_name(reason)));
+            text.push_str(&format!(
+                "Incomplete: {}\n",
+                matching::human_name(reason, &self.display_names)
+            ));
         }
         text
+    }
+}
+type DisplayNames = (im::OrdMap<String, String>, im::OrdMap<String, String>);
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NameKind {
+    symbol: SymbolKind,
+    synthetic: crate::qualified_name::SyntheticKind,
+}
+impl From<SymbolKind> for NameKind {
+    fn from(symbol: SymbolKind) -> Self {
+        Self {
+            symbol,
+            synthetic: crate::qualified_name::SyntheticKind::Source,
+        }
     }
 }
 #[derive(Clone)]
 pub(crate) struct Capture {
     baseline: Baseline,
     shapes: im::OrdMap<String, String>,
-    kinds: im::OrdMap<String, SymbolKind>,
+    kinds: im::OrdMap<String, NameKind>,
+    display_names: im::OrdMap<String, String>,
     lambda_owners: im::OrdMap<String, im::OrdSet<String>>,
     retained: state::ReportState,
     fact_updates: usize,
@@ -497,13 +539,19 @@ impl Capture {
                     | SymbolKind::Const
             ) && let Some(key) = ids.get(&symbol.id)
             {
-                kinds.insert(key.clone(), symbol.kind.clone());
+                kinds.insert(key.clone(), NameKind::from(symbol.kind.clone()));
             }
         }
+        let mut display_names = im::OrdMap::new();
         for function in &snapshot.functions {
+            let key = &ids[&function.id];
             kinds
-                .entry(ids[&function.id].clone())
-                .or_insert(SymbolKind::Function);
+                .entry(key.clone())
+                .or_insert_with(|| NameKind::from(SymbolKind::Function))
+                .synthetic = function.synthetic_kind;
+            if let Some(display) = matching::display_name(key, function) {
+                display_names.insert(key.clone(), display);
+            }
         }
         // Compiler waiting summaries apply async transmission masks. Legacy
         // graph aggregation is intentionally unchanged; use those summaries
@@ -614,6 +662,7 @@ impl Capture {
         Ok(Self {
             shapes,
             kinds,
+            display_names,
             lambda_owners,
             fact_updates: snapshot.functions.len(),
             witness_updates,
@@ -1068,6 +1117,7 @@ fn compare_keys(
         ReportStatus::Incomplete
     };
     Ok(SemanticDiff {
+        display_names: (before.display_names.clone(), after.display_names.clone()),
         schema: "willow.semantic-diff.v3",
         status,
         base: None,

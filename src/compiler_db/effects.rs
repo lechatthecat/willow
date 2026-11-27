@@ -1092,7 +1092,10 @@ impl EffectQueries {
         if let (Some(namespace), Some(owner)) = (&namespace, &owner) {
             let path = QualifiedName::join(namespace, owner);
             if let Some(unit) = self.resolve_module(consumer, &path) {
-                return Some((unit, FunctionId::free(target.name())));
+                return Some((
+                    unit,
+                    FunctionId::synthetic_free(target.name(), target.synthetic_kind()),
+                ));
             }
         }
         let (path, id) = if let Some(namespace) = namespace.as_deref() {
@@ -1102,18 +1105,29 @@ impl EffectQueries {
                     .map(String::as_str)
                     .unwrap_or(namespace),
                 match owner {
-                    Some(owner) => FunctionId::method(TypeId::local(owner), target.name()),
-                    None => FunctionId::free(target.name()),
+                    Some(owner) => FunctionId::synthetic_method(
+                        TypeId::local(owner),
+                        target.name(),
+                        target.synthetic_kind(),
+                    ),
+                    None => FunctionId::synthetic_free(target.name(), target.synthetic_kind()),
                 },
             )
         } else if let Some(owner) = owner.as_deref() {
             let path = imports.get(owner).map(String::as_str).unwrap_or(owner);
             if self.resolve_module(consumer, path).is_some() {
-                (path, FunctionId::free(target.name()))
+                (
+                    path,
+                    FunctionId::synthetic_free(target.name(), target.synthetic_kind()),
+                )
             } else if let Some((module, item)) = QualifiedName::new(path).split_last() {
                 (
                     module,
-                    FunctionId::method(TypeId::local(item), target.name()),
+                    FunctionId::synthetic_method(
+                        TypeId::local(item),
+                        target.name(),
+                        target.synthetic_kind(),
+                    ),
                 )
             } else {
                 return None;
@@ -1460,9 +1474,10 @@ impl<'a> UnitInventory<'a> {
                 }
                 Item::Interface(i) => {
                     for m in &i.methods {
-                        let id = FunctionId::method(
+                        let id = FunctionId::synthetic_method(
                             TypeId::local(&i.name),
                             format!("$default${}", m.name),
+                            crate::qualified_name::SyntheticKind::InterfaceDefault,
                         );
                         if let Some(body) = &m.default_body
                             && (i.type_params.is_empty() || callables.contains_key(&id))
@@ -3459,12 +3474,15 @@ fn source_callable(index: &super::ids::BodyIndex, body: BodyId) -> FunctionId {
     use super::ids::BodyOwner;
     match index.owner(body).map(|(_, owner)| owner) {
         Some(BodyOwner::Function(id)) => match id.owner() {
-            Some(owner) => FunctionId::method(TypeId::local(owner), id.name()),
-            None => FunctionId::free(id.name()),
+            Some(owner) => {
+                FunctionId::synthetic_method(TypeId::local(owner), id.name(), id.synthetic_kind())
+            }
+            None => FunctionId::synthetic_free(id.name(), id.synthetic_kind()),
         },
-        Some(BodyOwner::InterfaceDefault(id)) => FunctionId::method(
+        Some(BodyOwner::InterfaceDefault(id)) => FunctionId::synthetic_method(
             TypeId::local(id.owner().expect("interface owner")),
             format!("$default${}", id.name()),
+            crate::qualified_name::SyntheticKind::InterfaceDefault,
         ),
         Some(BodyOwner::Constructor { owner, .. }) => {
             FunctionId::method(TypeId::local(owner.name()), "init")

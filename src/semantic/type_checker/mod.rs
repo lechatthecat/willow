@@ -294,9 +294,10 @@ pub struct TypeChecker {
 /// dispatch union means an unused default (all implementations override it)
 /// does not taint the interface method.
 fn interface_default_effect_id(interface: &str, method: &str) -> FunctionId {
-    FunctionId::method(
+    FunctionId::synthetic_method(
         TypeId::from_source_name(interface),
         format!("$default${method}"),
+        crate::qualified_name::SyntheticKind::InterfaceDefault,
     )
 }
 
@@ -705,7 +706,7 @@ impl TypeChecker {
         // Instantiation aliases preserve the caller's scope until checked HIR
         // and backend signatures resolve the carried nominal declaration.
         if let Type::Named(name) = ty
-            && name.starts_with("$type$mono$")
+            && self.generics.nominal_aliases.contains_key(name)
         {
             return ty.clone();
         }
@@ -744,7 +745,7 @@ impl TypeChecker {
                     return self.normalize_std_type_item(name, &module, &item, args, span);
                 }
                 Type::Generic(
-                    if name.starts_with("$type$mono$") {
+                    if self.generics.nominal_aliases.contains_key(name) {
                         name.clone()
                     } else {
                         self.canonical_type_name(name)
@@ -917,7 +918,7 @@ impl TypeChecker {
             || name.to_owned(),
             |(identity, span)| {
                 // Specializations share a declaration span but remain distinct.
-                let specialization = identity.split_once("$mono$").map_or("", |(_, hash)| hash);
+                let specialization = crate::semantic::ids::specialization_name(identity);
                 format!(
                     "$declaration${}:{}:{specialization}",
                     span.file_id.0, span.start

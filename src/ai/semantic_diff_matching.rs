@@ -147,7 +147,9 @@ fn pairs_with_work(
                 continue;
             }
             if other.baseline.facts.contains_key(key)
-                || QualifiedName::new(key).contains_run(&DISPATCH_RUN)
+                || capture.kinds.get(key).is_some_and(|kind| {
+                    kind.synthetic == crate::qualified_name::SyntheticKind::Dispatch
+                })
             {
                 continue;
             }
@@ -176,7 +178,7 @@ fn pairs_with_work(
         visits += 1;
         let owner = |capture: &Capture, key: &str| {
             if !matches!(
-                capture.kinds.get(key),
+                capture.kinds.get(key).map(|kind| &kind.symbol),
                 Some(SymbolKind::Function | SymbolKind::Method)
             ) {
                 return None;
@@ -198,7 +200,7 @@ fn pairs_with_work(
     let mut inherited = Vec::new();
     for (old, new) in &result {
         visits += 1;
-        if before.kinds.get(old) == Some(&SymbolKind::Method) {
+        if before.kinds.get(old).map(|kind| &kind.symbol) == Some(&SymbolKind::Method) {
             for prefix in [&*DISPATCH_RUN, &*FUNCTION_RUN] {
                 let old = QualifiedName::new(old).replace_run(&METHOD_RUN, prefix);
                 let new = QualifiedName::new(new).replace_run(&METHOD_RUN, prefix);
@@ -253,8 +255,30 @@ pub(super) fn targets(callees: &[String], pairs: &BTreeMap<String, String>) -> V
     result
 }
 
-pub(super) fn human_name(name: &str) -> String {
-    let name = name.replace("$dispatch$", "");
+pub(super) fn display_name(key: &str, function: &Function) -> Option<String> {
+    let source = function.source_name.as_deref()?;
+    let (module, rest) = QualifiedName::new(key).split_first()?;
+    let (kind, _) = QualifiedName::new(rest).split_first()?;
+    Some(QualifiedName::from_segments([module, kind, source]))
+}
+
+pub(super) fn human_name(name: &str, display_names: &DisplayNames) -> String {
+    let lookup = |key| {
+        display_names
+            .0
+            .get(key)
+            .or_else(|| display_names.1.get(key))
+    };
+    let name = lookup(name).map_or(name, String::as_str);
+    for prefix in ["ambiguous symbol: ", "missing-source: "] {
+        if let Some(display) = name.strip_prefix(prefix).and_then(lookup) {
+            return format!("{prefix}{}", plain_human_name(display));
+        }
+    }
+    plain_human_name(name)
+}
+
+fn plain_human_name(name: &str) -> String {
     if let Some((prefix, _)) = name.split_once("<function-value candidates:") {
         return format!("{prefix}<function value call>");
     }
@@ -266,7 +290,7 @@ pub(super) fn human_name(name: &str) -> String {
     let name = name
         .rsplit_once('#')
         .filter(|(_, suffix)| suffix.chars().all(|c| c.is_ascii_digit()))
-        .map_or(name.as_str(), |(stem, _)| stem);
+        .map_or(name, |(stem, _)| stem);
     super::super::super::generics::source_spelling(name)
 }
 
@@ -292,14 +316,58 @@ mod tests {
                 let new = format!("m{i}.wi::function::new#0");
                 before.baseline.facts.insert(old.clone(), fact.clone());
                 after.baseline.facts.insert(new.clone(), fact.clone());
-                before.kinds.insert(old.clone(), SymbolKind::Function);
-                after.kinds.insert(new.clone(), SymbolKind::Function);
+                before
+                    .kinds
+                    .insert(old.clone(), SymbolKind::Function.into());
+                after.kinds.insert(new.clone(), SymbolKind::Function.into());
                 keys.extend([old, new]);
             }
             let (pairs, _, visits) = pairs_with_work(&before, &after, &keys).unwrap();
             assert_eq!(pairs.len(), n);
             assert_eq!(visits, 6 * n);
             println!("rename pairs={n} candidate_and_inheritance_visits={visits}");
+        }
+    }
+
+    #[test]
+    fn dispatch_correspondence_uses_kind_instead_of_spelling() {
+        let (template, _) =
+            super::super::tests::captures("fn f() {} fn main() {}", "fn f() {} fn main() {}");
+        for (synthetic, old, new, expected) in [
+            (
+                crate::qualified_name::SyntheticKind::Source,
+                "main.wi::function::$dispatch$old#0",
+                "main.wi::function::$dispatch$new#0",
+                1,
+            ),
+            (
+                crate::qualified_name::SyntheticKind::Dispatch,
+                "main.wi::function::old#0",
+                "main.wi::function::new#0",
+                0,
+            ),
+        ] {
+            let mut before = template.clone();
+            let mut after = template.clone();
+            let fact = before.baseline.facts["main.wi::function::f#0"].clone();
+            for (capture, key) in [(&mut before, old), (&mut after, new)] {
+                capture.baseline.facts.clear();
+                capture.baseline.facts.insert(key.into(), fact.clone());
+                capture.kinds.clear();
+                capture.kinds.insert(
+                    key.into(),
+                    NameKind {
+                        symbol: SymbolKind::Function,
+                        synthetic,
+                    },
+                );
+            }
+            let keys = [old.to_owned(), new.to_owned()].into();
+            let (pairs, _) = pairs(&before, &after, &keys).unwrap();
+            assert_eq!(pairs.len(), expected);
+            if expected != 0 {
+                assert_eq!(pairs.get(old).map(String::as_str), Some(new));
+            }
         }
     }
 
@@ -325,8 +393,12 @@ mod tests {
                     let child = format!("m{i}.wi::function::<lambda {name}@10:20>");
                     capture.baseline.facts.insert(owner.clone(), fact.clone());
                     capture.baseline.facts.insert(child.clone(), lambda.clone());
-                    capture.kinds.insert(owner.clone(), SymbolKind::Function);
-                    capture.kinds.insert(child.clone(), SymbolKind::Function);
+                    capture
+                        .kinds
+                        .insert(owner.clone(), SymbolKind::Function.into());
+                    capture
+                        .kinds
+                        .insert(child.clone(), SymbolKind::Function.into());
                     capture
                         .lambda_owners
                         .entry(scope(&child).unwrap())
@@ -392,6 +464,15 @@ mod tests {
     #[test]
     fn semantic_diff_rename_human_names_cover_evidence() {
         let report = SemanticDiff {
+            display_names: (
+                [(
+                    "main.wi::function::$dispatch$C::f".to_owned(),
+                    "main.wi::function::C::f".to_owned(),
+                )]
+                .into_iter()
+                .collect(),
+                Default::default(),
+            ),
             schema: "willow.semantic-diff.v3",
             status: ReportStatus::Complete,
             base: None,
@@ -418,7 +499,10 @@ mod tests {
                 signature: None,
                 targets: None,
             }],
-            summary: ReportSummary::default(),
+            summary: ReportSummary {
+                uncertainty: vec!["missing-source: main.wi::function::$dispatch$C::f".into()],
+                ..Default::default()
+            },
         };
         let text = report.human(true);
         for internal in ["$dispatch$", "@6", "@40", "#0", "function-value candidates"] {
@@ -426,5 +510,19 @@ mod tests {
         }
         assert!(text.contains("function value call"));
         assert!(text.contains("lambda in main"));
+        assert!(text.contains("Incomplete: missing-source: main.wi::function::C::f"));
+        let wire = serde_json::to_value(&report).unwrap();
+        assert!(wire.get("display_names").is_none());
+        assert_eq!(
+            wire["changes"][0]["symbol"],
+            "main.wi::function::$dispatch$C::f"
+        );
+        assert_eq!(
+            human_name(
+                "main.wi::function::source$dispatch$name#0",
+                &Default::default()
+            ),
+            "main.wi::function::source$dispatch$name",
+        );
     }
 }

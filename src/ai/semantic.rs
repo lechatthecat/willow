@@ -1920,7 +1920,10 @@ impl<'a> EffectWalk<'a> {
             .flatten()
             .map(|site| (site.target.as_str(), site))
             .collect();
-        let bucket = cause.id.starts_with("$indirect-arity:");
+        let bucket = matches!(
+            cause.synthetic_kind,
+            crate::qualified_name::SyntheticKind::Indirect { .. }
+        );
         for &k in &session.callees[j] {
             self.edge_visits += 1;
             let origin = origin.or(via.filter(|_| bucket && !self.nested(k)));

@@ -489,7 +489,7 @@ impl TypeChecker {
                             && conversions.insert((owner, conversion))
                         {
                             use crate::semantic::call_graph::CallSites;
-                            let hub = FunctionId::free(format!("$contract$into${conversion}"));
+                            let hub = FunctionId::synthetic_free(format!("$contract$into${conversion}"), crate::qualified_name::SyntheticKind::ContractInto);
                             // Share the virtual target union across callers and repeated ? sites.
                             if conversion_hubs.insert(conversion) {
                                 let targets = self.method_effect_ids(&Type::Named(conversion.owner_type().unwrap().to_string()), "into");
@@ -611,10 +611,10 @@ impl TypeChecker {
             graph.merge(
                 call.caller,
                 CallSites {
-                    targets: [FunctionId::free(format!(
-                        "$contract$arity{}",
-                        call.bit.trailing_zeros()
-                    ))]
+                    targets: [FunctionId::synthetic_free(
+                        format!("$contract$arity{}", call.bit.trailing_zeros()),
+                        crate::qualified_name::SyntheticKind::ContractArity,
+                    )]
                     .into(),
                     // The arity set is conservative, not a proof that an arbitrary
                     // parameter cannot receive an unseen value.
@@ -627,7 +627,10 @@ impl TypeChecker {
             #[cfg(test)]
             CONTRACT_GRAPH_WORK.with(|n| n.set(n.get() + 1));
             graph.merge(
-                FunctionId::free(format!("$contract$arity{}", value.bit.trailing_zeros())),
+                FunctionId::synthetic_free(
+                    format!("$contract$arity{}", value.bit.trailing_zeros()),
+                    crate::qualified_name::SyntheticKind::ContractArity,
+                ),
                 CallSites {
                     has_unknown: value.target.is_none(),
                     ..Default::default()
@@ -653,7 +656,10 @@ impl TypeChecker {
             let Some(summary) = facts.get(&target) else {
                 continue;
             };
-            let hub = FunctionId::free(format!("$contract$arity{}", value.bit.trailing_zeros()));
+            let hub = FunctionId::synthetic_free(
+                format!("$contract$arity{}", value.bit.trailing_zeros()),
+                crate::qualified_name::SyntheticKind::ContractArity,
+            );
             for bit in CONTRACT_BITS {
                 if summary.intersects(bit) {
                     problem = problem.seed(hub, bit, Some(EffectWitness::External(hub)));
@@ -814,9 +820,11 @@ impl TypeChecker {
                 {
                     problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
                 }
-            } else if id.name().starts_with("$contract$arity")
-                || id.name().starts_with("$contract$into$")
-            {
+            } else if matches!(
+                id.synthetic_kind(),
+                crate::qualified_name::SyntheticKind::ContractArity
+                    | crate::qualified_name::SyntheticKind::ContractInto
+            ) {
                 problem = problem.body(id);
             } else {
                 problem = problem.seed(id, CONTRACT_EFFECTS, None);
@@ -825,7 +833,7 @@ impl TypeChecker {
             // signature merely because an empty runtime fact was allocated.
             if let Some(owner) = id.owner()
                 && self.symbols.lookup_interface(&owner).is_some()
-                && !id.name().starts_with("$default$")
+                && id.synthetic_kind() != crate::qualified_name::SyntheticKind::InterfaceDefault
                 && graph.get(&id).is_none_or(|sites| sites.targets.is_empty())
             {
                 problem = problem.seed(id, CONTRACT_EFFECTS, None);
@@ -1296,7 +1304,7 @@ impl TypeChecker {
             let mut cursor = id;
             let mut conversion_span = None;
             while let Some(&(callee, span)) = paths[index].get(&cursor) {
-                if callee.name().starts_with("$contract$into$") {
+                if callee.synthetic_kind() == crate::qualified_name::SyntheticKind::ContractInto {
                     conversion_span = span;
                 } else {
                     if let Some(span) = conversion_span.take().or(span) {

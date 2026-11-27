@@ -249,6 +249,140 @@ impl Generics {
     }
 }
 
+#[cfg(test)]
+mod name_provenance_replay_tests {
+    use super::*;
+    use crate::qualified_name::SyntheticKind;
+    use crate::semantic::ids::{
+        SymbolInterner, project_source_names, source_name, specialization_name, synthetic_name_kind,
+    };
+    use crate::semantic::type_checker::precheck::Cache;
+    use crate::semantic::type_checker::precheck_journal::Key;
+    use serde_json::json;
+
+    #[test]
+    fn generic_name_metadata_replays_across_fresh_symbol_owners() {
+        fn execute(size: usize, prior: Option<&[u8]>, body: BodyId) -> (Vec<u8>, usize, usize) {
+            let symbols = SymbolInterner::new();
+            let _scope = symbols.enter();
+            let cache = Rc::new(match prior {
+                Some(bytes) => Cache::restore(serde_json::from_slice(bytes).unwrap()).unwrap(),
+                None => Cache::default(),
+            });
+            let mut checker = TypeChecker::new();
+            checker.prechecks = Some(Rc::clone(&cache));
+            REPLAYED_NAME_ROWS.set(0);
+            let (names, alias) = checker.precheck_operation(
+                "synthetic_names".into(),
+                body,
+                json!(size),
+                |checker| {
+                    cache.bodies.set(cache.bodies.get() + 1);
+                    let mut names = Vec::new();
+                    for i in 0..size {
+                        let args = vec![Type::FixedArray(Box::new(Type::I64), i as u64)];
+                        let name = symbol("Item", &args);
+                        checker.generics.instances.insert(
+                            (1, "0::Item".into(), args),
+                            QualifiedName::join("$local::module", &name),
+                        );
+                        names.push(name);
+                    }
+                    let canonical = "module::Payload";
+                    let alias = symbol("$type", &[Type::Named(canonical.into())]);
+                    crate::semantic::ids::register_synthetic_name(
+                        &alias,
+                        canonical,
+                        SyntheticKind::NominalAlias,
+                    );
+                    checker
+                        .generics
+                        .nominal_aliases
+                        .insert(alias.clone(), canonical.into());
+                    (names, alias)
+                },
+            );
+            let mut suffixes = HashSet::new();
+            for name in names {
+                assert_eq!(synthetic_name_kind(&name), SyntheticKind::Monomorph);
+                let qualified = QualifiedName::join("$local::module", &name);
+                assert_eq!(source_name(&qualified), "$local::module::Item");
+                assert_eq!(
+                    project_source_names(&format!("no method on {qualified}"), &HashMap::new()),
+                    "no method on module::Item"
+                );
+                let suffix = specialization_name(&qualified);
+                assert!(!suffix.is_empty());
+                suffixes.insert(suffix);
+            }
+            assert_eq!(suffixes.len(), size);
+            assert_eq!(synthetic_name_kind(&alias), SyntheticKind::NominalAlias);
+            assert_eq!(source_name(&alias), "module::Payload");
+            (
+                serde_json::to_vec(&cache.active_records()).unwrap(),
+                cache.bodies.get(),
+                REPLAYED_NAME_ROWS.get(),
+            )
+        }
+
+        for size in [1, 16, 128] {
+            let body = BodyId::fresh();
+            let (mut bytes, checks, _) = execute(size, None, body);
+            assert_eq!(checks, 1);
+            for _ in 0..3 {
+                let (next, checks, rows) = execute(size, Some(&bytes), body);
+                assert_eq!(checks, 0);
+                assert_eq!(rows, size + 1);
+                bytes = next;
+            }
+        }
+    }
+
+    #[test]
+    fn generic_name_metadata_replays_only_present_changed_rows() {
+        for size in [1, 16, 128] {
+            for field in [
+                "generic.instances",
+                "registry.instantiated_classes",
+                "registry.interface_instances",
+            ] {
+                let symbols = SymbolInterner::new();
+                let _scope = symbols.enter();
+                let rows: Vec<_> = (0..size)
+                    .map(|i| json!([(1, format!("0::Item{i}"), vec![Type::<String>::I64]), null]))
+                    .collect();
+                REPLAYED_NAME_ROWS.set(0);
+                restore_name_provenance(&Key::new(field, None), &json!(rows)).unwrap();
+                assert_eq!(REPLAYED_NAME_ROWS.get(), size);
+                let key = Key::new(
+                    field,
+                    Some(json!((1, "0::Changed", vec![Type::<String>::Bool]))),
+                );
+                REPLAYED_NAME_ROWS.set(0);
+                restore_name_provenance(&key, &json!([true, null])).unwrap();
+                assert_eq!(REPLAYED_NAME_ROWS.get(), 1);
+                REPLAYED_NAME_ROWS.set(0);
+                restore_name_provenance(&key, &json!([false, null])).unwrap();
+                assert_eq!(REPLAYED_NAME_ROWS.get(), 0);
+            }
+            let rows: Vec<_> = (0..size)
+                .map(|i| json!([format!("alias{i}"), format!("Payload{i}")]))
+                .collect();
+            let key = Key::new("generic.nominal_aliases", None);
+            REPLAYED_NAME_ROWS.set(0);
+            restore_name_provenance(&key, &json!(rows)).unwrap();
+            assert_eq!(REPLAYED_NAME_ROWS.get(), size);
+            for i in 0..size {
+                assert_eq!(
+                    synthetic_name_kind(&format!("alias{i}")),
+                    SyntheticKind::NominalAlias
+                );
+                assert_eq!(source_name(&format!("alias{i}")), format!("Payload{i}"));
+            }
+        }
+    }
+}
+
 enum InstantiationTypeRef<'a> {
     Class(&'a ClassInfo),
     Enum(&'a EnumInfo),
@@ -391,6 +525,11 @@ mod template_registry_tests {
                 }
                 // Force the file/name index fallback for a canonical instance.
                 let canonical = format!("$local::module::Heap$mono${:064x}", 7);
+                crate::semantic::ids::register_monomorph_name(
+                    &canonical,
+                    "$local::module::Heap",
+                    &format!("{:064x}", 7),
+                );
                 let mut info = checker.symbols.lookup_class("Heap").unwrap().clone();
                 info.name = canonical.clone();
                 checker.symbols.define_class(canonical.clone(), info);
@@ -1118,7 +1257,69 @@ pub(super) fn mentions(ty: &Type, matches: impl Fn(&str) -> bool) -> bool {
 fn symbol(name: &str, args: &[Type]) -> String {
     let mut digest = Sha256::new();
     digest.update(serde_json::to_vec(args).expect("type serialization"));
-    format!("{name}$mono${:x}", crate::hex::Hex(&digest.finalize()))
+    let suffix = format!("{:x}", crate::hex::Hex(&digest.finalize()));
+    let spelling = format!("{name}$mono${suffix}");
+    crate::semantic::ids::register_monomorph_name(&spelling, name, &suffix);
+    spelling
+}
+
+/// Recreate only provenance owned by the changed journal rows. A warm checker
+/// can restore an instance without executing its original creation path; its
+/// typed instantiation key retains the template and arguments needed by that
+/// same constructor. Never copy or scan the session's complete name registry.
+fn restore_name_provenance(
+    key: &super::precheck_journal::Key,
+    value: &serde_json::Value,
+) -> anyhow::Result<()> {
+    let monomorph = matches!(
+        key.field.as_str(),
+        "generic.instances" | "registry.instantiated_classes" | "registry.interface_instances"
+    );
+    if !monomorph && key.field != "generic.nominal_aliases" {
+        return Ok(());
+    }
+    let restore = |encoded: &serde_json::Value, value: &serde_json::Value| {
+        if monomorph {
+            let (_, declaration, args): InstantiationKey = serde_json::from_value(encoded.clone())?;
+            let (_, source) = QualifiedName::new(&declaration)
+                .split_first()
+                .ok_or_else(|| anyhow::anyhow!("invalid generic declaration identity"))?;
+            symbol(source, &args);
+        } else {
+            let alias = encoded
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid nominal alias key"))?;
+            let canonical = value
+                .as_str()
+                .ok_or_else(|| anyhow::anyhow!("invalid nominal alias target"))?;
+            crate::semantic::ids::register_synthetic_name(
+                alias,
+                canonical,
+                crate::qualified_name::SyntheticKind::NominalAlias,
+            );
+        }
+        #[cfg(test)]
+        REPLAYED_NAME_ROWS.set(REPLAYED_NAME_ROWS.get() + 1);
+        Ok::<_, anyhow::Error>(())
+    };
+    if let Some(encoded) = &key.key {
+        if value.get(0) == Some(&serde_json::Value::Bool(true)) {
+            restore(encoded, &value[1])?;
+        }
+    } else {
+        let rows = value
+            .as_array()
+            .ok_or_else(|| anyhow::anyhow!("invalid generic journal rows"))?;
+        for row in rows {
+            restore(&row[0], &row[1])?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static REPLAYED_NAME_ROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[willow_continuations::checker]
@@ -1244,6 +1445,11 @@ impl TypeChecker {
                     // table instead of leaving an owner-local bare name.
                     let canonical = self.generic_nominal_identity(identity, declaration_span);
                     let alias = symbol("$type", &[Type::Named(canonical.clone())]);
+                    crate::semantic::ids::register_synthetic_name(
+                        &alias,
+                        &canonical,
+                        crate::qualified_name::SyntheticKind::NominalAlias,
+                    );
                     // The alias hashes `canonical`, so every unit records the
                     // same module-qualified value for it.
                     if !self.generics.nominal_aliases.contains_key(&alias) {
@@ -1424,7 +1630,8 @@ impl TypeChecker {
         if let Some(canonical) = self.generics.nominal_aliases.get(name) {
             return canonical.clone();
         }
-        let source = name.split_once("$mono$").map_or(name, |(base, _)| base);
+        let source = crate::semantic::ids::source_name(name);
+        let source = source.as_str();
         if let Some(template) = self.generics.classes.get(source) {
             return format!("{source}<{}>", template.type_params.join(", "));
         }
@@ -2474,6 +2681,7 @@ impl Generics {
         key: &super::precheck_journal::Key,
         value: serde_json::Value,
     ) -> anyhow::Result<()> {
+        restore_name_provenance(key, &value)?;
         let mut registry = self.registry.borrow_mut();
         match key.field.as_str() {
             "generic.rejected_parameter_methods" => {

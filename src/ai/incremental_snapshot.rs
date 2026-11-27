@@ -130,6 +130,8 @@ pub(crate) struct VerificationSnapshotState {
     metadata: Option<Arc<Snapshot>>,
     header: Option<Header>,
     records: im::OrdMap<String, Arc<Projection>>,
+    // Typed classification for outgoing edges, independent of ordered record lookup.
+    indirect_kinds: im::HashMap<String, crate::qualified_name::SyntheticKind>,
     roots: im::HashMap<BodyId, Root>,
     declarations: im::HashMap<(UnitId, String), Span>,
     units: im::HashMap<UnitId, Unit>,
@@ -224,7 +226,11 @@ fn callable_owner(index: &crate::compiler_db::ids::BodyIndex, body: BodyId) -> O
         BodyOwner::Function(id) => Some((unit, id)),
         BodyOwner::InterfaceDefault(id) => Some((
             unit,
-            FunctionId::method(id.owner_type()?, format!("$default${}", id.name())),
+            FunctionId::synthetic_method(
+                id.owner_type()?,
+                format!("$default${}", id.name()),
+                crate::qualified_name::SyntheticKind::InterfaceDefault,
+            ),
         )),
         BodyOwner::Lambda { .. } => Some((unit, FunctionId::lambda(body))),
         BodyOwner::Constructor { owner, .. } => Some((unit, FunctionId::method(owner, "init"))),
@@ -320,6 +326,18 @@ impl Drop for CaptureScope {
     }
 }
 impl VerificationSnapshotState {
+    fn record_indirect_kind(&mut self, id: &str, kind: crate::qualified_name::SyntheticKind) {
+        if matches!(kind, crate::qualified_name::SyntheticKind::Indirect { .. }) {
+            self.indirect_kinds.insert(id.to_owned(), kind);
+        } else {
+            self.indirect_kinds.remove(id);
+        }
+    }
+    fn is_indirect_bucket(&self, id: &str) -> bool {
+        #[cfg(test)]
+        INDIRECT_KIND_PROBES.set(INDIRECT_KIND_PROBES.get() + 1);
+        self.indirect_kinds.contains_key(id)
+    }
     pub(crate) fn projection_items_cloned(&self) -> usize {
         self.projection_items_cloned.get()
     }
@@ -420,7 +438,9 @@ impl VerificationSnapshotState {
         let record = &self.records[id];
         let f = &record.function;
         let mut function = Function {
+            synthetic_kind: f.synthetic_kind,
             identity: f.identity.clone(),
+            source_name: f.source_name.clone(),
             body_id: f.body_id,
             body_location: f.body_location.clone(),
             rename_calls: vec![],
@@ -715,9 +735,10 @@ pub(crate) fn record_default(
             RootKind::Default(member),
             body.id,
             method.span,
-            FunctionId::method(
+            FunctionId::synthetic_method(
                 TypeId::local(&interface.name),
                 format!("$default${}", method.name),
+                crate::qualified_name::SyntheticKind::InterfaceDefault,
             ),
         );
     }
@@ -1799,6 +1820,7 @@ fn full_snapshot(
                 .insert(id.clone());
         }
         state.dirty_instance_owners.insert(id.clone());
+        state.record_indirect_kind(&id, record.function.synthetic_kind);
         state.records.insert(id, Arc::new(record));
     }
     state.register_units(frontend, inputs.entry);
@@ -2355,9 +2377,10 @@ impl VerificationSnapshotState {
                                 span: method.span,
                                 key: (
                                     unit,
-                                    FunctionId::method(
+                                    FunctionId::synthetic_method(
                                         TypeId::local(&interface.name),
                                         format!("$default${}", method.name),
+                                        crate::qualified_name::SyntheticKind::InterfaceDefault,
                                     ),
                                 ),
                             },
@@ -2422,9 +2445,10 @@ impl VerificationSnapshotState {
             {
                 let id = match owner {
                     BodyOwner::Function(id) => Some(id),
-                    BodyOwner::InterfaceDefault(id) => Some(FunctionId::method(
+                    BodyOwner::InterfaceDefault(id) => Some(FunctionId::synthetic_method(
                         id.owner_type().unwrap(),
                         format!("$default${}", id.name()),
+                        crate::qualified_name::SyntheticKind::InterfaceDefault,
                     )),
                     BodyOwner::Lambda { .. } => Some(FunctionId::lambda(body)),
                     BodyOwner::Constructor { owner, .. } => Some(FunctionId::method(owner, "init")),
@@ -2781,7 +2805,10 @@ impl VerificationSnapshotState {
                     }
                 }
             }
-            if function.id.starts_with("$indirect-arity:") {
+            if matches!(
+                function.synthetic_kind,
+                crate::qualified_name::SyntheticKind::Indirect { .. }
+            ) {
                 affected.insert(function.id.clone());
             }
         }
@@ -2814,7 +2841,7 @@ impl VerificationSnapshotState {
                     .function
                     .callees
                     .iter()
-                    .filter(|id| id.starts_with("$indirect-arity:"))
+                    .filter(|id| self.is_indirect_bucket(id))
                     .cloned()
             })
             .collect();
@@ -2823,7 +2850,10 @@ impl VerificationSnapshotState {
             if !seen_buckets.insert(id.clone()) {
                 continue;
             }
-            if !self.indirect.active(&id) {
+            if !self.indirect.active(
+                &id,
+                self.indirect_kinds.get(&id).copied().unwrap_or_default(),
+            ) {
                 removed_ids.insert(id.clone());
             }
             if let Some(record) = self.records.get(&id) {
@@ -2832,7 +2862,7 @@ impl VerificationSnapshotState {
                         .function
                         .callees
                         .iter()
-                        .filter(|id| id.starts_with("$indirect-arity:"))
+                        .filter(|id| self.is_indirect_bucket(id))
                         .cloned(),
                 );
             }
@@ -2911,6 +2941,7 @@ impl VerificationSnapshotState {
     fn remove_records(&mut self, removed_functions: &[String]) {
         for id in removed_functions {
             self.dirty_instance_owners.insert(id.clone());
+            self.indirect_kinds.remove(id);
             if let Some(old) = self.records.remove(id) {
                 for callee in &old.function.callees {
                     if let Some(callers) = self.reverse.get_mut(callee) {
@@ -3002,6 +3033,7 @@ impl VerificationSnapshotState {
                     .insert(id.clone());
             }
             self.dirty_instance_owners.insert(id.clone());
+            self.record_indirect_kind(&id, record.function.synthetic_kind);
             self.records.insert(id, Arc::new(record));
         }
         Ok(())
@@ -3266,5 +3298,46 @@ mod quota_tests {
             encoded(&projection).unwrap(),
             legacy_bound(&(&projection.function, &projection.semantic))
         );
+    }
+}
+
+#[cfg(test)]
+thread_local! { static INDIRECT_KIND_PROBES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+#[cfg(test)]
+mod synthetic_bucket_index_tests {
+    use super::*;
+    use crate::qualified_name::SyntheticKind;
+
+    #[test]
+    fn synthetic_bucket_edge_classification_scales_with_edges() {
+        for buckets in [1, 16, 256] {
+            let mut state = VerificationSnapshotState::default();
+            for i in 0..buckets {
+                state.record_indirect_kind(
+                    &format!("renamed{i}"),
+                    SyntheticKind::Indirect {
+                        slot: 1,
+                        wildcard: false,
+                    },
+                );
+                state.record_indirect_kind(&format!("$indirect-arity:{i}"), SyntheticKind::Source);
+            }
+            for fanout in [1, 16, 256] {
+                INDIRECT_KIND_PROBES.set(0);
+                for _ in 0..fanout {
+                    for i in 0..buckets {
+                        assert!(state.is_indirect_bucket(&format!("renamed{i}")));
+                        assert!(!state.is_indirect_bucket(&format!("$indirect-arity:{i}")));
+                    }
+                }
+                assert_eq!(INDIRECT_KIND_PROBES.get(), 2 * buckets * fanout);
+            }
+            assert_eq!(state.indirect_kinds.len(), buckets);
+            state.remove_records(&["renamed0".to_owned()]);
+            assert!(!state.is_indirect_bucket("renamed0"));
+            state.record_indirect_kind("renamed1", SyntheticKind::Source);
+            assert!(!state.is_indirect_bucket("renamed1"));
+        }
     }
 }

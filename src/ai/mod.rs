@@ -99,6 +99,10 @@ pub struct DisplayPosition {
 #[serde(deny_unknown_fields)]
 pub struct Function {
     #[serde(default)]
+    pub synthetic_kind: crate::qualified_name::SyntheticKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_name: Option<String>,
+    #[serde(default)]
     pub identity: Option<SymbolIdentity>,
     #[serde(skip)]
     pub(crate) body_id: Option<BodyId>,
@@ -281,7 +285,8 @@ pub(crate) fn capture(
             }
         }
         let mut initializer_calls = crate::semantic::call_graph::CallSites::default();
-        let initializer = id.name().starts_with("$static$");
+        let initializer =
+            id.synthetic_kind() == crate::qualified_name::SyntheticKind::StaticInitializer;
         let mut walk = AstWalk::new(body);
         while let Some(event) = walk.next() {
             let capability = match event {
@@ -410,7 +415,7 @@ fn capture_unit_declarations(
     let mut unit_graph = CallGraph::default();
     for (id, sites) in graph.iter() {
         let contract = id.namespace().is_none()
-            && !id.name().starts_with("$default$")
+            && id.synthetic_kind() != crate::qualified_name::SyntheticKind::InterfaceDefault
             && id
                 .owner()
                 .is_some_and(|owner| symbols.lookup_interface(owner.as_ref()).is_some())
@@ -538,9 +543,10 @@ fn capture_body_roots<'a>(
                         && let Some(body) = index.and_then(|i| i.initializer_body(expr.id()))
                     {
                         pending.push((
-                            FunctionId::method(
+                            FunctionId::synthetic_method(
                                 TypeId::local(&c.name),
                                 format!("$static${}", field.name),
+                                crate::qualified_name::SyntheticKind::StaticInitializer,
                             ),
                             field.span,
                             body,
@@ -573,9 +579,10 @@ fn capture_body_roots<'a>(
                 for m in &i.methods {
                     if let Some(body) = &m.default_body {
                         pending.push((
-                            FunctionId::method(
+                            FunctionId::synthetic_method(
                                 TypeId::local(&i.name),
                                 format!("$default${}", m.name),
+                                crate::qualified_name::SyntheticKind::InterfaceDefault,
                             ),
                             m.span,
                             body.id,
@@ -1411,8 +1418,10 @@ fn import_aliases<'a>(
 
 fn local_id(id: FunctionId) -> FunctionId {
     match id.owner() {
-        Some(owner) => FunctionId::method(TypeId::local(owner), id.name()),
-        None => FunctionId::free(id.name()),
+        Some(owner) => {
+            FunctionId::synthetic_method(TypeId::local(owner), id.name(), id.synthetic_kind())
+        }
+        None => FunctionId::synthetic_free(id.name(), id.synthetic_kind()),
     }
 }
 
@@ -1448,7 +1457,10 @@ impl CallResolver<'_> {
                     .filter(|(_, item)| item.is_none())
                     .map(|(target, _)| *target)
             }) {
-                return (target, FunctionId::free(id.name()));
+                return (
+                    target,
+                    FunctionId::synthetic_free(id.name(), id.synthetic_kind()),
+                );
             }
         }
         if let Some(ns) = id.namespace() {
@@ -1463,8 +1475,14 @@ impl CallResolver<'_> {
                 return (
                     *target,
                     item.as_ref().map_or_else(
-                        || FunctionId::free(id.name()),
-                        |item| FunctionId::method(TypeId::local(item), id.name()),
+                        || FunctionId::synthetic_free(id.name(), id.synthetic_kind()),
+                        |item| {
+                            FunctionId::synthetic_method(
+                                TypeId::local(item),
+                                id.name(),
+                                id.synthetic_kind(),
+                            )
+                        },
                     ),
                 );
             }
@@ -1477,7 +1495,10 @@ impl CallResolver<'_> {
                     .dependencies()
                     .unit_for_path(unit, owner.as_ref())
             {
-                return (target, FunctionId::free(id.name()));
+                return (
+                    target,
+                    FunctionId::synthetic_free(id.name(), id.synthetic_kind()),
+                );
             }
         } else if !self.captured[&unit].declarations.contains_key(&id)
             && let Some((target, Some(item))) = aliases.get(id.name().as_ref())
@@ -1503,7 +1524,9 @@ fn function_nodes(
             nodes.entry(key).or_insert_with(|| {
                 let (module, name) = node_name(captured, paths, owner, local);
                 Function {
+                    synthetic_kind: local.synthetic_kind(),
                     identity: None,
+                    source_name: None,
                     body_id: None,
                     body_location: None,
                     rename_calls: vec![],

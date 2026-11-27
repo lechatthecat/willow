@@ -36,9 +36,12 @@ fn render(name: &str, instances: &HashMap<String, String>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::qualified_name::SyntheticKind;
+    use crate::semantic::ids::{register_monomorph_name, register_synthetic_name};
 
     #[test]
     fn runtime_source_names_lookup_scaling() {
+        register_synthetic_name("$local", "", SyntheticKind::LocalNamespace);
         for count in [1, 16, 128, 1024] {
             let instances: HashMap<_, _> = (0..count)
                 .map(|i| (format!("f{i}$mono${i:064x}"), format!("f{i}<i64>")))
@@ -60,8 +63,15 @@ mod tests {
 
     #[test]
     fn runtime_source_names_spellings() {
-        let mono = format!("$mono${:064x}", 1);
+        let hash = format!("{:064x}", 1);
+        let mono = format!("$mono${hash}");
         let pkg = format!("$pkg{:032x}", 2);
+        register_synthetic_name("$local", "", SyntheticKind::LocalNamespace);
+        register_synthetic_name("$receiver", "", SyntheticKind::ForeignReceiver);
+        register_synthetic_name(&pkg, "", SyntheticKind::PackageNamespace);
+        for source in ["a", "Box", "other"] {
+            register_monomorph_name(&format!("{source}{mono}"), source, &hash);
+        }
         let instances = HashMap::from([
             (format!("a{mono}"), "a<i64>".into()),
             (format!("Box{mono}"), "Box<Array<String>>".into()),

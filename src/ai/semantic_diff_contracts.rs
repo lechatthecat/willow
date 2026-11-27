@@ -111,6 +111,7 @@ pub type Report = SemanticDiff<comparison::ComparisonChange, ContractSummary>;
 pub fn incomplete(reason: String) -> Report {
     let original = SemanticDiff::incomplete(reason);
     SemanticDiff {
+        display_names: original.display_names,
         schema: "willow.semantic-diff.v4",
         status: original.status,
         base: original.base,
@@ -375,6 +376,7 @@ pub fn verify(options: &Options, policy: &Policy) -> Result<Report> {
     summary.policy_violations = Some(policy_violations);
     summary.uncertainty = uncertainty;
     Ok(SemanticDiff {
+        display_names: report.display_names,
         schema: "willow.semantic-diff.v4",
         status,
         base: Some(RevisionDescription {

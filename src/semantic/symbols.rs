@@ -66,9 +66,8 @@ impl Drop for SymbolReadCapture {
 /// when an edit shifts the declaration's offsets.
 fn nominal_key_into(span: Span, declared: &str, key: &mut String) {
     use std::fmt::Write;
-    let base = declared
-        .split_once("$mono$")
-        .map_or(declared, |(base, _)| base);
+    let source = crate::semantic::ids::source_name(declared);
+    let base = source.as_str();
     let base = QualifiedName::new(&base)
         .split_last()
         .map_or(base, |(_, name)| name);

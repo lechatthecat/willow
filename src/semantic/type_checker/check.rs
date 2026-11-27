@@ -857,9 +857,10 @@ impl TypeChecker {
                                     {
                                         owner = owner.in_namespace(namespace);
                                     }
-                                    Some(FunctionId::method(
+                                    Some(FunctionId::synthetic_method(
                                         owner,
                                         format!("$default${}", id.name()),
+                                        crate::qualified_name::SyntheticKind::InterfaceDefault,
                                     ))
                                 })
                                 .unwrap_or_else(|| {
@@ -1082,7 +1083,14 @@ impl TypeChecker {
     /// to every known implementation by `connect_interface_lock_effects`.
     pub(super) fn method_effect_ids(&self, obj_ty: &Type, method: &str) -> Vec<FunctionId> {
         if matches!(obj_ty, Type::Array(_) | Type::FixedArray(..))
-            && !method.starts_with("__abi_")
+            && !matches!(
+                crate::semantic::intrinsics::MethodName::classify(method),
+                crate::semantic::intrinsics::MethodName::AbiConcat
+                    | crate::semantic::intrinsics::MethodName::AbiCopy
+                    | crate::semantic::intrinsics::MethodName::AbiDebug
+                    | crate::semantic::intrinsics::MethodName::AbiLen
+                    | crate::semantic::intrinsics::MethodName::AbiResize
+            )
             && let Some(owner) = self.array_storage_method_class(obj_ty)
         {
             return vec![FunctionId::method(TypeId::from_source_name(owner), method)];
@@ -1838,7 +1846,7 @@ impl TypeChecker {
             None => self.check_expr(&s.init),
         };
         self.copy_capture_cause(s.init.span(), s.span);
-        if s.name.starts_with("$compound_array_") {
+        if s.synthetic_kind == crate::qualified_name::SyntheticKind::CompoundArray {
             self.record_element_write(&s.init, reference_start, true);
         }
         let ty = if let Some(ann) = &annotation {

@@ -1568,7 +1568,7 @@ impl<'a> StructuredIndex<'a> {
         // contract. Follow only those edges, never ordinary caller/callee edges.
         let mut dispatch: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
         for f in &snapshot.functions {
-            if f.synthetic && f.name.starts_with("$dispatch$") {
+            if f.synthetic_kind == crate::qualified_name::SyntheticKind::Dispatch {
                 for callee in &f.callees {
                     dispatch.entry(&f.id).or_default().push(callee);
                     dispatch.entry(callee).or_default().push(&f.id);

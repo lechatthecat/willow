@@ -61,8 +61,15 @@ impl Captured {
             // A monomorphized interface's methods (`Self` calls in its default
             // bodies) carry no dispatch targets of their own: `route` links
             // them to the template's union. Classes are filtered there.
-            if let Some((template, _)) = owner.split_once("$mono$") {
-                let method = FunctionId::method(TypeId::local(template), id.name());
+            if crate::semantic::ids::synthetic_name_kind(&owner)
+                == crate::qualified_name::SyntheticKind::Monomorph
+            {
+                let template = crate::semantic::ids::source_name(&owner);
+                let method = FunctionId::synthetic_method(
+                    TypeId::local(template),
+                    id.name(),
+                    id.synthetic_kind(),
+                );
                 let method = match (id.module(), id.namespace()) {
                     (Some(module), _) => method.in_module(module),
                     (None, Some(namespace)) => method.in_namespace(namespace),
@@ -93,7 +100,8 @@ fn generic_interface(
     method: FunctionId,
 ) -> Option<&crate::semantic::symbols::InterfaceInfo> {
     let interface = symbols.lookup_interface(method.owner()?.as_ref())?;
-    (!interface.type_params.is_empty() && !method.name().starts_with("$default$"))
+    (!interface.type_params.is_empty()
+        && method.synthetic_kind() != crate::qualified_name::SyntheticKind::InterfaceDefault)
         .then_some(interface)
 }
 
@@ -303,7 +311,9 @@ pub(super) fn route<'a>(
 fn union(id: String, method: &Function, key: &str, mut callees: Vec<String>) -> Function {
     callees.sort_unstable();
     Function {
+        synthetic_kind: crate::qualified_name::SyntheticKind::Source,
         identity: None,
+        source_name: None,
         body_id: None,
         body_location: None,
         rename_calls: vec![],
@@ -349,7 +359,9 @@ mod tests {
 
     fn placeholder() -> Function {
         Function {
+            synthetic_kind: crate::qualified_name::SyntheticKind::Source,
             identity: None,
+            source_name: None,
             body_id: None,
             body_location: None,
             rename_calls: vec![],

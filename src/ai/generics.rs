@@ -19,7 +19,7 @@ pub(crate) struct Source {
     pub(super) declarations: Vec<Declaration>,
     owners: Vec<(Span, String)>,
     details: HashMap<Span, symbols::DeclarationDetails>,
-    callables: HashMap<Span, (String, Span)>,
+    callables: HashMap<Span, (String, Span, crate::qualified_name::SyntheticKind)>,
     callable_names: HashMap<String, Span>,
     pub(super) items: HashMap<String, Declaration>,
 }
@@ -33,7 +33,7 @@ impl Source {
         self.callable_names = self
             .callables
             .iter()
-            .map(|(span, (name, _))| (name.clone(), *span))
+            .map(|(span, (name, _, _))| (name.clone(), *span))
             .collect();
         self.declarations.sort_by_key(|d| d.span.start);
         self.owners.sort_by_key(|(span, _)| span.start);
@@ -196,12 +196,25 @@ impl Source {
         for item in &items {
             match item {
                 Item::Function(f) => {
-                    callables.insert(f.span, (f.name.clone(), f.body.span));
+                    callables.insert(
+                        f.span,
+                        (
+                            f.name.clone(),
+                            f.body.span,
+                            crate::qualified_name::SyntheticKind::Source,
+                        ),
+                    );
                 }
                 Item::Class(c) => {
                     for m in c.methods.iter().filter(|m| c.span.contains(m.span)) {
-                        callables
-                            .insert(m.span, (QualifiedName::join(&c.name, &m.name), m.body.span));
+                        callables.insert(
+                            m.span,
+                            (
+                                QualifiedName::join(&c.name, &m.name),
+                                m.body.span,
+                                crate::qualified_name::SyntheticKind::Source,
+                            ),
+                        );
                     }
                 }
                 Item::Interface(i) => {
@@ -215,6 +228,7 @@ impl Source {
                                         format_args!("$default${}", m.name),
                                     ),
                                     body.span,
+                                    crate::qualified_name::SyntheticKind::InterfaceDefault,
                                 ),
                             );
                         }
@@ -339,11 +353,11 @@ pub(super) fn restore(
                     .cloned()
             })
             .map_names(|name| {
-                QualifiedName::from_segments(QualifiedName::new(&name).segments().map(|segment| {
-                    segment
-                        .split_once("$mono$")
-                        .map_or(segment, |(source, _)| source)
-                }))
+                QualifiedName::from_segments(
+                    QualifiedName::new(&name)
+                        .segments()
+                        .map(crate::semantic::ids::source_name),
+                )
             })
         };
         let restore = |d: &mut Declaration| {
@@ -404,8 +418,10 @@ pub(super) fn restore(
             if generic_callable && r.role == "member" {
                 r.role = "call".into();
             }
-            r.written = if (r.written.contains("$mono$")
-                || crate::semantic::ids::has_internal_module_prefix(&r.written))
+            r.written = if (QualifiedName::new(&r.written).segments().any(|segment| {
+                crate::semantic::ids::synthetic_name_kind(segment)
+                    == crate::qualified_name::SyntheticKind::Monomorph
+            }) || crate::semantic::ids::has_internal_module_prefix(&r.written))
                 && let Some(source) = written.get(&(r.span.file_id.0, r.span.start))
             {
                 (*source).clone()
@@ -456,9 +472,9 @@ pub(super) fn restore(
             // their first source declaration deterministically rather than let
             // HashMap iteration choose the owner of unknown-effect evidence.
             let mut templates: HashMap<FunctionId, (Span, Span)> = HashMap::new();
-            for (&span, (name, body)) in &source.callables {
+            for (&span, (name, body, kind)) in &source.callables {
                 if !instantiated.contains(&span) {
-                    let id = callable(name);
+                    let id = callable(name, *kind);
                     let first = templates.entry(id).or_insert((span, *body));
                     if (span.file_id.0, span.start, span.end)
                         < (first.0.file_id.0, first.0.start, first.0.end)
@@ -497,43 +513,28 @@ pub(super) fn restore(
 /// unknown, but it never runs, so it cannot call anything at runtime.
 pub(super) const UNINSTANTIATED: &str = "uninstantiated-generic-template";
 
-fn callable(name: &str) -> FunctionId {
+fn callable(name: &str, kind: crate::qualified_name::SyntheticKind) -> FunctionId {
     QualifiedName::new(&name).split_last().map_or_else(
-        || FunctionId::free(name),
-        |(owner, name)| FunctionId::method(TypeId::local(owner), name),
+        || FunctionId::synthetic_free(name, kind),
+        |(owner, name)| FunctionId::synthetic_method(TypeId::local(owner), name, kind),
     )
 }
 /// Compiler generated spelling consists of qualified segments; erase only the
 /// specialization suffix, retaining method/module segments.
 pub(super) fn source_spelling(name: &str) -> String {
-    if let Some(lambda) = name.strip_prefix("<lambda ")
-        && let Some((owner, location)) = lambda.rsplit_once('@')
-    {
-        return format!("<lambda {}@{location}", source_spelling(owner));
-    }
-    QualifiedName::from_segments(
-        QualifiedName::new(name)
-            .segments()
-            .filter(|s| !s.starts_with("$pkg") && *s != "$local")
-            .map(|s| s.split_once("$mono$").map_or(s, |(source, _)| source)),
-    )
+    crate::semantic::ids::project_generic_names(name)
 }
 
-/// Merge instantiations into their source functions. Returns each original
-/// id's merged id, or nothing when no function was renamed.
-pub(super) fn aggregate(
+/// Restore each callable once before remapping graph edges and merging evidence.
+fn restore_callable_identities(
     sources: &HashMap<UnitId, Source>,
     paths: &HashMap<UnitId, String>,
-    functions: &mut Vec<Function>,
-    semantic: &mut SemanticFacts,
+    functions: &mut [Function],
 ) -> HashMap<String, String> {
-    if sources.is_empty() && !functions.iter().any(|f| f.name.contains("$mono$")) {
-        return HashMap::new();
-    }
     let callables: HashMap<_, _> = sources
         .values()
         .flat_map(|s| &s.callables)
-        .filter_map(|(span, (name, _))| {
+        .filter_map(|(span, (name, _, kind))| {
             Some((
                 (
                     paths
@@ -542,7 +543,7 @@ pub(super) fn aggregate(
                     span.start,
                     span.end,
                 ),
-                name,
+                (name, kind),
             ))
         })
         .collect();
@@ -553,15 +554,36 @@ pub(super) fn aggregate(
         let name = f.locations.iter().find_map(|l| {
             callables
                 .get(&(l.path.as_str(), l.start, l.end))
-                .map(|name| (*name, &l.path))
+                .map(|&(name, kind)| (name, *kind, &l.path))
         });
-        if let Some((name, module)) = name {
+        if let Some((name, kind, module)) = name {
             f.name.clone_from(name);
+            f.synthetic_kind = kind;
             // Imported default copies belong to the declaring source callable,
             // even when a consuming unit owns the instantiated class.
             module_changed = f.module != *module;
             if module_changed {
                 f.module.clone_from(module);
+            }
+        } else if f.synthetic_kind == crate::qualified_name::SyntheticKind::Dispatch {
+            if let Some(source) = &mut f.source_name {
+                let emitted_source = match QualifiedName::new(source).split_first() {
+                    Some((namespace, rest))
+                        if matches!(
+                            crate::semantic::ids::synthetic_name_kind(namespace),
+                            crate::qualified_name::SyntheticKind::LocalNamespace
+                                | crate::qualified_name::SyntheticKind::PackageNamespace
+                        ) =>
+                    {
+                        QualifiedName::join(namespace, source_spelling(rest))
+                    }
+                    _ => source_spelling(source),
+                };
+                let projected = source_spelling(source);
+                if projected != *source {
+                    *source = projected;
+                    f.name = format!("$dispatch${emitted_source}");
+                }
             }
         } else {
             f.name = source_spelling(&f.name);
@@ -574,6 +596,30 @@ pub(super) fn aggregate(
         ids.insert(f.id.clone(), id.clone());
         f.id = id;
     }
+    ids
+}
+
+/// Merge instantiations into their source functions. Returns each original
+/// id's merged id, or nothing when no function was renamed.
+pub(super) fn aggregate(
+    sources: &HashMap<UnitId, Source>,
+    paths: &HashMap<UnitId, String>,
+    functions: &mut Vec<Function>,
+    semantic: &mut SemanticFacts,
+) -> HashMap<String, String> {
+    if sources.is_empty()
+        && !functions.iter().any(|f| {
+            QualifiedName::new(f.source_name.as_deref().unwrap_or(&f.name))
+                .segments()
+                .any(|segment| {
+                    crate::semantic::ids::synthetic_name_kind(segment)
+                        == crate::qualified_name::SyntheticKind::Monomorph
+                })
+        })
+    {
+        return HashMap::new();
+    }
+    let ids = restore_callable_identities(sources, paths, functions);
     let remap = |id: &mut String| {
         #[cfg(test)]
         REMAPS.with(|count| count.set(count.get() + 1));
@@ -828,7 +874,7 @@ pub(super) fn present_types(snapshot: &mut Snapshot) {
     let present = |ty: &Type, module| {
         ty.map_names(|name| {
             let public = names.name(name, module);
-            if public.contains("$pkg") {
+            if crate::semantic::ids::has_internal_module_prefix(&public) {
                 source_spelling(&public)
             } else {
                 public
@@ -868,8 +914,188 @@ thread_local! { static REMAPS: std::cell::Cell<usize> = const { std::cell::Cell:
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn synthetic_function_fixture(name: &str, id: &str) -> Function {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "module": "main.wi", "name": name,
+            "locations": [], "synthetic": false, "fingerprint": "body",
+            "body_fingerprint": "body", "callees": [], "runtime_effects": 0,
+            "unknown": false, "unresolved": []
+        }))
+        .unwrap()
+    }
+
+    fn generic_default_source() -> (Program, Source) {
+        let tokens = crate::lexer::Lexer::new(
+            "interface Read<T> { fn get(self) -> i64 { return 7; } } fn main() {}",
+        )
+        .tokenize()
+        .unwrap();
+        let (program, diagnostics) = crate::parser::Parser::new(tokens).parse();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let source = Source::capture(&program);
+        (program, source)
+    }
+
+    #[test]
+    fn unused_generic_default_keeps_creation_kind_through_restore_and_storage() {
+        use crate::qualified_name::SyntheticKind;
+        let (program, source) = generic_default_source();
+        let unit = crate::module::ModuleId(0);
+        let paths = HashMap::from([(unit, "main.wi".to_owned())]);
+        let sources = HashMap::from([(unit, source)]);
+        let mut captures = HashMap::from([(
+            unit,
+            capture_unit_declarations(
+                &program,
+                &CallGraph::default(),
+                &Default::default(),
+                &Facts::default(),
+                &crate::semantic::symbols::SymbolTable::default(),
+            ),
+        )]);
+        restore(&sources, &mut captures);
+        let expected = FunctionId::synthetic_method(
+            TypeId::local("Read"),
+            "$default$get",
+            SyntheticKind::InterfaceDefault,
+        );
+        assert!(captures[&unit].templates.contains(&expected));
+        assert!(
+            !captures[&unit]
+                .templates
+                .contains(&FunctionId::method(TypeId::local("Read"), "$default$get"))
+        );
+        let nodes = function_nodes(&captures, &paths, &|unit, id| (unit, id), HashMap::new());
+        let function = &nodes[&(unit, expected)];
+        assert_eq!(function.synthetic_kind, SyntheticKind::InterfaceDefault);
+        let restored: Function =
+            serde_json::from_slice(&serde_json::to_vec(function).unwrap()).unwrap();
+        assert_eq!(restored.synthetic_kind, SyntheticKind::InterfaceDefault);
+        assert_eq!(restored.name, function.name);
+    }
+
+    #[test]
+    fn instantiated_generic_default_merge_kind_is_independent_of_order() {
+        use crate::qualified_name::SyntheticKind;
+        let (_, source) = generic_default_source();
+        let (&span, _) = source.callables.iter().next().unwrap();
+        let unit = crate::module::ModuleId(0);
+        let sources = HashMap::from([(unit, source)]);
+        let paths = HashMap::from([(unit, "main.wi".to_owned())]);
+        for reverse in [false, true] {
+            let mut copied = synthetic_function_fixture("Concrete::get", "copied");
+            copied.locations.push(Location {
+                display: None,
+                path: "main.wi".to_owned(),
+                start: span.start,
+                end: span.end,
+            });
+            let mut declared = copied.clone();
+            declared.name = "Read::$default$get".into();
+            declared.id = node_id(&declared.module, &declared.name);
+            declared.synthetic_kind = SyntheticKind::InterfaceDefault;
+            let mut functions = vec![copied, declared];
+            if reverse {
+                functions.reverse();
+            }
+            aggregate(
+                &sources,
+                &paths,
+                &mut functions,
+                &mut SemanticFacts::default(),
+            );
+            assert_eq!(functions.len(), 1);
+            assert_eq!(functions[0].name, "Read::$default$get");
+            assert_eq!(functions[0].synthetic_kind, SyntheticKind::InterfaceDefault);
+            let restored: Vec<Function> =
+                serde_json::from_slice(&serde_json::to_vec(&functions).unwrap()).unwrap();
+            assert_eq!(restored, functions);
+        }
+    }
+
+    #[test]
+    fn generic_dispatch_projection_uses_stored_source_provenance() {
+        use crate::qualified_name::SyntheticKind;
+        crate::semantic::ids::register_monomorph_name("Box$mono$abc", "Box", "abc");
+        let mut generated = synthetic_function_fixture("$dispatch$Box$mono$abc::get", "dispatch");
+        generated.synthetic_kind = SyntheticKind::Dispatch;
+        generated.synthetic = true;
+        generated.source_name = Some("Box$mono$abc::get".into());
+        let mut functions = vec![generated];
+        let remap = aggregate(
+            &HashMap::new(),
+            &HashMap::new(),
+            &mut functions,
+            &mut SemanticFacts::default(),
+        );
+        let projected = &functions[0];
+        assert_eq!(projected.name, "$dispatch$Box::get");
+        assert_eq!(projected.source_name.as_deref(), Some("Box::get"));
+        assert_eq!(projected.synthetic_kind, SyntheticKind::Dispatch);
+        assert_eq!(remap["dispatch"], projected.id);
+        let restored: Function =
+            serde_json::from_slice(&serde_json::to_vec(projected).unwrap()).unwrap();
+        assert_eq!(restored, *projected);
+    }
+    #[test]
+    fn qualified_dispatch_projection_is_idempotent_after_storage() {
+        use crate::qualified_name::SyntheticKind;
+        for namespace in ["$local", "$pkgtyped"] {
+            crate::semantic::ids::register_synthetic_name(
+                namespace,
+                "",
+                if namespace == "$local" {
+                    SyntheticKind::LocalNamespace
+                } else {
+                    SyntheticKind::PackageNamespace
+                },
+            );
+            crate::semantic::ids::register_monomorph_name("Box$mono$abc", "Box", "abc");
+            let source = format!("{namespace}::module::Box$mono$abc::get");
+            let name = format!("$dispatch${source}");
+            let mut functions: Vec<Function> = vec![serde_json::from_value(serde_json::json!({
+                "id":"dispatch", "module":"m.wi", "name":name,
+                "source_name":source, "synthetic_kind":"Dispatch", "locations":[],
+                "synthetic":true, "fingerprint":"", "body_fingerprint":"", "callees":[], "runtime_effects":0, "unknown":false, "unresolved":[]
+            })).unwrap()];
+            let sources = HashMap::from([(crate::module::ModuleId(0), Source::default())]);
+            aggregate(
+                &sources,
+                &HashMap::new(),
+                &mut functions,
+                &mut SemanticFacts::default(),
+            );
+            assert_eq!(
+                functions[0].name,
+                format!("$dispatch${namespace}::module::Box::get")
+            );
+            assert_eq!(
+                functions[0].source_name.as_deref(),
+                Some("module::Box::get")
+            );
+            let expected = functions.clone();
+            functions = serde_json::from_slice(&serde_json::to_vec(&functions).unwrap()).unwrap();
+            aggregate(
+                &sources,
+                &HashMap::new(),
+                &mut functions,
+                &mut SemanticFacts::default(),
+            );
+            assert_eq!(functions, expected);
+        }
+    }
+
     #[test]
     fn operation_names_preserve_prefixes_and_scale_per_expression() {
+        crate::semantic::ids::register_synthetic_name(
+            "$pkg123",
+            "",
+            crate::qualified_name::SyntheticKind::PackageNamespace,
+        );
+        for name in ["fold", "push"] {
+            crate::semantic::ids::register_monomorph_name(&format!("{name}$mono$abc"), name, "abc");
+        }
         for count in [1, 16, 256, 4096] {
             let cases = [
                 ("call:fold$mono$abc", "call:fold"),
@@ -918,6 +1144,14 @@ mod tests {
     }
     #[test]
     fn source_names_preserve_method_segments_and_lambda_locations() {
+        crate::semantic::ids::register_synthetic_name(
+            "$pkg123",
+            "",
+            crate::qualified_name::SyntheticKind::PackageNamespace,
+        );
+        for name in ["Ring", "fold"] {
+            crate::semantic::ids::register_monomorph_name(&format!("{name}$mono$abc"), name, "abc");
+        }
         assert_eq!(
             source_spelling("$pkg123::coll::Ring$mono$abc::push"),
             "coll::Ring::push"
@@ -949,7 +1183,7 @@ mod tests {
             let mut source = Source::default();
             let mut functions: Vec<Function> = (0..n).map(|i| {
                 let span = Span::new(i * 10, i * 10 + 9, 1, 1);
-                source.callables.insert(span, (format!("f{i}"), span));
+                source.callables.insert(span, (format!("f{i}"), span, crate::qualified_name::SyntheticKind::Source));
                 serde_json::from_value(serde_json::json!({
                     "id":format!("f{i}"), "module":path, "name":format!("f{i}"),
                     "locations":[{"path":path,"start":span.start,"end":span.end}], "synthetic":false,
@@ -1008,6 +1242,19 @@ mod tests {
             for instances in [1, 8, 64] {
                 let sites = 4;
                 let n = declarations * instances;
+                for i in 0..n {
+                    let source = format!("f{}", i / instances);
+                    crate::semantic::ids::register_monomorph_name(
+                        &format!("{source}$mono${i}"),
+                        &source,
+                        &i.to_string(),
+                    );
+                    crate::semantic::ids::register_monomorph_name(
+                        &format!("g$mono${i}"),
+                        "g",
+                        &i.to_string(),
+                    );
+                }
                 let mut functions: Vec<Function> = (0..n).map(|i| serde_json::from_value(serde_json::json!({
                     "id":format!("f{i}"), "module":"m.wi", "name":format!("f{}$mono${i}", i / instances),
                     "locations":[{"path":"m.wi","start": i / instances * 10,"end": i / instances * 10+9}],
@@ -1076,6 +1323,19 @@ mod tests {
         for declarations in [1, 8, 64] {
             for instances in [1, 8, 64] {
                 let n = declarations * instances;
+                for i in 0..n {
+                    let source = format!("f{}", i / instances);
+                    crate::semantic::ids::register_monomorph_name(
+                        &format!("{source}$mono${i}"),
+                        &source,
+                        &i.to_string(),
+                    );
+                    crate::semantic::ids::register_monomorph_name(
+                        &format!("g$mono${i}"),
+                        "g",
+                        &i.to_string(),
+                    );
+                }
                 let mut functions: Vec<Function> = (0..n).map(|i| serde_json::from_value(serde_json::json!({
                     "id":format!("f{i}"), "module":"m.wi", "name":format!("f{}$mono${i}", i / instances),
                     "locations":[{"path":"m.wi","start": i / instances * 10,"end": i / instances * 10+9}],

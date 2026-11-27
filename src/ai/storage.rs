@@ -644,7 +644,9 @@ mod tests {
             let mut s = snapshot("/w", "/");
             s.compiler = compiler_stamp();
             s.functions = vec![Function {
+                synthetic_kind: crate::qualified_name::SyntheticKind::Source,
                 identity: None,
+                source_name: None,
                 body_id: None,
                 body_location: None,
                 rename_calls: vec![],

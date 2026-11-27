@@ -1,5 +1,6 @@
 //! Persistent address-taken candidate buckets, updated from typed owner outputs.
 use super::*;
+use crate::qualified_name::SyntheticKind;
 use crate::semantic::indirect_lock::IndirectInputs;
 use std::{collections::HashSet, sync::Arc};
 type Bucket = (u64, Option<String>);
@@ -226,18 +227,20 @@ impl State {
         }
         callers
     }
-    pub(super) fn active(&self, id: &str) -> bool {
+    pub(super) fn active(&self, id: &str, kind: SyntheticKind) -> bool {
         if self.active_ids.contains_key(id) {
             return true;
         }
-        let Some(slot) = id
-            .strip_prefix("$indirect-arity:")
-            .and_then(|suffix| suffix.strip_suffix(":*"))
-            .and_then(|slot| slot.parse::<u32>().ok())
+        let SyntheticKind::Indirect {
+            slot,
+            wildcard: true,
+        } = kind
         else {
             return false;
         };
-        let bit = 1u64 << slot;
+        let Some(bit) = 1u64.checked_shl(u32::from(slot)) else {
+            return false;
+        };
         self.values
             .get(&(bit, None))
             .is_some_and(|values| !values.is_empty())
@@ -329,17 +332,36 @@ mod tests {
             ..Default::default()
         };
         let mut state = State::default();
+        let wildcard = SyntheticKind::Indirect {
+            slot: 0,
+            wildcard: true,
+        };
         state.replace(unit, caller_body, Some(calls));
         state.replace(unit, first, Some(values.clone()));
         assert!(state.replace(unit, second, Some(values.clone())).is_empty());
-        assert!(state.active(&indirect::wild_bucket_id(0)));
+        assert!(state.active(&indirect::wild_bucket_id(0), wildcard));
+        assert!(state.active("renamed wildcard", wildcard));
+        assert!(!state.active(&indirect::wild_bucket_id(0), SyntheticKind::Source));
+        assert!(!state.active(
+            &indirect::wild_bucket_id(0),
+            SyntheticKind::Indirect {
+                slot: 64,
+                wildcard: true,
+            },
+        ));
         assert!(state.replace(unit, first, Some(values)).is_empty());
         assert!(state.replace(unit, first, None).is_empty());
-        assert!(state.active(&indirect::wild_bucket_id(0)));
+        assert!(state.active(&indirect::wild_bucket_id(0), wildcard));
         let affected = state.replace(unit, second, None);
         assert!(affected.contains(&(unit, caller)));
-        assert!(!state.active(&indirect::wild_bucket_id(0)));
-        assert!(state.active(&indirect::typed_bucket_id(0, "fn()->void")));
+        assert!(!state.active(&indirect::wild_bucket_id(0), wildcard));
+        assert!(state.active(
+            &indirect::typed_bucket_id(0, "fn()->void"),
+            SyntheticKind::Indirect {
+                slot: 0,
+                wildcard: false,
+            },
+        ));
         state.replace(unit, caller_body, None);
         assert!(
             state.owners.is_empty()

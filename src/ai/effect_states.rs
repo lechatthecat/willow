@@ -149,7 +149,10 @@ impl Analysis {
                 let unknown = RuntimeEffects::ALL.difference(declared_absent[i]);
                 result.reason(i, unknown.bits(), 3, f.locations.first());
             }
-            if f.id.starts_with("$indirect-arity:") {
+            if matches!(
+                f.synthetic_kind,
+                crate::qualified_name::SyntheticKind::Indirect { .. }
+            ) {
                 result.reason(i, f.runtime_effects, 0, None);
             }
             if let Some(sites) = snapshot.semantic.unresolved_calls.get(&f.id) {
@@ -294,9 +297,10 @@ impl Analysis {
             for &caller in &index.callers[i] {
                 self.edge_visits += 1;
                 if slot == 0
-                    && snapshot.functions[caller]
-                        .id
-                        .starts_with("$indirect-arity:")
+                    && matches!(
+                        snapshot.functions[caller].synthetic_kind,
+                        crate::qualified_name::SyntheticKind::Indirect { .. }
+                    )
                 {
                     continue;
                 }
@@ -427,7 +431,9 @@ mod tests {
                     complete: true,
                 });
                 Function {
+                    synthetic_kind: crate::qualified_name::SyntheticKind::Source,
                     identity: None,
+                    source_name: None,
                     body_id: None,
                     body_location: None,
                     rename_calls: vec![],
@@ -699,6 +705,10 @@ mod tests {
     fn indirect_bucket_does_not_promote_candidate_witness() {
         let mut s = fixture(2);
         s.functions[0].id = "$indirect-arity:1".into();
+        s.functions[0].synthetic_kind = crate::qualified_name::SyntheticKind::Indirect {
+            slot: 1,
+            wildcard: false,
+        };
         s.functions[0].synthetic = true;
         s.functions[0].runtime_effects = 1;
         link(&mut s, 0, 1);

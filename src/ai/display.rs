@@ -11,6 +11,7 @@ use crate::qualified_name::QualifiedName;
 /// compiler spelling.
 pub(super) struct TypeNames {
     packages: HashMap<String, Option<String>>,
+    namespaces: crate::qualified_name::NameMetadata,
     /// (context module, spelling) -> canonical declaration name.
     local: HashMap<(String, String), String>,
 }
@@ -98,21 +99,32 @@ impl TypeNames {
                     .or_insert_with(|| canonical(identity));
             }
         }
-        Self { packages, local }
+        let mut namespaces = crate::qualified_name::NameMetadata::default();
+        namespaces.register(
+            crate::semantic::ids::LOCAL_NAMESPACE,
+            "",
+            crate::qualified_name::SyntheticKind::LocalNamespace,
+        );
+        Self {
+            packages,
+            local,
+            namespaces,
+        }
     }
 
     pub(super) fn name(&self, name: &str, module: Option<&str>) -> String {
-        if let Some(path) = QualifiedName::new(name).strip_qualifier("$local") {
-            return path.to_owned();
-        }
-        if let Some(rest) = name.strip_prefix("$pkg")
-            && let Some((hash, path)) = QualifiedName::new(rest).split_first()
-        {
-            return match self.packages.get(&format!("$pkg{hash}")) {
-                Some(Some(package)) => QualifiedName::join(package, path),
-                Some(None) => path.to_owned(),
-                None => name.to_owned(),
-            };
+        if let Some((namespace, path)) = QualifiedName::new(name).split_first() {
+            if self.namespaces.kind(namespace)
+                == crate::qualified_name::SyntheticKind::LocalNamespace
+            {
+                return path.to_owned();
+            }
+            if let Some(package) = self.packages.get(namespace) {
+                return match package {
+                    Some(package) => QualifiedName::join(package, path),
+                    None => path.to_owned(),
+                };
+            }
         }
         match module {
             Some(module) if !QualifiedName::new(&name).is_qualified() => self
@@ -275,7 +287,14 @@ mod tests {
     use super::*;
 
     fn names() -> TypeNames {
+        let mut namespaces = crate::qualified_name::NameMetadata::default();
+        namespaces.register(
+            crate::semantic::ids::LOCAL_NAMESPACE,
+            "",
+            crate::qualified_name::SyntheticKind::LocalNamespace,
+        );
         TypeNames {
+            namespaces,
             packages: HashMap::new(),
             local: HashMap::new(),
         }

@@ -417,6 +417,7 @@ impl Capture {
             if let Some(key) = self.retained.ids.get(id) {
                 self.shapes.remove(key);
                 self.kinds.remove(key);
+                self.display_names.remove(key);
                 self.panic_evidence.remove(key);
                 if matching::is_lambda(key)
                     && let Some(owner) = matching::scope(key)
@@ -493,7 +494,7 @@ impl Capture {
                     )
                 });
             self.retained.ids.insert(symbol.id.clone(), key.clone());
-            self.kinds.insert(key.clone(), symbol.kind.clone());
+            self.kinds.insert(key.clone(), symbol.kind.clone().into());
             let mut fact = self.baseline.facts.get(&key).map_or(
                 Fact {
                     signature: None,
@@ -538,7 +539,7 @@ impl Capture {
                     &f.name,
                 ]);
                 self.retained.ids.insert(f.id.clone(), key.clone());
-                self.kinds.insert(key.clone(), SymbolKind::Function);
+                self.kinds.insert(key.clone(), SymbolKind::Function.into());
                 self.baseline.facts.insert(
                     key,
                     Arc::new(Fact {
@@ -548,6 +549,19 @@ impl Capture {
                         callees: vec![],
                     }),
                 );
+            }
+            let key = &self.retained.ids[&f.id];
+            self.kinds
+                .entry(key.clone())
+                .or_insert_with(|| SymbolKind::Function.into())
+                .synthetic = f.synthetic_kind;
+            match matching::display_name(key, f) {
+                Some(display) => {
+                    self.display_names.insert(key.clone(), display);
+                }
+                None => {
+                    self.display_names.remove(key);
+                }
             }
         }
         for f in &patch.functions {
