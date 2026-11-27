@@ -11,6 +11,7 @@ use std::collections::HashMap;
 /// state crosses the frontend/backend boundary.
 #[derive(serde::Serialize, serde::Deserialize)]
 pub struct CheckedUnit {
+    pub analysis_calls: HashMap<ExprId, Option<crate::semantic::ids::FunctionId>>,
     pub(crate) bodies: Vec<BodyId>,
     /// Injected default copies checked with their interface, not here.
     pub(crate) reused_bodies: Vec<BodyId>,
@@ -31,6 +32,7 @@ pub struct CheckedUnit {
 impl From<TypeChecker> for CheckedUnit {
     fn from(checker: TypeChecker) -> Self {
         Self {
+            analysis_calls: checker.analysis_calls,
             bodies: checker.checked_bodies,
             reused_bodies: checker.reused_bodies,
             diagnostics: checker.errors,
@@ -51,6 +53,7 @@ impl From<TypeChecker> for CheckedUnit {
 impl CheckedUnit {
     pub fn tables(&self) -> SemanticFacts<'_> {
         SemanticFacts {
+            analysis_calls: &self.analysis_calls,
             symbols: &self.symbols,
             expr_types: &self.expr_types,
             enum_variant_resolutions: &self.enum_variant_resolutions,
@@ -89,6 +92,7 @@ impl CheckedDeclarations {
 
     pub fn into_unit(self) -> CheckedUnit {
         CheckedUnit {
+            analysis_calls: HashMap::new(),
             bodies: Vec::new(),
             reused_bodies: Vec::new(),
             diagnostics: Vec::new(),

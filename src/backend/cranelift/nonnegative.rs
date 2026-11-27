@@ -61,7 +61,7 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                     LirInst::Defer { .. } | LirInst::EnterDeferScope { .. } => true,
                     ir_variants!(
                         LirInst;
-                        Compute, Let, Assign, LeaveDeferScope, FlushDefers,
+                        Compute, Let, Assign, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                         SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
                     ) => false,
@@ -100,7 +100,7 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                 }
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer,
                     SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
                     ReleaseLock, MatchTest, MatchBind, Unsupported
                 ) => {
@@ -301,7 +301,7 @@ pub(super) fn analyze(f: &LirFunction) -> Proof {
                 }
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer,
                     SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
                     ReleaseLock, MatchTest, MatchBind, Unsupported
                 ) => {}

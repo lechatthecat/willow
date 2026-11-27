@@ -112,7 +112,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
     }) {
         return Some("the LIR entry block must not have incoming edges".into());
     }
-    if lir_call_frame_entries(f).is_none() {
+    if lir_call_frame_entries(f, |_| true).is_none() {
         return Some("method preparation frames disagree across control-flow edges".into());
     }
     if lir_reference_scope_entries(f).is_none() {
@@ -529,6 +529,11 @@ fn instruction_rejection_reason(
         // be given an explicit validation decision here.
         LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
         LirInst::FlushDefers { .. } => {}
+        LirInst::RestoreCallPreparation { entry } => {
+            if entry.0 >= f.blocks.len() {
+                return Some("invalid preparation entry block".into());
+            }
+        }
         // Names locals this walker has already decided on, and stores
         // a constant into the slots it gave them.
         LirInst::ClearScopeRoots { .. } => {}
@@ -582,7 +587,7 @@ fn instruction_rejection_reason(
                 }
                 ir_variants!(
                     LirInst;
-                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                     ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
                     SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
@@ -623,7 +628,7 @@ pub(in crate::backend::cranelift) fn lir_async_rejection_reason(f: &LirFunction)
             }
             ir_variants!(
                 LirInst;
-                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                 ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                 SelectCommit, ReleaseLock, MatchTest, MatchBind
             ) => None,

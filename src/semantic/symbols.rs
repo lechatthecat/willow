@@ -152,8 +152,34 @@ pub struct VarInfo {
     pub declaration_span: Span,
 }
 
+/// Small signature facts shared by native resolution and ownership checking.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct NativeFunction {
+    pub owner: Option<String>,
+    pub method: Option<String>,
+    pub receiver: bool,
+    pub consumes: Vec<usize>,
+    pub closes: bool,
+    pub automatic: bool,
+}
+impl NativeFunction {
+    pub fn from_bridge(bridge: &crate::rust_bridge_ir::RustBridgeSymbol) -> Option<Self> {
+        bridge.native.as_ref()?;
+        Some(Self {
+            owner: bridge.native_owner.clone(),
+            method: bridge.native_method.clone(),
+            receiver: bridge.native_receiver,
+            consumes: bridge.consume_inputs.clone(),
+            closes: bridge.close_handle,
+            automatic: bridge.auto_close,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FuncInfo {
+    #[serde(default)]
+    pub native: Option<NativeFunction>,
     #[serde(default)]
     /// Foreign call without a bounded, nonblocking developer declaration.
     pub foreign: bool,
@@ -656,6 +682,14 @@ impl SymbolTable {
         self.precheck_values = fingerprints;
     }
 
+    /// Resolve the free ABI target of an already qualified native member.
+    pub(crate) fn native_function(&self, name: &str) -> Option<&FuncInfo> {
+        self.lookup_func(name).or_else(|| {
+            let (module, function) = name.rsplit_once("::")?;
+            self.lookup_module_func(module, function)
+        })
+    }
+
     pub fn lookup_func(&self, name: &str) -> Option<&FuncInfo> {
         let result = self.lookup_func_raw(name);
         self.precheck_symbol_read(SymbolRead::Function(name.to_owned()), result);
@@ -1062,6 +1096,7 @@ mod tests {
     }
     fn function_info(ty: Type) -> FuncInfo {
         FuncInfo {
+            native: None,
             foreign: false,
             sending: false,
             params: vec![],

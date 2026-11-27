@@ -256,7 +256,7 @@ pub(crate) fn fold_blocks(blocks: &mut [SourceBlock]) {
                     SourceInst::Expr(value) => propagate_scalar(value, &mut facts),
                     ir_variants!(
                         SourceInst;
-                        Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                        Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots,
                         Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                         SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                         MatchTest, MatchBind
@@ -289,6 +289,7 @@ pub(crate) fn fold_blocks(blocks: &mut [SourceBlock]) {
                     }
                     SourceInst::EnterDeferScope { .. }
                     | SourceInst::LeaveDeferScope { .. }
+                    | SourceInst::RestoreCallPreparation { .. }
                     | SourceInst::FlushDefers { .. }
                     | SourceInst::ClearScopeRoots { .. }
                     | SourceInst::ReleaseLock(_)
@@ -515,7 +516,7 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                 SourceInst::ClearScopeRoots { .. } => true,
                 ir_variants!(
                     SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, FieldAssign,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, FieldAssign,
                     IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Expr
@@ -575,7 +576,7 @@ pub(crate) fn eliminate_tail_recursion(function: &mut super::lowered::SourceFunc
                 }
                 ir_variants!(
                     SourceInst;
-                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, Let, Assign,
                     FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind, Expr
@@ -727,7 +728,7 @@ pub(crate) fn unroll_scalar_loops(function: &mut super::lowered::SourceFunction)
         SourceInst::Assign { value, .. } => leaf(value),
         ir_variants!(
             SourceInst;
-            EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, FieldAssign,
+            EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer, FieldAssign,
             IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
             SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
         ) => false,
@@ -923,7 +924,7 @@ pub(crate) fn inline_scalar_leaves(
                 SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
                 ir_variants!(
                     SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, Let, Assign,
                     FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind, Expr
@@ -1075,7 +1076,7 @@ fn object_alias_target(
             .and_then(|_| names.get(name.as_str()).copied()),
         ir_variants!(
             SourceInst;
-            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer,
+            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer,
             Let, Assign, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
             SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest,
             MatchBind, Expr
@@ -1245,7 +1246,7 @@ pub(crate) fn scalar_replace_objects(
             SourceInst::ClearScopeRoots { .. } => continue,
             ir_variants!(
                 SourceInst;
-                EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign, FieldAssign,
+                EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, Let, Assign, FieldAssign,
                 IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
                 SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
             ) => return,

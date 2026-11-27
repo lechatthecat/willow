@@ -116,10 +116,7 @@ fn cleanup_nested_flush_preserves_outer_scope_and_panic_parent() {
             register(1),
             enter(2, None),
             register(2),
-            LirInst::FlushDefers {
-                sites: vec![LirDeferId(2), LirDeferId(1)],
-                scopes: 2,
-            },
+            LirInst::FlushDefers { scopes: 2 },
             leave(0),
         ],
         Terminator::Return(None),
@@ -138,58 +135,56 @@ fn cleanup_nested_flush_preserves_outer_scope_and_panic_parent() {
 }
 
 #[test]
-fn cleanup_flush_rejects_non_suffix_unknown_and_incomplete_sites() {
-    for sites in [vec![0], vec![9], vec![1], vec![1, 2, 9]] {
-        let mut inner = enter(1, None);
-        if let LirInst::EnterDeferScope { sites, .. } = &mut inner {
-            sites.push((LirDeferId(2), Span::new(0, 0, 1, 1)));
-        }
+fn cleanup_flush_rejects_scope_underflow() {
+    for scopes in [1, 2, usize::MAX] {
         let graph = function(vec![block(
             0,
-            vec![
-                enter(0, None),
-                inner,
-                LirInst::FlushDefers {
-                    sites: sites.into_iter().map(LirDeferId).collect(),
-                    scopes: 1,
-                },
-            ],
+            vec![LirInst::FlushDefers { scopes }],
             Terminator::Return(None),
         )]);
         assert_eq!(
             CleanupGraph::lower(&graph).unwrap_err(),
-            "cleanup flush sites are not a complete active scope suffix"
+            "cleanup scope underflow"
         );
     }
-    let no_owner = function(vec![block(
-        0,
-        vec![LirInst::FlushDefers {
-            sites: vec![LirDeferId(0)],
-            scopes: 1,
-        }],
-        Terminator::Return(None),
-    )]);
-    assert!(CleanupGraph::lower(&no_owner).is_err());
-}
-
-#[test]
-fn cleanup_flush_rejects_sites_of_scopes_it_does_not_leave() {
-    // Leaving only the inner scope must not claim the outer scope's site.
     let graph = function(vec![block(
         0,
         vec![
             enter(0, None),
-            enter(1, None),
-            LirInst::FlushDefers {
-                sites: vec![LirDeferId(1), LirDeferId(0)],
-                scopes: 1,
-            },
+            register(0),
+            LirInst::FlushDefers { scopes: 2 },
         ],
         Terminator::Return(None),
     )]);
     assert_eq!(
         CleanupGraph::lower(&graph).unwrap_err(),
-        "cleanup flush sites are not a complete active scope suffix"
+        "cleanup scope underflow"
+    );
+}
+
+#[test]
+fn cleanup_flush_cannot_name_a_partial_or_foreign_registration_set() {
+    // A flush names only a scope suffix. Sites are resolved from its owner,
+    // so partial/foreign site lists are no longer representable in this IR.
+    let graph = function(vec![block(
+        0,
+        vec![
+            enter(0, None),
+            register(0),
+            enter(1, None),
+            register(1),
+            LirInst::FlushDefers { scopes: 1 },
+            leave(0),
+        ],
+        Terminator::Return(None),
+    )]);
+    let lowered = CleanupGraph::lower(&graph).unwrap();
+    let edge = lowered.exits[&(0, 4)];
+    assert_eq!(edge.from, Some(RootScopeId(1)));
+    assert_eq!(edge.to, Some(RootScopeId(0)));
+    assert_eq!(
+        lowered.scopes[edge.from.unwrap().0].sites,
+        vec![LirDeferId(1)]
     );
 }
 
@@ -207,10 +202,7 @@ fn cleanup_flush_leaves_only_the_counted_siteless_scopes() {
         block(0, vec![siteless(), siteless()], branch(1, 2)),
         block(
             1,
-            vec![LirInst::FlushDefers {
-                sites: vec![],
-                scopes: 1,
-            }],
+            vec![LirInst::FlushDefers { scopes: 1 }],
             Terminator::Jump(BlockId(3)),
         ),
         block(
@@ -381,7 +373,7 @@ fn cleanup_leave_matches_site_sets_independent_of_order_and_duplicates() {
 }
 
 #[test]
-fn cleanup_flush_accepts_complete_suffix_with_duplicate_requests() {
+fn cleanup_flush_resolves_the_complete_registered_suffix() {
     let graph = function(vec![block(
         0,
         vec![
@@ -389,10 +381,7 @@ fn cleanup_flush_accepts_complete_suffix_with_duplicate_requests() {
             register(0),
             enter(1, None),
             register(1),
-            LirInst::FlushDefers {
-                sites: vec![LirDeferId(1), LirDeferId(1)],
-                scopes: 1,
-            },
+            LirInst::FlushDefers { scopes: 1 },
             leave(0),
         ],
         Terminator::Return(None),
@@ -538,10 +527,16 @@ fn cleanup_deep_scope_fanout_shares_states_and_registration_nodes() {
             blocks.push(block(index, vec![], branch(leaves + index - 1, next)));
         }
         for index in leaves..2 * leaves {
-            blocks.push(block(index, vec![], Terminator::Return(None)));
+            blocks.push(block(
+                index,
+                vec![LirInst::FlushDefers { scopes: depth }],
+                Terminator::Return(None),
+            ));
         }
         let graph = CleanupGraph::lower(&function(blocks)).unwrap();
         assert_eq!(graph.states.len(), 2 * depth);
+        assert_eq!(graph.ancestor_queries, leaves);
+        assert!(graph.exits.values().all(|edge| edge.to.is_none()));
         assert_eq!(graph.registrations.len(), depth);
         assert_eq!(graph.edge_checks, 2 * leaves - 1);
         assert_eq!(graph.order.len(), 2 * leaves);
@@ -551,10 +546,11 @@ fn cleanup_deep_scope_fanout_shares_states_and_registration_nodes() {
                 .all(|state| *state == graph.after[&(0, 2 * depth - 1)])
         );
         println!(
-            "cleanup persistent depth={depth} fanout={leaves} states={} registrations={} edge_checks={}",
+            "cleanup persistent depth={depth} fanout={leaves} states={} registrations={} edge_checks={} ancestor_queries={}",
             graph.states.len(),
             graph.registrations.len(),
-            graph.edge_checks
+            graph.edge_checks,
+            graph.ancestor_queries
         );
     }
 }

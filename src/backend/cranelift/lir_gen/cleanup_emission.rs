@@ -125,8 +125,8 @@ impl FuncGen<'_, '_> {
             });
             scope_locks.push(lock);
             scopes.push(super::super::PanicScope {
-                call_frames_at_entry: Vec::new(),
-                reference_scopes_at_entry: Vec::new(),
+                call_frames_at_entry: im::Vector::new(),
+                reference_scopes_at_entry: im::Vector::new(),
                 cleanup: cleanups[index],
                 resume: scope
                     .recovery
@@ -192,23 +192,21 @@ impl FuncGen<'_, '_> {
                     .map_or(graph.scopes[state.scope.0].entry_state.unwrap().0, |id| {
                         registration_states[&id]
                     });
-                let mut machine = states[previous].clone();
-                if !cooperative {
-                    machine.entries.register(sites[&node.site].clone());
-                }
+                let machine = states[previous].clone();
                 registration_states.insert(registration, index);
                 machine
             } else {
                 let mut machine = state.parent.map_or(&initial, |id| &states[id.0]).clone();
-                machine.entries.push(if cooperative {
+                // Every lexical registration has a preallocated flag. A scope
+                // shares one guarded cleanup body across all registered prefixes.
+                machine.entries.push_guarded(
                     graph.scopes[state.scope.0]
                         .sites
                         .iter()
                         .map(|id| sites[id].clone())
-                        .collect()
-                } else {
-                    Vec::new()
-                });
+                        .collect(),
+                    true,
+                );
                 machine.panic.push(scopes[state.scope.0].clone());
                 if let Some(lock) = &scope_locks[state.scope.0] {
                     machine.locks.push(lock.clone());
@@ -239,6 +237,7 @@ impl FuncGen<'_, '_> {
             scopes,
             panic_states,
             normal: HashMap::new(),
+            protocols: super::cleanup_protocol::cleanup_protocols(function),
             roots,
         }
     }

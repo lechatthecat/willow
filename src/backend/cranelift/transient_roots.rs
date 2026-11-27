@@ -318,7 +318,7 @@ pub(super) fn gc_free(f: &LirFunction, inst: &LirInst) -> bool {
         LirInst::ClearScopeRoots { .. } => true,
         ir_variants!(
             LirInst;
-            EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+            EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
             SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
             Unsupported
         ) => false,
@@ -384,6 +384,7 @@ pub(super) fn inst_locals(inst: &LirInst) -> Vec<LirLocalId> {
             out.extend(bindings.iter().copied());
         }
         LirInst::LeaveDeferScope { .. }
+        | LirInst::RestoreCallPreparation { .. }
         | LirInst::FlushDefers { .. }
         | LirInst::Unsupported { .. } => {}
     }

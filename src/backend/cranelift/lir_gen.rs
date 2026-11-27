@@ -77,6 +77,7 @@ use super::{
 };
 
 mod cleanup_emission;
+mod cleanup_protocol;
 mod type_support;
 pub(super) use type_support::*;
 mod validation;
@@ -101,6 +102,7 @@ struct LirBlockLayout<'a> {
     function: &'a LirFunction,
     blocks: &'a [cranelift_codegen::ir::Block],
     return_type: &'a Type,
+    preparation_depths: &'a [(usize, usize)],
 }
 
 #[cfg(test)]
@@ -115,25 +117,23 @@ struct LirCleanupState {
     locks: super::Chain<super::CoopLockScope>,
 }
 
-/// A normal flush can share code only with the same lexical registrations,
-/// panic destinations and root/protocol depth. Return values remain in their
-/// already-bound LIR locals; a block parameter selects the continuation.
+/// Normal cleanup shares lexical suffixes within one root/protocol context.
+/// Each scope retains its own panic destination. Return values stay in their
+/// LIR locals; one control word records the continuation and stopping depth.
 #[derive(Clone, Hash, PartialEq, Eq)]
 struct NormalCleanupKey {
-    region: Option<crate::ir::lowered::cleanup::CleanupRegionId>,
-    entries: usize,
-    depth: usize,
+    protocol: (Option<usize>, Option<usize>),
     roots: usize,
-    panic_target: Option<cranelift_codegen::ir::Block>,
     panic_depth: usize,
     recover_depth: usize,
     call_depth: usize,
     native_active: bool,
 }
 struct NormalCleanup {
-    entry: cranelift_codegen::ir::Block,
-    end: Option<cranelift_codegen::ir::Block>,
-    selector: cranelift_codegen::ir::Value,
+    entries: HashMap<usize, cranelift_codegen::ir::Block>,
+    dispatch: cranelift_codegen::ir::Block,
+    slots: Option<cranelift_codegen::ir::StackSlot>,
+    selector_offset: Option<i32>,
     continuations: Vec<cranelift_codegen::ir::Block>,
 }
 
@@ -143,6 +143,7 @@ struct LirCleanupBindings {
     scopes: Vec<super::PanicScope>,
     panic_states: Vec<LirCleanupState>,
     normal: HashMap<NormalCleanupKey, NormalCleanup>,
+    protocols: cleanup_protocol::ProtocolMap,
     roots: usize,
 }
 struct LirBlockDeferCtx<'a> {
@@ -304,7 +305,7 @@ fn lir_defer_entry_poll(
                 }
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
                 ) => false,
@@ -328,14 +329,20 @@ fn lir_defer_entry_poll(
 /// Argument evaluation may cross basic blocks or a cooperative suspension.
 /// Validate the matching preparations and retain the source frames at each
 /// entry, independently of the order in which machine blocks are emitted.
-fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
+fn lir_call_frame_entries(
+    f: &LirFunction,
+    enabled: impl Fn(&str) -> bool,
+) -> Option<Vec<im::Vector<(String, Span)>>> {
     use crate::ir::lowered::{LirOperand, LirRvalue};
-    type Stack = Vec<(crate::ir::lowered::LirLocalId, String, Span)>;
+    type Stack = (
+        im::Vector<(crate::ir::lowered::LirLocalId, String, Span)>,
+        im::Vector<(String, Span)>,
+    );
     let mut entries: Vec<Option<Stack>> = vec![None; f.blocks.len()];
     if entries.is_empty() {
         return Some(Vec::new());
     }
-    entries[0] = Some(Vec::new());
+    entries[0] = Some(Default::default());
     let mut work = vec![0];
     while let Some(index) = work.pop() {
         let mut stack = entries.get(index)?.clone()?;
@@ -343,11 +350,25 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
         let mut diverged = false;
         for instruction in &f.blocks[index].instrs {
             match instruction {
+                LirInst::RestoreCallPreparation { entry } => {
+                    // The lowering names the dominating loop header. Restore
+                    // its persistent prefix without rescanning outer preparations.
+                    let target = entries.get(entry.0)?.as_ref()?;
+                    if target.0.len() > stack.0.len() {
+                        return None;
+                    }
+                    stack = target.clone();
+                }
                 LirInst::Compute {
                     local,
                     value: LirRvalue::PrepareMethod { method, .. },
                     span,
-                } => stack.push((*local, method.clone(), *span)),
+                } => {
+                    stack.0.push_back((*local, method.clone(), *span));
+                    if enabled(method) {
+                        stack.1.push_back((method.clone(), *span));
+                    }
+                }
                 LirInst::Compute {
                     value:
                         LirRvalue::MethodCall {
@@ -355,7 +376,10 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
                         },
                     ..
                 } => {
-                    let (prepared, expected, _) = stack.pop()?;
+                    let (prepared, expected, _) = stack.0.pop_back()?;
+                    if enabled(method) {
+                        stack.1.pop_back()?;
+                    }
                     if *receiver != LirOperand::Local(prepared) || *method != expected {
                         return None;
                     }
@@ -391,7 +415,9 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
         }
         for (target, state) in edges {
             match entries.get_mut(target)? {
-                Some(existing) if *existing != state => return None,
+                Some(existing) if !existing.0.ptr_eq(&state.0) && existing.0 != state.0 => {
+                    return None;
+                }
                 Some(_) => {}
                 entry @ None => {
                     *entry = Some(state);
@@ -403,27 +429,21 @@ fn lir_call_frame_entries(f: &LirFunction) -> Option<Vec<Vec<(String, Span)>>> {
     Some(
         entries
             .into_iter()
-            .map(|entry| {
-                entry
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|(_, name, span)| (name, span))
-                    .collect()
-            })
+            .map(|entry| entry.unwrap_or_default().1)
             .collect(),
     )
 }
 
 fn lir_reference_scope_entries(
     f: &LirFunction,
-) -> Option<Vec<Vec<Vec<super::FlatReferenceDebug>>>> {
+) -> Option<Vec<im::Vector<im::Vector<super::FlatReferenceDebug>>>> {
     use crate::ir::lowered::{LirOperand, LirRvalue as V};
-    type Scopes = Vec<Vec<super::FlatReferenceDebug>>;
+    type Scopes = im::Vector<im::Vector<super::FlatReferenceDebug>>;
     let mut entries: Vec<Option<Scopes>> = vec![None; f.blocks.len()];
     if entries.is_empty() {
         return Some(Vec::new());
     }
-    entries[0] = Some(Vec::new());
+    entries[0] = Some(Default::default());
     let mut work = vec![0];
     while let Some(index) = work.pop() {
         let mut scopes = entries.get(index)?.clone()?;
@@ -431,10 +451,19 @@ fn lir_reference_scope_entries(
         let mut diverged = false;
         for instruction in &f.blocks[index].instrs {
             match instruction {
+                LirInst::RestoreCallPreparation { entry } => {
+                    // The lowering names the dominating loop header. Restore
+                    // its persistent prefix without rescanning outer preparations.
+                    let target = entries.get(entry.0)?.as_ref()?;
+                    if target.len() > scopes.len() {
+                        return None;
+                    }
+                    scopes = target.clone();
+                }
                 LirInst::Compute {
                     value: V::BeginReferenceCall,
                     ..
-                } => scopes.push(Vec::new()),
+                } => scopes.push_back(im::Vector::new()),
                 LirInst::Compute {
                     value:
                         V::ReferenceDebug {
@@ -443,7 +472,7 @@ fn lir_reference_scope_entries(
                             index,
                         },
                     ..
-                } => scopes.last_mut()?.push(super::FlatReferenceDebug {
+                } => scopes.back_mut()?.push_back(super::FlatReferenceDebug {
                     argument: argument.clone(),
                     callee: *callee,
                     index: *index,
@@ -460,7 +489,7 @@ fn lir_reference_scope_entries(
                     .iter()
                     .any(|arg| matches!(arg, LirOperand::Reference { .. })) =>
                 {
-                    scopes.pop()?;
+                    scopes.pop_back()?;
                 }
                 // Panic unwinds preparations at runtime and recovery restores
                 // the state captured on scope entry. The syntactic terminator
@@ -493,7 +522,7 @@ fn lir_reference_scope_entries(
         }
         for (target, state) in edges {
             match entries.get_mut(target)? {
-                Some(existing) if *existing != state => return None,
+                Some(existing) if !existing.ptr_eq(&state) && *existing != state => return None,
                 Some(_) => {}
                 entry @ None => {
                     *entry = Some(state);
@@ -519,7 +548,7 @@ fn lir_inst_span(inst: &LirInst) -> Option<Span> {
         | LirInst::Unsupported { span, .. } => Some(*span),
         ir_variants!(
             LirInst;
-            Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, SelectInit,
+            Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, SelectInit,
             SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock
         ) => None,
     }
@@ -722,12 +751,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         let outer_confined_maps = self.suspension.lir_confined_maps;
         self.suspension.lir_confined_maps = super::local_maps::confined_scalar_maps(f);
         let incoming_frames =
-            lir_call_frame_entries(f).expect("validated method preparation frames");
+            lir_call_frame_entries(f, |method| self.flat_method_frame_enabled(method))
+                .expect("validated method preparation frames");
         let incoming_references =
             lir_reference_scope_entries(f).expect("validated reference argument scopes");
         let outer_references = self.diagnostics.lir_reference_scopes.clone();
         let outer_frames = self.diagnostics.lir_call_frames.clone();
         let outer_frame_depth = self.diagnostics.callstack_frame_depth;
+        let preparation_depths: Vec<_> = incoming_frames
+            .iter()
+            .zip(&incoming_references)
+            .map(|(m, r)| {
+                (
+                    outer_frames.len() + m.len(),
+                    outer_references.len() + r.len(),
+                )
+            })
+            .collect();
         let entry = self.builder.current_block().expect("entry block active");
         let mut poll_blocks = lir_sync_poll_blocks(f);
         let loop_depths = super::block_layout::lir_loop_depths(f);
@@ -811,13 +851,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             self.diagnostics.lir_reference_scopes = outer_references.clone();
             self.diagnostics
                 .lir_reference_scopes
-                .extend(incoming_references[i].clone());
-            let frames: Vec<_> = incoming_frames[i]
-                .iter()
-                .filter(|(method, _)| self.flat_method_frame_enabled(method))
-                .cloned()
-                .collect();
-            self.diagnostics.lir_call_frames.extend(frames);
+                .append(incoming_references[i].clone());
+            self.diagnostics
+                .lir_call_frames
+                .append(incoming_frames[i].clone());
             self.diagnostics.callstack_frame_depth =
                 outer_frame_depth + self.diagnostics.lir_call_frames.len() - outer_frames.len();
             let block_coop = coop
@@ -862,6 +899,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     function: f,
                     blocks: &blocks,
                     return_type: &f.return_type,
+                    preparation_depths: &preparation_depths,
                 },
                 block,
                 block_coop,
@@ -896,18 +934,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         self.install_lir_cleanup(&cleanup_bindings.initial);
         for cleanup in cleanup_bindings.normal.into_values() {
-            if let Some(end) = cleanup.end {
-                self.builder.switch_to_block(end);
-                let mut switch = cranelift_frontend::Switch::new();
-                for (index, &continuation) in cleanup.continuations.iter().enumerate() {
-                    switch.set_entry(index as u128, continuation);
-                }
-                switch.emit(self.builder, cleanup.selector, cleanup.continuations[0]);
-                for continuation in cleanup.continuations {
-                    self.builder.seal_block(continuation);
-                }
+            self.builder.switch_to_block(cleanup.dispatch);
+            let mut switch = cranelift_frontend::Switch::new();
+            for (index, &continuation) in cleanup.continuations.iter().enumerate() {
+                switch.set_entry(index as u128, continuation);
             }
-            self.builder.seal_block(cleanup.entry);
+            let selector = self.load_cleanup_control(cleanup.slots, cleanup.selector_offset, 0);
+            switch.emit(self.builder, selector, cleanup.continuations[0]);
+            for continuation in cleanup.continuations {
+                self.builder.seal_block(continuation);
+            }
+            self.builder.seal_block(cleanup.dispatch);
+            for entry in cleanup.entries.into_values() {
+                self.builder.seal_block(entry);
+            }
         }
         // The enclosing function compiler may append shared panic-return CFG
         // after the LIR body. It seals all blocks once that ABI edge exists.
@@ -1232,7 +1272,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     // Cleanup bodies bind their own locals when emitted.
                     ir_variants!(
                         LirInst;
-                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
                         SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                         Unsupported
@@ -1395,6 +1435,7 @@ pub(super) fn cleanup_needs_task_stack(function: &LirFunction) -> bool {
         }
         for instruction in region.blocks.iter().flat_map(|block| &block.instrs) {
             match instruction {
+                LirInst::RestoreCallPreparation { .. } => {}
                 LirInst::Compute { value, .. } if task_stack_boundary(value) => return true,
                 LirInst::Defer { body, .. } => pending.push(&body.function),
                 ir_variants!(
@@ -1463,7 +1504,7 @@ impl FuncGen<'_, '_> {
         {
             self.diagnostics
                 .lir_call_frames
-                .push((method.clone(), span));
+                .push_back((method.clone(), span));
             self.diagnostics.callstack_frame_depth = 1;
         }
         if value
@@ -1471,7 +1512,9 @@ impl FuncGen<'_, '_> {
             .iter()
             .any(|arg| matches!(arg, LirOperand::Reference { .. }))
         {
-            self.diagnostics.lir_reference_scopes.push(Vec::new());
+            self.diagnostics
+                .lir_reference_scopes
+                .push_back(im::Vector::new());
         }
         self.diagnostics.fault_site_span = Some(span);
         let result = self.emit_lir_rvalue(function, value, span);
@@ -1556,7 +1599,7 @@ impl FuncGen<'_, '_> {
         {
             self.diagnostics
                 .lir_call_frames
-                .pop()
+                .pop_back()
                 .expect("prepared boundary method");
             self.emit_callstack_pop();
         }

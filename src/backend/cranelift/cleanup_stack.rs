@@ -50,9 +50,16 @@ impl<T> Chain<T> {
             len: self.len() + 1,
         }));
     }
-    pub fn pop(&mut self) {
-        self.head = self.head.as_ref().and_then(|node| node.parent.head.clone());
+
+    pub fn pop(&mut self) -> Option<T>
+    where
+        T: Clone,
+    {
+        let node = self.head.take()?;
+        self.head = node.parent.head.clone();
+        Some(node.value.clone())
     }
+
     pub fn iter_rev(&self) -> impl Iterator<Item = &T> {
         std::iter::successors(self.head.as_deref(), |node| node.parent.head.as_deref())
             .map(|node| &node.value)

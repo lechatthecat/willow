@@ -137,7 +137,7 @@ pub(crate) fn devirtualize_function_values(
                 }
                 ir_variants!(
                     SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer, Let,
                     Assign, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind, Expr
@@ -249,7 +249,7 @@ pub(crate) fn devirtualize_function_values(
                     // Only Compute and immutable Let populate the definition table.
                     ir_variants!(
                         SourceInst;
-                        Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                        Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots,
                         Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                         SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                         MatchTest, MatchBind, Expr

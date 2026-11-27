@@ -21,6 +21,10 @@ std::thread_local! {
     static CALLBACK_WORK: std::cell::Cell<(usize, usize, usize, usize)> = const {
         std::cell::Cell::new((0, 0, 0, 0))
     };
+    // Capture lookups, cancellation-map entries indexed, snapshot restores.
+    static DEFER_BINDING_WORK: std::cell::Cell<(usize, usize, usize)> = const {
+        std::cell::Cell::new((0, 0, 0))
+    };
 }
 
 #[cfg(test)]
@@ -42,6 +46,7 @@ struct CoopPollBody<'a> {
     current_class: Option<&'a str>,
     lir: &'a LirFunction,
     result_offset: Option<i32>,
+    cleanup_selector: Option<i32>,
     lir_defer_offsets: HashMap<LirDeferId, i32>,
     lir_send_offsets: HashMap<LirLocalId, i32>,
     cleanup: Option<(&'a LirFunction, bool)>,
@@ -67,6 +72,7 @@ type LirAsyncLayoutPlan = (
     HashMap<LirLocalId, i32>,
     HashMap<LirDeferId, i32>,
     HashMap<LirLocalId, i32>,
+    Option<i32>,
 );
 const MUTEX_STATUS_RECURSIVE: i64 = willow_abi::LockAcquireStatus::Recursive as i64;
 /// This acquisition's generation is dead; the caller must acquire again.
@@ -206,7 +212,7 @@ impl UnitCodegenContext<'_> {
                     }
                     ir_variants!(
                         LirInst;
-                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                         SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
                     ) => false,
@@ -327,7 +333,7 @@ impl UnitCodegenContext<'_> {
                 LirInst::Defer { id, span, .. } => Some((*id, *span)),
                 ir_variants!(
                     LirInst;
-                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                     ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                     SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
                 ) => None,
@@ -352,8 +358,27 @@ impl UnitCodegenContext<'_> {
                 ty: Type::I64,
             });
         }
+        let cleanup_selector = (!defer_offsets.is_empty()).then(|| {
+            let offset = async_frame_slot_offset(
+                reserved.len(),
+                reference_type(self.output.module.target_config()).bytes(),
+            );
+            reserved.push(AsyncFrameSlot {
+                storage_kind: crate::ir::lowered::LirStorageKind::Value,
+                source_span: None,
+                name: "__cleanup_selector".into(),
+                ty: Type::I64,
+            });
+            offset
+        });
         let layout = AsyncFrameLayout::try_new(reserved, &self.enum_infos)?;
-        Ok((layout, offsets, defer_offsets, send_offsets))
+        Ok((
+            layout,
+            offsets,
+            defer_offsets,
+            send_offsets,
+            cleanup_selector,
+        ))
     }
 
     /// Cooperative-async lowering:
@@ -410,7 +435,7 @@ impl UnitCodegenContext<'_> {
             name: p.name.clone(),
             ty: p.ty.clone().into(),
         }));
-        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
+        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets, cleanup_selector) =
             self.lir_async_layout(&lir, slots, first_param_slot)?;
         let parameter_offsets: Vec<_> = lir
             .locals
@@ -464,6 +489,7 @@ impl UnitCodegenContext<'_> {
                 current_class: None,
                 lir: &lir,
                 result_offset,
+                cleanup_selector,
                 lir_defer_offsets,
                 lir_send_offsets,
             },
@@ -606,7 +632,7 @@ impl UnitCodegenContext<'_> {
         // Lowered parameters always start at slot 2: instance methods include
         // the receiver as their first lowered parameter. Locals follow the
         // parameters, frame-backed across suspensions and keyed by LirLocalId.
-        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets) =
+        let (layout, lir_offsets, lir_defer_offsets, lir_send_offsets, cleanup_selector) =
             self.lir_async_layout(&lir, slots, 2)?;
         let parameter_offsets: Vec<_> = lir
             .locals
@@ -800,6 +826,7 @@ impl UnitCodegenContext<'_> {
                 current_class: method.map(|(class, _)| class),
                 lir: &lir,
                 result_offset: Some(result_offset),
+                cleanup_selector,
                 lir_defer_offsets,
                 lir_send_offsets,
             },
@@ -1061,6 +1088,7 @@ impl UnitCodegenContext<'_> {
                                 current_class: body.current_class,
                                 lir: body.lir,
                                 result_offset: None,
+                                cleanup_selector: None,
                                 lir_defer_offsets: HashMap::new(),
                                 lir_send_offsets: HashMap::new(),
                                 boundary: Some((*local, value, *span)),
@@ -1080,12 +1108,19 @@ impl UnitCodegenContext<'_> {
                     && super::lir_gen::cleanup_needs_task_stack(&action.function)
                 {
                     let flag_offset = body.lir_defer_offsets[id];
-                    let bindings: Vec<_> = body
-                        .lir
-                        .locals
+                    // A cleanup region names its enclosing captures explicitly;
+                    // unrelated parent locals never need callback bindings.
+                    let bindings: Vec<_> = action
+                        .captures
                         .iter()
-                        .filter_map(|local| {
-                            lir_offsets.get(&local.id).map(|offset| {
+                        .filter_map(|id| {
+                            #[cfg(test)]
+                            DEFER_BINDING_WORK.with(|work| {
+                                let (captures, indexed, restores) = work.get();
+                                work.set((captures + 1, indexed, restores));
+                            });
+                            let local = &body.lir.locals[id.0 as usize];
+                            lir_offsets.get(id).map(|offset| {
                                 (local.name.clone(), VarStorage::async_local(local, *offset))
                             })
                         })
@@ -1110,13 +1145,15 @@ impl UnitCodegenContext<'_> {
                         self.compile_coop_main_poll(
                             &symbol,
                             f,
-                            offsets.clone(),
+                            // Captures already carry their concrete frame slots.
+                            HashMap::new(),
                             HashMap::new(),
                             &bindings,
                             CoopPollBody {
                                 current_class: body.current_class,
                                 lir: body.lir,
                                 result_offset: None,
+                                cleanup_selector: None,
                                 lir_defer_offsets: HashMap::new(),
                                 lir_send_offsets: HashMap::new(),
                                 boundary: None,
@@ -1201,6 +1238,7 @@ impl UnitCodegenContext<'_> {
             fg.suspension.async_frame = Some(frame);
             fg.suspension.async_frame_offsets = offsets;
             fg.suspension.lir_frame_offsets = lir_offsets;
+            fg.suspension.cleanup_selector_offset = body.cleanup_selector;
             fg.suspension.lir_defer_offsets = body.lir_defer_offsets.clone();
             fg.suspension.lir_send_offsets = body.lir_send_offsets.clone();
             fg.locals.current_class = body.current_class;
@@ -1386,6 +1424,10 @@ impl UnitCodegenContext<'_> {
             );
             cleanup_events.sort_unstable_by_key(|(order, ..)| std::cmp::Reverse(*order));
 
+            // Sites in one LIR region share one binding vector. Index it once
+            // and restore a persistent map head for each action, so unrelated
+            // frame locals do not multiply cancellation codegen work.
+            let mut binding_snapshots: HashMap<_, im::HashMap<String, VarStorage>> = HashMap::new();
             for (_, is_lock, index) in cleanup_events {
                 if is_lock {
                     let site = &lock_sites[index];
@@ -1405,9 +1447,22 @@ impl UnitCodegenContext<'_> {
                 }
 
                 let site = &sites[index];
-                for (name, storage) in site.bindings.iter() {
-                    fg.locals.vars.insert(name.clone(), storage.clone());
-                }
+                let snapshot = binding_snapshots
+                    .entry(std::rc::Rc::as_ptr(&site.bindings))
+                    .or_insert_with(|| {
+                        #[cfg(test)]
+                        DEFER_BINDING_WORK.with(|work| {
+                            let (captures, indexed, restores) = work.get();
+                            work.set((captures, indexed + site.bindings.len(), restores));
+                        });
+                        site.bindings.iter().cloned().collect()
+                    });
+                fg.locals.vars = snapshot.clone();
+                #[cfg(test)]
+                DEFER_BINDING_WORK.with(|work| {
+                    let (captures, indexed, restores) = work.get();
+                    work.set((captures, indexed, restores + 1));
+                });
                 let flag =
                     fg.builder
                         .ins()
@@ -2411,7 +2466,7 @@ mod task_boundary_callback_tests {
                 ty: local.ty.clone(),
             })
             .collect();
-        let (layout, offsets, _, _) = codegen.lir_async_layout(&lir, reserved, 0).unwrap();
+        let (layout, offsets, _, _, _) = codegen.lir_async_layout(&lir, reserved, 0).unwrap();
         (lir, layout, offsets)
     }
 
@@ -2525,7 +2580,7 @@ mod task_boundary_callback_tests {
             let (lir, _, _) = print_frame_layout(&source);
             let mut backend = Codegen::for_tests(&crate::CompilerOptions::debug()).unwrap();
             let codegen = backend.declaration_context();
-            let (layout, _, _, scratch) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
+            let (layout, _, _, scratch, _) = codegen.lir_async_layout(&lir, Vec::new(), 0).unwrap();
             assert_eq!(scratch.len(), count);
             assert_eq!(
                 layout
@@ -2560,7 +2615,7 @@ mod task_boundary_callback_tests {
                 reserved.push(slot("pair", pair.clone()));
                 reserved.push(slot("reference", Type::String));
             }
-            let (layout, _, _, _) = codegen.lir_async_layout(&lir, reserved, 2).unwrap();
+            let (layout, _, _, _, _) = codegen.lir_async_layout(&lir, reserved, 2).unwrap();
             assert_eq!(layout.slot_count(), 3 + count * 3);
             assert_eq!(layout.slots[1].name, "__task_id");
             for word in 0..layout.slot_count() {
@@ -2570,7 +2625,7 @@ mod task_boundary_callback_tests {
                 );
             }
         }
-        let (layout, _, _, _) = codegen
+        let (layout, _, _, _, _) = codegen
             .lir_async_layout(&lir, vec![slot("__result", pair)], 1)
             .unwrap();
         assert_eq!(layout.slot_count(), 3);
@@ -2674,6 +2729,30 @@ mod task_boundary_callback_tests {
         }
         source.push('}');
         source
+    }
+
+    #[test]
+    fn deferred_callback_bindings_scale_with_captures_and_shared_frame() {
+        for (locals, defers) in [(4, 4), (64, 4), (64, 16), (64, 64)] {
+            let mut source = format!("{WORK} async fn subject() {{ let input = work(1);");
+            for index in 0..locals {
+                source.push_str(&format!("let live{index} = work({index});"));
+            }
+            source.push_str(&"defer work(input);".repeat(defers));
+            for index in 0..locals {
+                source.push_str(&format!("println(live{index});"));
+            }
+            source.push_str("} async fn main() { await subject(); }");
+            DEFER_BINDING_WORK.with(|work| work.set((0, 0, 0)));
+            callback_work(&source);
+            let (captures, indexed, restores) = DEFER_BINDING_WORK.with(|work| work.get());
+            println!(
+                "locals={locals} defers={defers} captures={captures} indexed={indexed} restores={restores}"
+            );
+            assert_eq!(captures, defers);
+            assert_eq!(restores, defers);
+            assert!(indexed <= 2 * (locals + defers + 1), "{indexed}");
+        }
     }
 
     /// Perspective 1: one callback per task-stack boundary. The count is the

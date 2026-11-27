@@ -269,7 +269,7 @@ fn scalar_recursion_depth(function: &SourceFunction, overflow_checks: OverflowCh
                 SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
                 ir_variants!(
                     SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, Let, Assign,
                     FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind, Expr

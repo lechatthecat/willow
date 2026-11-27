@@ -150,6 +150,7 @@ pub(super) fn confined_scalar_maps(f: &LirFunction) -> bool {
                 }
                 LirInst::ClearScopeRoots { .. }
                 | LirInst::LeaveDeferScope { .. }
+                | LirInst::RestoreCallPreparation { .. }
                 | LirInst::FlushDefers { .. } => true,
                 LirInst::EnterDeferScope { sites, lock, .. } => sites.is_empty() && lock.is_none(),
                 LirInst::MatchTest { scrutinee, .. } => !maps[scrutinee.0 as usize],

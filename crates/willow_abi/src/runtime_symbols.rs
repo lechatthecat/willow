@@ -526,6 +526,7 @@ runtime_abi_schema! {
     NONE; willow_rust_bridge_panic => ([] -> None);
     NONE; willow_rust_bridge_handle_error => ([I32, I64] -> None);
     NONE; willow_rust_bridge_panic_message => ([Ptr, I64] -> None);
+    NONE; willow_debug_record_handle_output => ([I64, Ptr, Ptr, I64, I32] -> None);
     NONE; willow_rust_bridge_frame_new => ([] -> Some(Ptr));
     NONE; willow_rust_bridge_frame_drop => ([Ptr] -> None);
     NONE; willow_rust_bridge_root => ([Ptr, I64] -> None);

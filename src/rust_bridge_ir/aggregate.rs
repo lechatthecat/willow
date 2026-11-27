@@ -378,6 +378,7 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     } else {
         ", records: *const *const u64"
     };
+    let consumed: std::collections::HashSet<_> = symbol.consume_inputs.iter().copied().collect();
     let mutable = if symbol.close_handle { "" } else { "mut " };
     writeln!(source, "#[unsafe(no_mangle)] pub unsafe extern \"C\" fn {}(input: *const BridgeValue, output: *mut BridgeValue{metadata}) {{\nunsafe {{ {guard}({revision}); }}\nlet outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {{\nlet {mutable}frame = BridgeFrame::new();",symbol.abi_symbol).unwrap();
     for (i, record) in records.iter().enumerate() {
@@ -398,22 +399,46 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
         let Scalar::Opaque(name) = &symbol.input_types[0] else {
             unreachable!()
         };
+        let close = if symbol.auto_close {
+            "close_if_open"
+        } else {
+            "close"
+        };
         if symbol.uses_blocking_pool() {
-            writeln!(source, "let id = frame.payload(a0, false).low;\nlet lease = handles::take(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id)));\nlet _ = blocking_call(move || drop(lease));\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+            let retired = if symbol.auto_close {
+                "Err(handles::HandleError::Closed) => None,"
+            } else {
+                ""
+            };
+            writeln!(source, "let id = frame.payload(a0, false).low;\nlet lease = match handles::detach(id, std::any::TypeId::of::<opaque_tags::r#{name}>()) {{ Ok(value) => Some(value), {retired} Err(error) => std::panic::panic_any((error, id)) }};\nlet _ = blocking_call(move || drop(lease));\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}} ").unwrap();
             return;
         }
-        writeln!(source, "let id = frame.payload(a0, false).low;\n{{ let _region = BridgeRegion::enter(); handles::close(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id))); }}\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+        writeln!(source, "let id = frame.payload(a0, false).low;\n{{ let _region = BridgeRegion::enter(); handles::{close}(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id))); }}\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}} ").unwrap();
         return;
     }
     let mut serial = 0;
     let mut arguments = Vec::new();
     for (i, ty) in symbol.input_types.iter().enumerate() {
-        arguments.push(ty.decode_mode(
-            source,
-            &format!("a{i}"),
-            &mut serial,
-            symbol.is_async || symbol.uses_blocking_pool(),
-        ));
+        if consumed.contains(&i) {
+            let Scalar::Opaque(name) = ty else {
+                unreachable!("consumed native argument must be opaque")
+            };
+            if symbol.auto_close {
+                // Scope cleanup may follow an explicit close or another
+                // consuming call; only that retired generation is a no-op.
+                writeln!(source, "let id = frame.payload(a{i}, false).low; let value = match handles::take::<bridge::r#{name}>(id, std::any::TypeId::of::<opaque_tags::r#{name}>()) {{ Ok(value) => value, Err(handles::HandleError::Closed) => {{ unsafe {{ *output = BridgeValue::default(); }} return; }}, Err(error) => std::panic::panic_any((error, id)), }}; let mut owned{i} = ConsumedHandle(Some(value));").unwrap();
+            } else {
+                writeln!(source, "let id = frame.payload(a{i}, false).low; let mut owned{i} = ConsumedHandle(Some(handles::take::<bridge::r#{name}>(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id)))));").unwrap();
+            }
+            arguments.push(format!("owned{i}.take()"));
+        } else {
+            arguments.push(ty.decode_mode(
+                source,
+                &format!("a{i}"),
+                &mut serial,
+                symbol.is_async || symbol.uses_blocking_pool(),
+            ));
+        }
     }
     if symbol.is_async {
         // The task constructor copies inputs now; user Rust only runs on the executor.
@@ -441,8 +466,8 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
         return;
     }
     write!(source, "let adapter: fn(").unwrap();
-    for ty in &symbol.input_types {
-        write!(source, "{},", ty.rust_type(true)).unwrap();
+    for (i, ty) in symbol.input_types.iter().enumerate() {
+        write!(source, "{},", ty.rust_type(!consumed.contains(&i))).unwrap();
     }
     writeln!(
         source,
@@ -459,7 +484,13 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
             .input_types
             .iter()
             .enumerate()
-            .map(|(i, ty)| ty.borrow_owned(source, &format!("&mut owned.{i}"), &mut serial))
+            .map(|(i, ty)| {
+                if consumed.contains(&i) {
+                    format!("owned.{i}")
+                } else {
+                    ty.borrow_owned(source, &format!("&mut owned.{i}"), &mut serial)
+                }
+            })
             .collect();
         writeln!(
             source,

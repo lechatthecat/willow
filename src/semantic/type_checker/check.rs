@@ -464,6 +464,17 @@ impl TypeChecker {
         s: &StaticCallExpr,
         context: CallContext<'_>,
     ) -> Type {
+        if let Some(owner) = self.resolve_static_call_class_quiet(&s.class)
+            && let Some((name, info)) = self.native_member(&owner, &s.method, false)
+        {
+            self.check_type_visibility(&owner, s.span);
+            self.static_call_classes
+                .insert(s.id, TypeId::from_source_name(&owner));
+            if !s.type_args.is_empty() {
+                self.generic_error(s.span, "native functions do not accept type arguments");
+            }
+            return self.check_native_member(s.id, s.span, name, info, &s.args, false);
+        }
         // Constructor syntax supplies a class argument from the expected array
         // when omitted, then uses the declaration's ordinary static dispatch.
         if self
@@ -832,7 +843,18 @@ impl TypeChecker {
     fn record_resolved_call(&mut self, expr: &Expr) {
         use crate::semantic::intrinsics::BuiltinMethod;
         let mut inline_callback = false;
+        let native = self
+            .analysis_calls
+            .get(&expr.id())
+            .copied()
+            .flatten()
+            .filter(|id| {
+                self.symbols
+                    .native_function(&id.to_string())
+                    .is_some_and(|info| info.native.is_some())
+            });
         let mut targets = match expr {
+            _ if native.is_some() => vec![native.unwrap()],
             // Constant reads inline their value. Keep a string constant's
             // resolved identity outside AI capture too, so allocation proofs
             // distinguish it from a shadowing local without resolving again.
@@ -2091,6 +2113,11 @@ impl TypeChecker {
 
     /// Member calls on an already-checked, non-error receiver.
     pub(super) fn check_receiver_method_call(&mut self, obj_ty: &Type, m: &MethodCallExpr) -> Type {
+        if let Type::Named(owner) = obj_ty
+            && let Some((name, info)) = self.native_member(owner, &m.method, true)
+        {
+            return self.check_native_member(m.id, m.span, name, info, &m.args, true);
+        }
         if let Type::Named(name) = obj_ty
             && self.generics.parameter_names.contains(name)
         {

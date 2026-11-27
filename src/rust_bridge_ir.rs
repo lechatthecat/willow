@@ -228,6 +228,16 @@ pub struct RustBridgeSymbol {
     pub assumption_span: Option<crate::diagnostics::Span>,
     #[serde(default)]
     pub close_handle: bool,
+    #[serde(default)]
+    pub auto_close: bool,
+    #[serde(default)]
+    pub native_owner: Option<String>,
+    #[serde(default)]
+    pub native_method: Option<String>,
+    #[serde(default)]
+    pub native_receiver: bool,
+    #[serde(default)]
+    pub consume_inputs: Vec<usize>,
     /// Developer assertion, bound to the resolved lock and bridge source.
     /// Native declarations use an empty marker; their shared fingerprint lives
     /// exclusively in rust-review.toml and is checked before execution.
@@ -288,6 +298,11 @@ impl RustBridgeSymbol {
             assumption_span: None,
             rust_crate: String::new(),
             close_handle: false,
+            auto_close: false,
+            native_owner: None,
+            native_method: None,
+            native_receiver: false,
+            consume_inputs: vec![],
             nonblocking: None,
             abi_symbol: name.clone(),
             willow_function: name,
@@ -363,7 +378,9 @@ impl RustBridgeSymbol {
             bytes
         };
         let package_hash = Sha256::digest(identity.as_bytes());
-        let name = QualifiedName::new(&self.willow_function).last_segment();
+        let name = QualifiedName::new(&self.willow_function)
+            .last_segment()
+            .replace('$', "_");
         bound.abi_symbol = format!(
             "__willow_rust_{:x}_{name}_{:x}",
             crate::hex::Hex(&package_hash),
@@ -500,3 +517,5 @@ use aggregate::aggregate_wrapper;
 )]
 #[path = "rust_bridge_ir/async_executor_tests.rs"]
 mod async_executor_tests;
+
+mod handle_debug;

@@ -43,6 +43,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "recover".to_string(),
             FuncInfo {
+                native: None,
                 foreign: false,
                 sending: false,
                 params: Vec::new(),
@@ -63,6 +64,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    native: None,
                     foreign: false,
                     sending: false,
                     param_infos: value_param_infos(&params),
@@ -79,6 +81,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_collect".to_string(),
             FuncInfo {
+                native: None,
                 foreign: false,
                 sending: false,
                 param_infos: vec![],
@@ -95,6 +98,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    native: None,
                     foreign: false,
                     sending: false,
                     param_infos: vec![],
@@ -155,6 +159,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    native: None,
                     foreign: false,
                     sending: false,
                     param_infos: vec![],
@@ -173,6 +178,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "panic".to_string(),
             FuncInfo {
+                native: None,
                 foreign: false,
                 sending: false,
                 param_infos: value_param_infos(&panic_params),
@@ -189,6 +195,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "sleep".to_string(),
             FuncInfo {
+                native: None,
                 foreign: false,
                 sending: false,
                 param_infos: value_param_infos(&sleep_params),
@@ -204,6 +211,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "yield".to_string(),
             FuncInfo {
+                native: None,
                 foreign: false,
                 sending: false,
                 param_infos: vec![],
@@ -249,6 +257,7 @@ impl TypeChecker {
                 Some((
                     item.name.to_string(),
                     FuncInfo {
+                        native: None,
                         foreign: false,
                         sending: false,
                         param_infos: value_param_infos(&params),
@@ -666,6 +675,10 @@ impl TypeChecker {
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
+                            native: f
+                                .rust_bridge
+                                .as_deref()
+                                .and_then(NativeFunction::from_bridge),
                             foreign: f
                                 .rust_bridge
                                 .as_ref()

@@ -148,6 +148,7 @@ impl SourceFunction {
                         SourceInst::Compute { .. }
                         | SourceInst::EnterDeferScope { .. }
                         | SourceInst::LeaveDeferScope { .. }
+                        | SourceInst::RestoreCallPreparation { .. }
                         | SourceInst::FlushDefers { .. }
                         | SourceInst::ClearScopeRoots { .. }
                         | SourceInst::ReleaseLock(_)
@@ -455,7 +456,8 @@ impl SuspendOp {
 
 /// A cleanup CFG replayed at each exit where this registration is live.
 /// Captures name enclosing locals; region parameter locals reuse their names
-/// and storage. Region-owned locals receive fresh storage at each replay.
+/// and storage, with dense IDs belonging to the region. Capture IDs belong to
+/// the enclosing function. Region-owned locals receive fresh storage at replay.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SourceDeferBody {
     pub function: Box<SourceFunction>,
@@ -546,13 +548,16 @@ pub(crate) enum SourceInst {
     LeaveDeferScope {
         sites: Vec<LirDeferId>,
     },
-    /// Run the named registrations newest first, without changing lexical
-    /// scope metadata. Emitted immediately before a
-    /// `return`, `break` or `continue` that leaves their scopes.
+    /// Abandon preparations opened inside this loop, retaining its entry prefix.
+    RestoreCallPreparation {
+        entry: BlockId,
+    },
+    /// Run the complete suffix of active scopes, newest registrations first.
+    /// Emitted before a `return`, `break` or `continue` that leaves these scopes.
+    /// Scope ownership supplies the registrations once; exits never copy them.
     FlushDefers {
-        sites: Vec<LirDeferId>,
-        /// Innermost open scopes this exit leaves. Explicit because a `lock`
-        /// scope has no sites, so the sites alone cannot say where it stops.
+        /// Number of innermost open scopes this exit leaves, including scopes
+        /// with no registrations such as lexical lock boundaries.
         scopes: usize,
     },
     /// The end of the lexical scope that declared `locals`.
@@ -1521,6 +1526,7 @@ fn lower_function<'r>(
 /// the ones that were already open when the loop started.
 #[derive(Debug, Clone, Copy)]
 struct LirLoopFrame {
+    preparation_entry: BlockId,
     exit: BlockId,
     next: BlockId,
     defer_depth: usize,
@@ -1823,6 +1829,7 @@ fn instruction_executes_call(inst: &SourceInst) -> bool {
         | SourceInst::ReleaseLock { .. }
         | SourceInst::EnterDeferScope { .. }
         | SourceInst::LeaveDeferScope { .. }
+        | SourceInst::RestoreCallPreparation { .. }
         | SourceInst::FlushDefers { .. }
         | SourceInst::ClearScopeRoots { .. }
         | SourceInst::MatchTest { .. }
@@ -2318,12 +2325,20 @@ impl<'r> Builder<'r> {
 /// mid-block `return`s) and renumber the survivors densely.
 fn prune_unreachable(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
     let mut reachable = vec![false; blocks.len()];
+    let mut has_preparations = false;
     let mut stack = vec![0usize];
     while let Some(i) = stack.pop() {
         if std::mem::replace(&mut reachable[i], true) {
             continue;
         }
         for inst in &blocks[i].instrs {
+            has_preparations |= matches!(
+                inst,
+                SourceInst::Compute {
+                    value: LirRvalue::PrepareMethod { .. } | LirRvalue::BeginReferenceCall,
+                    ..
+                }
+            );
             if let SourceInst::EnterDeferScope {
                 resume: Some(resume),
                 ..
@@ -2375,15 +2390,24 @@ fn prune_unreachable(blocks: Vec<SourceBlock>) -> Vec<SourceBlock> {
             for target in &mut block.recovery {
                 *target = BlockId(remap[target.0]);
             }
-            for inst in &mut block.instrs {
-                if let SourceInst::EnterDeferScope {
-                    resume: Some(resume),
-                    ..
-                } = inst
-                {
-                    *resume = BlockId(remap[resume.0]);
+            block.instrs.retain_mut(|inst| {
+                // Pure scalar loops must retain their existing optimization
+                // eligibility. No preparation means this marker is a no-op.
+                if !has_preparations && matches!(inst, SourceInst::RestoreCallPreparation { .. }) {
+                    return false;
                 }
-            }
+                match inst {
+                    SourceInst::EnterDeferScope {
+                        resume: Some(target),
+                        ..
+                    }
+                    | SourceInst::RestoreCallPreparation { entry: target } => {
+                        *target = BlockId(remap[target.0]);
+                    }
+                    _ => {}
+                }
+                true
+            });
             block.terminator = match block.terminator {
                 SourceTerminator::Jump(b) => SourceTerminator::Jump(BlockId(remap[b.0])),
                 SourceTerminator::Branch {
@@ -2467,8 +2491,11 @@ fn format_inst(inst: &SourceInst) -> String {
         SourceInst::LeaveDeferScope { sites } => {
             format!("leave defer scope ({} sites);", sites.len())
         }
-        SourceInst::FlushDefers { sites, scopes } => {
-            format!("flush defers ({} sites, {scopes} scopes);", sites.len())
+        SourceInst::RestoreCallPreparation { entry } => {
+            format!("restore call preparation from b{};", entry.0)
+        }
+        SourceInst::FlushDefers { scopes } => {
+            format!("flush defers ({scopes} scopes);")
         }
         SourceInst::ClearScopeRoots { locals } => {
             let names = locals

@@ -2,6 +2,9 @@
 //! to the bounded Rust pool from task stacks. No managed callback is supported.
 pub(crate) mod aggregate;
 mod asynchronous;
+pub(crate) mod handle_sites;
+mod reporting;
+pub(crate) use reporting::report_normal_exit;
 #[cfg(test)]
 mod handles;
 #[unsafe(no_mangle)]

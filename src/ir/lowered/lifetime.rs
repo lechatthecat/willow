@@ -23,7 +23,7 @@ pub(super) fn clear_dead_temporaries(function: &mut SourceFunction) -> Liveness 
                     }
                     ir_variants!(
                         SourceInst;
-                        Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
                         SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
                         ReleaseLock, MatchTest, MatchBind, Expr
@@ -96,7 +96,7 @@ fn clear_function(function: &mut SourceFunction) -> Liveness {
             SourceInst::EnterDeferScope { lock: None, .. }
             | ir_variants!(
                 SourceInst;
-                Let, Assign, LeaveDeferScope, FlushDefers, ClearScopeRoots, FieldAssign,
+                Let, Assign, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, FieldAssign,
                 IndexAssign, StaticFieldAssign, SuperInit, SelectInit, SelectProbe, SelectPick,
                 SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
             ) => {}

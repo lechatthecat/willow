@@ -248,6 +248,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_transfer_ownership(&mut self, root: AstEvent<'_>) {
+        self.check_native_ownership(root);
         if !self.enforce_send_sync {
             return;
         }

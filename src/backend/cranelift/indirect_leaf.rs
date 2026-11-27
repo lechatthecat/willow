@@ -126,7 +126,7 @@ impl Leaf {
                 LirInst::ClearScopeRoots { .. } => {}
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
                 ) => return None,

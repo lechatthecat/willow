@@ -253,16 +253,7 @@ impl<'r> Builder<'r> {
         if from >= to {
             return;
         }
-        let mut sites = Vec::new();
-        for scope in &self.defer_scopes[from..to] {
-            let mut scope_sites: Vec<_> = scope.values().copied().collect();
-            scope_sites.sort_unstable();
-            sites.extend(scope_sites);
-        }
-        self.push(SourceInst::FlushDefers {
-            sites,
-            scopes: to - from,
-        });
+        self.push(SourceInst::FlushDefers { scopes: to - from });
     }
 
     pub(super) fn lower_stmt(&mut self, stmt: &HirStmt) {
@@ -491,6 +482,9 @@ impl<'r> Builder<'r> {
             }
             HirStmt::Break { .. } => {
                 let frame = *self.loop_stack.last().expect("break outside loop");
+                self.push(SourceInst::RestoreCallPreparation {
+                    entry: frame.preparation_entry,
+                });
                 self.flush_defers_down_to(frame.defer_depth);
                 self.clear_scope_roots_down_to(frame.scope_depth);
                 self.terminate(SourceTerminator::Jump(frame.exit));
@@ -554,6 +548,9 @@ impl<'r> Builder<'r> {
             }
             HirStmt::Continue { .. } => {
                 let frame = *self.loop_stack.last().expect("continue outside loop");
+                self.push(SourceInst::RestoreCallPreparation {
+                    entry: frame.preparation_entry,
+                });
                 self.flush_defers_down_to(frame.defer_depth);
                 self.clear_scope_roots_down_to(frame.scope_depth);
                 self.terminate(SourceTerminator::Jump(frame.next));
@@ -633,6 +630,7 @@ impl<'r> Builder<'r> {
 
                 self.switch_to(body_block);
                 self.loop_stack.push(LirLoopFrame {
+                    preparation_entry: header,
                     exit,
                     next: backedge,
                     defer_depth: self.defer_depth,
@@ -860,6 +858,7 @@ impl<'r> Builder<'r> {
         self.terminate(SourceTerminator::Jump(entry));
         self.switch_to(entry);
         self.loop_stack.push(LirLoopFrame {
+            preparation_entry: entry,
             exit,
             next: handoff,
             defer_depth: self.defer_depth,
@@ -1103,6 +1102,7 @@ impl<'r> Builder<'r> {
         let element = self.push_synth_let(name, false, element_binding);
         self.scope_roots.push(element);
         self.loop_stack.push(LirLoopFrame {
+            preparation_entry: header,
             exit,
             next: inc_block,
             defer_depth: self.defer_depth,

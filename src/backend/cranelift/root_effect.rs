@@ -78,7 +78,7 @@ pub(super) fn preserves_stack_helper(function: &LirFunction) -> bool {
                 },
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
                 ) => false,
@@ -144,7 +144,7 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
                 LirInst::ClearScopeRoots { .. } => true,
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
                 ) => false,
@@ -243,7 +243,7 @@ pub(super) fn is_safepoint_free_leaf(
                 LirInst::ClearScopeRoots { .. } => true,
                 ir_variants!(
                     LirInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit, SelectProbe,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit, SelectProbe,
                     SelectPick, SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
                     Unsupported
                 ) => false,

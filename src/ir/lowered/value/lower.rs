@@ -804,7 +804,7 @@ fn lower_store(
         SourceInst::StaticFieldAssign { value, .. } => valid_operand(value),
         ir_variants!(
             SourceInst;
-            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+            Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer, Let,
             Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
             SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
         ) => false,
@@ -898,7 +898,7 @@ fn lower_store(
             }
             ir_variants!(
                 SourceInst;
-                Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Defer, Let,
+                Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Defer, Let,
                 Assign, SuperInit, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                 SelectCommit, ReleaseLock, MatchTest, MatchBind, Expr
             ) => unreachable!(),
@@ -943,7 +943,7 @@ fn lower_blocks_with(
                 }
                 ir_variants!(
                     SourceInst;
-                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                    Compute, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots,
                     Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind

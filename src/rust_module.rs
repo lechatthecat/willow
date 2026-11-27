@@ -36,6 +36,7 @@ enum NativeType {
     Bytes { borrowed: bool },
     Record(String),
     Opaque(String),
+    OwnedOpaque(String),
     Array(Box<Self>),
     Option(Box<Self>),
     Result(Box<Self>, Box<Self>),
@@ -47,7 +48,7 @@ impl NativeType {
             Self::String { .. } => Scalar::String,
             Self::Bytes { .. } => Scalar::Bytes,
             Self::Record(n) => Scalar::Record(format!("{module}_{n}")),
-            Self::Opaque(n) => Scalar::Opaque(format!("{module}_{n}")),
+            Self::Opaque(n) | Self::OwnedOpaque(n) => Scalar::Opaque(format!("{module}_{n}")),
             Self::Array(t) => Scalar::Array(Box::new(t.scalar(module))),
             Self::Option(t) => Scalar::Option(Box::new(t.scalar(module))),
             Self::Result(a, b) => {
@@ -59,7 +60,7 @@ impl NativeType {
         match self {
             Self::String { .. } => Type::String,
             Self::Bytes { .. } => Type::Array(Box::new(Type::U8)),
-            Self::Record(n) | Self::Opaque(n) => Type::Named(n.clone()),
+            Self::Record(n) | Self::Opaque(n) | Self::OwnedOpaque(n) => Type::Named(n.clone()),
             Self::Array(t) => Type::Array(Box::new(t.willow())),
             Self::Option(t) => Type::Generic("Option".into(), vec![t.willow()]),
             Self::Result(a, b) => Type::Generic("Result".into(), vec![a.willow(), b.willow()]),
@@ -85,7 +86,7 @@ impl NativeType {
         CONVERSION_VISITS.set(CONVERSION_VISITS.get() + 1);
         match self {
             Self::String { borrowed } | Self::Bytes { borrowed } => input && !borrowed,
-            Self::Record(_) => true,
+            Self::Record(_) | Self::OwnedOpaque(_) => true,
             Self::Array(t) | Self::Option(t) => t.needs_conversion(input),
             Self::Result(a, b) => a.needs_conversion(input) || b.needs_conversion(input),
             _ => false,
@@ -105,6 +106,8 @@ impl NativeType {
         // Each type node appends once; nested Option/Result never recopy an
         // already-generated suffix. Identity Vec/scalar paths remain moves.
         match self {
+            Self::OwnedOpaque(_) if input => write!(out, "*({value})").unwrap(),
+            Self::OwnedOpaque(_) => write!(out, "Box::new({value})").unwrap(),
             Self::String { borrowed: false } if input => {
                 write!(out, "({value}).to_owned()").unwrap()
             }
@@ -141,6 +144,7 @@ impl NativeType {
         match self {
             Self::String { borrowed } | Self::Bytes { borrowed } => *borrowed,
             Self::Record(_) | Self::Opaque(_) => true,
+            Self::OwnedOpaque(_) => false,
             Self::Array(t) | Self::Option(t) => t.needs_owned_conversion(),
             Self::Result(a, b) => a.needs_owned_conversion() || b.needs_owned_conversion(),
             _ => false,
@@ -154,6 +158,7 @@ impl NativeType {
         CONVERSION_VISITS.set(CONVERSION_VISITS.get() + 1);
         match self {
             Self::Value(_) => write!(out, "*({value})").unwrap(),
+            Self::OwnedOpaque(_) => unreachable!("owned handles move directly"),
             Self::String { borrowed: true } => write!(out, "({value}).as_str()").unwrap(),
             Self::Bytes { borrowed: true } => write!(out, "({value}).as_slice()").unwrap(),
             Self::String { borrowed: false } | Self::Bytes { borrowed: false } => {
@@ -357,6 +362,7 @@ impl Deriver<'_> {
             "f64" => Scalar::F64,
             "bool" => Scalar::Bool,
             "String" => return Ok(NativeType::String { borrowed: false }),
+            _ if self.opaque.contains(&n) => return Ok(NativeType::OwnedOpaque(n)),
             _ if self.structs.contains_key(&n) && !self.opaque.contains(&n) => {
                 return Ok(NativeType::Record(n));
             }
@@ -462,6 +468,18 @@ impl Deriver<'_> {
             };
             self.attributes(&p.attrs)?;
             let ty = self.ty(&p.ty, true)?;
+            if !matches!(ty, NativeType::OwnedOpaque(_)) {
+                let mut pending = vec![&ty];
+                while let Some(t) = pending.pop() {
+                    match t {
+                        NativeType::OwnedOpaque(_) => return Err(self.error(p.ty.span(), "owned handles in container arguments are unsupported; pass the handle directly")),
+                        NativeType::Option(t) | NativeType::Array(t) => pending.push(t),
+                        NativeType::Result(a, b) => { pending.push(a); pending.push(b); }
+                        _ => {}
+                    }
+                }
+            }
+
             if matches!(ty, NativeType::Value(Scalar::Void)) {
                 return Err(self.error(p.ty.span(), "unit arguments are unsupported"));
             }
@@ -495,6 +513,11 @@ impl Deriver<'_> {
             symbol.no_io = no_io;
             symbol.assumption_span = Some(span);
         }
+        symbol.consume_inputs = types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, ty)| matches!(ty, NativeType::OwnedOpaque(_)).then_some(i))
+            .collect();
         symbol.is_async = f.sig.asyncness.is_some();
         if symbol.is_async {
             symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
@@ -550,15 +573,29 @@ impl Deriver<'_> {
         for arg in &mut signature.inputs {
             if let syn::FnArg::Receiver(receiver) = arg {
                 self.attributes(&receiver.attrs)?;
-                if !matches!(receiver.kind, syn::ReceiverKind::Reference(_, None, None))
-                    || receiver.mutability.is_some()
-                    || !self.opaque.contains(&owner_name)
+                if !self.opaque.contains(&owner_name)
+                    || (receiver.mutability.is_some()
+                        && !matches!(receiver.kind, syn::ReceiverKind::Value))
                 {
-                    return Err(
-                        self.error(receiver.span(), "methods require an opaque &self receiver")
-                    );
+                    return Err(self.error(
+                        receiver.span(),
+                        "&mut self is unsupported: opaque handles may alias; use an internal Mutex",
+                    ));
                 }
-                *arg = syn::parse_str(&format!("receiver: &{owner}")).unwrap();
+                *arg = match receiver.kind {
+                    syn::ReceiverKind::Reference(_, None, None) => {
+                        syn::parse_str(&format!("receiver: &{owner}")).unwrap()
+                    }
+                    syn::ReceiverKind::Value => {
+                        syn::parse_str(&format!("receiver: {owner}")).unwrap()
+                    }
+                    _ => {
+                        return Err(self.error(
+                            receiver.span(),
+                            "unsupported receiver; expected &self or self",
+                        ));
+                    }
+                };
             }
         }
         let function = syn::ItemFn {
@@ -569,6 +606,10 @@ impl Deriver<'_> {
             block: Box::new(syn::parse_str("{}").unwrap()),
         };
         let mut derived = self.function(&function, path)?;
+        let symbol = derived.rust_bridge.as_mut().unwrap();
+        symbol.native_owner = Some(owner_name.clone());
+        symbol.native_method = Some(method_name.clone());
+        symbol.native_receiver = method.sig.receiver().is_some();
         let native = derived
             .rust_bridge
             .as_mut()
@@ -590,6 +631,8 @@ impl Deriver<'_> {
         types: &[NativeType],
         output: &NativeType,
     ) -> (String, String) {
+        let consumed: std::collections::HashSet<_> =
+            symbol.consume_inputs.iter().copied().collect();
         let target = format!("{}_{name}", self.module);
         let mut adapter = format!(
             "pub {}fn {target}(",
@@ -601,7 +644,9 @@ impl Deriver<'_> {
             .collect();
         for (i, ty) in symbol.input_types.iter().enumerate() {
             let mutable = if owned_conversions[i] { "mut " } else { "" };
-            let rust_type = if symbol.is_async {
+            let rust_type = if consumed.contains(&i) {
+                ty.rust_type(false)
+            } else if symbol.is_async {
                 ty.owned_rust_type()
             } else {
                 ty.rust_type(true)
@@ -618,6 +663,8 @@ impl Deriver<'_> {
         for (i, ty) in types.iter().enumerate() {
             if owned_conversions[i] {
                 ty.append_owned_conversion(&mut adapter, &format!("&mut a{i}"), &self.module);
+            } else if consumed.contains(&i) {
+                write!(adapter, "*a{i}").unwrap();
             } else if symbol.is_async {
                 write!(adapter, "a{i}").unwrap();
             } else {
@@ -838,6 +885,9 @@ impl<'ast> Visit<'ast> for HandleUses<'_> {
         syn::visit::visit_type_reference(self, r);
     }
     fn visit_type_path(&mut self, p: &'ast syn::TypePath) {
+        if p.path.is_ident("Self") {
+            self.0.insert("Self".into());
+        }
         if (p
             .path
             .segments
@@ -910,7 +960,9 @@ pub(crate) fn parse(path: &Path, source: &str, file: FileId) -> (Program, Vec<Di
                 if let syn::ImplItem::Fn(m) = item
                     && matches!(m.vis, syn::Visibility::Public(_))
                 {
-                    if m.sig.receiver().is_some() {
+                    if m.sig.receiver().is_some()
+                        || matches!(&m.sig.output, syn::ReturnType::Type(_, t) if matches!(&**t, syn::Type::Path(p) if p.path.is_ident("Self")))
+                    {
                         d.opaque.insert(ident(owner));
                     }
                     HandleUses(&mut d.opaque).visit_signature(&m.sig);
@@ -969,6 +1021,7 @@ fn derive_items(
             }
         }
     }
+    resolve_native_closers(program);
     let mut names = HashSet::new();
     for item in &program.items {
         if let Item::Function(f) = item
@@ -981,6 +1034,91 @@ fn derive_items(
         }
     }
     records.finish(d, program)
+}
+
+/// A consuming, argument-free synchronous `close(self)` returning unit is
+/// also the resource cleanup operation. Other Rust close signatures keep a
+/// distinct internal target, preserving the generated explicit Drop function.
+fn resolve_native_closers(program: &mut Program) {
+    let mut closers = HashMap::new();
+    let mut disposal_names = HashSet::new();
+    for item in &mut program.items {
+        let Item::Function(function) = item else {
+            continue;
+        };
+        let Some(bridge) = function.rust_bridge.as_mut() else {
+            continue;
+        };
+        let method = bridge.native_method.as_deref();
+        if bridge.native_receiver
+            && method.is_some_and(|m| m == "dispose" || m.starts_with("dispose_"))
+        {
+            disposal_names.insert(function.name.clone());
+        }
+        if bridge.close_handle || method != Some("close") {
+            continue;
+        }
+        let scope_cleanup = bridge.native_receiver
+            && !bridge.is_async
+            && function.params.len() == 1
+            && function.return_type == Type::Void
+            && bridge.consume_inputs == [0];
+        if scope_cleanup {
+            closers.insert(function.name.clone(), Some(function.clone()));
+        } else {
+            if bridge.native_receiver {
+                closers.insert(function.name.clone(), None);
+            }
+            // Native member lookup uses metadata, so this unspellable suffix
+            // needs no reserved user-visible name and cannot collide with one.
+            function.name.push_str("$method");
+            bridge.willow_function = function.name.clone();
+            bridge.abi_symbol = function.name.clone();
+        }
+    }
+    program.items.retain_mut(|item| {
+        let Item::Function(function) = item else {
+            return true;
+        };
+        let Some(bridge) = function.rust_bridge.as_mut().filter(|b| b.close_handle) else {
+            return true;
+        };
+        let Some(owner) = bridge.native_owner.as_ref() else {
+            return true;
+        };
+        let Some(closer) = closers.get(&format!("{owner}_close")) else {
+            return true;
+        };
+        let Some(closer) = closer else {
+            if !bridge.auto_close {
+                // A native instance close owns that spelling. Give its Drop
+                // operation a free instance name without adding an ABI wrapper.
+                let mut alias = String::from("dispose");
+                let mut suffix = 2;
+                while disposal_names.contains(&format!("{owner}_{alias}")) {
+                    alias = format!("dispose_{suffix}");
+                    suffix += 1;
+                }
+                bridge.native_method = Some(alias);
+            }
+            return true;
+        };
+        if !bridge.auto_close {
+            return false;
+        }
+        let name = function.name.clone();
+        *function = closer.clone();
+        function.name = name;
+        function.body.id = BodyId::fresh();
+        let bridge = function.rust_bridge.as_mut().unwrap();
+        bridge.willow_function = function.name.clone();
+        bridge.abi_symbol = function.name.clone();
+        bridge.auto_close = true;
+        bridge.native_method = Some("$use_close".into());
+        // Both wrappers call the one adapter emitted by the public method.
+        bridge.native.as_mut().unwrap().adapter.clear();
+        true
+    });
 }
 
 #[derive(Default)]
@@ -1071,6 +1209,9 @@ impl RecordInterfaces {
             Scalar::Void,
         );
         symbol.close_handle = true;
+        symbol.native_owner = Some(name.clone());
+        symbol.native_method = Some("close".into());
+        symbol.native_receiver = true;
         if let Some((no_block, no_io, span)) = assumed {
             if no_block {
                 symbol.declare_nonblocking(String::new());
@@ -1112,6 +1253,17 @@ impl RecordInterfaces {
             constant: None,
             rust_bridge: Some(Box::new(symbol)),
         }));
+        let Item::Function(mut cleanup) = program.items.last().unwrap().clone() else {
+            unreachable!()
+        };
+        cleanup.name.push_str("$scope");
+        cleanup.body.id = BodyId::fresh();
+        let bridge = cleanup.rust_bridge.as_mut().unwrap();
+        bridge.willow_function = cleanup.name.clone();
+        bridge.abi_symbol = cleanup.name.clone();
+        bridge.auto_close = true;
+        bridge.native_method = Some("$use_close".into());
+        program.items.push(Item::Function(cleanup));
     }
 
     fn add_record(

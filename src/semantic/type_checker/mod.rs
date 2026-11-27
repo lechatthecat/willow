@@ -267,7 +267,7 @@ pub struct TypeChecker {
     unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     static_sync: HashMap<(TypeId, Span), bool>,
     static_markers: send_sync::MarkerCache,
-    analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    pub(crate) analysis_calls: HashMap<ExprId, Option<FunctionId>>,
     /// Constructor bodies whose call-agnostic flow reported a missing field;
     /// `finish_effect_analysis` decides their E0842 with panic facts.
     pending_constructor_flow: Vec<crate::parser::ast::BodyId>,
@@ -2958,3 +2958,5 @@ pub(super) fn bundled_storage_spelling(
         }
     })
 }
+
+mod native_handles;

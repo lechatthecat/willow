@@ -736,3 +736,235 @@ fn scaling_26_cancellation_inside_defer_shares_only_unconsumed_actions() {
         }
     }
 }
+
+/// Count actual machine call sites, including cancellation and panic cleanup.
+/// Interleaved exits exercise every registered prefix, not just a final set.
+#[test]
+fn native_cleanup_machine_calls_share_registered_prefixes() {
+    for asynchronous in [false, true] {
+        for shape in ["flat", "interleaved", "nested"] {
+            let mut baseline = 0;
+            for (bindings, exits) in [(4, 4), (4, 32), (16, 32), (64, 64)] {
+                let prefix = if asynchronous { "async " } else { "" };
+                let mut source =
+                    format!("fn finish_handle(n:i64) {{ println(n); }} {prefix}fn work(n:i64) {{");
+                for i in 0..bindings {
+                    if shape == "nested" {
+                        source.push_str("if n >= 0 {");
+                    }
+                    source.push_str(&format!("defer finish_handle({i});"));
+                    if shape != "flat" {
+                        source.push_str(&format!("if n == {i} {{ return; }}"));
+                    }
+                }
+                if shape == "flat" {
+                    for i in 0..exits {
+                        source.push_str(&format!("if n == {i} {{ return; }}"));
+                    }
+                }
+                if shape == "nested" {
+                    source.push_str(&"}".repeat(bindings));
+                }
+                source.push_str(if asynchronous {
+                    "} async fn main() { await work(0); }"
+                } else {
+                    "} fn main() { work(0); }"
+                });
+                let names = compile_and_collect_relocation_targets_all(&source, &PLAIN);
+                let calls = count_of(&names, |name| name.ends_with("finish_handle"));
+                assert!(calls >= bindings, "missing cleanup calls: {names:?}");
+                if bindings == 4 && exits == 4 {
+                    baseline = calls;
+                }
+                assert_eq!(
+                    calls * 4,
+                    baseline * bindings,
+                    "async={asynchronous} shape={shape} bindings={bindings} exits={exits}"
+                );
+                println!(
+                    "cleanup async={asynchronous} shape={shape} bindings={bindings} exits={exits} calls={calls}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_cleanup_nested_dispatch_preserves_exit_depth_after_suspension() {
+    for asynchronous in [false, true] {
+        let prefix = if asynchronous { "async " } else { "" };
+        let mut source =
+            format!("fn finish_handle(n:i64) {{ println(n); }} {prefix}fn work(n:i64) {{");
+        for i in 0..8 {
+            source.push_str(&format!(
+                "if n >= 0 {{ defer finish_handle({i}); if n == {i} {{ return; }}"
+            ));
+            if asynchronous {
+                source.push_str("await sleep(1);");
+            }
+        }
+        source.push_str(&"}".repeat(8));
+        source.push_str(&format!("}} {prefix}fn main() {{"));
+        for n in [-1, 0, 3, 7, 99] {
+            let call = if asynchronous { "await " } else { "" };
+            source.push_str(&format!("{call}work({n}); println(-9);"));
+        }
+        source.push('}');
+        let (out, ok) = compile_and_run(&source);
+        assert!(ok, "{out}");
+        assert_eq!(
+            out,
+            "-9\n0\n-9\n3\n2\n1\n0\n-9\n7\n6\n5\n4\n3\n2\n1\n0\n-9\n7\n6\n5\n4\n3\n2\n1\n0\n-9\n"
+        );
+    }
+}
+
+#[test]
+fn native_cleanup_prepared_reference_try_exits_share_actions() {
+    for (bindings, exits) in [(2, 1), (2, 4), (4, 1), (4, 4), (16, 16)] {
+        let mut source = String::from(
+            "fn finish_handle(n:i64) { println(n); } fn maybe(n:i64)->Result<i64,String> { if n==0 { return Err(\"bad\"); } return Ok(n); } fn consume(total:&mut i64,n:i64) { total=total+n; } fn work(n:i64)->Result<i64,String> { let mut total=0;",
+        );
+        for i in 0..bindings {
+            source.push_str(&format!("defer finish_handle({i});"));
+        }
+        source.push_str(&"consume(&total, maybe(n)?);".repeat(exits));
+        source.push_str("return Ok(total); } fn main() { match work(0) { Ok(v)=>println(v), Err(e)=>println(e) } }");
+        let names = compile_and_collect_relocation_targets_all(&source, &PLAIN);
+        let calls = count_of(&names, |name| name.ends_with("finish_handle"));
+        assert_eq!(calls, 5 * bindings, "bindings={bindings} exits={exits}");
+        println!("prepared_try bindings={bindings} exits={exits} cleanup_calls={calls}");
+        let (output, ok) = compile_and_run(&source);
+        assert!(ok, "{output}");
+        let expected = (0..bindings)
+            .rev()
+            .map(|i| format!("{i}\n"))
+            .collect::<String>()
+            + "bad\n";
+        assert_eq!(output, expected);
+    }
+}
+
+#[test]
+fn native_cleanup_retained_reference_break_and_continue_share_actions() {
+    for jump in ["break", "continue"] {
+        let mut baseline = 0;
+        for (bindings, exits) in [(2, 1), (2, 4), (4, 1), (4, 4), (16, 16)] {
+            let mut source = String::from(
+                "fn finish_handle(n:i64) { println(n); } fn consume(total:&mut i64,n:void) { total=total+1; } fn work(n:i64)->i64 { let mut total=0; consume(&total, match n { _ => { let mut i=0; while i<2 {",
+            );
+            for i in 0..bindings {
+                source.push_str(&format!("defer finish_handle({i});"));
+            }
+            source.push_str("i=i+1;");
+            for i in 0..exits {
+                source.push_str(&format!("if n=={i} {{ {jump}; }}"));
+            }
+            source.push_str("} println(9); } }); return total; } fn main() { println(work(0)); }");
+            let names = compile_and_collect_relocation_targets_all(&source, &PLAIN);
+            let calls = count_of(&names, |name| name.ends_with("finish_handle"));
+            if bindings == 2 && exits == 1 {
+                baseline = calls;
+            }
+            assert_eq!(
+                2 * calls,
+                baseline * bindings,
+                "jump={jump} bindings={bindings} exits={exits}"
+            );
+            assert!(calls >= bindings);
+            println!(
+                "retained_reference jump={jump} bindings={bindings} exits={exits} cleanup_calls={calls}"
+            );
+            let (output, ok) = compile_and_run(&source);
+            assert!(ok, "{output}");
+            let cycle = (0..bindings)
+                .rev()
+                .map(|i| format!("{i}\n"))
+                .collect::<String>();
+            let expected = cycle.repeat(if jump == "break" { 1 } else { 2 }) + "9\n1\n";
+            assert_eq!(output, expected);
+        }
+    }
+}
+
+#[test]
+fn native_cleanup_abandoned_preparations_preserve_outer_calls() {
+    for jump in ["break", "continue"] {
+        for method in [false, true] {
+            let mut baseline = 0;
+            for (bindings, exits) in [(2, 1), (2, 4), (4, 1), (4, 4), (16, 16)] {
+                let call = if method { "c.consume" } else { "consume" };
+                let mut source = format!(
+                    "fn finish_handle(n:i64) {{ println(n); }} fn consume(total:&mut i64,n:void) {{ total=total+1; }} class C {{ pub fn consume(self,total:&mut i64,n:void) {{ total=total+1; }} }} fn work(n:i64)->i64 {{ let c=new C(); let mut first=0; while first<2 {{ first=first+1; if first==1 {{ continue; }} break; }} let mut total=0; {call}(&total, match n {{ _ => {{ let mut i=0; while i<2 {{"
+                );
+                for i in 0..bindings {
+                    source.push_str(&format!("defer finish_handle({i});"));
+                }
+                source.push_str("i=i+1;");
+                for i in 0..exits {
+                    source.push_str(&format!(
+                        "{call}(&total, match n {{ {i} => {{ {jump}; }}, _ => {{}} }});"
+                    ));
+                }
+                source.push_str(
+                    "} println(9); } }); return total; } fn main() { println(work(0)); }",
+                );
+                let names = compile_and_collect_relocation_targets_all(&source, &PLAIN);
+                let calls = count_of(&names, |name| name.ends_with("finish_handle"));
+                if bindings == 2 && exits == 1 {
+                    baseline = calls;
+                }
+                assert_eq!(
+                    2 * calls,
+                    baseline * bindings,
+                    "jump={jump} method={method} bindings={bindings} exits={exits}"
+                );
+                println!(
+                    "abandoned jump={jump} method={method} bindings={bindings} exits={exits} cleanup_calls={calls}"
+                );
+                let (output, ok) = compile_and_run(&source);
+                assert!(ok, "{output}");
+                let cycle = (0..bindings)
+                    .rev()
+                    .map(|i| format!("{i}\n"))
+                    .collect::<String>();
+                let expected = cycle.repeat(if jump == "break" { 1 } else { 2 }) + "9\n1\n";
+                assert_eq!(output, expected);
+                if bindings == 2 && exits == 1 {
+                    let (output, ok) = super::support::compile_and_run_release(&source);
+                    assert!(ok, "{output}");
+                    assert_eq!(output, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn native_cleanup_async_abandoned_method_preserves_outer_preparation() {
+    for jump in ["break", "continue"] {
+        for loop_head in ["while i<2", "for round in 0..2"] {
+            let source = format!(
+                r#"
+            class C {{ pub fn consume(self, total:&mut i64, n:void) {{ total=total+1; }} }}
+            async fn main() {{ let c=new C(); let mut total=0;
+                c.consume(&total, match 0 {{ _ => {{ let mut i=0; {loop_head} {{
+                    defer println(7); i=i+1; await sleep(1);
+                    c.consume(&total, match i {{ 1 => {{ {jump}; }}, _ => {{}} }});
+                }} }} }}); println(total);
+            }}
+        "#
+            );
+            let (output, ok) = compile_and_run(&source);
+            assert!(ok, "{output}");
+            assert_eq!(
+                output,
+                if jump == "break" {
+                    "7\n1\n"
+                } else {
+                    "7\n7\n2\n"
+                }
+            );
+        }
+    }
+}

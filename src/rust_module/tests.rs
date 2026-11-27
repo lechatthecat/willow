@@ -344,14 +344,73 @@ fn nested_conversion_output_scales_linearly_and_scalar_arrays_are_moves() {
 }
 
 #[test]
+fn disposal_aliases_preserve_bridge_count() {
+    for owners in [1, 16] {
+        for occupied in [0, 1, 8, 64] {
+            let mut source = String::new();
+            for owner in 0..owners {
+                write!(
+                    source,
+                    "pub struct H{owner}(i64); impl H{owner} {{ pub fn close(&self) {{}}"
+                )
+                .unwrap();
+                if owner == 0 && occupied > 0 {
+                    source.push_str("pub fn dispose(&self) {}");
+                    for suffix in 2..=occupied {
+                        write!(source, "pub fn dispose_{suffix}(&self) {{}}").unwrap();
+                    }
+                }
+                source.push('}');
+            }
+            let program = interface(&source);
+            let bridges = program
+                .items
+                .iter()
+                .filter(|item| matches!(item, Item::Function(_)))
+                .count();
+            assert_eq!(bridges, 3 * owners + occupied);
+            let alias = if occupied > 0 {
+                format!("dispose_{}", occupied + 1)
+            } else {
+                "dispose".to_owned()
+            };
+            assert_eq!(
+                function(&program, "H0_close").native_method.as_deref(),
+                Some(alias.as_str())
+            );
+            if owners > 1 {
+                assert_eq!(
+                    function(&program, "H1_close").native_method.as_deref(),
+                    Some("dispose")
+                );
+            }
+            println!("owners={owners} occupied={occupied} bridges={bridges}");
+        }
+    }
+}
+
+#[test]
 fn assume_no_block_attribute_validation_perspectives() {
     // 1-9: valid free function, method, opaque close, independent claims,
     // retained allocation/panic/foreign effects, async rejection, no pure claim.
     let program = interface("#[willow::assume(no_block)] pub fn f() {} pub fn g() {}");
     assert!(function(&program, "f").nonblocking.is_some());
     assert!(function(&program, "g").nonblocking.is_none());
-    // 10-22: malformed effect/path/list, duplicates, unsupported placements,
-    // async assertions, mutable/by-value/typed receivers and name collisions.
+    let consuming = interface("pub struct Handle(i64); impl Handle { pub fn f(self) {} }");
+    assert_eq!(function(&consuming, "Handle_f").consume_inputs, vec![0]);
+    let mutable = interface(
+        "pub struct Handle(i64); impl Handle { pub fn finish(mut self) -> i64 { self.0 += 1; self.0 } }",
+    );
+    assert_eq!(function(&mutable, "Handle_finish").consume_inputs, vec![0]);
+    let close = interface("pub struct Handle(i64); impl Handle { pub fn close(&self) {} }");
+    assert!(function(&close, "Handle_close").close_handle);
+    assert!(function(&close, "Handle_close$scope").auto_close);
+    let method = function(&close, "Handle_close$method");
+    assert!(!method.close_handle);
+    assert!(method.consume_inputs.is_empty());
+    assert!(method.native_receiver);
+    // Malformed effect/path/list, duplicates, unsupported placements,
+    // async assertions, mutable/typed receivers and name collisions.
     for source in [
         "#[willow::assume] pub fn f() {}",
         "#[willow::assume()] pub fn f() {}",
@@ -363,9 +422,8 @@ fn assume_no_block_attribute_validation_perspectives() {
         "pub fn f(#[willow::assume(no_block)] x: i64) {}",
         "#[willow::assume(no_block)] pub async fn f() {}",
         "pub struct Handle(i64); impl Handle { pub fn f(&mut self) {} }",
-        "pub struct Handle(i64); impl Handle { pub fn f(self) {} }",
         "pub struct Handle(i64); impl Handle { pub fn f(self: &Self) {} }",
-        "pub struct Handle(i64); impl Handle { pub fn close(&self) {} }",
+        "pub struct Handle(i64); pub fn Handle_close(h: &Handle) {}",
     ] {
         let (_, errors) = parse(Path::new("src/native.rs"), source, FileId(7));
         assert!(!errors.is_empty(), "{source}");

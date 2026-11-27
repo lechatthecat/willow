@@ -20,6 +20,7 @@ pub(super) type DeclaredTypeParams = indexmap::IndexSet<String, crate::counted_h
 /// keeps this same lexical/inference state until independent lambda inputs exist.
 /// Immutable declarations and unit orchestration are deliberately absent.
 pub(super) struct BodyState {
+    pub(super) native_captures: HashMap<ExprId, Vec<String>>,
     /// One causal witness per expression/binding, shared across alias chains.
     /// Diagnostic-only: callable kinds remain the authority for sharing.
     pub(super) callable_causes: HashMap<Span, std::rc::Rc<Label>>,
@@ -126,6 +127,7 @@ impl Default for BodyState {
             lexical_block_depth: 0,
             async_local_types: Vec::new(),
             task_loan_args: HashSet::new(),
+            native_captures: HashMap::new(),
             sending_results: HashSet::new(),
             sending_args: HashSet::new(),
             sending_body: None,
@@ -317,6 +319,7 @@ impl TypedBody {
         unit.enum_variant_resolutions
             .extend(self.enum_variant_resolutions);
         unit.pattern_resolutions.extend(self.pattern_resolutions);
+        unit.analysis_calls.extend(self.analysis_calls);
         unit.arm_leaves.extend(self.arm_leaves);
         unit.static_call_classes.extend(self.static_call_classes);
         unit.builtin_calls.extend(self.builtin_calls);

@@ -1906,6 +1906,7 @@ impl TypeChecker {
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {
+                        native: None,
                         foreign: false,
                         sending: false,
                         params,

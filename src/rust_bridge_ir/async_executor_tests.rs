@@ -16,6 +16,10 @@ unsafe fn willow_rust_bridge_panic() -> ! {
 
 mod runtime_stubs {
     use super::*;
+    #[unsafe(no_mangle)]
+    extern "C" fn willow_rust_bridge_register_reporter(_: extern "C" fn()) {}
+    #[unsafe(no_mangle)]
+    extern "C" fn willow_debug_report_handle_site(_: u64, _: *const u8, _: usize) {}
     pub static WAKES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     #[unsafe(no_mangle)]
     extern "C" fn willow_sched_wake(_: u64) {

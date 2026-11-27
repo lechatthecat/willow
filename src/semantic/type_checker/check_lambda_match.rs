@@ -673,6 +673,13 @@ impl TypeChecker {
             Type::Closure(param_types, Box::new(ret_ty))
         };
         let captured = task_local;
+        self.local.native_captures.insert(
+            l.id,
+            captures
+                .iter()
+                .map(|capture| capture.name.clone())
+                .collect(),
+        );
         self.lambda_captures.insert(l.id, captures);
         // Record the lambda's type here rather than leaving it to `check_expr`:
         // a lambda passed as a call argument is checked through

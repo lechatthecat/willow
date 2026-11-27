@@ -11,7 +11,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.emit_debug_reference_call_clear();
         self.diagnostics
             .lir_reference_scopes
-            .pop()
+            .pop_back()
             .expect("prepared reference scope");
     }
 

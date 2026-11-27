@@ -943,6 +943,16 @@ fn lower_method_call_expr(
     checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
+    if let Some(target) = ctx.tables.native_target(m.id) {
+        let mut args = vec![lower_expr(&m.object, ctx)?];
+        args.extend(lower_value_args(&m.args, ctx)?);
+        return Ok(HirExpr {
+            kind: native_call_kind(target, args),
+            ty: checked_type.clone().unwrap().into(),
+            span: m.span,
+        });
+    }
+
     // `super.method(args)`: the receiver is `self`, and the checker typed the
     // `super` receiver as the base class whose implementation is called.
     if let Expr::Var(name, span, id) = &m.object
@@ -1164,6 +1174,15 @@ fn lower_static_call_expr(
     checked_type: Option<Type>,
     ctx: &mut LowerCtx,
 ) -> Result<HirExpr, Diagnostic> {
+    if let Some(target) = ctx.tables.native_target(s.id) {
+        let args = lower_value_args(&s.args, ctx)?;
+        return Ok(HirExpr {
+            kind: native_call_kind(target, args),
+            ty: checked_type.clone().unwrap().into(),
+            span: s.span,
+        });
+    }
+
     // `config::LIMIT`: an uppercase bare member parses like a fieldless
     // variant; a module's `const` takes precedence, as in the checker.
     //
@@ -2120,4 +2139,19 @@ fn bind_variant_tuple<'p>(
         variant: variant.to_string(),
         bindings,
     })
+}
+
+fn native_call_kind(target: String, args: Vec<HirExpr>) -> HirExprKind {
+    match target.rsplit_once("::") {
+        Some((module, function)) => HirExprKind::StaticCall {
+            class: module.into(),
+            method: function.into(),
+            args,
+        },
+        None => HirExprKind::Call {
+            binding: HirCallBinding::Function,
+            callee: target.into(),
+            args,
+        },
+    }
 }

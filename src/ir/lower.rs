@@ -63,6 +63,7 @@ use crate::semantic::intrinsics::{BuiltinMethod, Intrinsic};
 /// optional per-node facts, never an optional checking phase. The references
 /// borrow one checked unit; no fact maps are cloned at this boundary.
 pub struct SemanticFacts<'a> {
+    pub analysis_calls: &'a HashMap<ExprId, Option<crate::semantic::ids::FunctionId>>,
     pub symbols: &'a symbols::SymbolTable,
     pub expr_types: &'a HashMap<ExprId, Type>,
     pub enum_variant_resolutions: &'a HashMap<ExprId, String>,
@@ -77,6 +78,7 @@ pub struct SemanticFacts<'a> {
 impl<'a> SemanticFacts<'a> {
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
+            analysis_calls: &checker.analysis_calls,
             symbols: &checker.symbols,
             expr_types: &checker.expr_types,
             enum_variant_resolutions: &checker.enum_variant_resolutions,
@@ -91,6 +93,7 @@ impl<'a> SemanticFacts<'a> {
 
     fn lowering(&self) -> PartialCheckerTables<'a> {
         PartialCheckerTables {
+            analysis_calls: Some(self.analysis_calls),
             checked: true,
             mutable_capture_declarations: Default::default(),
             symbols: Some(self.symbols),
@@ -160,6 +163,7 @@ pub(crate) fn lower_resolution(
 /// per-node facts diagnosed instead of using standalone inference.
 #[derive(Default)]
 pub struct PartialCheckerTables<'a> {
+    pub analysis_calls: Option<&'a HashMap<ExprId, Option<crate::semantic::ids::FunctionId>>>,
     pub(crate) checked: bool,
     /// One unit-wide index, shared by all lowered functions and nested lambdas.
     pub mutable_capture_declarations: std::sync::OnceLock<std::collections::HashSet<Span>>,
@@ -1932,4 +1936,12 @@ fn contract_expression(mut expression: HirExpr) -> HirExpr {
         true
     });
     expression
+}
+
+impl PartialCheckerTables<'_> {
+    fn native_target(&self, id: ExprId) -> Option<String> {
+        let target = self.analysis_calls?.get(&id)?.as_ref()?.to_string();
+        self.symbols?.native_function(&target)?.native.as_ref()?;
+        Some(target)
+    }
 }

@@ -199,6 +199,10 @@ impl TypeChecker {
             f.return_type_span.as_deref().copied().unwrap_or(f.span),
         );
         let info = FuncInfo {
+            native: f
+                .rust_bridge
+                .as_deref()
+                .and_then(crate::semantic::symbols::NativeFunction::from_bridge),
             foreign: f
                 .rust_bridge
                 .as_ref()

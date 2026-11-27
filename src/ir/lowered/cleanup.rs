@@ -159,6 +159,8 @@ pub struct CleanupGraph {
     pub transitions: HashMap<(usize, usize), CleanupTransition>,
     /// Number of CFG edges checked; each check compares one identity.
     pub edge_checks: usize,
+    /// Indexed ancestor queries, independent of the number of scopes exited.
+    pub ancestor_queries: usize,
     pub scopes: Vec<Scope>,
     pub entries: Vec<Option<RootScopeId>>,
     pub enters: HashMap<(usize, usize), RootScopeId>,
@@ -228,6 +230,10 @@ impl CleanupGraph {
         let mut pending = vec![0];
         visited[0] = true;
         let mut regions = HashMap::new();
+        // Persistent indexed paths avoid walking depth ancestors for every
+        // exit. Clones share storage; updates/lookups copy/traverse only a
+        // logarithmic vector path rather than an entire lexical stack.
+        let mut paths: Vec<im::Vector<CleanupStateId>> = Vec::new();
         while let Some(index) = pending.pop() {
             graph.order.push(index);
             let mut state = graph.incoming_states[index];
@@ -246,6 +252,7 @@ impl CleanupGraph {
                     graph.before.insert(location, state);
                 }
                 match instruction {
+                    LirInst::RestoreCallPreparation { .. } => {}
                     LirInst::EnterDeferScope { resume, lock, .. } => {
                         let id = graph.enters[&(index, position)];
                         graph.scopes[id.0].parent_state = state;
@@ -275,6 +282,9 @@ impl CleanupGraph {
                             parent: state,
                             registrations: None,
                         });
+                        let mut path = state.map_or_else(im::Vector::new, |id| paths[id.0].clone());
+                        path.push_back(next);
+                        paths.push(path);
                         state = Some(next);
                         graph.scopes[id.0].entry_state = state;
                         scope = Some(id);
@@ -305,22 +315,16 @@ impl CleanupGraph {
                             },
                         );
                     }
-                    LirInst::FlushDefers { sites, scopes } => {
-                        let requested: HashSet<_> = sites.iter().copied().collect();
-                        let mut covered = HashSet::new();
+                    LirInst::FlushDefers { scopes } => {
                         let from = scope;
                         let from_state = state;
-                        for _ in 0..*scopes {
-                            let id = scope.ok_or("cleanup scope underflow")?;
-                            covered.extend(graph.scopes[id.0].site_set.iter().copied());
-                            state = graph.states[state.expect("active scope has state").0].parent;
-                            scope = state.map(|id| graph.states[id.0].scope);
-                        }
-                        if requested != covered {
-                            return Err(
-                                "cleanup flush sites are not a complete active scope suffix",
-                            );
-                        }
+                        let path = state.map(|id| &paths[id.0]);
+                        let len = path.map_or(0, im::Vector::len);
+                        let remaining =
+                            len.checked_sub(*scopes).ok_or("cleanup scope underflow")?;
+                        graph.ancestor_queries += 1;
+                        state = remaining.checked_sub(1).map(|index| path.unwrap()[index]);
+                        scope = state.map(|id| graph.states[id.0].scope);
                         let next = regions.len();
                         let region = *regions
                             .entry((from_state, state))
@@ -352,6 +356,10 @@ impl CleanupGraph {
                             parent: previous.parent,
                             registrations: Some(registration),
                         });
+                        let mut path = paths[state.unwrap().0].clone();
+                        let last = path.len() - 1;
+                        path.set(last, next);
+                        paths.push(path);
                         state = Some(next);
                         graph
                             .transitions

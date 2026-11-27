@@ -123,7 +123,7 @@ pub(crate) fn analyze_with(
                 SourceInst::Defer { body, .. } => pinned.extend(body.captures.iter().copied()),
                 ir_variants!(
                     SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots, Let, Assign,
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots, Let, Assign,
                     FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, ReleaseLock,
                     MatchTest, MatchBind, Expr
                 ) => {}
@@ -253,7 +253,7 @@ pub(crate) fn stable_borrow_rejection(function: &super::LirFunction) -> Option<S
                 }
                 ir_variants!(
                     LirInst;
-                    Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, ClearScopeRoots,
+                    Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, ClearScopeRoots,
                     SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
                     ReleaseLock, MatchTest, MatchBind, Unsupported
                 ) => {}
@@ -476,6 +476,7 @@ pub(super) fn visit_instruction_locals(
         // and nothing it names is redefined either.
         SourceInst::EnterDeferScope { .. }
         | SourceInst::LeaveDeferScope { .. }
+        | SourceInst::RestoreCallPreparation { .. }
         | SourceInst::FlushDefers { .. }
         | SourceInst::ClearScopeRoots { .. } => {}
     }

@@ -865,3 +865,20 @@ fn math_helpers_abi_and_effects() {
         willow_abi::RuntimeEffects::NONE
     );
 }
+
+#[test]
+fn debug_handle_output_abi_matches_schema() {
+    let _: unsafe extern "C" fn(u64, *const u64, *const u8, usize, u32) =
+        crate::rust_bridge_abi::handle_sites::willow_debug_record_handle_output;
+    assert_schema(
+        "willow_debug_record_handle_output",
+        &[I64, Ptr, Ptr, I64, I32],
+        None,
+    );
+    assert!(
+        runtime_symbol("willow_debug_record_handle_output")
+            .unwrap()
+            .effects()
+            .is_empty()
+    );
+}

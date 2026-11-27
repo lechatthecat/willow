@@ -87,7 +87,7 @@ pub(super) fn groups(f: &LirFunction, widths: &[Option<u32>]) -> Vec<Vec<LirLoca
                 }
                 ir_variants!(
                     LirInst;
-                    Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, SelectInit,
+                    Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation, Defer, SelectInit,
                     SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind, Unsupported
                 ) => {

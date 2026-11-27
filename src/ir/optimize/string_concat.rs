@@ -97,7 +97,7 @@ fn visit_fusion_bodies(
             for instruction in &mut block.instrs {
                 match instruction {
                     SourceInst::Defer { body, .. } => functions.push(body.function.as_mut()),
-                    ir_variants!(SourceInst; Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ir_variants!(SourceInst; Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
                         SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
                         ReleaseLock, MatchTest, MatchBind, Expr) => {}
@@ -460,7 +460,7 @@ fn crossing_writes(
 fn computation(inst: &SourceInst) -> Option<(LirLocalId, &LirRvalue)> {
     match inst {
         SourceInst::Compute { local, value, .. } => Some((*local, value)),
-        ir_variants!(SourceInst; Defer, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+        ir_variants!(SourceInst; Defer, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
             ClearScopeRoots, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
             SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit,
             ReleaseLock, MatchTest, MatchBind, Expr) => None,
@@ -1455,7 +1455,7 @@ fn scan_origins<C>(
                     (Fresh, None)
                 }
                 ir_variants!(SourceInst; Expr, EnterDeferScope, LeaveDeferScope,
-                    FlushDefers, Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
+                    FlushDefers, RestoreCallPreparation, Defer, FieldAssign, IndexAssign, StaticFieldAssign, SuperInit,
                     SelectInit, SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
                     MatchTest, MatchBind) => {
                     fields.invalidate(i);

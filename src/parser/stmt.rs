@@ -84,6 +84,34 @@ impl Parser {
                 tuple_scopes.push((std::mem::take(&mut stmts), pattern, init, else_block, span));
                 continue;
             }
+            // Contextual keyword: existing `use(...)` and `let use = ...`
+            // remain valid. Resource bindings share defer registration/cleanup.
+            if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "use")
+                && matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Ident(_))
+                )
+            {
+                self.tokens[self.pos].kind = TokenKind::Let;
+                let statement = self.parse_let()?;
+                let Stmt::Let(binding) = &statement else {
+                    unreachable!()
+                };
+                let span = binding.span;
+                let object = Expr::Var(binding.name.clone(), span, ExprId::fresh());
+                stmts.push(statement);
+                stmts.push(Stmt::Defer(DeferStmt {
+                    body: DeferBody::Expr(Expr::MethodCall(Box::new(MethodCallExpr {
+                        id: ExprId::fresh(),
+                        object,
+                        method: "$use_close".into(),
+                        args: vec![],
+                        span,
+                    }))),
+                    span,
+                }));
+                continue;
+            }
             let statement_depth = self.brace_depth;
             match self.parse_stmt() {
                 Ok(stmt) => stmts.push(stmt),

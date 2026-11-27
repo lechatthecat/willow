@@ -12,6 +12,7 @@ use cranelift_object::ObjectBuilder;
 #[cfg(test)]
 use willow_abi::runtime_symbols::names as rt;
 mod cleanup_stack;
+mod handle_debug;
 mod runtime_names;
 use cleanup_stack::Chain;
 mod runtime_module;
@@ -174,6 +175,7 @@ pub struct BuildCodegenDb {
 struct EmissionState {
     runtime_names: HashMap<String, String>,
     rust_bridge_symbols: HashMap<(u32, String), String>,
+    handle_debug_outputs: HashMap<Type, Option<DataId>>,
     enum_payload_layouts: HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     module: ObjectModule,
     string_literals: HashMap<String, StringLiteralData>,
@@ -444,6 +446,7 @@ impl Codegen {
             output: EmissionState {
                 runtime_names: HashMap::new(),
                 rust_bridge_symbols: HashMap::new(),
+                handle_debug_outputs: HashMap::new(),
                 enum_payload_layouts: HashMap::new(),
                 module,
                 string_literals: HashMap::new(),
@@ -1239,7 +1242,7 @@ pub(super) struct DeferEntry {
     flag_offset: Option<i32>,
     sync_flag_slot: Option<cranelift_codegen::ir::StackSlot>,
     bindings: std::rc::Rc<Vec<(String, VarStorage)>>,
-    vars_at_registration: std::rc::Rc<HashMap<String, VarStorage>>,
+    vars_at_registration: std::rc::Rc<im::HashMap<String, VarStorage>>,
     /// The deferred body contains a direct call to the compiler-known
     /// `recover()` builtin. Calls hidden behind another function/lambda do not
     /// grant recovery capability.
@@ -1250,10 +1253,12 @@ pub(super) struct DeferEntry {
 /// ancestors, actions, or captured binding maps.
 #[derive(Clone, Default)]
 struct DeferStack {
-    // The bool marks a panic frame: its static sites need runtime flag checks.
-    // Ordinary frames contain only the graph-proven registered prefix.
+    // Guarded frames use the lexical site's registration flag, allowing one
+    // cleanup body to serve exits before and after a site's registration.
     frames: Chain<(Chain<std::rc::Rc<DeferEntry>>, bool)>,
     identity: usize,
+    unguarded: bool,
+    ancestors: Chain<(usize, bool)>,
     sequence: std::rc::Rc<std::cell::Cell<usize>>,
 }
 impl DeferStack {
@@ -1269,10 +1274,17 @@ impl DeferStack {
     fn len(&self) -> usize {
         self.frames.len()
     }
+    fn pop(&mut self) {
+        self.frames.pop().expect("cleanup frame");
+        (self.identity, self.unguarded) = self.ancestors.pop().expect("cleanup parent");
+    }
+    #[cfg(test)]
     fn push(&mut self, entries: Vec<std::rc::Rc<DeferEntry>>) {
         self.push_guarded(entries, false);
     }
     fn push_guarded(&mut self, entries: Vec<std::rc::Rc<DeferEntry>>, guarded: bool) {
+        self.ancestors.push((self.identity, self.unguarded));
+        self.unguarded |= !guarded && !entries.is_empty();
         let mut frame = Chain::default();
         for entry in entries {
             frame.push(entry);
@@ -1280,19 +1292,11 @@ impl DeferStack {
         self.identity = self.fresh_identity();
         self.frames.push((frame, guarded));
     }
-    fn register(&mut self, entry: std::rc::Rc<DeferEntry>) {
-        let (head, guarded) = self.frames.last().expect("defer scope");
-        let guarded = *guarded;
-        let mut frame = head.clone();
-        frame.push(entry);
-        self.frames.pop();
-        self.identity = self.fresh_identity();
-        self.frames.push((frame, guarded));
-    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
 struct SyncCancelCleanupKey {
+    return_target: Option<cranelift_codegen::ir::Block>,
     defers: usize,
     consumed: usize,
     panic_target: Option<cranelift_codegen::ir::Block>,
@@ -1313,13 +1317,13 @@ enum RootDepth {
 #[derive(Clone)]
 pub(super) struct PanicScope {
     /// Preparations live before this lexical scope must be replayed on recovery.
-    call_frames_at_entry: Vec<(String, crate::diagnostics::Span)>,
-    reference_scopes_at_entry: Vec<Vec<FlatReferenceDebug>>,
+    call_frames_at_entry: im::Vector<(String, crate::diagnostics::Span)>,
+    reference_scopes_at_entry: im::Vector<im::Vector<FlatReferenceDebug>>,
     cleanup: cranelift_codegen::ir::Block,
     resume: cranelift_codegen::ir::Block,
     root_depth_at_entry: RootDepth,
     defer_depth: usize,
-    vars_before: std::rc::Rc<HashMap<String, VarStorage>>,
+    vars_before: std::rc::Rc<im::HashMap<String, VarStorage>>,
     /// Native-stack root depth at cooperative scope entry. `None` for an
     /// ordinary synchronous function.
     coop_root_depth_at_entry: Option<usize>,
@@ -1427,6 +1431,7 @@ struct RootReservation {
 /// Per-function emitter with independently owned state for each responsibility.
 /// Unit metadata and shared object output remain borrowed, never copied.
 struct FuncGen<'a, 'b> {
+    handle_debug_outputs: &'a HashMap<Type, Option<DataId>>,
     enum_payload_layouts: &'a mut HashMap<Type, HashMap<String, std::sync::Arc<EnumPayloadLayout>>>,
     builder: &'a mut FunctionBuilder<'b>,
     module: &'a mut ObjectModule,
@@ -1498,13 +1503,13 @@ struct CleanupState {
     defer_counter: usize,
     /// Pre-zeroed registration flags for synchronous defer sites in the
     /// lexical block currently being emitted, keyed by source span.
-    sync_defer_flags: HashMap<crate::ir::lowered::LirDeferId, cranelift_codegen::ir::StackSlot>,
+    sync_defer_flags: im::HashMap<crate::ir::lowered::LirDeferId, cranelift_codegen::ir::StackSlot>,
     /// Synchronous lexical scopes that are valid recovery continuations.
     /// These continuations apply to synchronous panic unwinding.
     panic_scopes: Chain<PanicScope>,
     /// Defer registrations already consumed on the cleanup path currently
     /// being emitted. A nested panic must not execute them again.
-    unavailable_defer_ids: HashSet<usize>,
+    unavailable_defer_ids: im::HashSet<usize>,
     /// Identity of the consumed-registration set during normal defer replay.
     sync_cancel_defer_context: usize,
     /// Number of compiler-generated panic-defer entries surrounding the code
@@ -1529,6 +1534,15 @@ struct CleanupState {
     panic_depth_snapshot: Option<(cranelift_codegen::ir::Block, cranelift_codegen::ir::Value)>,
     emitting_sync_cancel_cleanup: bool,
     sync_cancel_cleanups: HashMap<SyncCancelCleanupKey, cranelift_codegen::ir::Block>,
+    sync_cancel_suffixes: HashMap<
+        (
+            usize,
+            usize,
+            Option<cranelift_codegen::ir::Block>,
+            cranelift_codegen::ir::Block,
+        ),
+        cranelift_codegen::ir::Block,
+    >,
     /// Invocation-constant native-stack safepoint countdown pointer (null outside
     /// task stacks) known to dominate the current LIR block.
     sync_native_active: Option<cranelift_codegen::ir::Value>,
@@ -1570,8 +1584,8 @@ struct FunctionDiagnostics<'a> {
     callstack_frame_depth: usize,
     /// Source call frames opened before their argument expressions. They can
     /// span LIR edges and must be replayed when a cooperative poll resumes.
-    lir_call_frames: Vec<(String, crate::diagnostics::Span)>,
-    lir_reference_scopes: Vec<Vec<FlatReferenceDebug>>,
+    lir_call_frames: im::Vector<(String, crate::diagnostics::Span)>,
+    lir_reference_scopes: im::Vector<im::Vector<FlatReferenceDebug>>,
     /// Source span of the statement being emitted. Debug builds publish it as
     /// the runtime fault site before every runtime call that can raise, so a
     /// fault with no location of its own (array bounds, a blocked channel op,
@@ -1617,6 +1631,7 @@ struct SuspensionState {
     /// poll emitter; source spans remain available only for diagnostics.
     lir_frame_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
     lir_confined_maps: bool,
+    cleanup_selector_offset: Option<i32>,
     lir_defer_offsets: HashMap<crate::ir::lowered::LirDeferId, i32>,
     lir_send_offsets: HashMap<crate::ir::lowered::LirLocalId, i32>,
 }
@@ -1626,7 +1641,8 @@ struct FunctionLocals<'a> {
     /// When compiling `fn main() -> Result<void, E>`: the error payload type `E`.
     /// Each return inspects the Result and exits accordingly.
     main_result_err_ty: Option<Type>,
-    vars: HashMap<String, VarStorage>,
+    // Cleanup snapshots share unchanged bindings; replay only copies HAMT paths.
+    vars: im::HashMap<String, VarStorage>,
     current_class: Option<&'a str>,
     is_async: bool,
     terminated: bool,
@@ -1682,7 +1698,7 @@ impl CoopSuspendPoints {
 struct CoopSuspendPoint {
     resume: cranelift_codegen::ir::Block,
     roots: Vec<cranelift_codegen::ir::StackSlot>,
-    call_frames: Vec<(String, crate::diagnostics::Span)>,
+    call_frames: im::Vector<(String, crate::diagnostics::Span)>,
     reference_restore: Option<cranelift_codegen::ir::Block>,
 }
 
@@ -1774,6 +1790,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     fn new(builder: &'a mut FunctionBuilder<'b>, unit: &'a mut UnitCodegenContext<'_>) -> Self {
         Self {
             builder,
+            handle_debug_outputs: &unit.output.handle_debug_outputs,
             module: &mut unit.output.module,
             gc_bitmap_descriptors: &mut unit.output.gc_bitmap_descriptors,
             gc_layout_descriptors: &mut unit.output.gc_layout_descriptors,
@@ -1804,8 +1821,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             reuse: LirReuseState::default(),
             diagnostics: FunctionDiagnostics {
                 callstack_frame_depth: 0,
-                lir_call_frames: Vec::new(),
-                lir_reference_scopes: Vec::new(),
+                lir_call_frames: im::Vector::new(),
+                lir_reference_scopes: im::Vector::new(),
                 fault_site_span: None,
                 build_mode: unit.build_mode,
                 overflow_checks: unit.overflow_checks,
@@ -2636,7 +2653,7 @@ pub(super) fn lir_address_taken_locals(
                     LirInst::Defer { body, .. } => pending.push(&body.function),
                     ir_variants!(
                         LirInst;
-                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                        Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                         ClearScopeRoots, SelectInit, SelectProbe, SelectPick, SelectUnregister,
                         SelectCommit, ReleaseLock, MatchTest, MatchBind, Unsupported
                     ) => {}

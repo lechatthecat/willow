@@ -21,7 +21,7 @@
 //! so it cannot deadlock against a thread the exit itself just terminated.
 //! Nothing in the runtime relies on the teardown being skipped: every Willow
 //! `print` flushes before it returns, and the runtime registers no `atexit`
-//! handlers and keeps no exit-time reporting.
+//! handlers. Normal-completion diagnostics run explicitly before termination.
 
 /// Exit status of a program ended by an unhandled language panic, the same on
 /// every platform. A panic is an expected program failure, so it ends like

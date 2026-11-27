@@ -1692,3 +1692,961 @@ fn unified_assumption_native_manifest_review_and_execution() {
     f.approve_native();
     f.success(&["check", ".", "--offline"]);
 }
+
+// Explicit native ownership perspectives:
+// 1 Self constructor, 2 Box<Self>, 3 Result<Self>, 4 borrowed receiver reuse,
+// 5 value receiver, 6 straight-line use error, 7 alias runtime error,
+// 8 branch runtime error, 9 ordinary cleanup, 10 return, 11 failing ?, 12 Ok ?,
+// 13 break, 14 continue, 15 await, 16 inner scope, 17 LIFO with defer,
+// 18 explicit close + use, 19 consumed use, 20 unclosed warning,
+// 21 argument escape, 22 returned handle, 23 stored handle, 24 capture,
+// 25 scalar-result nonescape, 26 &mut rejection, 27 typed receiver rejection,
+// 28 task close effects, 29 no_wait effects, 30 lock effects,
+// 31 contextual use identifier, 32 independent alternatives, 33 rebind,
+// 34 repeated cached build, 35 cleanup scaling, 36 nested owned-input rejection,
+// 37 short-circuit RHS, 38 payload pattern consumption, 39 import aliases,
+// 40 scalar match results versus escaping aliases, 41 custom consuming close,
+// 42 native close name collisions retain explicit disposal, 43 debug reports,
+// 44 release silence, 45 panic silence, 46 signal silence,
+// 47 mutable value receiver, 48 abandoned call preparation, 49 creation sites,
+// 50 Result/Option and record output sites, 51 blocking-pool locations,
+// 52 async consumption, 53 no release instrumentation, 54 slot reuse bounds.
+// Backend tests also
+// count actual sync/async cleanup call sites for flat, interleaved and deep scopes.
+const OWNED_NATIVE: &str = r#"
+use std::sync::atomic::{AtomicI64, Ordering};
+static DROPS: AtomicI64 = AtomicI64::new(0);
+#[willow::assume(no_block)]
+pub struct Handle(i64);
+impl Drop for Handle { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } }
+impl Handle {
+    #[willow::assume(no_block)]
+    pub fn new(value: i64) -> Self { Self(value) }
+    #[willow::assume(no_block)]
+    pub fn boxed(value: i64) -> Box<Self> { Box::new(Self(value)) }
+    #[willow::assume(no_block)]
+    pub fn result(value: i64) -> Result<Self, String> { Ok(Self(value)) }
+    #[willow::assume(no_block)]
+    pub fn read(&self) -> i64 { self.0 }
+    #[willow::assume(no_block)]
+    pub fn finish(self) -> i64 { self.0 }
+}
+#[willow::assume(no_block)]
+pub fn drops() -> i64 { DROPS.load(Ordering::SeqCst) }
+#[willow::assume(no_block)]
+pub fn borrow(handle: &Handle) -> i64 { handle.0 }
+"#;
+
+#[test]
+fn native_ownership_calls_and_scope_exits() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", r#"
+import native;
+fn ordinary() { use h = native::Handle::new(42); println(h.read()); println(h.read()); }
+fn early() -> i64 { use h = native::Handle::boxed(4); return h.read(); }
+fn tried() -> Result<i64, String> { use h = native::Handle::result(3)?; let n: Result<i64, String> = Err("exit"); return Ok(n?); }
+fn loops() { for i in 0..4 { use h = native::Handle::new(i); if i == 0 { continue; } if i == 2 { break; } } }
+fn explicit() { use h = native::Handle::new(5); h.close(); }
+fn consumed() { use h = native::Handle::new(6); println(h.finish()); }
+fn main() {
+ ordinary(); println(native::drops());
+ println(early()); println(native::drops());
+ println(tried().is_err()); println(native::drops());
+ loops(); println(native::drops());
+ explicit(); println(native::drops());
+ consumed(); println(native::drops());
+}
+"#);
+    f.approve_native();
+    for _ in 0..2 {
+        let out = f.success(&["run", ".", "--offline"]);
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout),
+            "42\n42\n1\n4\n2\ntrue\n3\n6\n7\n6\n8\n"
+        );
+    }
+}
+
+#[test]
+fn native_ownership_diagnostics_and_escape() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for (body, error, warning) in [
+        (
+            "let h = native::Handle::new(1); println(h.read());",
+            false,
+            true,
+        ),
+        ("let h = native::Handle::new(1); h.close();", false, false),
+        (
+            "use h = native::Handle::new(1); println(h.read());",
+            false,
+            false,
+        ),
+        (
+            "let h = native::Handle::new(1); println(native::borrow(h));",
+            false,
+            false,
+        ),
+        (
+            "let h = native::Handle::new(1); let f = || { println(h.read()); }; f();",
+            false,
+            false,
+        ),
+        (
+            "let h = native::Handle::new(1); h.finish(); h.read();",
+            true,
+            false,
+        ),
+        (
+            "let h = native::Handle::new(1); h.close(); h.read();",
+            true,
+            false,
+        ),
+        (
+            "let h = native::Handle::new(1); if true { h.finish(); } h.read();",
+            false,
+            false,
+        ),
+        ("let use = 3; println(use);", false, false),
+        (
+            "let mut h=native::Handle::new(1); h.close(); h=native::Handle::new(2); h.read();",
+            false,
+            true,
+        ),
+        (
+            "let mut h=native::Handle::new(1); h=native::Handle::new(2); h.close();",
+            false,
+            true,
+        ),
+        ("let h=native::Handle::new(1); let alias=h;", false, false),
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {body} }}"),
+        );
+        let out = f.command(&["check", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(!out.status.success(), error, "{body}: {stderr}");
+        assert_eq!(stderr.contains("W0906"), warning, "{body}: {stderr}");
+        if error {
+            assert!(stderr.contains("E0906"), "{stderr}");
+        }
+    }
+}
+
+#[test]
+fn native_ownership_await_and_runtime_alias() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write(
+        "src/main.wi",
+        r#"
+import native;
+async fn tick() -> i64 { return 7; }
+async fn worker() { use h = native::Handle::new(42); println(await tick()); println(h.read()); }
+async fn main() { await worker(); println(native::drops()); }
+"#,
+    );
+    f.approve_native();
+    let out = f.success(&["run", ".", "--offline"]);
+    assert_eq!(out.stdout, b"7\n42\n1\n");
+    for body in [
+        "let h = native::Handle::new(1); let alias = h; if true { h.finish(); } alias.read();",
+        "let h = native::Handle::new(1); if true { h.finish(); } h.read();",
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {body} }}"),
+        );
+        f.success(&["check", ".", "--offline"]);
+        let out = f.command(&["run", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{body}");
+        assert!(
+            stderr.contains("closed") || stderr.contains("Closed"),
+            "{stderr}"
+        );
+    }
+}
+
+#[test]
+fn native_ownership_awaited_result_warnings_and_escapes() {
+    let f = Fixture::new();
+    f.write(
+        "src/native.rs",
+        &format!(
+            r#"{OWNED_NATIVE}
+impl Handle {{
+    pub async fn later(value: i64) -> Self {{ Self(value) }}
+    pub async fn later_boxed(value: i64) -> Box<Self> {{ Box::new(Self(value)) }}
+    pub async fn later_result(value: i64) -> Result<Self, String> {{ Ok(Self(value)) }}
+}}
+"#
+        ),
+    );
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for expression in [
+        "await native::Handle::later(1)",
+        "await native::Handle::later_boxed(1)",
+        "(await native::Handle::later_result(1))?",
+    ] {
+        // Each case checks a direct owned result, never alias provenance.
+        for (body, warnings, returns_handle) in [
+            ("let h=VALUE; println(h.read());", 1, false),
+            ("let h=VALUE; h.close();", 0, false),
+            ("use h=VALUE; println(h.read());", 0, false),
+            ("let h=VALUE; h.finish();", 0, false),
+            ("let h=VALUE; println(native::borrow(h));", 0, false),
+            ("let h=VALUE; let alias=h;", 0, false),
+            ("let h=VALUE; let stored=[h];", 0, false),
+            (
+                "let h=VALUE; let read=|| { return h.read(); }; println(read());",
+                0,
+                false,
+            ),
+            ("let h=VALUE; return Ok(h);", 0, true),
+            (
+                "let mut h=native::Handle::new(0); h.close(); h=VALUE; println(h.read());",
+                1,
+                false,
+            ),
+            ("let mut h=VALUE; h=VALUE; h.close();", 1, false),
+            ("let mut h=VALUE; h.close(); h=VALUE; h.close();", 0, false),
+            ("let mut h=VALUE; h=VALUE; let alias=h;", 0, false),
+        ] {
+            let body = body.replace("VALUE", expression);
+            let (output, tail) = if returns_handle {
+                ("native::Handle", "")
+            } else {
+                ("void", "return Result::Ok();")
+            };
+            f.write("src/main.wi", &format!("import native; async fn work()->Result<{output},String> {{ {body} {tail} }} async fn main() {{ await work(); }}"));
+            let out = f.success(&["check", ".", "--offline"]);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert_eq!(
+                stderr.matches("warning[W0906]").count(),
+                warnings,
+                "{body}: {stderr}"
+            );
+        }
+    }
+    // Await unwraps direct syntax only; a stored future is not traced to its origin.
+    f.write("src/main.wi", "import native; async fn main() { let pending=native::Handle::later(1); let h=await pending; println(h.read()); }");
+    let out = f.success(&["check", ".", "--offline"]);
+    assert!(!String::from_utf8_lossy(&out.stderr).contains("W0906"));
+}
+
+#[test]
+fn native_ownership_effect_parity() {
+    let f = Fixture::new();
+    // Constructor and ordinary read are reviewed; Drop deliberately is not.
+    f.write(
+        "src/native.rs",
+        &OWNED_NATIVE.replace("#[willow::assume(no_block)]\npub struct", "pub struct"),
+    );
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for context in [
+        "async fn work() { BODY } async fn main() { await work(); }",
+        "no_wait fn work() { BODY } fn main() { work(); }",
+        "async fn main() { let lock_value = Mutex::new(0); lock lock_value as value { BODY } }",
+    ] {
+        let mut codes = Vec::new();
+        for body in [
+            "use h = native::Handle::new(1);",
+            "let h = native::Handle::new(1); h.close();",
+        ] {
+            f.write(
+                "src/main.wi",
+                &format!("import native; {}", context.replace("BODY", body)),
+            );
+            let out = f.command(&["check", ".", "--offline"]).output().unwrap();
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            let allowed = context.starts_with("async fn work");
+            assert_eq!(out.status.success(), allowed, "{context}: {body}: {stderr}");
+            let errors: Vec<_> = stderr
+                .lines()
+                .filter_map(|line| {
+                    line.strip_prefix("error[")
+                        .and_then(|s| s.split(']').next())
+                })
+                .map(str::to_owned)
+                .collect();
+            assert_eq!(errors.is_empty(), allowed, "{stderr}");
+            if allowed {
+                f.success(&["run", ".", "--offline"]);
+            }
+            codes.push(errors);
+        }
+        assert_eq!(codes[0], codes[1], "{context}");
+    }
+}
+
+#[test]
+fn native_ownership_branch_rebinding_and_escape_results() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for (program, warning) in [
+        (
+            "fn main() { let h = native::Handle::new(1); if true { h.finish(); } else { println(h.read()); h.close(); } }",
+            false,
+        ),
+        (
+            "fn main() { let mut h = native::Handle::new(1); h.finish(); h = native::Handle::new(2); println(h.read()); h.close(); }",
+            false,
+        ),
+        (
+            "fn work() -> i64 { let h = native::Handle::new(1); return h.read(); } fn main() { println(work()); }",
+            true,
+        ),
+        (
+            "fn work() -> native::Handle { let h = native::Handle::new(1); return h; } fn main() { work().close(); }",
+            false,
+        ),
+        (
+            "class Holder { pub handle: native::Handle; } fn main() { let h = native::Handle::new(1); let holder = new Holder(h); holder.handle.close(); }",
+            false,
+        ),
+        (
+            "fn work() -> i64 { let h = native::Handle::new(1); return match h { bound => 1 }; } fn main() { println(work()); }",
+            false,
+        ),
+        (
+            "fn work() -> native::Handle { let h = native::Handle::new(1); return match h { bound => bound }; } fn main() { work().close(); }",
+            false,
+        ),
+        (
+            "fn work() -> native::Handle { let h = native::Handle::new(1); return match h { bound => native::Handle::new(2) }; } fn main() { work().close(); }",
+            false,
+        ),
+    ] {
+        f.write("src/main.wi", &format!("import native; {program}"));
+        let out = f.success(&["check", ".", "--offline"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stderr.contains("W0906"), warning, "{program}: {stderr}");
+    }
+}
+
+#[test]
+fn native_ownership_cleanup_output_scales_additively() {
+    let f = Fixture::new();
+    f.write(
+        "src/native.rs",
+        &OWNED_NATIVE.replace("#[willow::assume(no_block)]", ""),
+    );
+    let mut samples = std::collections::BTreeMap::new();
+    for bindings in [4, 16, 64] {
+        for exits in [4, 16, 64] {
+            let mut source = "import native; fn probe(n: i64) -> i64 {\n".to_owned();
+            for i in 0..bindings {
+                source.push_str(&format!("use h{i} = native::Handle::new({i});\n"));
+            }
+            for i in 0..exits {
+                source.push_str(&format!("if n == {i} {{ return {i}; }}\n"));
+            }
+            source.push_str("return -1; } fn main() { println(probe(0)); }");
+            f.write("src/main.wi", &source);
+            let out = f.success(&["build", "src/main.wi", "--emit-lir"]);
+            let lir = String::from_utf8(out.stdout).unwrap();
+            let instructions = lir.lines().filter(|line| line.starts_with("  ")).count();
+            assert_eq!(
+                lir.matches("method: \"Handle_close$scope\"").count(),
+                bindings
+            );
+            assert!(
+                lir.lines()
+                    .filter(|line| line.contains("FlushDefers"))
+                    .all(|line| !line.contains("sites"))
+            );
+            samples.insert((bindings, exits), instructions);
+            println!(
+                "native cleanup bindings={bindings} exits={exits} instructions={instructions} close_bodies={bindings}"
+            );
+        }
+    }
+    for bindings in [4, 16, 64] {
+        assert_eq!(
+            samples[&(bindings, 64)] - samples[&(bindings, 4)],
+            samples[&(4, 64)] - samples[&(4, 4)]
+        );
+    }
+}
+
+#[test]
+fn native_ownership_receiver_policy_and_nested_owned_rejection() {
+    let f = Fixture::new();
+    f.write("src/main.wi", "import native; fn main() {}");
+    for member in [
+        "pub fn change(&mut self) {}",
+        "pub fn change(self: &Self) {}",
+        "pub fn nested(value: Option<Self>) {}",
+        "pub async fn nested(value: Result<Self, String>) {}",
+    ] {
+        f.write("src/native.rs", &format!("pub struct Handle(i64); impl Handle {{ pub fn new() -> Self {{ Self(1) }} {member} }}"));
+        let out = f.command(&["check", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{member}");
+        assert!(
+            stderr.contains("rust_module_signature"),
+            "{member}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn native_ownership_nested_cleanup_order_and_propagation_success() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write(
+        "src/main.wi",
+        r#"
+import native;
+fn work() -> Result<i64, String> {
+    defer { println(native::drops()); }
+    use outer = native::Handle::new(1);
+    if true { use inner = native::Handle::new(2); println(native::drops()); }
+    println(native::drops());
+    use other = native::Handle::result(3)?;
+    println(native::drops());
+    return Ok(other.read());
+}
+fn main() { println(work().unwrap()); println(native::drops()); }
+"#,
+    );
+    f.approve_native();
+    let out = f.success(&["run", ".", "--offline"]);
+    assert_eq!(out.stdout, b"0\n1\n1\n3\n3\n3\n");
+}
+
+#[test]
+fn native_ownership_short_circuit_and_payload_consumption() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for condition in ["false && h.finish() == 1", "true || h.finish() == 1"] {
+        f.write("src/main.wi", &format!("import native; fn main() {{ let h = native::Handle::new(1); let skipped = {condition}; println(h.read()); h.close(); println(native::drops()); }}"));
+        let out = f.success(&["run", ".", "--offline"]);
+        assert_eq!(out.stdout, b"1\n1\n", "{condition}");
+    }
+    for body in [
+        "match native::Handle::result(1) { Ok(h) => { h.finish(); h.read(); }, Err(e) => {} }",
+        "let Ok(h) = native::Handle::result(1) else { return; }; h.finish(); h.read();",
+        "let h = native::Handle::new(1); match h { bound => { bound.finish(); bound.read(); } }",
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {body} }}"),
+        );
+        f.success(&["check", ".", "--offline"]);
+        let out = f.command(&["run", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{body}: {stderr}");
+        assert!(stderr.contains("closed"), "{body}: {stderr}");
+    }
+    f.write("src/main.wi", "import native; fn main() { match native::Handle::result(1) { Ok(h) => { println(h.read()); h.close(); }, Err(e) => {} } println(native::drops()); }");
+    let out = f.success(&["run", ".", "--offline"]);
+    assert_eq!(out.stdout, b"1\n1\n");
+}
+
+#[test]
+fn native_ownership_import_aliases_and_scope_name_collision() {
+    let f = Fixture::new();
+    f.write("src/native.rs", &format!("{OWNED_NATIVE} impl Handle {{ #[willow::assume(no_block)] pub fn close_scope(&self) -> i64 {{ self.0 }} }}"));
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for (imports, owner) in [
+        ("import native as renamed;", "renamed::Handle"),
+        ("import native::Handle;", "Handle"),
+        ("import native::Handle as Resource;", "Resource"),
+    ] {
+        f.write("src/main.wi", &format!("{imports} fn main() {{ use h = {owner}::new(42); println(h.close_scope()); println(h.read()); }}"));
+        for _ in 0..2 {
+            let out = f.success(&["run", ".", "--offline"]);
+            assert_eq!(out.stdout, b"42\n42\n", "{imports}");
+        }
+        f.write(
+            "src/main.wi",
+            &format!("{imports} fn main() {{ let h = {owner}::new(42); h.finish(); h.read(); }}"),
+        );
+        let out = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!out.status.success(), "{imports}");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("E0906"),
+            "{out:?}"
+        );
+    }
+}
+
+#[test]
+fn native_ownership_custom_consuming_close_matches_scope_cleanup() {
+    let f = Fixture::new();
+    f.write("src/native.rs", &OWNED_NATIVE.replace(
+        "pub fn finish(self) -> i64 { self.0 }",
+        "pub fn finish(self) -> i64 { self.0 } #[willow::assume(no_block)] pub fn close(self) { DROPS.fetch_add(100, Ordering::SeqCst); }"));
+    f.write("src/main.wi", "import native; fn work() { use a = native::Handle::new(1); use b = native::Handle::new(2); b.close(); } fn main() { work(); println(native::drops()); }");
+    f.approve_native();
+    for _ in 0..2 {
+        let result = f.success(&["run", ".", "--offline"]);
+        assert_eq!(String::from_utf8_lossy(&result.stdout), "202\n");
+    }
+    // Reviewed custom close is usable on both explicit and implicit task paths.
+    f.write("src/main.wi", "import native; async fn work() { use a = native::Handle::new(1); let b = native::Handle::new(2); b.close(); } async fn main() { await work(); println(native::drops()); }");
+    let result = f.success(&["run", ".", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&result.stdout), "202\n");
+}
+
+#[test]
+fn native_ownership_native_close_shapes_preserve_explicit_disposal() {
+    for (method, call, disposal, expected) in [
+        (
+            "pub fn close(&self) -> i64 { self.0 }",
+            "println(h.close()); println(h.read());",
+            "h.dispose()",
+            "7\n7\n0\n1\n1\n",
+        ),
+        (
+            "pub fn close(&self, n:i64) -> i64 { self.0+n }",
+            "println(h.close(3));",
+            "h.dispose()",
+            "10\n0\n1\n1\n",
+        ),
+        (
+            "pub fn close(&self) -> i64 { self.0 }
+             pub fn dispose(&self) -> i64 { self.0+1 }
+             pub fn dispose_2(&self) -> i64 { self.0+2 }",
+            "println(h.close()); println(h.dispose()); println(h.dispose_2());",
+            "h.dispose_3()",
+            "7\n8\n9\n0\n1\n1\n",
+        ),
+        (
+            "pub fn close() -> i64 { 42 }",
+            "println(native::Handle::close());",
+            "h.close()",
+            "42\n0\n1\n1\n",
+        ),
+    ] {
+        let f = Fixture::new();
+        f.write(
+            "src/native.rs",
+            &OWNED_NATIVE.replace(
+                "pub fn finish(self) -> i64 { self.0 }",
+                &format!(
+                    "pub fn finish(self) -> i64 {{ self.0 }} #[willow::assume(no_block)] {method}"
+                ),
+            ),
+        );
+        f.write("src/main.wi", &format!("import native; fn work() {{ use h = native::Handle::new(7); {call} println(native::drops()); {disposal}; println(native::drops()); }} fn main() {{ work(); println(native::drops()); }}"));
+        f.approve_native();
+        let result = f.success(&["run", ".", "--offline"]);
+        assert_eq!(String::from_utf8_lossy(&result.stdout), expected);
+        f.write("src/main.wi", &format!("import native; fn main() {{ let h = native::Handle::new(7); {disposal}; h.read(); }}"));
+        let result = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("E0906"));
+    }
+}
+
+#[test]
+fn native_ownership_partial_decode_and_panicking_close_drop_once() {
+    let f = Fixture::new();
+    // Native bridge failures terminate the process. Observe Drop before the
+    // fatal boundary through a destructor marker, rather than Willow recover.
+    let native = OWNED_NATIVE.replace(
+        "DROPS.fetch_add(1, Ordering::SeqCst);",
+        "DROPS.fetch_add(1, Ordering::SeqCst); eprintln!(\"owned drop marker\");",
+    );
+    f.write("src/native.rs", &format!("{native} #[willow::assume(no_block)] pub fn both(a:Handle,b:Handle) -> i64 {{ a.0+b.0 }}"));
+    f.write("src/main.wi", "import native; fn work(i:i64) { let h = native::Handle::new(7); let xs=[h]; println(native::both(h,xs[i])); } fn main() { work(0); }");
+    f.approve_native();
+    let result = f.command(&["run", ".", "--offline"]).output().unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(error.contains("rust_handle_closed"), "{error}");
+    assert_eq!(error.matches("owned drop marker").count(), 1, "{error}");
+    f.write("src/native.rs", &native.replace("pub fn finish(self) -> i64 { self.0 }", "pub fn finish(self) -> i64 { self.0 } #[willow::assume(no_block)] pub fn close(self) { panic!(\"close panic\"); }"));
+    f.write(
+        "src/main.wi",
+        "import native; fn main() { use h = native::Handle::new(7); }",
+    );
+    f.approve_native();
+    let result = f.command(&["run", ".", "--offline"]).output().unwrap();
+    let error = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success(), "{result:?}");
+    assert!(error.contains("RustPanic"), "{error}");
+    assert_eq!(error.matches("owned drop marker").count(), 1, "{error}");
+}
+
+#[test]
+fn native_ownership_mutable_value_receiver_consumes() {
+    let f = Fixture::new();
+    f.write(
+        "src/native.rs",
+        &OWNED_NATIVE.replace(
+            "pub fn finish(self) -> i64 { self.0 }",
+            "pub fn finish(mut self) -> i64 { self.0 += 1; self.0 }",
+        ),
+    );
+    f.write("src/main.wi", "import native; fn main() { use h = native::Handle::new(41); println(h.finish()); println(native::drops()); }");
+    f.approve_native();
+    let out = f.success(&["run", ".", "--offline"]);
+    assert_eq!(out.stdout, b"42\n1\n");
+    f.write("src/main.wi", "import native; fn main() { let h = native::Handle::new(41); h.finish(); println(h.read()); }");
+    let out = f.command(&["check", ".", "--offline"]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{stderr}");
+    assert!(stderr.contains("E0906"), "{stderr}");
+}
+
+#[test]
+fn native_ownership_abandoned_reference_break_and_continue_drop_once() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for asynchronous in [false, true] {
+        for jump in ["break", "continue"] {
+            for outer in [false, true] {
+                println!(
+                    "abandoned native preparation async={asynchronous} jump={jump} outer={outer}"
+                );
+                let suspend = if asynchronous { "await tick();" } else { "" };
+                let body = format!(
+                    "let mut i=0; while i<2 {{ use h=native::Handle::new(i); {suspend} i=i+1; consume(&total, match i {{ 1 => {{ {jump}; }}, _ => {{}} }}); }}"
+                );
+                let body = if outer {
+                    format!("consume(&retained, match 0 {{ _ => {{ {body} }} }});")
+                } else {
+                    body
+                };
+                let async_kw = if asynchronous { "async " } else { "" };
+                let awaited = if asynchronous { "await " } else { "" };
+                let suspend = if asynchronous {
+                    "println(await tick());"
+                } else {
+                    ""
+                };
+                f.write("src/main.wi", &format!("import native; fn consume(total:&mut i64,n:void) {{ total=total+1; }} async fn tick()->i64 {{ return 9; }} {async_kw}fn worker() {{ let mut total=0; let mut retained=0; {suspend} {body} println(total); println(retained); }} {async_kw}fn main() {{ {awaited}worker(); println(native::drops()); }}"));
+                let out = f
+                    .command(&["run", ".", "--offline"])
+                    .env("RUST_BACKTRACE", "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "async={asynchronous} jump={jump} outer={outer}\nsource: {}\nstderr: {}",
+                    fs::read_to_string(f.root.join("src/main.wi")).unwrap(),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                let expected = format!(
+                    "{}{}\n{}\n{}\n",
+                    if asynchronous { "9\n" } else { "" },
+                    if jump == "break" { 0 } else { 1 },
+                    usize::from(outer),
+                    if jump == "break" { 1 } else { 2 }
+                );
+                assert_eq!(
+                    String::from_utf8_lossy(&out.stdout),
+                    expected,
+                    "async={asynchronous} jump={jump} outer={outer}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn native_ownership_aliases_are_dynamic_and_warning_free() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for body in [
+        "let h=native::Handle::new(1); let alias=h; h.finish(); alias.read();",
+        "let h=native::Handle::new(1); let xs=[h]; xs[0].finish(); xs[0].read();",
+        "let h=native::Handle::new(1); let alias=match h { x => x }; alias.finish(); h.read();",
+        "let h=native::Handle::new(1); let f=|| { h.read(); }; h.finish(); f();",
+        "let h=native::Handle::new(1); defer { h.read(); } h.finish();",
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {body} }}"),
+        );
+        let check = f.success(&["check", ".", "--offline"]);
+        assert!(
+            !String::from_utf8_lossy(&check.stderr).contains("W0906"),
+            "{body}: {check:?}"
+        );
+        let run = f.command(&["run", ".", "--offline"]).output().unwrap();
+        assert!(!run.status.success(), "{body}");
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("closed"),
+            "{body}: {run:?}"
+        );
+    }
+    for body in [
+        "let mut h=native::Handle::new(1); let old=h; old.finish(); h=native::Handle::new(2); println(h.read()); h.close();",
+        "let h=native::Handle::new(1); let xs=[h]; xs[0].finish(); xs[0]=native::Handle::new(2); println(xs[0].read()); xs[0].close();",
+        "let h=native::Handle::new(2); let alias=h; println(alias.read()); h.close();",
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {body} }}"),
+        );
+        let run = f.success(&["run", ".", "--offline"]);
+        assert_eq!(run.stdout, b"2\n", "{body}");
+        assert!(
+            !String::from_utf8_lossy(&run.stderr).contains("W0906"),
+            "{body}: {run:?}"
+        );
+    }
+}
+
+#[test]
+fn native_ownership_reports_debug_leaks_without_changing_status() {
+    let f = Fixture::new();
+    f.write(
+        "src/native.rs",
+        &format!(
+            "{OWNED_NATIVE}\n\
+        pub struct Other(i64); impl Other {{ pub fn new() -> Self {{ Self(0) }} }}\n\
+        pub fn crash() {{ panic!(\"native failure\"); }}\n\
+        pub fn abort() {{ std::process::abort(); }}"
+        ),
+    );
+    let leak = "let h=native::Handle::new(1); let alias=h; println(alias.read()); \
+        let other=native::Handle::boxed(2); let items=[other]; \
+        let extra=native::Other::new(); let copy=extra; \
+        use closed=native::Handle::new(3); closed.close();";
+    f.write(
+        "src/main.wi",
+        &format!("import native; fn main() {{ {leak} }}"),
+    );
+    f.approve_native();
+    let checked = f.success(&["check", ".", "--offline"]);
+    assert!(!String::from_utf8_lossy(&checked.stderr).contains("W0906"));
+    for _ in 0..2 {
+        let run = f.success(&["run", ".", "--offline"]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        let reports: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.starts_with("Willow unclosed Rust handles:"))
+            .collect();
+        assert_eq!(run.stdout, b"1\n");
+        assert_eq!(run.status.code(), Some(0));
+        assert_eq!(reports.len(), 2, "{stderr}");
+        assert!(reports[0].ends_with("::Handle: 2"), "{stderr}");
+        assert!(reports[1].ends_with("::Other: 1"), "{stderr}");
+    }
+    let release = f.success(&["run", ".", "--release", "--offline"]);
+    assert_eq!(release.stdout, b"1\n");
+    assert!(!String::from_utf8_lossy(&release.stderr).contains("Willow unclosed Rust handles:"));
+    for failure in [
+        "panic(\"willow failure\");",
+        "native::crash();",
+        "native::abort();",
+    ] {
+        f.write(
+            "src/main.wi",
+            &format!("import native; fn main() {{ {leak} {failure} }}"),
+        );
+        let run = f.command(&["run", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert!(!run.status.success(), "{failure}: {stderr}");
+        assert!(
+            !stderr.contains("Willow unclosed Rust handles:"),
+            "{failure}: {stderr}"
+        );
+    }
+    f.write(
+        "src/main.wi",
+        "import native; fn main() { use h=native::Handle::new(1); }",
+    );
+    let run = f.success(&["run", ".", "--offline"]);
+    assert!(!String::from_utf8_lossy(&run.stderr).contains("Willow unclosed Rust handles:"));
+    let pure = Fixture::new();
+    pure.write("src/main.wi", "fn main() { println(99); }");
+    let run = pure.success(&["run", ".", "--offline"]);
+    assert_eq!(run.stdout, b"99\n");
+    assert!(!String::from_utf8_lossy(&run.stderr).contains("Willow unclosed Rust handles:"));
+}
+
+#[test]
+fn native_ownership_main_error_reports_and_keeps_status() {
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    for asynchronous in [false, true] {
+        let prefix = if asynchronous { "async " } else { "" };
+        f.write("src/main.wi", &format!("import native; {prefix}fn main() -> Result<void,String> {{ let h=native::Handle::new(1); let alias=h; use closed=native::Handle::new(2); return Err(\"expected failure\"); }}"));
+        let run = f.command(&["run", ".", "--offline"]).output().unwrap();
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{stderr}");
+        assert!(stderr.contains("Error: expected failure"), "{stderr}");
+        let reports: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.starts_with("Willow unclosed Rust handles:"))
+            .collect();
+        assert_eq!(reports.len(), 1, "{stderr}");
+        assert!(reports[0].ends_with("::Handle: 1"), "{stderr}");
+    }
+}
+
+#[test]
+fn native_ownership_creation_sites_cover_containers_pool_and_async() {
+    let f = Fixture::new();
+    f.write(
+        "src/native.rs",
+        &format!(
+            r#"{OWNED_NATIVE}
+pub fn optional(yes: bool) -> Option<Box<Handle>> {{ yes.then(|| Box::new(Handle(4))) }}
+pub fn nested() -> Result<Option<Box<Handle>>, String> {{ Ok(Some(Box::new(Handle(5)))) }}
+pub fn error_handle() -> Result<i64, Box<Handle>> {{ Err(Box::new(Handle(6))) }}
+pub struct Pair {{ pub first: Box<Handle>, pub second: Box<Handle> }}
+pub fn many() -> Pair {{ Pair {{ first: Box::new(Handle(7)), second: Box::new(Handle(8)) }} }}
+pub fn pooled() -> Box<Handle> {{
+    assert!(std::thread::current().name().unwrap_or("").starts_with("willow-rust-blocking"));
+    Box::new(Handle(9))
+}}
+pub async fn later() -> Box<Handle> {{ Box::new(Handle(10)) }}
+impl Handle {{ pub async fn async_finish(self) -> i64 {{ self.0 }} }}
+"#
+        ),
+    );
+    f.write(
+        "src/helper.wi",
+        "import native;\npub fn create() -> native::Handle { return native::Handle::new(11); }\n",
+    );
+    let source = r#"import native; import native::optional;
+import helper;
+async fn main() {
+    let a = native::Handle::new(1); let copy_a = a;
+    let b = native::Handle::result(2); let copy_b = b;
+    let c = native::optional(true); let copy_c = c;
+    let d = native::nested(); let copy_d = d;
+    let e = native::error_handle(); let copy_e = e;
+    let f = native::many(); let copy_f = f;
+    let g = native::pooled(); let copy_g = g;
+    let h = await native::later(); let copy_h = h;
+    let i = helper::create(); let copy_i = i;
+    let make = optional;
+    let j = make(true); let copy_j = j;
+    let empty = native::optional(false);
+    let consumed = native::Handle::new(12);
+    println(await consumed.async_finish());
+}
+
+"#;
+    f.write("src/main.wi", source);
+    f.approve_native();
+    for _ in 0..2 {
+        let run = f.success(&["run", ".", "--offline"]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.stdout, b"12\n");
+        assert!(!stderr.contains("W0906"), "{stderr}");
+        assert!(stderr.contains("::Handle: 11"), "{stderr}");
+        let sites: Vec<_> = stderr
+            .lines()
+            .filter(|line| line.contains(" created at "))
+            .collect();
+        assert_eq!(sites.len(), 11, "{stderr}");
+        for (file, line, count) in [
+            ("main.wi", 4, 1),
+            ("main.wi", 5, 1),
+            ("main.wi", 6, 1),
+            ("main.wi", 7, 1),
+            ("main.wi", 8, 1),
+            ("main.wi", 9, 2),
+            ("main.wi", 10, 1),
+            ("main.wi", 11, 1),
+            ("helper.wi", 2, 1),
+            ("main.wi", 14, 1),
+        ] {
+            assert_eq!(
+                sites
+                    .iter()
+                    .filter(|site| site.ends_with(&format!("{file}:{line}")))
+                    .count(),
+                count,
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
+fn native_ownership_debug_site_codegen_is_linear_and_absent_in_release() {
+    use object::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
+    let f = Fixture::new();
+    f.write("src/native.rs", OWNED_NATIVE);
+    f.write("src/main.wi", "import native; fn main() {}");
+    f.approve_native();
+    let binary = f.root.join("sites-output");
+    let object = binary.with_extension(if cfg!(all(windows, target_env = "msvc")) {
+        "obj"
+    } else {
+        "o"
+    });
+    for (calls, release) in [(1, false), (16, false), (64, false), (64, true)] {
+        let mut source = String::from("import native; fn main() {\n");
+        for i in 0..calls {
+            source.push_str(&format!(
+                "let h{i} = native::Handle::new({i}); let alias{i} = h{i};\n"
+            ));
+        }
+        source.push_str("}\n");
+        f.write("src/main.wi", &source);
+        let output = f
+            .command(&[
+                "build",
+                ".",
+                "--offline",
+                "-o",
+                binary.to_str().unwrap(),
+                if release { "--release" } else { "--debug" },
+            ])
+            .env("WILLOW_KEEP_OBJECT", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bytes = fs::read(&object).unwrap();
+        let object = object::File::parse(&*bytes).unwrap();
+        let records = object
+            .sections()
+            .flat_map(|s| s.relocations())
+            .filter(|(_, relocation)| {
+                if let RelocationTarget::Symbol(index) = relocation.target() {
+                    return object
+                        .symbol_by_index(index)
+                        .unwrap()
+                        .name()
+                        .unwrap()
+                        .ends_with("willow_debug_record_handle_output");
+                }
+                false
+            })
+            .count();
+        assert_eq!(records, if release { 0 } else { calls });
+        let shapes = object
+            .symbols()
+            .filter(|s| s.name().is_ok_and(|n| n.contains("__willow_handle_shape_")))
+            .count();
+        // Handle and Result<Handle,String> are the fixture's two return shapes.
+        assert_eq!(shapes, if release { 0 } else { 2 });
+        eprintln!(
+            "handle_calls={calls} release={release} recording_calls={records} descriptors={shapes}"
+        );
+    }
+}

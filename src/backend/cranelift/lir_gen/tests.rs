@@ -632,7 +632,7 @@ fn divergent_preparations_scale_with_nesting() {
             .iter()
             .find(|f| f.name.is_free_named("main"))
             .unwrap();
-        assert!(lir_call_frame_entries(function).is_some());
+        assert!(lir_call_frame_entries(function, |_| true).is_some());
         assert!(lir_reference_scope_entries(function).is_some());
         let mut counts = [0; 4];
         for instruction in function.blocks.iter().flat_map(|b| &b.instrs) {

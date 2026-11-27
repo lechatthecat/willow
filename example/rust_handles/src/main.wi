@@ -1,0 +1,14 @@
+import native;
+fn work() -> i64 {
+    use counter = native::Counter::new(42);
+    println(counter.read());
+    return counter.finish();
+}
+fn main() {
+    println(work());
+    println(native::drops());
+    let counter = native::Counter::new(7);
+    println(counter.read());
+    counter.close();
+    println(native::drops());
+}

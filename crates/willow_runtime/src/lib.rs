@@ -207,6 +207,7 @@ pub unsafe extern "C" fn runtime_start(argc: i32, argv: *mut *mut c_char) {
     gc::report_publication_stats_if_requested();
     gc::shutdown_mark_workers();
     gc_telemetry::flush_observations();
+    rust_bridge_abi::report_normal_exit();
     panic_context::replace_current_context(previous_panic_context);
 }
 

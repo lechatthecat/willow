@@ -290,7 +290,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             ir_variants!(
                 LirInst;
-                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers, RestoreCallPreparation,
                 ClearScopeRoots, Defer, ReleaseLock, MatchTest, MatchBind, Unsupported
             ) => unreachable!(),
         }
@@ -412,6 +412,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let value = self
                         .emit_coop_awaited_result(task_frame, Some(result_ty), *cancel_aware)
                         .expect("value-producing await has a result");
+                    if let Some(span) = function.locals[result.0 as usize].source_span {
+                        self.emit_handle_debug_site(value, result_ty, span);
+                    }
                     self.store_lir_local(function, *result, value);
                 } else {
                     self.emit_coop_awaited_result(task_frame, None, *cancel_aware);
@@ -557,6 +560,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             function,
             blocks,
             return_type,
+            preparation_depths,
         } = layout;
         if let Some((poll, in_loop)) = sync_poll
             && (self.cleanup.lir_cleanup_exit.is_none() || block.id.0 != 0)
@@ -602,6 +606,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                             ))
                     {
                         self.store_lir_local(function, *local, result);
+                    }
+                }
+                LirInst::RestoreCallPreparation { entry } => {
+                    let (methods, references) = preparation_depths[entry.0];
+                    while self.diagnostics.lir_reference_scopes.len() > references {
+                        self.emit_flat_reference_call_end();
+                    }
+                    while self.diagnostics.lir_call_frames.len() > methods {
+                        self.emit_callstack_pop();
+                        self.diagnostics.lir_call_frames.pop_back();
                     }
                 }
                 LirInst::EnterDeferScope { sites, .. } => {
@@ -654,12 +668,29 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         unreachable!()
                     };
                     let depth = defers.bindings.state(after).entries.len();
+                    let abandoned_preparation = matches!(inst, LirInst::FlushDefers { .. })
+                        && matches!(block.terminator, Terminator::Return(_));
+                    if abandoned_preparation {
+                        // An abrupt function exit abandons argument preparation.
+                        // Release its diagnostic/reference protocol before shared
+                        // cleanup; otherwise each `?` site duplicates every action.
+                        // Other exits can stay inside a prepared expression.
+                        for _ in 0..self.diagnostics.lir_reference_scopes.len() {
+                            self.emit_debug_reference_call_clear();
+                        }
+                        for _ in 0..self.diagnostics.lir_call_frames.len() {
+                            self.emit_callstack_pop();
+                        }
+                        self.diagnostics.lir_call_frames.clear();
+                        self.diagnostics.lir_reference_scopes.clear();
+                    }
                     if edge.scopes > 0 {
-                        self.emit_lir_shared_normal_cleanup(
-                            depth,
-                            Some(edge.region),
-                            defers.bindings,
-                        );
+                        let protocol = if abandoned_preparation {
+                            (None, None)
+                        } else {
+                            defers.bindings.protocols[&(defers.block_index, inst_index)]
+                        };
+                        self.emit_lir_shared_normal_cleanup(depth, defers.bindings, protocol);
                     }
                     if coop.is_none() && !self.locals.terminated {
                         let roots = self.roots.gc_root_count - defers.bindings.roots;
@@ -896,88 +927,155 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // already published handle/token with phase zero inside NoPreemptGuard.
     }
 
+    pub(super) fn load_cleanup_control(
+        &mut self,
+        slot: Option<cranelift_codegen::ir::StackSlot>,
+        frame_offset: Option<i32>,
+        word: i32,
+    ) -> cranelift_codegen::ir::Value {
+        if let Some(offset) = frame_offset {
+            self.builder.ins().load(
+                types::I32,
+                MemFlagsData::new(),
+                self.suspension.async_frame.unwrap(),
+                offset + word * 4,
+            )
+        } else {
+            self.builder.ins().stack_load(
+                reference_type(self.module.target_config()),
+                types::I32,
+                slot.unwrap(),
+                word * 4,
+            )
+        }
+    }
+
     fn emit_lir_shared_normal_cleanup(
         &mut self,
         depth: usize,
-        region: Option<crate::ir::lowered::cleanup::CleanupRegionId>,
         ledger: &mut LirCleanupBindings,
+        protocol: (Option<usize>, Option<usize>),
     ) {
-        // Active reference/call preparations carry per-site diagnostic values.
-        // Their cleanup remains local rather than merging distinct protocols.
-        if !self.diagnostics.lir_call_frames.is_empty()
-            || !self.diagnostics.lir_reference_scopes.is_empty()
-        {
-            self.emit_flush_defers_from(depth);
-            return;
-        }
-        // A poll-shaped body (poll fn, cancellation cleanup, task-stack
-        // boundary callback) is re-entered at its suspend points by the state
-        // dispatch, which jumps straight into the middle of a flush that
-        // crosses a task-stack boundary. The selector's defining block then no
-        // longer dominates the switch at the end of the shared region, so the
-        // sharing is only sound while every edge into the flush comes from the
-        // flush's own entry.
-        if self.suspension.async_frame.is_some() {
-            self.emit_flush_defers_from(depth);
+        if depth == self.cleanup.defer_stack.len() {
             return;
         }
         let key = NormalCleanupKey {
-            region,
-            entries: self.cleanup.defer_stack.identity,
-            depth,
+            protocol,
             roots: self.roots.gc_root_count,
-            panic_target: self.cleanup.panic_scopes.last().map(|scope| scope.cleanup),
             panic_depth: self.cleanup.panic_defer_codegen_depth,
             recover_depth: self.cleanup.recover_eligible_depth,
             call_depth: self.diagnostics.callstack_frame_depth,
             native_active: self.cleanup.sync_native_active.is_some(),
         };
-        let (entry, index) = if let Some(cleanup) = ledger.normal.get(&key) {
-            (cleanup.entry, cleanup.continuations.len())
-        } else {
-            let entry = self.builder.create_block();
-            self.builder.append_block_param(entry, types::I32);
-            if let Some(active) = self.cleanup.sync_native_active {
-                self.builder
-                    .append_block_param(entry, self.builder.func.dfg.value_type(active));
-            }
-            (entry, 0)
-        };
-        let selector = self.builder.ins().iconst(types::I32, index as i64);
-        let mut args = vec![selector.into()];
-        if let Some(active) = self.cleanup.sync_native_active {
-            args.push(active.into());
-        }
-        self.builder.ins().jump(entry, &args);
         if !ledger.normal.contains_key(&key) {
-            self.builder.switch_to_block(entry);
-            let selector = self.builder.block_params(entry)[0];
-            let before_active = self.cleanup.sync_native_active;
-            if before_active.is_some() {
-                self.cleanup.sync_native_active = Some(self.builder.block_params(entry)[1]);
-            }
-            self.emit_flush_defers_from(depth);
-            self.cleanup.sync_native_active = before_active;
-            let end = (!self.locals.terminated).then(|| self.builder.current_block().unwrap());
+            let selector_offset = self.suspension.cleanup_selector_offset;
+            let slots = selector_offset.is_none().then(|| {
+                self.builder.create_sized_stack_slot(StackSlotData::new(
+                    StackSlotKind::ExplicitSlot,
+                    8,
+                    2,
+                ))
+            });
+            let dispatch = self.builder.create_block();
             ledger.normal.insert(
                 key.clone(),
                 NormalCleanup {
-                    entry,
-                    end,
-                    selector,
+                    entries: HashMap::new(),
+                    dispatch,
+                    slots,
+                    selector_offset,
                     continuations: Vec::new(),
                 },
             );
         }
-        let cleanup = ledger.normal.get_mut(&key).unwrap();
-        if cleanup.end.is_some() {
-            let continuation = self.builder.create_block();
-            cleanup.continuations.push(continuation);
-            self.builder.switch_to_block(continuation);
-            self.locals.terminated = false;
-        } else {
-            self.locals.terminated = true;
+        let control = &ledger.normal[&key];
+        let (slots, offset, dispatch) = (control.slots, control.selector_offset, control.dispatch);
+        let index = control.continuations.len();
+        for (word, value) in [(0, index), (1, depth)] {
+            let value = self.builder.ins().iconst(types::I32, value as i64);
+            if let Some(offset) = offset {
+                self.builder.ins().store(
+                    MemFlagsData::new(),
+                    value,
+                    self.suspension.async_frame.unwrap(),
+                    offset + word * 4,
+                );
+            } else {
+                self.builder.ins().stack_store(
+                    reference_type(self.module.target_config()),
+                    value,
+                    slots.unwrap(),
+                    word * 4,
+                );
+            }
         }
+        let original = LirCleanupState {
+            entries: self.cleanup.defer_stack.clone(),
+            panic: self.cleanup.panic_scopes.clone(),
+            locks: self.cleanup.lock_scopes.clone(),
+        };
+        let active_before = self.cleanup.sync_native_active;
+        let continuation = self.builder.create_block();
+        ledger
+            .normal
+            .get_mut(&key)
+            .unwrap()
+            .continuations
+            .push(continuation);
+        loop {
+            let identity = self.cleanup.defer_stack.identity;
+            let existing = ledger.normal[&key].entries.get(&identity).copied();
+            let entry = existing.unwrap_or_else(|| {
+                let entry = self.builder.create_block();
+                if let Some(active) = self.cleanup.sync_native_active {
+                    self.builder
+                        .append_block_param(entry, self.builder.func.dfg.value_type(active));
+                }
+                ledger
+                    .normal
+                    .get_mut(&key)
+                    .unwrap()
+                    .entries
+                    .insert(identity, entry);
+                entry
+            });
+            let active = self.cleanup.sync_native_active.map(Into::into);
+            self.builder.ins().jump(entry, active.as_slice());
+            if existing.is_some() {
+                break;
+            }
+            self.builder.switch_to_block(entry);
+            if active_before.is_some() {
+                self.cleanup.sync_native_active = Some(self.builder.block_params(entry)[0]);
+            }
+            let parent_depth = self.cleanup.defer_stack.len() - 1;
+            // One body per lexical scope. Descendant exits join this same
+            // suffix; neither bindings nor actions are copied per exit/depth.
+            let selector = self.suspension.cleanup_selector_offset.take();
+            self.emit_flush_defers_from(parent_depth);
+            self.suspension.cleanup_selector_offset = selector;
+            if self.locals.terminated {
+                break;
+            }
+            if parent_depth == ledger.initial.entries.len() {
+                self.builder.ins().jump(dispatch, &[]);
+                break;
+            }
+            let stop = self.load_cleanup_control(slots, offset, 1);
+            let done = self
+                .builder
+                .ins()
+                .icmp_imm_s(IntCC::Equal, stop, parent_depth as i64);
+            let next = self.builder.create_block();
+            self.builder.ins().brif(done, dispatch, &[], next, &[]);
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+            self.pop_cleanup_scope();
+        }
+        self.install_lir_cleanup(&original);
+        self.cleanup.sync_native_active = active_before;
+        self.builder.switch_to_block(continuation);
+        self.locals.terminated = false;
     }
 
     fn emit_lir_operand_return(

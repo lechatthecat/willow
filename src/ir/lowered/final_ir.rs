@@ -212,8 +212,13 @@ pub enum LirInst {
     LeaveDeferScope {
         sites: Vec<LirDeferId>,
     },
+    /// Restore the method/reference prefix at the dominating loop header.
+    RestoreCallPreparation {
+        entry: BlockId,
+    },
+    /// Flush the complete active suffix; its registrations belong to the
+    /// matching EnterDeferScope instructions and are never copied per exit.
     FlushDefers {
-        sites: Vec<LirDeferId>,
         scopes: usize,
     },
     ClearScopeRoots {
@@ -459,17 +464,36 @@ pub(super) fn finish_program(source: super::SourceProgram) -> LirProgram {
 }
 
 /// Convert cleanup regions in postorder without consuming native stack depth.
-pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
-    enum Work {
-        Enter(usize, super::SourceFunction, Vec<String>),
-        Finish(usize, LirFunction, Vec<(usize, usize, usize)>),
+fn local_name_collisions(
+    locals: &[LirLocal],
+    names: &std::collections::HashMap<&str, LirLocalId>,
+    inherited: Vec<String>,
+) -> std::collections::HashSet<LirLocalId> {
+    let mut collisions: std::collections::HashSet<_> = locals
+        .iter()
+        .filter_map(|local| {
+            let base = local.name.strip_suffix('$')?;
+            names.contains_key(base).then_some(local.id)
+        })
+        .collect();
+    for name in inherited {
+        collisions.insert(names[name.as_str()]);
     }
-    let mut pending = vec![Work::Enter(0, source, Vec::new())];
+    collisions
+}
+
+enum FinishWork {
+    Enter(usize, super::SourceFunction, Vec<String>),
+    Finish(usize, LirFunction, Vec<(usize, usize, usize)>),
+}
+
+pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
+    let mut pending = vec![FinishWork::Enter(0, source, Vec::new())];
     let mut finished = std::collections::HashMap::new();
     let mut next_id = 1;
     while let Some(work) = pending.pop() {
         match work {
-            Work::Finish(id, mut function, children) => {
+            FinishWork::Finish(id, mut function, children) => {
                 for (block, instruction, child) in children {
                     let LirInst::Defer { body, .. } =
                         &mut function.blocks[block].instrs[instruction]
@@ -480,24 +504,15 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                 }
                 finished.insert(id, function);
             }
-            Work::Enter(id, mut source, inherited_collisions) => {
+            FinishWork::Enter(id, mut source, inherited_collisions) => {
                 use super::SourceInst as I;
                 let names: std::collections::HashMap<_, _> = source
                     .locals
                     .iter()
                     .map(|local| (local.name.as_str(), local.id))
                     .collect();
-                let mut collisions: std::collections::HashSet<_> = source
-                    .locals
-                    .iter()
-                    .filter_map(|local| {
-                        let base = local.name.strip_suffix('$')?;
-                        names.contains_key(base).then_some(local.id)
-                    })
-                    .collect();
-                for name in inherited_collisions {
-                    collisions.insert(names[name.as_str()]);
-                }
+                let collisions =
+                    local_name_collisions(&source.locals, &names, inherited_collisions);
                 let mut blocks = Vec::new();
                 let mut children = Vec::new();
                 let mut child_work = Vec::new();
@@ -554,8 +569,9 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                 lock,
                             },
                             I::LeaveDeferScope { sites } => LirInst::LeaveDeferScope { sites },
-                            I::FlushDefers { sites, scopes } => {
-                                LirInst::FlushDefers { sites, scopes }
+                            I::FlushDefers { scopes } => LirInst::FlushDefers { scopes },
+                            I::RestoreCallPreparation { entry } => {
+                                LirInst::RestoreCallPreparation { entry }
                             }
                             I::ClearScopeRoots { locals } => LirInst::ClearScopeRoots { locals },
                             I::Defer { id, body, span } => {
@@ -567,7 +583,11 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                                     &body.captures,
                                     &collisions,
                                 );
-                                child_work.push(Work::Enter(child, *body.function, inherited));
+                                child_work.push(FinishWork::Enter(
+                                    child,
+                                    *body.function,
+                                    inherited,
+                                ));
                                 LirInst::Defer {
                                     id,
                                     body: LirDeferBody {
@@ -654,7 +674,7 @@ pub(super) fn finish_function(source: super::SourceFunction) -> LirFunction {
                     async_frame: source.async_frame,
                     captures: source.captures,
                 };
-                pending.push(Work::Finish(id, function, children));
+                pending.push(FinishWork::Finish(id, function, children));
                 pending.extend(child_work);
             }
         }

@@ -159,3 +159,18 @@ impl Drop for BridgeFrame {
         unsafe { willow_rust_bridge_frame_drop(self.raw) }
     }
 }
+
+/// Only consuming calls need this guard: a later decode may panic before the
+/// adapter is entered. Drop arbitrary Rust values inside the foreign region.
+struct ConsumedHandle<T>(Option<Box<T>>);
+impl<T> ConsumedHandle<T> {
+    fn take(&mut self) -> Box<T> { self.0.take().unwrap() }
+}
+impl<T> Drop for ConsumedHandle<T> {
+    fn drop(&mut self) {
+        if let Some(value) = self.0.take() {
+            let _region = BridgeRegion::enter();
+            drop(value);
+        }
+    }
+}

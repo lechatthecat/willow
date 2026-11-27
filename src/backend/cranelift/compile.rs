@@ -1791,6 +1791,7 @@ impl UnitCodegenContext<'_> {
         symbol: &str,
         target: cranelift_module::FuncId,
     ) -> Result<cranelift_module::FuncId> {
+        self.declare_handle_debug_output(f)?;
         let bridge = f.rust_bridge.as_ref().unwrap();
         // Record declarations are source-local. Signature qualification supplies
         // their module prefix; an extern function namespace does not own types.

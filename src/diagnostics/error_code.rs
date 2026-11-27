@@ -118,6 +118,8 @@ error_codes! {
     E0813, // `Task.try_join()` has been removed — use `await`
     W0801, // async frame exceeds the large-frame warning threshold
     W0802, // discarded task/future expression statement
+    W0906, // owned native handle neither closed nor escaped
+    E0906, // statically proven use after native handle consumption
     // Static members / implicit self E083x
     E0830, // static property requires an initializer
     E0831, // `self` not available in static method (or explicit self on static)

@@ -176,6 +176,16 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         use crate::ir::lowered::LirOperand;
         match operand {
+            LirOperand::Local(local)
+                if !function.locals[local.0 as usize].is_gc_owner()
+                    && function.locals[local.0 as usize].ty == Type::Void =>
+            {
+                // Unit has no stored payload. In particular, task-boundary
+                // callbacks intentionally omit its frame slot; its expression
+                // effects already ran in the preceding LIR instructions.
+                let ty = self.clif_type(&Type::Void);
+                self.builder.ins().iconst(ty, 0)
+            }
             LirOperand::Local(local) => self.load_lir_local(function, *local),
             LirOperand::Integer { value, ty } => {
                 let ty = self.clif_type(ty);
@@ -243,7 +253,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         span: Span,
     ) -> cranelift_codegen::ir::Value {
         use crate::ir::lowered::LirRvalue;
-        match value {
+        let output = match value {
             LirRvalue::StartTask { .. }
             | LirRvalue::PrepareMethod { .. }
             | LirRvalue::MethodCall { .. }
@@ -286,7 +296,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             LirRvalue::IndirectCall { .. } => self.emit_lir_indirect_rvalue(function, value, span),
             LirRvalue::BeginReferenceCall => {
                 self.emit_debug_reference_call_scope_push();
-                self.diagnostics.lir_reference_scopes.push(Vec::new());
+                self.diagnostics
+                    .lir_reference_scopes
+                    .push_back(im::Vector::new());
                 self.builder.ins().iconst(types::I8, 0)
             }
             LirRvalue::ReferenceDebug {
@@ -297,9 +309,9 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 self.emit_flat_reference_debug(argument, callee, *index);
                 self.diagnostics
                     .lir_reference_scopes
-                    .last_mut()
+                    .back_mut()
                     .expect("prepared reference scope")
-                    .push(FlatReferenceDebug {
+                    .push_back(FlatReferenceDebug {
                         argument: argument.clone(),
                         callee: *callee,
                         index: *index,
@@ -308,7 +320,17 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             }
             LirRvalue::Use(operand) => self.emit_lir_operand(function, operand),
             LirRvalue::StringLiteral(value) => self.emit_string_literal(value),
+        };
+        match value {
+            LirRvalue::DirectCall { result, .. }
+            | LirRvalue::StaticCall { result, .. }
+            | LirRvalue::IndirectCall { result, .. }
+            | LirRvalue::AwaitFuture { result, .. } => {
+                self.emit_handle_debug_site(output, result, span);
+            }
+            _ => {}
         }
+        output
     }
 
     fn emit_lir_calls_rvalue(
@@ -343,7 +365,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 if self.flat_method_frame_enabled(method) {
                     self.diagnostics
                         .lir_call_frames
-                        .push((method.clone(), span));
+                        .push_back((method.clone(), span));
                 }
                 receiver
             }
@@ -360,7 +382,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     let (prepared, _) = self
                         .diagnostics
                         .lir_call_frames
-                        .pop()
+                        .pop_back()
                         .expect("prepared method frame");
                     assert_eq!(prepared, *method);
                 }

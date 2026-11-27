@@ -38,6 +38,28 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         order
     }
 
+    /// Move the compile-time view to the enclosing lexical cleanup scope.
+    pub(super) fn pop_cleanup_scope(&mut self) {
+        self.cleanup.defer_stack.pop();
+        let depth = self.cleanup.defer_stack.len();
+        if self
+            .cleanup
+            .panic_scopes
+            .last()
+            .is_some_and(|scope| scope.defer_depth >= depth)
+        {
+            self.cleanup.panic_scopes.pop();
+        }
+        while self
+            .cleanup
+            .lock_scopes
+            .last()
+            .is_some_and(|scope| scope.defer_depth >= depth)
+        {
+            self.cleanup.lock_scopes.pop();
+        }
+    }
+
     /// Run every registered defer from frame `depth` outward, innermost frame
     /// first, newest registration first (LIFO). Frames are left in place —
     /// scope bookkeeping pops them.
@@ -97,12 +119,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let previous =
                     std::mem::replace(&mut self.locals.vars, (*entry.vars_at_registration).clone());
                 vars_before.get_or_insert(previous);
-                // Rebind the hidden frame operands: coop loop bodies restore
-                // `vars`, wiping the names between registration and a
-                // function-exit flush.
-                for (name, storage) in entry.bindings.iter() {
-                    self.locals.vars.insert(name.clone(), storage.clone());
-                }
+                // The captured map already includes hidden frame operands.
                 // Async: leave REGISTERED before entering user cleanup code.
                 // A future recoverable panic may unwind out of that code; if
                 // the flag stayed set until afterwards, cancellation/recovery
@@ -678,12 +695,18 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         }
         // Poll-shaped entries can resume in the middle of a cleanup, so only
         // ordinary synchronous functions share this terminal path.
+        let guarded = !self.cleanup.defer_stack.unguarded;
         let key = (self.suspension.async_frame.is_none()
             && self.suspension.coop_frame.is_none()
             && self.cleanup.panic_return_block.is_some())
         .then(|| SyncCancelCleanupKey {
+            return_target: self.cleanup.panic_return_block,
             defers: self.cleanup.defer_stack.identity,
-            consumed: self.cleanup.sync_cancel_defer_context,
+            consumed: if guarded {
+                0
+            } else {
+                self.cleanup.sync_cancel_defer_context
+            },
             // A lexical cleanup block identifies its entire enclosing chain.
             panic_target: self.cleanup.panic_scopes.last().map(|scope| scope.cleanup),
             roots: self.roots.gc_root_count,
@@ -767,7 +790,20 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             let outcome = self.builder.ins().select(active, panicked, ready);
             self.builder.ins().return_(&[outcome]);
         } else if let Some(return_block) = self.cleanup.panic_return_block {
-            self.emit_flush_defers_from(0);
+            // Guarded lexical sites clear their flag before calling user code.
+            // A shared cancellation body must include every site: its first
+            // caller may already have consumed a different prefix than later
+            // callers. Runtime flags select precisely the remaining actions.
+            let unavailable =
+                guarded.then(|| std::mem::take(&mut self.cleanup.unavailable_defer_ids));
+            if guarded {
+                self.emit_shared_cancel_suffix(return_block);
+            } else {
+                self.emit_flush_defers_from(0);
+            }
+            if let Some(unavailable) = unavailable {
+                self.cleanup.unavailable_defer_ids = unavailable;
+            }
             if !self.locals.terminated {
                 self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
                 self.builder.ins().jump(return_block, &[]);
@@ -789,6 +825,47 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.switch_to_block(resume);
         self.builder.seal_block(resume);
         self.locals.terminated = false;
+    }
+
+    /// Cancellation shares lexical suffixes across both source exits and
+    /// cleanup calls. Registration flags select the still-live actions.
+    fn emit_shared_cancel_suffix(&mut self, return_block: cranelift_codegen::ir::Block) {
+        let stack = self.cleanup.defer_stack.clone();
+        let panic = self.cleanup.panic_scopes.clone();
+        let locks = self.cleanup.lock_scopes.clone();
+        let active = self.cleanup.sync_native_active.take();
+        loop {
+            let key = (
+                self.cleanup.defer_stack.identity,
+                self.roots.gc_root_count,
+                self.cleanup.panic_scopes.last().map(|scope| scope.cleanup),
+                return_block,
+            );
+            if let Some(&entry) = self.cleanup.sync_cancel_suffixes.get(&key) {
+                self.builder.ins().jump(entry, &[]);
+                break;
+            }
+            let entry = self.builder.create_block();
+            self.cleanup.sync_cancel_suffixes.insert(key, entry);
+            self.builder.ins().jump(entry, &[]);
+            self.builder.switch_to_block(entry);
+            if self.cleanup.defer_stack.len() == 0 {
+                self.emit_void_runtime_call(rt::willow_sync_cleanup_leave, &[]);
+                self.builder.ins().jump(return_block, &[]);
+                break;
+            }
+            let depth = self.cleanup.defer_stack.len() - 1;
+            self.emit_flush_defers_from(depth);
+            if self.locals.terminated {
+                break;
+            }
+            self.pop_cleanup_scope();
+        }
+        self.cleanup.defer_stack = stack;
+        self.cleanup.panic_scopes = panic;
+        self.cleanup.lock_scopes = locks;
+        self.cleanup.sync_native_active = active;
+        self.locals.terminated = true;
     }
 
     /// Branch an already-raised synchronous language panic to the nearest
@@ -907,9 +984,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     I::Invoke(id) => {
                         let entry = &scope.entries[id];
                         self.locals.vars = (*entry.vars_at_registration).clone();
-                        for (name, storage) in entry.bindings.iter() {
-                            self.locals.vars.insert(name.clone(), storage.clone());
-                        }
                         self.emit_void_runtime_call(rt::willow_panic_enter_defer, &[]);
                         self.cleanup.panic_defer_codegen_depth = 1;
                         self.cleanup.recover_eligible_depth =
