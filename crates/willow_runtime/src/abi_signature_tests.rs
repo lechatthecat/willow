@@ -636,6 +636,21 @@ fn scalar_bridge_runtime_abi_matches_schema() {
 }
 
 #[test]
+fn blocking_bridge_callback_abi_matches_schema() {
+    let _: unsafe extern "C" fn(
+        usize,
+        unsafe extern "C" fn(usize, u32) -> usize,
+        unsafe extern "C" fn(usize),
+    ) -> usize = crate::rust_bridge_abi::willow_rust_bridge_run;
+    let _: unsafe extern "C" fn(*const u8, usize) = crate::rust_bridge_abi::willow_rust_bridge_fail;
+    assert_schema("willow_rust_bridge_run", &[I64, Ptr, Ptr], Some(I64));
+    assert_schema("willow_rust_bridge_fail", &[Ptr, I64], None);
+    let effects = runtime_symbol("willow_rust_bridge_run").unwrap().effects();
+    assert!(effects.contains(willow_abi::RuntimeEffects::MAY_SUSPEND));
+    assert!(!effects.contains(willow_abi::RuntimeEffects::MAY_BLOCK));
+}
+
+#[test]
 fn aggregate_bridge_runtime_abi_matches_schema() {
     use crate::rust_bridge_abi::aggregate::*;
     use willow_abi::{

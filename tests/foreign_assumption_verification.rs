@@ -197,7 +197,7 @@ fn assert_contracts_unproven(report: &Value) {
                 .is_some_and(|name| name.ends_with("::guard#0"))
         })
         .unwrap();
-    for effect in ["may-io", "may-block"] {
+    for effect in ["may-io", "may-suspend"] {
         assert!(
             guard["effects"]["target"]
                 .as_array()

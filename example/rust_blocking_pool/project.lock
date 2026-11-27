@@ -1,0 +1,21 @@
+lock-version = 1
+
+[root]
+package = "path:."
+
+[[package]]
+id = "path:."
+name = "rust_blocking_pool"
+version = "0.1.0"
+dependencies = []
+
+[package.source]
+kind = "path"
+path = "."
+
+[rust]
+modules = true
+cargo-lock-hash = "8cbd66e2f597dd71920f8e1c438f91a17c31c04e514b5fd6ad7cb9d0bc631c0f"
+bridge-input-hash = "29c487b88de0764f1b10a7349e5b5ceb0cd8cbba7dbd693439e2e127c18302b4"
+
+[rust.dependencies]

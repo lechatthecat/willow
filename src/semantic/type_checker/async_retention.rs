@@ -327,6 +327,7 @@ pub(super) fn analyze(
 fn deferred_operands(body: &DeferBody) -> Vec<&Expr> {
     match body {
         DeferBody::Expr(Expr::Call(c)) => c.args.iter().map(|a| &a.expr).collect(),
+        DeferBody::Expr(Expr::StaticCall(c)) => c.args.iter().map(|a| &a.expr).collect(),
         DeferBody::Expr(Expr::MethodCall(c)) => std::iter::once(&c.object)
             .chain(c.args.iter().map(|a| &a.expr))
             .collect(),

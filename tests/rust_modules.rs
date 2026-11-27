@@ -664,7 +664,7 @@ async fn main() {
         assert_eq!(b["trust"], "developer_declared");
         assert_eq!(b["review_current"], false);
         let effects = b["effects"].as_u64().unwrap() as u8;
-        assert_ne!(effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(), 0);
+        assert_ne!(effects & willow_abi::RuntimeEffects::MAY_SUSPEND.bits(), 0);
         assert_ne!(effects & willow_abi::RuntimeEffects::MAY_ALLOCATE.bits(), 0);
         assert_ne!(effects & willow_abi::RuntimeEffects::MAY_PANIC.bits(), 0);
         assert_ne!(effects & willow_abi::ffi::FOREIGN_CALL, 0);
@@ -797,11 +797,18 @@ fn native_assume_unreviewed_contexts_keep_diagnostics() {
             // Review the remaining constructor claim so only context errors remain.
             f.approve_native();
             let output = f.command(&["check", ".", "--offline"]).output().unwrap();
+            if context == "task" {
+                assert!(
+                    output.status.success(),
+                    "{call}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                continue;
+            }
             assert!(!output.status.success(), "{call}/{context}");
             let error = String::from_utf8_lossy(&output.stderr);
             assert!(
                 error.contains(match context {
-                    "task" => "E0810",
                     "lock" => "E2604",
                     _ => "E2612",
                 }) && !error.contains("rust_nonblocking_review_required"),
@@ -1047,11 +1054,12 @@ fn main() {{ println(exercise()); }}
             assert_eq!(bridge["schema"], 2);
             assert_eq!(bridge["assumptions"]["no_io"], true);
             assert_eq!(bridge["assumptions"]["no_block"], no_block);
+            assert_eq!(bridge["execution"], "blocking_pool_in_task");
             assert_eq!(bridge["review_current"], false);
             assert_eq!(bridge["evidence_kind"], "unknown");
             let bits = bridge["effects"].as_u64().unwrap() as u8;
             assert_ne!(bits & RuntimeEffects::MAY_IO.bits(), 0);
-            assert_ne!(bits & RuntimeEffects::MAY_BLOCK.bits(), 0);
+            assert_ne!(bits & RuntimeEffects::MAY_SUSPEND.bits(), 0);
         }
         let output = f.command(&["check", ".", "--offline"]).output().unwrap();
         assert!(!output.status.success());
@@ -1064,12 +1072,20 @@ fn main() {{ println(exercise()); }}
         f.success(&["check", ".", "--offline"]);
         let reviewed = f.review_query();
         for bridge in reviewed["bridges"].as_array().unwrap() {
+            assert_eq!(
+                bridge["execution"],
+                if no_block {
+                    "direct"
+                } else {
+                    "blocking_pool_in_task"
+                }
+            );
             assert_eq!(bridge["review_current"], true);
             assert_eq!(bridge["evidence_kind"], "assumption");
             assert_eq!(bridge["official_verified"], false);
             let bits = bridge["effects"].as_u64().unwrap() as u8;
             assert_eq!(bits & RuntimeEffects::MAY_IO.bits(), 0);
-            assert_eq!(bits & RuntimeEffects::MAY_BLOCK.bits() == 0, no_block);
+            assert_eq!(bits & RuntimeEffects::MAY_SUSPEND.bits() == 0, no_block);
             assert_ne!(bits & RuntimeEffects::MAY_ALLOCATE.bits(), 0);
             assert_ne!(bits & RuntimeEffects::MAY_PANIC.bits(), 0);
             let location = &bridge["assumption_location"];
@@ -1083,6 +1099,25 @@ fn main() {{ println(exercise()); }}
             assert_eq!(evidence["schema"], "willow.effects.v3");
             assert_eq!(evidence["assumptions"]["no_io"]["kind"], "assumption");
             assert_eq!(!evidence["assumptions"]["no_wait"].is_null(), no_block);
+            assert_eq!(!evidence["assumptions"]["no_suspend"].is_null(), no_block);
+            let block = evidence["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|effect| effect["effect"] == RuntimeEffects::MAY_BLOCK.bits())
+                .unwrap();
+            assert_eq!(block["state"], "none", "{evidence}");
+            if no_block {
+                let suspend = evidence["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|effect| effect["effect"] == RuntimeEffects::MAY_SUSPEND.bits())
+                    .unwrap();
+                assert_eq!(suspend["state"], "none", "{evidence}");
+                assert_eq!(suspend["evidence_kind"], "assumption", "{evidence}");
+            }
+
             let io = evidence["effects"]
                 .as_array()
                 .unwrap()
@@ -1096,6 +1131,31 @@ fn main() {{ println(exercise()); }}
                     .as_str()
                     .unwrap()
                     .ends_with("native.rs")
+            );
+        }
+        if no_block {
+            let output = f
+                .command(&[
+                    "effects",
+                    "main::helper",
+                    "--project-dir",
+                    ".",
+                    "--format=json",
+                ])
+                .output()
+                .unwrap();
+            let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            // Native allocation/panic bounds remain unknown; the query can
+            // still report precise reviewed absence and source locations.
+            assert_eq!(query["result"]["status"], "incomplete", "{query}");
+            let assumptions = &query["result"]["assumptions"];
+            assert_eq!(
+                assumptions["no_suspend"]["location"]["path"], "src/native.rs",
+                "{query}"
+            );
+            assert!(
+                assumptions["no_suspend"]["location"]["line"].is_number(),
+                "{query}"
             );
         }
         assert_eq!(

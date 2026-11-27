@@ -119,11 +119,14 @@ pub fn get(id: u64, name: TypeId) -> Result<Lease, HandleError> {
         .unwrap_or_else(|p| p.into_inner())
         .get(id, name)
 }
-pub fn close(id: u64, name: TypeId) -> Result<(), HandleError> {
-    let removed = table()
+pub fn take(id: u64, name: TypeId) -> Result<Lease, HandleError> {
+    table()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .close(id, name)?;
+        .close(id, name)
+}
+pub fn close(id: u64, name: TypeId) -> Result<(), HandleError> {
+    let removed = take(id, name)?;
     drop(removed);
     Ok(())
 }

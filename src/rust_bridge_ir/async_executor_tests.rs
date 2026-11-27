@@ -8,6 +8,7 @@ impl BridgeFrame {
 }
 #[path = "../../crates/willow_runtime/src/rust_bridge_abi/handles.rs"]
 mod handles;
+include!("owned.rs");
 include!("futures.rs");
 unsafe fn willow_rust_bridge_panic() -> ! {
     panic!("RustPanic");

@@ -215,20 +215,14 @@ fn rust_panic_stops_before_continuation_without_crossing_ffi() {
 }
 
 #[test]
-fn scheduler_task_rejects_foreign_call_before_running_rust_body() {
+fn scheduler_task_routes_foreign_call_and_continues() {
     let f = Fixture::new();
     f.sources(
         "extern rust { fn touch(); } async fn main() { touch(); println(987654321); }",
-        "pub fn touch() { println!(\"RUST_BODY_MUST_NOT_RUN\"); }",
+        "pub fn touch() { assert!(std::thread::current().name().unwrap_or(\"\").starts_with(\"willow-rust-blocking\")); }",
     );
-    let output = f.command(&["run", "--offline"]);
-    let error = String::from_utf8_lossy(&output.stderr);
-    assert!(!output.status.success());
-    assert!(error.contains("E0810"), "{error}");
-    assert!(error.contains("unproven call in `touch`"), "{error}");
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(!stdout.contains("RUST_BODY_MUST_NOT_RUN"));
-    assert!(!stdout.contains("987654321"));
+    let output = f.successful(&["run", "--offline"]);
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "987654321\n");
 }
 
 #[test]
@@ -278,12 +272,21 @@ fn adapter_counts_scale_once_per_declaration() {
         let source = wrappers(&symbols, Path::new("ffi.rs"), 1);
         assert_eq!(source.matches("#[unsafe(no_mangle)]").count(), count);
         assert_eq!(source.matches("let adapter:").count(), count);
-        assert_eq!(source.matches("std::panic::catch_unwind").count(), count);
-        assert_eq!(source.matches("BridgeRegion::enter()").count(), count);
+        assert_eq!(
+            source.matches("std::panic::catch_unwind").count(),
+            count + 3
+        );
+        assert_eq!(source.matches("BridgeRegion::enter()").count(), 2);
         assert_eq!(source.matches("struct BridgeRegion").count(), 1);
-        let empty_len = wrappers(&[], Path::new("ffi.rs"), 1).len();
-        let bytes_per_wrapper = (source.len() - empty_len) / count;
-        assert_eq!(source.len(), empty_len + bytes_per_wrapper * count);
+        let one = wrappers(&symbols[..1], Path::new("ffi.rs"), 1).len();
+        let two = wrappers(
+            &[symbols[0].clone(), symbols[0].clone()],
+            Path::new("ffi.rs"),
+            1,
+        )
+        .len();
+        let bytes_per_wrapper = two - one;
+        assert_eq!(source.len(), one + bytes_per_wrapper * (count - 1));
         if let Some(previous) = previous {
             assert_eq!(bytes_per_wrapper, previous);
         }
@@ -432,8 +435,8 @@ fn mixed_scalar_arguments_cross_register_and_stack_abi_boundaries() {
 #[test]
 fn rust_panic_payload_drop_is_not_executed_at_ffi_boundary() {
     let f = Fixture::new();
-    f.sources(
-        "extern rust { fn fail(); } fn main() { fail(); println(987654321); }",
+    f.reviewed_sources(
+        r#"extern rust { nonblocking("REVIEW") fn fail(); } fn main() { fail(); println(987654321); }"#,
         r#"
         struct Payload;
         impl Drop for Payload {
@@ -484,7 +487,7 @@ fn ai_snapshot_exposes_scalar_signature_symbol_and_foreign_effects() {
     assert_ne!(symbol.effects & willow_abi::ffi::FOREIGN_CALL, 0);
     for effect in [
         willow_abi::RuntimeEffects::MAY_PANIC,
-        willow_abi::RuntimeEffects::MAY_BLOCK,
+        willow_abi::RuntimeEffects::MAY_SUSPEND,
         willow_abi::RuntimeEffects::MAY_ALLOCATE,
     ] {
         assert_ne!(symbol.effects & effect.bits(), 0);
@@ -580,6 +583,10 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         }}
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_enter(revision: u32) {{ assert_eq!(revision, {}); }}
+        #[unsafe(no_mangle)]
+        pub unsafe extern "C" fn willow_rust_bridge_run(context: usize, invoke: unsafe extern "C" fn(usize, u32) -> usize, _: unsafe extern "C" fn(usize)) -> usize {{ unsafe {{ invoke(context, 0) }} }}
+        #[unsafe(no_mangle)]
+        pub extern "C" fn willow_rust_bridge_fail(_: *const u8, _: usize) {{ std::process::abort() }}
         #[unsafe(no_mangle)]
         pub extern "C" fn willow_rust_bridge_region_enter() -> u32 {{ 0 }}
         #[unsafe(no_mangle)]
@@ -1179,15 +1186,15 @@ fn aggregate_wrapper_emission_is_linear_and_shared_per_declaration() {
         let per = (source.len() - baseline.len()) / (count - 1);
         assert_eq!(source.matches("let adapter:").count(), count);
         assert_eq!(source.matches("struct BridgeFrame").count(), 1);
-        assert_eq!(source.matches("catch_unwind(").count(), count);
-        // One per wrapper, plus the handle release shared by every wrapper.
-        assert_eq!(source.matches("BridgeRegion::enter()").count(), count + 1);
+        assert_eq!(source.matches("catch_unwind(").count(), count + 3);
+        // Native execution/disposal and caller-frame handle release are shared.
+        assert_eq!(source.matches("BridgeRegion::enter()").count(), 3);
         // The region holds only the foreign body: decoding reads managed
         // objects before it, and encoding allocates them after it.
         let body = source.find("let adapter:").unwrap();
-        let region = source[body..].find("BridgeRegion::enter()").unwrap();
+        let region = source[body..].find("blocking_call(move ||").unwrap();
         let handles = source[body..].find("frame.release_handles()").unwrap();
-        let decoded = source[..body].rfind("frame.bytes(").unwrap();
+        let decoded = source[..body].rfind("frame.owned_bytes(").unwrap();
         let encoded = source[body..].find("frame.output_").unwrap();
         assert!(decoded < body && region < handles && handles < encoded);
         if let Some(prior) = previous {
@@ -1563,7 +1570,7 @@ fn foreign_admission_effects_and_generated_paths_agree() {
                             }
                         }
                         assert_eq!(
-                            symbol.effects & RuntimeEffects::MAY_BLOCK.bits() == 0,
+                            symbol.effects & RuntimeEffects::MAY_SUSPEND.bits() == 0,
                             class == "nonblocking"
                         );
                         symbol
@@ -1585,9 +1592,13 @@ fn foreign_admission_effects_and_generated_paths_agree() {
                 // Aggregate support includes one shared handle-release region.
                 assert_eq!(
                     source.matches("BridgeRegion::enter()").count(),
-                    count + usize::from(ty == Scalar::String)
+                    (if bounded { count } else { 2 }) + usize::from(ty == Scalar::String)
                 );
-                assert_eq!(source.matches("std::panic::catch_unwind").count(), count);
+                assert_eq!(
+                    source.matches("std::panic::catch_unwind").count(),
+                    count + if bounded { 0 } else { 3 }
+                );
+                assert_eq!(source.contains("fn blocking_call<"), !bounded);
                 assert!(!source.contains("willow_blocking_"));
                 if let Some((old_count, old_len)) = previous {
                     let increment = source.len() - old_len;
@@ -1912,18 +1923,11 @@ fn nonblocking_many_tasks_gc_and_native_stack() {
 }
 
 #[test]
-fn nonblocking_does_not_disable_undeclared_runtime_guard() {
+fn nonblocking_and_default_entry_validate_revision_on_tasks() {
     let f = Fixture::new();
     f.reviewed_sources(r#"extern rust { nonblocking("REVIEW") fn attempt(); } async fn main() {attempt();}"#,
-        &format!("pub fn attempt() {{ unsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision:u32); }} unsafe {{ willow_rust_bridge_enter({}); }} println!(\"UNDECLARED_BODY\"); }}", willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION));
-    let output = f.command(&["run", "--offline"]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("rust_bridge_worker_blocking"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("UNDECLARED_BODY"));
+        &format!("pub fn attempt() {{ unsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision:u32); }} unsafe {{ willow_rust_bridge_enter({}); }} }}", willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION));
+    f.successful(&["run", "--offline"]);
 }
 
 #[test]
@@ -2242,8 +2246,13 @@ fn widened_bridge_shared_record_generation_is_linear() {
             willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
         );
         assert_eq!(source.matches("fn decode_record_").count(), n + 1);
+        assert_eq!(source.matches("fn decode_owned_record_").count(), n + 1);
+        assert_eq!(source.matches("fn borrow_record_").count(), n + 1);
         assert_eq!(source.matches("fn encode_record_").count(), n + 1);
-        assert_eq!(source.matches(" = frame.record_get(").count(), 2 * n + 1);
+        assert_eq!(
+            source.matches(" = frame.record_get(").count(),
+            2 * (2 * n + 1)
+        );
         assert_eq!(
             source.matches("frame.record_set(object,").count(),
             2 * n + 1
@@ -2252,8 +2261,8 @@ fn widened_bridge_shared_record_generation_is_linear() {
         assert!(metadata.len() < 500 * (n + 1));
         eprintln!(
             "fanout_depth={n} helpers={} reads={} writes={} metadata_bytes={} source_bytes={}",
-            2 * (n + 1),
-            2 * n + 1,
+            4 * (n + 1),
+            2 * (2 * n + 1),
             2 * n + 1,
             metadata.len(),
             source.len()
@@ -2486,7 +2495,7 @@ async fn main() {
 }
 
 #[test]
-fn nonblocking_opaque_close_requires_its_own_review() {
+fn nonblocking_opaque_close_review_controls_direct_execution() {
     let f = Fixture::new();
     let rust = "pub struct Resource; pub fn resource() -> Box<Resource> {Box::new(Resource)}";
     let template = r#"extern rust {
@@ -2520,13 +2529,7 @@ fn nonblocking_opaque_close_requires_its_own_review() {
         &template.replace("nonblocking(\"REVIEW\") opaque", "opaque"),
         rust,
     );
-    let output = f.command(&["check", "."]);
-    assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("E0810"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    f.successful(&["run", "--offline"]);
     f.sources(
         &reviewed,
         &format!("{rust}\n// changed destructor review input"),
@@ -2716,3 +2719,6 @@ pub fn array_char(x: Vec<char>) -> Vec<char> {
     );
     expected.push_str(&"true\n".repeat(3));
 }
+
+#[path = "rust_scalar_bridge/blocking_pool.rs"]
+mod blocking_pool;

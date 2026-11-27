@@ -1,6 +1,6 @@
 //! Bounded blocking-work pool used to isolate file I/O from scheduler workers.
-//! Synchronous foreign calls instead use the same-thread GC safe region and
-//! task admission guards in `rust_bridge_abi`; this pool does not route them.
+//! Rust calls use a separate pool with the same bounds and FIFO admission,
+//! so indefinitely blocked foreign bodies cannot starve file I/O.
 //! Stdout uses a separate one-thread, one-slot
 //! pool so an undrained output pipe cannot starve unrelated file I/O. The
 //! exported blocking gauges describe the general pool only.
@@ -33,7 +33,8 @@
 //! an unreserved slot in between.
 //!
 //! Work that has not been admitted stays owned by its Task, so cancelling that
-//! Task drops the job without ever running it. A burst of blocking calls
+//! Task drops the job without ever running it. Foreign jobs instead stay queued
+//! for native destruction on this pool, with their body suppressed. A burst of blocking calls
 //! therefore costs one parked Task per outstanding operation — the same as any
 //! other parked Task — and only ever shows up as latency; the pool itself never
 //! holds more than the queue capacity. The overload is observable through the
@@ -46,6 +47,8 @@ use crate::wait_queue::WaitQueue;
 use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Condvar, Mutex, OnceLock};
+
+pub(crate) mod foreign;
 
 pub(crate) type BlockingWork = Box<dyn FnOnce() + Send + 'static>;
 
@@ -117,12 +120,17 @@ fn blocking_worker_entry(
 impl BlockingPool {
     fn new(owner: &'static crate::runtime::Runtime, kind: PoolKind) -> Self {
         match kind {
-            PoolKind::General => {
+            PoolKind::General | PoolKind::Foreign => {
                 let threads =
                     willow_abi::settings::blocking_threads().unwrap_or(DEFAULT_BLOCKING_THREADS);
                 let capacity = willow_abi::settings::blocking_queue()
                     .unwrap_or_else(|| threads.saturating_mul(DEFAULT_BLOCKING_QUEUE_PER_THREAD));
-                Self::with_workers(threads, capacity, "willow-blocking", owner, kind)
+                let name = if matches!(kind, PoolKind::Foreign) {
+                    "willow-rust-blocking"
+                } else {
+                    "willow-blocking"
+                };
+                Self::with_workers(threads, capacity, name, owner, kind)
             }
             // Stdout can wait indefinitely for a consumer. It must not occupy
             // any of the general pool's workers. One writer and one queued job
@@ -274,6 +282,7 @@ impl BlockingPool {
 pub(crate) struct BlockingPools {
     general: OnceLock<BlockingPool>,
     stdout: OnceLock<BlockingPool>,
+    foreign: OnceLock<BlockingPool>,
 }
 
 impl BlockingPools {
@@ -281,6 +290,7 @@ impl BlockingPools {
         Self {
             general: OnceLock::new(),
             stdout: OnceLock::new(),
+            foreign: OnceLock::new(),
         }
     }
 }
@@ -289,6 +299,7 @@ impl BlockingPools {
 enum PoolKind {
     General,
     Stdout,
+    Foreign,
 }
 
 impl PoolKind {
@@ -296,6 +307,7 @@ impl PoolKind {
         match self {
             Self::General => &owner.blocking.general,
             Self::Stdout => &owner.blocking.stdout,
+            Self::Foreign => &owner.blocking.foreign,
         }
     }
 

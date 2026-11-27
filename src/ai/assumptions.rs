@@ -40,6 +40,7 @@ pub struct Assumptions<T = Assumption> {
     pub no_block: Option<T>,
     pub no_io: Option<T>,
     pub no_wait: Option<T>,
+    pub no_suspend: Option<T>,
 }
 impl Assumptions<&Assumption> {
     pub fn into_owned(self) -> Assumptions {
@@ -47,6 +48,7 @@ impl Assumptions<&Assumption> {
             no_block: self.no_block.cloned(),
             no_io: self.no_io.cloned(),
             no_wait: self.no_wait.cloned(),
+            no_suspend: self.no_suspend.cloned(),
         }
     }
 }
@@ -153,6 +155,7 @@ impl Analysis {
             no_block: block.map(|id| &self.evidence[id]),
             no_io: io.map(|id| &self.evidence[id]),
             no_wait: block.map(|id| &self.evidence[id]),
+            no_suspend: block.map(|id| &self.evidence[id]),
         }
     }
     pub fn output(&self, function: usize) -> Value {

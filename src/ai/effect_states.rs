@@ -125,11 +125,14 @@ impl Analysis {
         let mut declared_absent = vec![RuntimeEffects::NONE; snapshot.functions.len()];
         for bridge in &snapshot.semantic.interop.bridges {
             if let Some(&i) = index.by_id.get(bridge.function.as_str()) {
+                // Unreviewed task calls park on the pool. Reviewed direct calls
+                // exclude worker blocking through their explicit assumption.
+                declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_BLOCK);
                 if bridge.symbol.assumes_no_io() {
                     declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_IO);
                 }
                 if bridge.symbol.assumes_no_block() {
-                    declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_BLOCK);
+                    declared_absent[i] = declared_absent[i].union(RuntimeEffects::MAY_SUSPEND);
                 }
                 let unknown = RuntimeEffects::ALL.difference(declared_absent[i]);
                 result.reason(i, unknown.bits(), 4, None);
@@ -345,6 +348,8 @@ impl Analysis {
                     assumptions.no_io
                 } else if (1 << bit) == RuntimeEffects::MAY_BLOCK.bits() {
                     assumptions.no_block
+                } else if (1 << bit) == RuntimeEffects::MAY_SUSPEND.bits() {
+                    assumptions.no_suspend
                 } else {
                     None
                 };

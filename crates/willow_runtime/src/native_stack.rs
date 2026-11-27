@@ -487,6 +487,13 @@ pub(crate) fn poll_no_preempt(enter: bool) {
     }
 }
 
+/// Cleanup must finish even after the task has received cancellation.
+pub(crate) fn cancellation_suppressed() -> bool {
+    let stack = CURRENT.with(Cell::get);
+    // SAFETY: CURRENT belongs to this thread and remains live through the call.
+    !stack.is_null() && unsafe { (*stack).cleanup_depth != 0 }
+}
+
 /// Sticky task cancellation, suppressed while generated defer cleanup executes.
 pub(crate) fn cancelled() -> i32 {
     let stack = CURRENT.with(Cell::get);

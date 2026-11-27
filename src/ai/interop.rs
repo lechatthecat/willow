@@ -130,6 +130,7 @@ pub struct BridgeRecord<'a> {
     pub rust_adapter: &'a Option<String>,
     pub abi_symbol: &'a str,
     pub effects: u8,
+    pub execution: &'static str,
     #[serde(rename = "async")]
     pub is_async: bool,
     pub nonblocking: Option<&'a NonblockingReview>,
@@ -185,6 +186,13 @@ impl InteropGraph {
                     rust_adapter: &self.rust_adapter,
                     abi_symbol: &b.symbol.abi_symbol,
                     effects: b.symbol.effects,
+                    execution: if b.symbol.is_async {
+                        "async_executor"
+                    } else if b.symbol.uses_blocking_pool() {
+                        "blocking_pool_in_task"
+                    } else {
+                        "direct"
+                    },
                     is_async: b.symbol.is_async,
                     nonblocking: if b.symbol.native.is_some() {
                         None

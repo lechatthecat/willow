@@ -1599,7 +1599,7 @@ impl<'a> ColdUnitSolve<'a> {
             self.own.insert(id);
             self.seed(id, RuntimeEffects::NONE, None);
         }
-        for (id, span, nonblocking, is_async, no_io) in foreign {
+        for (id, span, nonblocking, _is_async, no_io) in foreign {
             self.seed(
                 id,
                 PANIC.union(RuntimeEffects::MAY_ALLOCATE),
@@ -1608,22 +1608,14 @@ impl<'a> ColdUnitSolve<'a> {
             if !nonblocking {
                 self.seed(
                     id,
-                    if is_async {
-                        RuntimeEffects::MAY_SUSPEND
-                    } else {
-                        RuntimeEffects::MAY_BLOCK
-                    },
+                    RuntimeEffects::MAY_SUSPEND,
                     Some(EffectWitness::Lock(LockEffectWitness {
                         owner: id,
                         cause: LockEffectCause {
                             is_conservative: true,
                             span,
                             operation: "extern rust".into(),
-                            kind: if is_async {
-                                LockEffectKind::Suspend
-                            } else {
-                                LockEffectKind::Block
-                            },
+                            kind: LockEffectKind::Suspend,
                             lock: None,
                         },
                     })),

@@ -31,15 +31,7 @@ impl TypeChecker {
     /// is not immediately awaited. Seed this at the call site so ordinary
     /// async-constructor effect masking cannot erase the foreign wait.
     pub(super) fn check_foreign_call(&mut self, span: Span, is_async: bool) {
-        self.record_direct_lock_effect(
-            span,
-            "extern rust",
-            if is_async {
-                LockEffectKind::Suspend
-            } else {
-                LockEffectKind::Block
-            },
-        );
+        self.record_direct_lock_effect(span, "extern rust", LockEffectKind::Suspend);
         if is_async && !self.local.current_async_context {
             self.push(
                 Diagnostic::new(

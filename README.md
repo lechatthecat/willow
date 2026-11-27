@@ -202,7 +202,11 @@ for collections, classes, enums, error handling and I/O.
 
 Rust crates require concrete, handwritten adapters and Cargo/Rust. Willow generates
 ABI wrappers, but does not analyze native bodies. Ordinary synchronous foreign
-calls carry blocking effects and are rejected in tasks and lexical locks.
+calls from tasks run on a bounded Rust blocking pool; the task waits while its
+scheduler worker runs other tasks. Generated opaque close uses the same path.
+These calls satisfy `no_block`, but require a current reviewed `nonblocking`
+assertion in `no_wait`, `no_suspend`, or lexical lock contexts. See the
+[parallel example](example/rust_blocking_pool) and [execution policy](protocol/ai_toolchain/RUST_BRIDGE.md#synchronous-foreign-execution-paths).
 
 - <a id="boundary-types"></a>**Boundary types:** scalars, strings, supported arrays, records, opaque handles and composed Option/Result values. Arbitrary classes, closures and raw pointers are not boundary types. See the [record mapping](example/rust_record_bridge/README.md), [declaration parser](src/parser/rust_declarations.rs) and [type mapping](src/rust_bridge_ir.rs).
 - <a id="async-calls-willow-task-awaits-rust-future"></a>**Async direction:** Willow can await an adapter's Rust Future; this does not enable Rust-to-Willow callbacks. Inputs are owned, and the Future must be `Send + 'static`. Adapters must arrange native runtime services. See the [async example](example/rust_async_pull) and [interop directions](protocol/ai_toolchain/RUST_BRIDGE.md#remaining-interop-directions).

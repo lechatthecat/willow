@@ -774,7 +774,7 @@ impl TypeChecker {
                 let mut effects = if bridge.assumes_no_block() {
                     RuntimeEffects::NONE
                 } else {
-                    LOCK_EFFECT_WAIT
+                    RuntimeEffects::MAY_SUSPEND
                 };
                 if !bridge.assumes_no_io() {
                     effects = effects.union(RuntimeEffects::MAY_IO);
@@ -845,7 +845,8 @@ impl TypeChecker {
                     .and_then(EffectWitness::lock)
                     .is_some_and(|c| c.operation == "extern rust")
                 {
-                    problem = problem.seed(id, LOCK_EFFECT_WAIT, None);
+                    problem =
+                        problem.seed(id, summary.effects().intersection(LOCK_EFFECT_WAIT), None);
                 }
             } else if matches!(
                 id.synthetic_kind(),
@@ -1389,6 +1390,12 @@ impl TypeChecker {
                 "certainty: {certainty}; call chain: {}",
                 chain.join(" -> ")
             ));
+            if matches!(
+                contract.kind,
+                EffectContractKind::NoWait | EffectContractKind::NoSuspend
+            ) {
+                diagnostic = diagnostic.with_help("unreviewed Rust calls wait on the blocking pool; a current reviewed nonblocking declaration is required where waiting is forbidden");
+            }
             if contract.kind == EffectContractKind::NoPanic {
                 diagnostic = diagnostic.with_help("checked arithmetic, FrozenArray indexing and contract guards can be discharged by @pure @verified with sufficient requires; explicit panic and unsupported operations remain violations");
             }
@@ -2418,7 +2425,7 @@ mod tests {
             (
                 "ffi transitive",
                 "extern rust { fn foreign(); } fn relay() { foreign(); } @effects(no_block) fn guard() { relay(); }",
-                Some(ErrorCode::E2612),
+                None,
             ),
             (
                 "trusted arithmetic",

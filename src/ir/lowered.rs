@@ -2175,6 +2175,15 @@ impl<'r> Builder<'r> {
                 args: capture_args(self, args, &mut inputs),
                 super_class: *super_class,
             },
+            HirExprKind::StaticCall {
+                class,
+                method,
+                args,
+            } => HirExprKind::StaticCall {
+                class: *class,
+                method: method.clone(),
+                args: capture_args(self, args, &mut inputs),
+            },
             HirExprKind::Print { value, newline } => HirExprKind::Print {
                 value: Box::new(capture(self, "print", (**value).clone(), &mut inputs)),
                 newline: *newline,
@@ -2182,7 +2191,7 @@ impl<'r> Builder<'r> {
             ir_variants!(
                 HirExprKind;
                 Int, Float, Bool, Str, Var, FnRef, Binary, Unary, Array, Index, Ternary, New,
-                FieldAccess, ObjectLiteral, StaticField, StaticCall, ReferenceArg, Range, Await,
+                FieldAccess, ObjectLiteral, StaticField, ReferenceArg, Range, Await,
                 TryPropagate, Lambda, Match, Select
             ) => return (expr.clone(), None),
         };

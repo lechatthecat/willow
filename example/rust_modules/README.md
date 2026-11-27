@@ -52,12 +52,10 @@ cannot also be passed as a value record. Records may contain nested records and
 return owned opaque handles, including inside Option/Result. A record input
 cannot consume an owned handle; pass the handle as a separate `&T` argument.
 
-Owned String/byte-vector arguments and record fields copy borrowed Willow data
-when Rust needs ownership. Borrowed arguments reuse the existing bridge views.
-Scalar arrays move the existing bridge vector without another conversion pass.
-Async borrowing follows the same Send/Sync restrictions as `extern rust`.
-Synchronous Rust calls, including explicit close, cannot run inside an async
-Willow task without the existing nonblocking proof. Use native async functions
-for task code; their adapters own arguments until the future finishes.
-Every derived function retains conservative MAY_BLOCK effects; there is no
-native-module nonblocking assertion in this phase.
+Unreviewed synchronous calls copy inputs into owned native values and run on a
+bounded Rust pool when called from tasks. Generated close follows the same rule;
+use `defer native::Handle_close(handle);` for cleanup. Reviewed
+`#[willow::assume(no_block)]` calls retain the direct borrowed path. Both paths
+require shared opaque handles to be `Send + Sync + 'static`. Async functions
+still return tasks and require owned inputs for their Rust futures.
+See the [execution and review policy](../../protocol/ai_toolchain/RUST_BRIDGE.md).

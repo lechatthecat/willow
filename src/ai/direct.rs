@@ -1637,6 +1637,7 @@ impl DirectSession {
                 &mut assumptions.no_block,
                 &mut assumptions.no_io,
                 &mut assumptions.no_wait,
+                &mut assumptions.no_suspend,
             ]
             .into_iter()
             .flatten()

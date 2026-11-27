@@ -26,7 +26,7 @@ macro_rules! scalar_case {
             assert_eq!(symbol.input_types, vec![$scalar]);
             assert_eq!(symbol.output_type, $scalar);
             assert_ne!(
-                symbol.effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(),
+                symbol.effects & willow_abi::RuntimeEffects::MAY_SUSPEND.bits(),
                 0
             );
         }
@@ -118,7 +118,7 @@ fn asynchronous_interfaces_keep_conservative_effects() {
         "echo",
     );
     assert!(symbol.is_async);
-    assert_ne!(
+    assert_eq!(
         symbol.effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits(),
         0
     );
@@ -471,7 +471,7 @@ fn unified_assumption_attributes_and_review_states() {
                 assert_eq!(symbol.assumes_no_block(), reviewed && block);
                 assert_eq!(symbol.assumes_no_io(), reviewed && io);
                 assert_eq!(
-                    symbol.effects & willow_abi::RuntimeEffects::MAY_BLOCK.bits() == 0,
+                    symbol.effects & willow_abi::RuntimeEffects::MAY_SUSPEND.bits() == 0,
                     reviewed && block
                 );
                 assert_eq!(

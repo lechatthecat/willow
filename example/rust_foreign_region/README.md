@@ -21,5 +21,7 @@ blocking input survives
 
 This runtime verification example deliberately uses native runtime ABI calls.
 Ordinary adapters do not need this driver or explicit mutator registration.
-Neither function is admitted inside a Willow Task; use an explicit async bridge
-for that. Callbacks here stay entirely in native code, not back into Willow.
+These calls originate outside a Willow task and therefore remain on the caller
+thread. From a task they instead use the bounded Rust pool; see
+[`rust_blocking_pool`](../rust_blocking_pool). Callbacks here stay entirely in
+native code, not back into Willow.

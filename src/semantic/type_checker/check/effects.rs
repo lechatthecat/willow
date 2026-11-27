@@ -1060,7 +1060,7 @@ impl TypeChecker {
                     format!("`{}` {action} inside the critical section", cause.operation),
                 ))
                 .with_help(format!(
-                    "move the `{}` outside the critical section",
+                    "move the `{}` outside the critical section; Rust calls here require a current reviewed nonblocking declaration",
                     cause.operation
                 )),
             );
@@ -1108,7 +1108,7 @@ impl TypeChecker {
                     cause.span,
                     format!("`{}` causes this transitive effect", cause.operation),
                 ))
-                .with_help("move the helper call outside the critical section"),
+                .with_help("move the helper call outside the critical section; Rust calls here require a current reviewed nonblocking declaration"),
             );
         }
     }

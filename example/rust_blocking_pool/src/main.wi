@@ -1,0 +1,10 @@
+import native;
+async fn call(value:i64)->i64 { return native::meet(value); }
+async fn main() {
+    let a = call(20);
+    let b = call(22);
+    println(await a + await b);
+    let resource = native::resource();
+    defer native::Resource_close(resource);
+    println(native::value(resource));
+}

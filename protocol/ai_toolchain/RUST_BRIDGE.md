@@ -120,25 +120,70 @@ existing build paths.
 
 | Class | Declaration and effects | Execution path |
 | --- | --- | --- |
-| Unknown | An ordinary synchronous declaration, with conservative `MAY_BLOCK` | Direct call on the synchronous caller's thread inside a GC safe region; rejected in Tasks by the compiler and runtime admission guard. |
-| Blocking | A native body known to wait uses the same ordinary declaration and `MAY_BLOCK`; there is no separate `blocking` annotation | The same synchronous guarded GC safe region as Unknown. |
-| NonBlocking | A current reviewed `nonblocking` / `no_block` assertion removes `MAY_BLOCK` | Direct call on the caller's thread, including a Task worker, inside a GC safe region. No blocking-pool submission. |
+| Unknown / Blocking | Ordinary synchronous declaration; `MAY_SUSPEND`, no `MAY_BLOCK` | In a task, owned native work runs on the bounded Rust pool and the caller parks. Outside a task, the calling thread runs it synchronously in a GC idle region. |
+| NonBlocking | Current reviewed `nonblocking` / `no_block` assertion; no waiting effects | Direct execution on the caller, including a task worker, in a GC idle region. No pool submission or transport allocation. |
 
-The compiler's effective bridge facts select the admission guard when generating
-each adapter. There is no runtime classification switch or automatic pool hop.
-The file-I/O blocking pool does not execute synchronous foreign calls. An Unknown
-or Blocking body cannot occupy a Task worker because it is rejected before entry.
-While an admitted synchronous caller waits, its published roots allow GC and
-independently driven Tasks to proceed. Its own continuation waits for the call;
-a synchronous main thread does not itself drive queued Tasks while inside Rust.
-Use an explicit async bridge when a Task needs to await foreign work.
+The same policy applies to native Rust modules, legacy `extern rust`, and
+generated opaque close. `no_block` describes scheduler-worker blocking and is
+satisfied by the default pool path; `no_wait`, `no_suspend`, and lexical locks
+reject that path. Diagnostics identify the need for a reviewed `nonblocking`
+assertion. Stale assertions remain build errors. All calls retain conservative
+allocation, panic and I/O effects unless an applicable reviewed I/O claim exists.
 
-All three paths preserve native thread/TLS and stack identity. Adapters pin
-borrowed managed inputs before entering the region, leave it before converting
-outputs, and leave it on panic as well. Native callbacks confined to native code
-remain on that thread; reverse callbacks into Willow are unsupported and must
-not run inside the region. A NonBlocking assertion covers the complete native
-call, including destructors, and must not conceal a wait.
+Rust work uses its own pool, separate from file I/O and stdout. Each Rust pool
+has `WILLOW_BLOCKING_THREADS` workers (default 4) and `WILLOW_BLOCKING_QUEUE`
+queued jobs (default 16 per worker). A full queue parks callers. FIFO reservations
+serve older waiters before newcomers. The existing exported blocking gauges
+continue to describe the general file-I/O pool. A hung Rust body can delay other
+Rust calls but cannot exhaust the file-I/O pool's threads.
+
+Inputs are decoded and pinned on the caller; strings, arrays and records become
+owned native values, and opaque arguments hold owned leases. Jobs and results
+must be `Send + 'static`; no GC pointer enters the pool. Shared opaque leases
+require `Send + Sync + 'static` even for reviewed declarations. Conversion back
+to Willow happens on the caller after completion, with output roots protected.
+Numeric vectors move into the adapter without a second element copy. Native
+execution and destruction run inside GC idle regions. Native-to-Willow reverse
+callbacks remain unsupported.
+
+Cancellation before start skips the body. Running native code cannot be
+interrupted; its result is discarded. Cancellation after publication discards
+an unconsumed result too. Native destruction uses the same bounded pool, so
+cancellation may wait for capacity, a running body, or its destructor. This avoids
+running arbitrary `Drop` code on a scheduler worker or leaking native values.
+Deferred close still completes during cancellation. A panic in the default
+body or close is contained and raised as recoverable `RustPanic` on the calling
+task; the pool remains usable. Reviewed direct calls retain their fatal panic
+boundary. No Rust unwind crosses the C ABI.
+
+Pool calls do not preserve thread/TLS affinity. Non-`Send` or non-`Sync` opaque
+types are build errors. For a thread-affine library, keep its state on an
+adapter-owned dedicated thread and expose a `Send + Sync` proxy exchanging owned
+messages. Keep waiting proxy operations unreviewed. A `nonblocking` assertion
+does not establish affinity between separate task invocations.
+
+Parallel calls use ordinary eager task creation: wrap a synchronous Rust call in
+an `async fn`, call it several times, then await the returned tasks. Willow has
+no separate `spawn` keyword or blocking declaration syntax. Use `defer` for
+explicit handle close. See [rust_blocking_pool](../../example/rust_blocking_pool).
+
+### When a direct-call review is worthwhile
+
+A local Linux x86-64 release measurement with one scheduler worker measured
+roughly 7–8 microseconds per trivial pooled call versus 0.23 microseconds per
+reviewed direct call. For a small 64-step native computation the figures were
+about 7.6 versus 0.36 microseconds; a 4096-step computation took about 17.1 versus
+8.8 microseconds. These are workload and machine dependent, not latency limits.
+The measurements used 1,000 and 10,000 calls per batch, three repetitions, and
+matched results and exact native invocation counts for both paths.
+
+Start with ordinary declarations. A reviewed direct path is valuable for a
+measured hot sequence of short calls (for example small TLS state-machine steps)
+whose own work is comparable to or below the pool handoff cost. Batch small
+operations when possible. Keep socket waits, contended locks, arbitrary callbacks
+and unbounded destructors on the pool even if the common case looks fast.
+A successful benchmark cannot justify `nonblocking`; bounded behavior of the
+whole call still needs review. Re-measure the actual workload on its target.
 
 ## Bounded synchronous calls from tasks
 
@@ -184,18 +229,20 @@ native stacks reserve 8 MiB with platform guard protection; this is a total stac
 budget, not a promise that all 8 MiB remain at a particular call site. Long or
 blocking operations must remain undeclared. Foreign bodies retain GC idle regions,
 pinned inputs and panic containment. Aggregate conversion still costs time
-proportional to the values copied. Native Rust panic terminates with `RustPanic`
-without unwinding through the C ABI.
+proportional to the values copied. A panic on this reviewed direct path terminates
+with `RustPanic` without unwinding through the C ABI.
 
-The declaration removes MAY_BLOCK, permitting `no_wait` and lock contexts, while
-retaining MAY_ALLOCATE, MAY_PANIC and FOREIGN_CALL. It never establishes purity.
-Undeclared functions retain static task rejection and the runtime task guard.
-Generated opaque close functions remain blocking unless separately reviewed:
+The declaration removes the default wait/suspend effect, permitting `no_wait`,
+`no_suspend` and lock contexts, while retaining MAY_ALLOCATE, MAY_PANIC and
+FOREIGN_CALL. It never establishes purity. Generated opaque close runs through
+the pool unless separately reviewed:
 place `nonblocking("<legacy_review_fingerprint>")` before the `opaque` declaration to
 review its generated close function. Reviewing another function does not review
 close; arbitrary native Drop implementations can block.
 
-Records expose `effects`, `nonblocking`, `trust`, and `official_verified`.
+Records expose `effects`, `execution`, `nonblocking`, `trust`, and
+`official_verified`. `execution` is `blocking_pool_in_task`, `direct`, or
+`async_executor`; the first executes directly outside task context.
 `trust` distinguishes `undeclared`, `developer_declared`, and the reserved
 `official_verified` category. There are currently no officially verified adapters;
 source syntax cannot claim that status. Standalone Cargo-backed queries also
@@ -241,7 +288,7 @@ Bridge schema 2 reports declared `assumptions`, `review_current`, effective
 `effects`, `evidence_kind`, and `assumption_location`. A declared but inactive
 claim is `unknown`, never proof. Effects schema `willow.effects.v3` reports
 `evidence_kind: "assumption"` and a source location for absence dependent on a
-reviewed boundary; the `assumptions` map also covers `no_wait`. Contract
+reviewed boundary; the `assumptions` map also covers `no_wait` and `no_suspend`. Contract
 warnings use W2613 and point to the assumption. `verify-edit` schema v3 (v4
 with contract approval policy) exposes `summary.assumptions.base/target`, even
 for unchanged contracts. Clients must check versions and reject unsupported

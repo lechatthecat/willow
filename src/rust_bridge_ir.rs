@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
 
-pub(crate) const WRAPPER_SCHEMA: &str = "10";
+pub(crate) const WRAPPER_SCHEMA: &str = "11";
 
 pub type RustBridgeSymbols = Vec<((u32, String), RustBridgeSymbol)>;
 
@@ -277,7 +277,7 @@ impl RustBridgeSymbol {
 
     pub fn new(name: String, inputs: Vec<Scalar>, output: Scalar) -> Self {
         let effects = willow_abi::RuntimeEffects::MAY_PANIC
-            .union(willow_abi::RuntimeEffects::MAY_BLOCK)
+            .union(willow_abi::RuntimeEffects::MAY_SUSPEND)
             .union(willow_abi::RuntimeEffects::MAY_ALLOCATE)
             .union(willow_abi::RuntimeEffects::MAY_IO);
         Self {
@@ -317,13 +317,18 @@ impl RustBridgeSymbol {
     pub fn apply_review(&mut self, current: bool) {
         use willow_abi::RuntimeEffects as E;
         self.review_current = current;
-        self.effects |= E::MAY_IO.union(E::MAY_BLOCK).bits();
+        self.effects &= !E::MAY_BLOCK.union(E::MAY_SUSPEND).bits();
+        self.effects |= E::MAY_IO.union(E::MAY_SUSPEND).bits();
         if self.assumes_no_io() {
             self.effects &= !E::MAY_IO.bits();
         }
-        if self.is_async || self.assumes_no_block() {
-            self.effects &= !E::MAY_BLOCK.bits();
+        if self.assumes_no_block() {
+            self.effects &= !E::MAY_SUSPEND.bits();
         }
+    }
+
+    pub fn uses_blocking_pool(&self) -> bool {
+        !self.is_async && !self.assumes_no_block()
     }
 
     pub fn entry_guard(&self) -> &'static str {
@@ -418,6 +423,12 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
     {
         source.push_str(include_str!("rust_bridge_ir/support.rs"));
     }
+    if symbols.iter().any(|s| s.is_async || s.uses_blocking_pool()) {
+        source.push_str(include_str!("rust_bridge_ir/owned.rs"));
+    }
+    if symbols.iter().any(RustBridgeSymbol::uses_blocking_pool) {
+        source.push_str(include_str!("rust_bridge_ir/blocking.rs"));
+    }
     if symbols.iter().any(|s| s.is_async) {
         source.push_str(include_str!("rust_bridge_ir/futures.rs"));
     }
@@ -445,9 +456,14 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
         for ty in &symbol.input_types {
             write!(source, "{},", ty.rust()).unwrap();
         }
+        let invocation = if symbol.uses_blocking_pool() {
+            "blocking_call(move || adapter("
+        } else {
+            "let _region = BridgeRegion::enter();\nadapter("
+        };
         write!(
             source,
-            ") -> {} = bridge::r#{target};\nlet _region = BridgeRegion::enter();\nadapter(",
+            ") -> {} = bridge::r#{target};\n{invocation}",
             symbol.output_type.rust()
         )
         .unwrap();
@@ -463,6 +479,9 @@ pub fn wrappers(symbols: &[RustBridgeSymbol], abi_path: &std::path::Path, revisi
             }
         }
         source.push(')');
+        if symbol.uses_blocking_pool() {
+            source.push_str(").unwrap_or_default()");
+        }
         if symbol.output_type == Scalar::Char {
             source.push_str(" as u32");
         }

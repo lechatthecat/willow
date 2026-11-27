@@ -11,7 +11,6 @@ pub(super) struct Inputs {
     pub(super) effects: std::sync::Arc<UnitEffects>,
     leaves: HashSet<FunctionId>,
     tasks: Vec<(FunctionId, Span)>,
-    foreign: HashSet<FunctionId>,
     indirect: IndirectInputs,
     std_aliases: HashMap<String, String>,
     unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
@@ -30,20 +29,13 @@ impl StaticInitQueries {
         let mut tasks = Vec::new();
         for item in &program.items {
             match item {
-                Item::Function(f) if f.is_async() && f.rust_bridge.is_some() => {
-                    // Construction only copies boundary values and schedules the
-                    // foreign executor; no user Rust is polled on this worker.
+                Item::Function(f) if f.rust_bridge.is_some() => {
+                    // Unreviewed calls copy owned values and suspend on the
+                    // foreign pool/executor; reviewed calls promise bounded work.
                     leaves.insert(FunctionId::free_from_source_name(&f.name));
                 }
                 Item::Function(f) if f.is_async() => {
                     tasks.push((FunctionId::free_from_source_name(&f.name), f.span));
-                }
-                Item::Function(f)
-                    if f.rust_bridge
-                        .as_ref()
-                        .is_some_and(|bridge| bridge.assumes_no_block()) =>
-                {
-                    leaves.insert(FunctionId::free_from_source_name(&f.name));
                 }
                 Item::Class(c) => {
                     let owner = TypeId::local(&c.name);
@@ -88,20 +80,6 @@ impl StaticInitQueries {
             effects: std::sync::Arc::clone(effects),
             leaves,
             tasks,
-            foreign: program
-                .items
-                .iter()
-                .filter_map(|item| match item {
-                    Item::Function(f)
-                        if f.rust_bridge.as_ref().is_some_and(|bridge| {
-                            !bridge.is_async && !bridge.assumes_no_block()
-                        }) =>
-                    {
-                        Some(FunctionId::free_from_source_name(&f.name))
-                    }
-                    _ => None,
-                })
-                .collect(),
             indirect: indirect.clone(),
             std_aliases,
             unsafe_static_accesses,
@@ -186,10 +164,9 @@ impl StaticInitQueries {
                 let node = positions[&(unit, id)];
                 loops[node] =
                     inputs.effects.preemption_loops.contains(&id) && !async_callables.contains(&id);
-                unknown[node] = inputs.foreign.contains(&id)
-                    || calls
-                        .unsupported_initialization
-                        .contains(&UnsupportedInitialization::UnresolvedCall)
+                unknown[node] = calls
+                    .unsupported_initialization
+                    .contains(&UnsupportedInitialization::UnresolvedCall)
                     || (calls.has_unknown && calls.unsupported_initialization.is_empty())
                     || (calls
                         .unsupported_initialization
@@ -574,10 +551,9 @@ mod tests {
     }
 
     #[test]
-    fn preemption_unknown_foreign_and_interface_fail_closed_on_both_targets() {
+    fn preemption_unknown_interface_and_callback_fail_closed_on_both_targets() {
         for native in [false, true] {
             for source in [
-                "extern rust { fn foreign(x:i64)->i64; } async fn main(){ println(foreign(42)); }",
                 "interface I { fn get(self)->i64; } async fn run(i:I)->i64{return i.get();} fn main(){}",
                 "async fn run(f:fn(i64)->i64)->i64{return f(1);} fn main(){}",
             ] {
@@ -663,13 +639,9 @@ mod tests {
     }
 
     #[test]
-    fn preemption_matching_foreign_value_remains_unknown() {
+    fn preemption_matching_foreign_value_uses_bounded_dispatch() {
         let source = "extern rust { fn foreign(x:i64)->i64; } fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(foreign));}";
-        assert!(
-            errors(source, true)
-                .iter()
-                .any(|e| e.code == ErrorCode::E0810)
-        );
+        assert!(errors(source, true).is_empty());
     }
 
     #[test]

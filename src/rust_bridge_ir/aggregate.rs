@@ -160,6 +160,43 @@ impl Scalar {
             _ => self.append_rust_type(output, false, Some("'static")),
         }
     }
+    fn borrow_owned(&self, source: &mut String, value: &str, serial: &mut usize) -> String {
+        let n = *serial;
+        *serial += 1;
+        let out = format!("b{n}");
+        match self {
+            Self::String | Self::Bytes | Self::Opaque(_) => {
+                writeln!(source, "let {out} = &**({value});").unwrap();
+            }
+            Self::Record(name) => {
+                writeln!(source, "let {out} = borrow_record_{name}({value});").unwrap();
+            }
+            Self::Array(t) if **t != Self::String => {
+                // Numeric arrays already have the adapter's owned Vec layout.
+                // Move that allocation instead of copying it for a borrowed view.
+                writeln!(source, "let {out} = std::mem::take({value});").unwrap();
+            }
+            Self::Array(t) => {
+                writeln!(source, "let {out} = ({value}).iter().map(|x{n}| {{").unwrap();
+                let child = t.borrow_owned(source, &format!("x{n}"), serial);
+                writeln!(source, "{child} }}).collect();").unwrap();
+            }
+            Self::Option(t) => {
+                writeln!(source, "let {out} = match {value} {{ Some(x{n}) => {{").unwrap();
+                let child = t.borrow_owned(source, &format!("x{n}"), serial);
+                writeln!(source, "Some({child}) }}, None => None }};").unwrap();
+            }
+            Self::Result(a, b) => {
+                writeln!(source, "let {out} = match {value} {{ Ok(x{n}) => {{").unwrap();
+                let child = a.borrow_owned(source, &format!("x{n}"), serial);
+                writeln!(source, "Ok({child}) }}, Err(x{n}) => {{").unwrap();
+                let child = b.borrow_owned(source, &format!("x{n}"), serial);
+                writeln!(source, "Err({child}) }} }};").unwrap();
+            }
+            _ => writeln!(source, "let {out} = *({value});").unwrap(),
+        }
+        out
+    }
     fn decode(&self, source: &mut String, value: &str, serial: &mut usize) -> String {
         self.decode_mode(source, value, serial, false)
     }
@@ -361,13 +398,22 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
         let Scalar::Opaque(name) = &symbol.input_types[0] else {
             unreachable!()
         };
+        if symbol.uses_blocking_pool() {
+            writeln!(source, "let id = frame.payload(a0, false).low;\nlet lease = handles::take(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id)));\nlet _ = blocking_call(move || drop(lease));\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
+            return;
+        }
         writeln!(source, "let id = frame.payload(a0, false).low;\n{{ let _region = BridgeRegion::enter(); handles::close(id, std::any::TypeId::of::<opaque_tags::r#{name}>()).unwrap_or_else(|error| std::panic::panic_any((error, id))); }}\nunsafe {{ *output = BridgeValue::default(); }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
         return;
     }
     let mut serial = 0;
     let mut arguments = Vec::new();
     for (i, ty) in symbol.input_types.iter().enumerate() {
-        arguments.push(ty.decode_mode(source, &format!("a{i}"), &mut serial, symbol.is_async));
+        arguments.push(ty.decode_mode(
+            source,
+            &format!("a{i}"),
+            &mut serial,
+            symbol.is_async || symbol.uses_blocking_pool(),
+        ));
     }
     if symbol.is_async {
         // The task constructor copies inputs now; user Rust only runs on the executor.
@@ -400,11 +446,36 @@ pub(super) fn aggregate_wrapper(source: &mut String, symbol: &RustBridgeSymbol, 
     }
     writeln!(
         source,
-        ") -> {} = bridge::r#{target};\nlet result = {{ let _region = BridgeRegion::enter(); adapter({}) }};\nframe.release_handles();",
-        symbol.output_type.rust_type(false),
-        arguments.join(",")
+        ") -> {} = bridge::r#{target};",
+        symbol.output_type.rust_type(false)
     )
     .unwrap();
+    if symbol.uses_blocking_pool() {
+        source.push_str("let Some(result) = blocking_call(move || {\n");
+        if !arguments.is_empty() {
+            writeln!(source, "let mut owned = ({},);", arguments.join(",")).unwrap();
+        }
+        let borrowed: Vec<_> = symbol
+            .input_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| ty.borrow_owned(source, &format!("&mut owned.{i}"), &mut serial))
+            .collect();
+        writeln!(
+            source,
+            "adapter({})\n}}) else {{ unsafe {{ *output = BridgeValue::default(); }} return; }};",
+            borrowed.join(",")
+        )
+        .unwrap();
+    } else {
+        writeln!(
+            source,
+            "let result = {{ let _region = BridgeRegion::enter(); adapter({}) }};",
+            arguments.join(",")
+        )
+        .unwrap();
+    }
+    source.push_str("frame.release_handles();\n");
     let encoded = symbol.output_type.encode(source, "result", &mut serial);
     writeln!(source,"unsafe {{ *output = {encoded}; }}\n}}));\nif let Err(payload) = outcome {{ bridge_panic(payload); }}\n}}").unwrap();
 }
@@ -480,7 +551,7 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
         }
         source.push_str("}\n");
     }
-    if symbols.iter().any(|s| s.is_async) {
+    if symbols.iter().any(|s| s.is_async || s.uses_blocking_pool()) {
         source.push_str("#[allow(dead_code, reason = \"Shared record support may be unused by a particular adapter\")] pub mod record_owned {\n");
         for record in &records {
             write!(
@@ -518,6 +589,14 @@ pub(super) fn record_structs(source: &mut String, symbols: &[RustBridgeSymbol]) 
                 offset += if ty.pair() { 2 } else { 1 };
             }
             writeln!(source, "records::r#{name} {{ {} }} }}", values.join(",")).unwrap();
+            writeln!(source, "#[allow(non_snake_case, dead_code, reason = \"Generated borrowed view of owned record\")] fn borrow_record_{name}(value: &mut record_owned::r#{name}) -> record_inputs::r#{name}<'_> {{").unwrap();
+            let mut fields = Vec::new();
+            for (field, ty) in &record.fields {
+                let borrowed =
+                    ty.borrow_owned(source, &format!("&mut value.r#{field}"), &mut serial);
+                fields.push(format!("r#{field}: {borrowed}"));
+            }
+            writeln!(source, "records::r#{name} {{ {} }} }}", fields.join(",")).unwrap();
         }
     }
     for record in &records {

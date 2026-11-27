@@ -834,7 +834,11 @@ impl TypeChecker {
             || matches!(
                 &d.body,
                 DeferBody::Expr(
-                    Expr::Call(_) | Expr::MethodCall(_) | Expr::Print(..) | Expr::Match(_)
+                    Expr::Call(_)
+                        | Expr::StaticCall(_)
+                        | Expr::MethodCall(_)
+                        | Expr::Print(..)
+                        | Expr::Match(_)
                 ) | DeferBody::Block(_)
             );
         if !supported {
@@ -902,6 +906,11 @@ impl TypeChecker {
                 .iter()
                 .find(|a| !matches!(a.mode, CallArgMode::Value))
                 .map(|a| a.span),
+            DeferBody::Expr(Expr::StaticCall(c)) => c
+                .args
+                .iter()
+                .find(|a| !matches!(a.mode, CallArgMode::Value))
+                .map(|a| a.span),
             DeferBody::Expr(Expr::MethodCall(m)) => m
                 .args
                 .iter()
@@ -941,6 +950,7 @@ impl TypeChecker {
         };
         match &d.body {
             DeferBody::Expr(Expr::Call(c)) => c.args.iter().for_each(|a| record(&a.expr)),
+            DeferBody::Expr(Expr::StaticCall(c)) => c.args.iter().for_each(|a| record(&a.expr)),
             DeferBody::Expr(Expr::MethodCall(m)) => {
                 record(&m.object);
                 m.args.iter().for_each(|a| record(&a.expr));
