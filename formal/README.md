@@ -186,12 +186,53 @@ operational reachability, exercising parsing, call extraction, local effect
 seeding and E2604 reporting. Three additional cases require conservative
 summaries for missing bodies, unknown calls and external targets.
 
+The source differential in
+[`effects_source.rs`](../src/semantic/type_checker/core_models/effects_source.rs)
+adds typed edges: Direct, Virtual, Interface, Indirect and Imported. Virtual
+entries use a pure open base and an override forwarding to the target function;
+the caller holds a base-typed receiver. Interface entries use a Send interface
+and a forwarding implementation. The independent oracle expands these entries
+itself. Indirect entries reach **all address-taken functions of the same arity**,
+including values created in unreachable bodies and other modules, not just the
+function assigned at that call site. Arity-one/two candidates and waiting lambda
+values are included. The generated lambdas contain a receive; current source
+checking gives them callable identities. Identity-less values remain a
+conservative waiting assumption, not a claim that every pure lambda waits.
+The oracle uses no production `dispatch_targets`, `close_reach` or
+`EffectProblem`; those are only exercised on the compiler side.
+
+| Source corpus | Fixed bound | Locked outcomes (accepted / rejected) |
+| --- | --- | --- |
+| Homogeneous Direct / Virtual / Interface / Indirect | 512 graphs * 8 wait sets * 4 kinds = 16,384 programs | Each of the first three: 1,024 / 3,072; Indirect: 804 / 3,292 |
+| Mixed local kinds, xorshift | 256 graphs of 4–6 functions, each checked inside and outside a lock | 87 / 169 |
+| Imported mixed kinds, xorshift | 64 projects of 3 modules * 3 functions, each checked inside and outside a lock | 16 / 48 |
+| Isolated imported entry paths | 4 kinds * 2 wait choices, each inside and outside a lock | 1 / 1 per kind |
+| Async virtual masks and arity isolation | 16 kind/wait/mask combinations + 6 disconnected-value/lambda combinations, each inside and outside a lock | Explicit expected result for every combination |
+
+All totals are asserted, with accepted/rejected lower bounds per kind (512 for
+homogeneous, 64 for mixed, 16 for imported, one for isolated imported entries).
+Each mixed program contains all its corpus's edge kinds. Outside-lock twins
+must all be legal. The isolated imported entries prevent an alternative direct
+path from hiding a missing dynamic-dispatch edge. Async overrides must not
+transmit their body's waits to the synchronous creator.
+
+Imports are analyzed in-process with `CompilerSession::analysis_with_emitter`,
+using temporary `.wi` files removed on drop (also during failure unwinding).
+The 64 projects mix virtual/interface/indirect edges in every module, including
+qualified receivers of imported classes/interfaces and item-imported function
+values. Cyclic imports are rejected by Willow: a further driver case pins
+E0403, so generated module dependencies form a DAG. Calls within a module may
+still recurse. Parsing or diagnostics other than E2604 fail the differential;
+the import-cycle check alone expects E0403. Failure output includes the replay
+seed/kind and generated sources. No generated programs are executed.
+
 **Refinement assumptions.** Every dynamic synchronous call is represented,
 local waiting operations are classified, masks match execution, and diagnostics
-are enforced by the driver. The production graph includes imported, virtual,
-interface and indirect targets; the generated source corpus covers direct
-single-module calls only. Compiler effect analysis does not prove native
-bodies. Console output is an explicit exception to E2604, even if it stalls
+are enforced by the driver. Direct, virtual, interface, indirect and imported
+calls now have the bounded source evidence above. It does not enumerate all
+inheritance shapes, generic instantiations, arities or module graphs, nor prove
+lowering or execution. Compiler effect analysis does not prove native bodies.
+Console output is an explicit exception to E2604, even if it stalls
 the worker; reviewed `nonblocking` foreign declarations are assumptions. The
 property concerns modeled waits, not arbitrary OS blocking, scheduler fairness,
 GC pauses or a bound on time spent holding a lock.
@@ -288,14 +329,17 @@ source-to-runtime refinement in the trusted base.
 
 ## Coverage and cost
 
-The twelve named `core_model_` tests cover empty graphs, local waits, pure and
+The nineteen named `core_model_` tests cover empty graphs, local waits, pure and
 waiting self recursion, mutual recursion, disconnected waits, transitive paths,
 diamonds, masked edges, missing evidence (three forms), acyclic lock order,
 self acquisition, two/three-lock cycles, unused locks, scalar/closure leaves,
 each of seven wrappers, nested wrappers, access before/during/after a loan,
 direct/alias/contained accesses, disjoint and overlapping child loans, join
 order, read/write accesses, exclusive permission restoration, conditional and
-unconditional rebinding, loop allocation origins and permanent transfers.
+unconditional rebinding, loop allocation origins and permanent transfers,
+base-receiver overrides, Send interface dispatch, same/different-arity function
+values, waiting lambdas, async override masks, imported dynamic dispatch,
+cyclic-import rejection and outside-lock controls.
 Failing comparisons print the generated source or graph/seed/mask for replay.
 
 All additional computation is test-only; production compilation, generated
@@ -308,6 +352,27 @@ the production SCC algorithm. The test visits at most 32,768 lock request
 assignments. Type enumeration grows geometrically with a fixed depth of three;
 each type comparison is linear in its nesting depth. Corpus sizes are explicit
 and stable; no wall-clock timing is used as correctness evidence.
+
+The added E2604 differential performs 17,084 semantic checks: 16,384 homogeneous,
+512 mixed, 128 imported, 16 isolated imported and 44 mask/arity checks. Together
+with the retained 128 direct-source checks this is 17,212 E2604 comparisons,
+plus one E0403 import-cycle check. There are 72 valid project fixtures and one
+cycle fixture; cleanup is asserted. Only one case's sources/diagnostics are
+retained at a time within each test.
+
+For the typed-edge oracle, two shared arity hubs avoid a call-by-candidate
+Cartesian expansion: each input edge and each address-taken function contributes
+at most one additional adjacency entry. One root traversal and construction
+cost O(V+E) time and space. Source emission indexes required wrappers and
+imports once, emits each wrapper once per target, and costs O(L) time/space for
+source length L, including identifier digits; the module bound is three and
+arity bound is two. Thus per-case oracle plus generator work is linear in L.
+Deterministic operation/emission checks at V=8,32,128 cover chains, fan-in and
+dense graphs, including repeated dispatch to the same target. This counts
+test-harness work, not a claim that the production compiler is linear for
+arbitrary inputs: each source comparison additionally runs the production
+semantic checker once on the stated bounded program. No backend or runtime
+work is added to production.
 
 The loan checks invoke the compiler 11,272 times (10,024 two-task traces,
 240 retained traces, and 1,008 conservative traces), below a fixed 20,000

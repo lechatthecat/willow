@@ -358,4 +358,5 @@ fn core_model_structural_markers_exhaustive_depth_three() {
     assert_eq!(count, 800);
 }
 
+mod effects_source;
 mod loans;
