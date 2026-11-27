@@ -1,5 +1,6 @@
 //! Source declaration provenance retained across monomorphization for AI queries.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::parser::ast::ImportDecl;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::{Declaration, Facts};
@@ -63,7 +64,7 @@ impl Source {
                 selected.nominal_aliases.insert(name.clone(), alias.clone());
             }
             let (item, span) = if let Some(item) = self.items.get(name) {
-                if item.kind != "function" {
+                if SymbolKind::from(item.kind.as_str()) != SymbolKind::Function {
                     continue;
                 }
                 (item, item.span)
@@ -234,7 +235,12 @@ impl Source {
             items: facts
                 .declarations
                 .iter()
-                .filter(|d| matches!(d.kind.as_str(), "function" | "class" | "interface"))
+                .filter(|d| {
+                    matches!(
+                        SymbolKind::from(d.kind.as_str()),
+                        SymbolKind::Function | SymbolKind::Class | SymbolKind::Interface
+                    )
+                })
                 .map(|d| (d.name.clone(), d.clone()))
                 .collect(),
             declarations: facts.declarations,
@@ -261,7 +267,7 @@ pub(super) fn restore(
     let class_declarations: HashMap<_, _> = sources
         .values()
         .flat_map(|s| &s.declarations)
-        .filter(|d| d.kind == "class")
+        .filter(|d| SymbolKind::from(d.kind.as_str()) == SymbolKind::Class)
         .map(|d| (d.span, d))
         .collect();
     // Local generated names can coincide in different modules. Index fully
@@ -341,7 +347,7 @@ pub(super) fn restore(
             })
         };
         let restore = |d: &mut Declaration| {
-            if d.kind == "import"
+            if SymbolKind::from(d.kind.as_str()) == SymbolKind::Import
                 && let Some(source) = imports.get(&d.span)
             {
                 *d = source.clone();
@@ -366,14 +372,15 @@ pub(super) fn restore(
             // Expanding an unqualified generic call into a static module call
             // invents a namespace-type use at the same source token. It is
             // compiler provenance, not a second source symbol for that token.
-            !(r.target.kind == "builtin-type"
+            !(SymbolKind::from(r.target.kind.as_str()) == SymbolKind::BuiltinType
                 && crate::semantic::ids::has_internal_module_prefix(&r.written)
                 && written
                     .get(&(r.span.file_id.0, r.span.start))
                     .is_some_and(|source| !QualifiedName::new(&source).is_qualified()))
         });
         for r in &mut capture.symbols.references {
-            let generic_callable = matches!(r.target.kind.as_str(), "function" | "method")
+            let kind = SymbolKind::from(r.target.kind.as_str());
+            let generic_callable = matches!(kind, SymbolKind::Function | SymbolKind::Method)
                 && declarations.contains_key(&(
                     r.target.span,
                     r.target.kind.as_str(),
@@ -381,7 +388,7 @@ pub(super) fn restore(
                 ));
             // Expanded programs drop their templates, so an annotation such as
             // `Box<i64>` resolves to no checked class; it names the template.
-            let template = (r.role == "type" && r.target.kind == "builtin-type")
+            let template = (r.role == "type" && kind == SymbolKind::BuiltinType)
                 .then(|| {
                     let span = sources.get(&unit)?.class_templates.get(&r.target.name)?;
                     class_declarations.get(span).copied()
@@ -415,10 +422,10 @@ pub(super) fn restore(
         if let Some(source) = sources.get(&unit) {
             let import_spans: std::collections::HashSet<_> =
                 source.imports.iter().map(|i| i.span).collect();
-            capture
-                .symbols
-                .declarations
-                .retain(|d| d.kind != "import" || !import_spans.contains(&d.span));
+            capture.symbols.declarations.retain(|d| {
+                SymbolKind::from(d.kind.as_str()) != SymbolKind::Import
+                    || !import_spans.contains(&d.span)
+            });
             for import in &source.imports {
                 let name = import
                     .alias
@@ -611,15 +618,10 @@ pub(super) fn aggregate(
             locations.dedup();
         }
     }
-    let operation_spelling = |operation: &mut String| {
-        if let Some((prefix @ ("call" | "static" | "method"), name)) = operation.split_once(':') {
-            *operation = format!("{prefix}:{}", source_spelling(name));
-        }
-    };
     for e in &mut semantic.expressions {
         remap(&mut e.function);
         if let Some(operation) = &mut e.operation {
-            operation_spelling(operation);
+            operation.map_call_name(source_spelling);
         }
         if let Some(target) = &mut e.target {
             remap(target);
@@ -640,9 +642,10 @@ pub(super) fn aggregate(
         // A source declaration is proven only if every specialization is.
         panic_evidence
             .entry(id)
-            .and_modify(|old: &mut serde_json::Value| {
-                if evidence["status"] != "PROVEN"
-                    || (old["status"] == "PROVEN" && evidence["basis"] == "solver-proof")
+            .and_modify(|old: &mut crate::semantic::type_checker::PanicEvidence| {
+                if evidence.status != crate::semantic::type_checker::PanicStatus::Proven
+                    || (old.status == crate::semantic::type_checker::PanicStatus::Proven
+                        && evidence.basis == crate::semantic::type_checker::PanicBasis::SolverProof)
                 {
                     *old = evidence.clone();
                 }
@@ -659,14 +662,19 @@ pub(super) fn aggregate(
     }
     for calls in unresolved.values_mut() {
         for call in calls.iter_mut() {
-            operation_spelling(&mut call.operation);
+            call.operation.map_call_name(source_spelling);
         }
-        fn key(c: &semantic::UnresolvedCall) -> (&str, usize, usize, &str) {
+        fn location_key(c: &semantic::UnresolvedCall) -> (&str, usize, usize) {
             let l = &c.location;
-            (&l.path, l.start, l.end, &c.operation)
+            (&l.path, l.start, l.end)
         }
-        calls.sort_by(|a, b| key(a).cmp(&key(b)));
-        calls.dedup_by(|a, b| key(a) == key(b));
+        let compare = |a: &semantic::UnresolvedCall, b: &semantic::UnresolvedCall| {
+            location_key(a)
+                .cmp(&location_key(b))
+                .then_with(|| a.operation.wire_cmp(&b.operation))
+        };
+        calls.sort_by(compare);
+        calls.dedup_by(|a, b| compare(a, b).is_eq());
     }
     semantic.unresolved_calls = unresolved;
     semantic.async_functions = std::mem::take(&mut semantic.async_functions)
@@ -696,15 +704,13 @@ pub(super) fn aggregate(
         });
     }
     semantic.effect_calls = effect_calls;
-    let mut witnesses = BTreeMap::<String, Vec<serde_json::Value>>::new();
+    let mut witnesses = BTreeMap::<String, Vec<super::evidence::EffectFact>>::new();
     for (mut id, mut values) in std::mem::take(&mut semantic.witnesses) {
         remap(&mut id);
         for value in &mut values {
-            if let Some(owner) = value["witness"]["owner"].as_str() {
-                let mut owner = owner.to_owned();
-                remap(&mut owner);
-                owner = source_spelling(&owner);
-                value["witness"]["owner"] = serde_json::json!(owner);
+            if let Some(owner) = &mut value.witness.owner {
+                remap(owner);
+                *owner = source_spelling(owner);
             }
         }
         witnesses.entry(id).or_default().extend(values);
@@ -714,14 +720,13 @@ pub(super) fn aggregate(
     for values in witnesses.values_mut() {
         let mut seen = std::collections::HashSet::new();
         values.retain(|value| {
-            let cause = &value["witness"]["cause"];
-            if !cause["operation"]
-                .as_str()
-                .is_some_and(|op| op.starts_with("channel-"))
-            {
+            let Some(cause) = &value.witness.cause else {
+                return true;
+            };
+            if !cause.operation.channel() {
                 return true;
             }
-            seen.insert(cause.to_string())
+            seen.insert(cause.clone())
         });
     }
     semantic.witnesses = witnesses;
@@ -896,7 +901,11 @@ mod tests {
             assert_eq!(REMAPS.with(|visits| visits.get()), count * cases.len());
             for (i, expression) in semantic.expressions.iter().enumerate() {
                 assert_eq!(
-                    expression.operation.as_deref(),
+                    expression
+                        .operation
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .as_deref(),
                     Some(cases[i % cases.len()].1)
                 );
             }
@@ -956,6 +965,7 @@ mod tests {
                             role: "call".into(),
                             ty: None,
                             location: Location {
+                                display: None,
                                 path: path.into(),
                                 start: i * 10 + 5,
                                 end: i * 10 + 6,
@@ -969,6 +979,7 @@ mod tests {
                             role: "call".into(),
                             ty: None,
                             location: Location {
+                                display: None,
                                 path: path.into(),
                                 start: i * 10 + 9,
                                 end: i * 10 + 10,
@@ -1036,8 +1047,14 @@ mod tests {
                             .windows(2)
                             .all(|w| w[0].location.start < w[1].location.start)
                     );
-                    assert_eq!(calls[0].operation, "call:g");
-                    assert!(calls.iter().skip(1).all(|c| c.operation == "f"));
+                    assert_eq!(
+                        calls[0].operation,
+                        super::super::operation::Operation::Call("g".into())
+                    );
+                    assert!(
+                        calls.iter().skip(1).all(|c| c.operation
+                            == super::super::operation::Operation::Other("f".into()))
+                    );
                 }
                 // One remap per input owner; callees and other facts are empty.
                 let remaps = REMAPS.with(|count| count.get());
@@ -1072,7 +1089,16 @@ mod tests {
                         .insert(format!("f{i}"), 1 << (i % 4));
                     semantic.witnesses.insert(
                         format!("f{i}"),
-                        vec![serde_json::json!({"witness":{"owner":format!("f{i}")}})],
+                        vec![super::super::evidence::EffectFact {
+                            effect: 1 << (i % 4),
+                            witness: super::super::evidence::Witness {
+                                owner: Some(format!("f{i}")),
+                                ..super::super::evidence::Witness::new(
+                                    super::super::evidence::WitnessKind::RuntimeCapability,
+                                )
+                            },
+                            paths: None,
+                        }],
                     );
                 }
                 REMAPS.with(|count| count.set(0));

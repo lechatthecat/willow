@@ -174,18 +174,21 @@ fn pairs_with_work(
     let mut owner_pairs = BTreeMap::new();
     for (old, new) in &result {
         visits += 1;
-        let owner = |key: &str| {
-            let (module, rest) = QualifiedName::new(key).split_first()?;
-            let (kind, name) = QualifiedName::new(rest).split_first()?;
-            if !matches!(kind, "function" | "method") {
+        let owner = |capture: &Capture, key: &str| {
+            if !matches!(
+                capture.kinds.get(key),
+                Some(SymbolKind::Function | SymbolKind::Method)
+            ) {
                 return None;
             }
+            let (module, rest) = QualifiedName::new(key).split_first()?;
+            let (_, name) = QualifiedName::new(rest).split_first()?;
             let name = name.rsplit_once('#').map_or(name, |(name, _)| name);
             Some(QualifiedName::from_segments([
                 module, "function", "lambda", name,
             ]))
         };
-        if let (Some(old), Some(new)) = (owner(old), owner(new)) {
+        if let (Some(old), Some(new)) = (owner(before, old), owner(after, new)) {
             owners.extend([old.clone(), new.clone()]);
             owner_pairs.insert(old, new);
         }
@@ -195,7 +198,7 @@ fn pairs_with_work(
     let mut inherited = Vec::new();
     for (old, new) in &result {
         visits += 1;
-        if QualifiedName::new(old).contains_run(&METHOD_RUN) {
+        if before.kinds.get(old) == Some(&SymbolKind::Method) {
             for prefix in [&*DISPATCH_RUN, &*FUNCTION_RUN] {
                 let old = QualifiedName::new(old).replace_run(&METHOD_RUN, prefix);
                 let new = QualifiedName::new(new).replace_run(&METHOD_RUN, prefix);
@@ -289,6 +292,8 @@ mod tests {
                 let new = format!("m{i}.wi::function::new#0");
                 before.baseline.facts.insert(old.clone(), fact.clone());
                 after.baseline.facts.insert(new.clone(), fact.clone());
+                before.kinds.insert(old.clone(), SymbolKind::Function);
+                after.kinds.insert(new.clone(), SymbolKind::Function);
                 keys.extend([old, new]);
             }
             let (pairs, _, visits) = pairs_with_work(&before, &after, &keys).unwrap();
@@ -320,6 +325,8 @@ mod tests {
                     let child = format!("m{i}.wi::function::<lambda {name}@10:20>");
                     capture.baseline.facts.insert(owner.clone(), fact.clone());
                     capture.baseline.facts.insert(child.clone(), lambda.clone());
+                    capture.kinds.insert(owner.clone(), SymbolKind::Function);
+                    capture.kinds.insert(child.clone(), SymbolKind::Function);
                     capture
                         .lambda_owners
                         .entry(scope(&child).unwrap())
@@ -386,13 +393,32 @@ mod tests {
     fn semantic_diff_rename_human_names_cover_evidence() {
         let report = SemanticDiff {
             schema: "willow.semantic-diff.v3",
-            status: "complete",
-            base: Value::Null,
-            target: Value::Null,
-            changes: vec![
-                json!({"symbol":"main.wi::function::$dispatch$C::f", "cause":[{"chain":["::function::<function-value candidates: arity 2, type (i,@6:Value,)->i>", "main.wi::function::<lambda main@40:50>"]}], "impacted_callers":["main.wi::method::C::f#0"]}),
-            ],
-            summary: json!({}),
+            status: ReportStatus::Complete,
+            base: None,
+            target: None,
+            changes: vec![SymbolChange {
+                symbol: "main.wi::function::$dispatch$C::f".into(),
+                cause: vec![Cause {
+                    chain: vec![
+                        "::function::<function-value candidates: arity 2, type (i,@6:Value,)->i>"
+                            .into(),
+                        "main.wi::function::<lambda main@40:50>".into(),
+                    ],
+                    certainty: CauseCertainty::ConservativeBound,
+                    effect: vec![],
+                    location: None,
+                    side: None,
+                }],
+                impacted_callers: vec!["main.wi::method::C::f#0".into()],
+                contract: None,
+                effects: None,
+                matching: MatchKind::Exact,
+                public_api: PublicApiChange::Unchanged,
+                renamed_to: None,
+                signature: None,
+                targets: None,
+            }],
+            summary: ReportSummary::default(),
         };
         let text = report.human(true);
         for internal in ["$dispatch$", "@6", "@40", "#0", "function-value candidates"] {

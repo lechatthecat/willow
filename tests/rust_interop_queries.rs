@@ -167,6 +167,7 @@ fn app_validate_impact_stops_at_regex_boundary() {
     assert_eq!(impact.nodes.len(), 2);
     assert_eq!(impact.dependency_boundary.len(), 1);
     let b = &impact.dependency_boundary[0];
+    let b = serde_json::to_value(b).unwrap();
     assert_eq!(b["kind"], "rust");
     assert_eq!(b["crate"]["name"], "regex");
     assert_eq!(b["crate"]["version"], "1.2.3");

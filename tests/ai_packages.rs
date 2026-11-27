@@ -92,7 +92,10 @@ fn package_queries_preserve_identity_across_aliases_and_follow_dry_run_delta() {
     assert_eq!(impact.nodes.len(), 3);
     assert!(impact.nodes.iter().all(|n| n.identity.is_some()));
     assert_eq!(impact.external_dependencies.len(), 1);
-    assert_eq!(impact.external_dependencies[0]["relation"], "callee");
+    assert_eq!(
+        serde_json::to_value(&impact.external_dependencies[0]).unwrap()["relation"],
+        "callee"
+    );
     let revision = snapshot.revision.clone();
     let mut session = QuerySession::new(snapshot.clone()).unwrap();
     let result = session.query(QueryRequest::SymbolInfo {
@@ -301,7 +304,7 @@ fn scoped_symbol_identities_distinguish_owners_and_shadowed_bindings() {
         ] {
             let symbols: Vec<_> = declarations
                 .iter()
-                .filter(|s| s.name == name && s.kind == kind)
+                .filter(|s| s.name == name && s.kind == willow_compiler::ai::SymbolKind::from(kind))
                 .collect();
             assert_eq!(symbols.len(), count, "{name}: {symbols:?}");
             for symbol in symbols {

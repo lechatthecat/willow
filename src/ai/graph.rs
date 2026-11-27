@@ -19,21 +19,39 @@ impl Default for Limits {
         }
     }
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImpactKind {
+    Lambda,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ImpactRelation {
+    Definition,
+    DirectCaller,
+    IndirectCaller,
+}
+#[derive(Debug, Clone, Serialize)]
 pub struct ImpactNode {
     pub identity: Option<SymbolIdentity>,
     pub id: String,
     pub level: usize,
     pub distance: usize,
     pub graph_distance: usize,
-    pub effects: serde_json::Value,
+    pub effects: Vec<effect_states::EffectState>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selector: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<ImpactKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relation: Option<ImpactRelation>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Impact {
     pub schema: &'static str,
     pub rust_dependencies: Vec<interop::RustCrateIdentity>,
-    pub dependency_boundary: Vec<serde_json::Value>,
-    pub external_dependencies: Vec<serde_json::Value>,
+    pub dependency_boundary: Vec<interop::DependencyBoundary>,
+    pub external_dependencies: Vec<packages::ExternalDependency>,
     pub revision: String,
     pub nodes: Vec<ImpactNode>,
     pub truncated: bool,
@@ -324,7 +342,10 @@ impl Snapshot {
                         level: (distance[i] + 1).min(3),
                         distance: distance[i],
                         graph_distance: graph_distance[i],
-                        effects: states.output(i),
+                        effects: states.typed_output(i),
+                        selector: None,
+                        kind: None,
+                        relation: None,
                     });
                 }
             }
@@ -498,6 +519,7 @@ mod tests {
                     functions[0].synthetic = true;
                     functions[0].unresolved.clear();
                     functions[1].locations.push(Location {
+                        display: None,
                         path: "m".into(),
                         start: 1,
                         end: 2,
@@ -537,10 +559,8 @@ mod tests {
                 assert!(result.unknown && result.reason.is_some());
                 assert!(result.nodes.iter().all(|f| {
                     f.effects
-                        .as_array()
-                        .unwrap()
                         .iter()
-                        .all(|e| e["state"] == "unknown")
+                        .all(|e| e.state == effect_states::State::Unknown)
                 }));
                 let mut snapshot = snapshot;
                 snapshot.compiler = storage::compiler_stamp();
@@ -608,7 +628,9 @@ mod tests {
     }
     #[test]
     fn allocation_witness_selection_visits_each_edge_once() {
-        use serde_json::json;
+        use super::super::evidence::{
+            CapabilityOperation, Cause, CauseSource, EffectFact, Witness, WitnessKind,
+        };
         for shape in ["chain", "fanout", "cycle", "duplicate_calls"] {
             for n in [16, 64, 256, 1024] {
                 let mut functions: Vec<_> = (0..n).map(node).collect();
@@ -623,13 +645,33 @@ mod tests {
                         _ if i + 1 < n => vec![format!("f{}", i + 1)],
                         _ => vec![],
                     };
-                    semantic.witnesses.insert(f.id.clone(), vec![json!({
-                        "effect": RuntimeEffects::MAY_ALLOCATE.bits(),
-                        "witness": {"kind":"runtime-capability", "cause": {
-                            "operation": if i + 1 == n {"array-allocation"} else {"panic-payload-allocation"},
-                            "location": {"path":"fixture.wi", "start":i, "end":i+1}
-                        }}
-                    })]);
+                    let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+                    witness.cause = Some(Cause {
+                        source: CauseSource::Located {
+                            location: Some(Location {
+                                display: None,
+                                path: "fixture.wi".into(),
+                                start: i,
+                                end: i + 1,
+                            }),
+                        },
+                        operation: if i + 1 == n {
+                            CapabilityOperation::ArrayAllocation
+                        } else {
+                            CapabilityOperation::PanicPayloadAllocation
+                        },
+                        kind: None,
+                        is_conservative: false,
+                        lock: None,
+                    });
+                    semantic.witnesses.insert(
+                        f.id.clone(),
+                        vec![EffectFact {
+                            effect: RuntimeEffects::MAY_ALLOCATE.bits(),
+                            witness,
+                            paths: None,
+                        }],
+                    );
                 }
                 let mut snapshot = Snapshot {
                     edit_context: None,

@@ -5,6 +5,7 @@
 //! the new state, otherwise recovery restores old bytes unless a conflict is found.
 //! Non-cooperating writers have a check/replacement race; see STRUCTURED_EDITS.md.
 use super::{Snapshot, hash};
+use crate::ai::SymbolKind;
 use crate::qualified_name::QualifiedName;
 use crate::{
     CompilerOptions, CompilerSession,
@@ -30,9 +31,95 @@ pub struct Request {
     pub revision: String,
     pub operations: Vec<Operation>,
 }
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PlanState {
+    Prepared,
+    Validated,
+    Applying,
+    Applied,
+    Aborted,
+    Unknown(String),
+}
+impl PlanState {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Validated => "validated",
+            Self::Applying => "applying",
+            Self::Applied => "applied",
+            Self::Aborted => "aborted",
+            Self::Unknown(s) => s,
+        }
+    }
+}
+impl Serialize for PlanState {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl<'de> Deserialize<'de> for PlanState {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        Ok(match String::deserialize(deserializer)?.as_str() {
+            "prepared" => Self::Prepared,
+            "validated" => Self::Validated,
+            "applying" => Self::Applying,
+            "applied" => Self::Applied,
+            "aborted" => Self::Aborted,
+            s => Self::Unknown(s.to_owned()),
+        })
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct DiffChange {
+    pub path: String,
+    pub diff: String,
+}
+#[derive(Serialize)]
+pub struct RenamePreview {
+    pub status: super::query_result::Status,
+    pub files_changed: usize,
+    pub work: EditWork,
+    pub dry_run: bool,
+    pub revision: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub changes: Option<Vec<DiffChange>>,
+}
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum PreviewChanges {
+    Full(Vec<Change>),
+    Diff(Vec<DiffChange>),
+}
+impl PreviewChanges {
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Full(v) => v.len(),
+            Self::Diff(v) => v.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+#[derive(Serialize)]
+pub struct PreparedPreview {
+    pub kind: &'static str,
+    pub transaction: String,
+    pub revision: String,
+    pub candidate: String,
+    pub state: PlanState,
+    pub changes: PreviewChanges,
+    pub work: EditWork,
+    pub verification_manifest: Option<super::verify::EditManifest>,
+}
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Change {
+pub struct Change {
     path: String,
     before: String,
     after: String,
@@ -50,7 +137,7 @@ struct Plan {
     revision: String,
     inputs: BTreeMap<String, String>,
     changes: Vec<Change>,
-    state: String,
+    state: PlanState,
     candidate: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     verification_baseline: Option<String>,
@@ -399,6 +486,18 @@ impl Workspace {
         format: ChangeFormat,
         snapshot: Snapshot,
     ) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.prepare_analyzed_typed(
+            entry, project, request, format, snapshot,
+        )?)?)
+    }
+    pub(super) fn prepare_analyzed_typed(
+        &self,
+        entry: &Path,
+        project: bool,
+        request: Request,
+        format: ChangeFormat,
+        snapshot: Snapshot,
+    ) -> Result<PreparedPreview> {
         self.ensure_recovered()?;
         let entry = fs::canonicalize(entry)?;
         let context = snapshot
@@ -468,7 +567,7 @@ impl Workspace {
             revision: snapshot.revision,
             inputs,
             changes,
-            state: "prepared".into(),
+            state: PlanState::Prepared,
             candidate: String::new(),
             verification_baseline: Some(baseline.revision().to_owned()),
             verification_modules: Some(
@@ -509,7 +608,7 @@ impl Workspace {
         }
         baseline.save(&self.directory.join(format!("{id}.baseline.json")))?;
         self.store(&id, &plan)?;
-        self.preview(&id, format)
+        self.preview_typed(&id, format)
     }
     fn analyze(
         &self,
@@ -526,24 +625,34 @@ impl Workspace {
         .analysis_for_edit_with_emitter(emitter)
     }
     pub fn preview(&self, id: &str, format: ChangeFormat) -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(self.preview_typed(id, format)?)?)
+    }
+    fn preview_typed(&self, id: &str, format: ChangeFormat) -> Result<PreparedPreview> {
         self.ensure_recovered()?;
         let plan = self.load(id)?;
+        let verification_manifest = plan.verification_manifest();
         let changes = match format {
-            ChangeFormat::Full => serde_json::to_value(&plan.changes)?,
-            ChangeFormat::Diff => plan
-                .changes
-                .iter()
-                .map(|c| {
-                    serde_json::json!({"path":c.path,
-                        "diff":super::diff::unified(&c.path, &c.before, &c.after)})
-                })
-                .collect(),
+            ChangeFormat::Full => PreviewChanges::Full(plan.changes),
+            ChangeFormat::Diff => PreviewChanges::Diff(
+                plan.changes
+                    .iter()
+                    .map(|c| DiffChange {
+                        path: c.path.clone(),
+                        diff: super::diff::unified(&c.path, &c.before, &c.after),
+                    })
+                    .collect(),
+            ),
         };
-        Ok(
-            serde_json::json!({"kind":"edit.preview", "transaction":id, "revision":plan.revision,
-            "candidate":plan.candidate, "state":plan.state, "changes":changes, "work":plan.work,
-            "verification_manifest":plan.verification_manifest()}),
-        )
+        Ok(PreparedPreview {
+            kind: "edit.preview",
+            transaction: id.to_owned(),
+            revision: plan.revision,
+            candidate: plan.candidate,
+            state: plan.state,
+            changes,
+            work: plan.work,
+            verification_manifest,
+        })
     }
     fn check_candidate(&self, id: &str, plan: &Plan) -> Result<()> {
         let replacements: BTreeMap<_, _> = plan
@@ -645,7 +754,7 @@ impl Workspace {
         self.ensure_recovered()?;
         let plan = self.load(id)?;
         ensure!(
-            matches!(plan.state.as_str(), "prepared" | "validated"),
+            matches!(plan.state, PlanState::Prepared | PlanState::Validated),
             "transaction is not pending"
         );
         ensure!(
@@ -758,7 +867,7 @@ impl Workspace {
         self.ensure_recovered()?;
         let mut plan = self.load(id)?;
         ensure!(
-            matches!(plan.state.as_str(), "prepared" | "validated"),
+            matches!(plan.state, PlanState::Prepared | PlanState::Validated),
             "transaction is not pending"
         );
         self.current(&plan)?;
@@ -799,7 +908,7 @@ impl Workspace {
         }
         self.check_candidate(id, &plan)?;
         self.current(&plan)?;
-        plan.state = "validated".into();
+        plan.state = PlanState::Validated;
         self.store(id, &plan)?;
         Ok(
             serde_json::json!({"kind":"edit.validated", "transaction":id, "candidate":plan.candidate}),
@@ -854,7 +963,7 @@ impl Workspace {
         let mut plan = self.load(id)?;
         // A failure after the success marker was removed still needs an undo
         // journal if rollback itself is interrupted or encounters an IO error.
-        plan.state = "applying".into();
+        plan.state = PlanState::Applying;
         self.store(id, &plan)?;
         if !self.directory.join("active").exists() {
             durable_write(&self.directory.join("active"), id.as_bytes())?;
@@ -875,7 +984,7 @@ impl Workspace {
             }
         }
         ensure!(failures.is_empty(), "{}", failures.join("; "));
-        plan.state = "aborted".into();
+        plan.state = PlanState::Aborted;
         self.store(id, &plan)?;
         if self.directory.join("active").exists() {
             self.clear_active()?;
@@ -893,7 +1002,7 @@ impl Workspace {
         self.ensure_recovered()?;
         let mut plan = self.load(id)?;
         ensure!(
-            plan.state == "validated",
+            plan.state == PlanState::Validated,
             "apply requires a validated, unapplied candidate"
         );
         ensure!(
@@ -911,7 +1020,7 @@ impl Workspace {
         durable_write(&self.directory.join("active"), id.as_bytes())?;
         #[cfg(test)]
         visibility_tests::checkpoint("intent");
-        plan.state = "applying".into();
+        plan.state = PlanState::Applying;
         self.store(id, &plan)?;
         #[cfg(test)]
         visibility_tests::checkpoint("applying");
@@ -968,7 +1077,7 @@ impl Workspace {
                 "post-apply analysis observed different input bytes"
             );
         }
-        plan.state = "applied".into();
+        plan.state = PlanState::Applied;
         self.store(id, &plan)?;
         #[cfg(test)]
         visibility_tests::checkpoint("committed");
@@ -1000,12 +1109,15 @@ impl Workspace {
         );
         ensure!(
             matches!(
-                plan.state.as_str(),
-                "validated" | "applying" | "applied" | "aborted"
+                plan.state,
+                PlanState::Validated
+                    | PlanState::Applying
+                    | PlanState::Applied
+                    | PlanState::Aborted
             ),
             "invalid recovery state"
         );
-        if matches!(plan.state.as_str(), "applied" | "aborted") {
+        if matches!(plan.state, PlanState::Applied | PlanState::Aborted) {
             self.clear_active()?;
             return Ok(
                 serde_json::json!({"kind":"edit.recovered", "transaction":id, "state":plan.state}),
@@ -1036,7 +1148,7 @@ impl Workspace {
             #[cfg(not(test))]
             let _ = index;
         }
-        plan.state = "aborted".into();
+        plan.state = PlanState::Aborted;
         self.store(id, &plan)?;
         self.clear_active()?;
         Ok(serde_json::json!({"kind":"edit.recovered", "transaction":id}))
@@ -1072,8 +1184,8 @@ fn candidate(plan: &Plan) -> Result<String> {
 
 use crate::workspace_transaction::{durable_write, durable_write_observed, sync_directory};
 
-#[derive(Default, Serialize, Deserialize)]
-pub(super) struct EditWork {
+#[derive(Debug, Default, Serialize, Deserialize)]
+pub struct EditWork {
     pub(super) tokens_indexed: usize,
     pub(super) expressions_indexed: usize,
     #[serde(default)]
@@ -1183,7 +1295,7 @@ pub(super) fn preview_analyzed(
     snapshot: &Snapshot,
     request: Request,
     diff: bool,
-) -> Result<serde_json::Value> {
+) -> Result<RenamePreview> {
     ensure!(request.revision == snapshot.revision, "stale revision");
     let root = Path::new(&snapshot.workspace);
     let context = snapshot
@@ -1220,13 +1332,22 @@ pub(super) fn preview_analyzed(
         );
     }
     context.verify_files()?;
-    let mut preview = serde_json::json!({"status":"ok","files_changed":changes.len(),"work":work,"dry_run":true,"revision":snapshot.revision});
-    if diff {
-        preview["changes"] = changes.iter().map(|c| {
-            serde_json::json!({"path":c.path,"diff":super::diff::unified(&c.path,&c.before,&c.after)})
-        }).collect();
-    }
-    Ok(preview)
+    Ok(RenamePreview {
+        status: super::query_result::Status::Ok,
+        files_changed: changes.len(),
+        work,
+        dry_run: true,
+        revision: snapshot.revision.clone(),
+        changes: diff.then(|| {
+            changes
+                .iter()
+                .map(|c| DiffChange {
+                    path: c.path.clone(),
+                    diff: super::diff::unified(&c.path, &c.before, &c.after),
+                })
+                .collect()
+        }),
+    })
 }
 
 /// Member-call tokens the type checker proved to be builtin methods
@@ -1237,14 +1358,15 @@ fn builtin_member_points<'a>(
 ) -> std::collections::HashSet<(&'a Path, usize)> {
     // Methods the bundled standard source declares are compiler-owned like
     // intrinsic builtins: a call to one is never a workspace rename target.
-    let bundled: std::collections::HashSet<_> = snapshot
+    let compiler_owned: std::collections::HashSet<_> = snapshot
         .semantic
         .symbols
         .iter()
         .filter(|s| {
-            s.location
-                .as_ref()
-                .is_some_and(|l| super::bundled_source(&l.path).is_some())
+            (s.is_builtin() && s.kind == super::SymbolKind::BuiltinMethod)
+                || s.location
+                    .as_ref()
+                    .is_some_and(|l| super::bundled_source(&l.path).is_some())
         })
         .map(|s| s.id.as_str())
         .collect();
@@ -1252,9 +1374,7 @@ fn builtin_member_points<'a>(
         .semantic
         .references
         .iter()
-        .filter(|r| {
-            r.target.starts_with("builtin:builtin-method:") || bundled.contains(r.target.as_str())
-        })
+        .filter(|r| compiler_owned.contains(r.target.as_str()))
         .filter_map(|r| {
             let path = Path::new(&r.location.path).strip_prefix(root).ok()?;
             Some((path, r.location.start))
@@ -1468,15 +1588,20 @@ impl<'a> StructuredIndex<'a> {
         let has_member_rename = snapshot.semantic.symbols.iter().any(|symbol| {
             requested_renames.contains(symbol.id.as_str())
                 && matches!(
-                    symbol.kind.as_str(),
-                    "method" | "field" | "static-field" | "variant" | "binding" | "parameter"
+                    symbol.kind,
+                    SymbolKind::Method
+                        | SymbolKind::Field
+                        | SymbolKind::StaticField
+                        | SymbolKind::Variant
+                        | SymbolKind::Binding
+                        | SymbolKind::Parameter
                 )
         });
         let local_ids: std::collections::HashSet<_> = snapshot
             .semantic
             .symbols
             .iter()
-            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter"))
+            .filter(|s| matches!(s.kind, SymbolKind::Binding | SymbolKind::Parameter))
             .map(|s| s.id.as_str())
             .collect();
         if requested_renames.iter().any(|id| local_ids.contains(id)) {
@@ -1497,7 +1622,7 @@ impl<'a> StructuredIndex<'a> {
         let mut explicit_aliases = std::collections::HashSet::new();
         let mut alias_points = std::collections::HashSet::new();
         for symbol in &snapshot.semantic.symbols {
-            if symbol.kind == "import"
+            if symbol.kind == SymbolKind::Import
                 && let Some(l) = &symbol.location
                 && let Ok(path) = Path::new(&l.path).strip_prefix(root)
                 && alias_tokens.contains(&(path, l.start, l.end))
@@ -1578,7 +1703,7 @@ impl<'a> StructuredIndex<'a> {
                 .filter_map(|s| {
                     let l = s.location.as_ref()?;
                     let path = Path::new(&l.path).strip_prefix(root).ok()?;
-                    Some(((path, l.start), usize::from(s.kind == "import")))
+                    Some(((path, l.start), usize::from(s.kind == SymbolKind::Import)))
                 })
                 .collect();
             let declaration = occurrences
@@ -2042,7 +2167,7 @@ mod tests {
                 }
             );
             assert!(!workspace.directory.join("active").exists());
-            assert_eq!(workspace.load(id).unwrap().state, "aborted");
+            assert_eq!(workspace.load(id).unwrap().state, PlanState::Aborted);
         }
     }
     struct Fixture(PathBuf);
@@ -2187,7 +2312,7 @@ mod tests {
             .semantic
             .symbols
             .iter()
-            .filter(|s| s.kind == "binding")
+            .filter(|s| s.kind == SymbolKind::Binding)
             .map(|s| Operation::Rename {
                 function: s.id.clone(),
                 name: "fresh".into(),
@@ -2334,7 +2459,7 @@ mod tests {
             after: "after".into(),
             offsets: Vec::new(),
         });
-        plan.state = "validated".into();
+        plan.state = PlanState::Validated;
         plan.candidate = candidate(&plan).unwrap();
         w.store(&id, &plan).unwrap();
         fs::write(f.0.join("unrelated.txt"), "keep me").unwrap();
@@ -2955,6 +3080,7 @@ mod tests {
             )
             .unwrap();
             let location = super::super::Location {
+                display: None,
                 path,
                 start: starts[0],
                 end: starts[0] + 5,
@@ -3102,7 +3228,7 @@ mod tests {
             w.validate(&id, &mut crate::diagnostics::HumanEmitter)
                 .is_err()
         );
-        plan.state = "validated".into();
+        plan.state = PlanState::Validated;
         w.store(&id, &plan).unwrap();
         assert!(w.apply(&id, &mut crate::diagnostics::HumanEmitter).is_err());
         assert!(

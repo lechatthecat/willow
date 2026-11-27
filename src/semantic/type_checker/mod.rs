@@ -4,6 +4,7 @@ mod contracts_tests;
 #[cfg(test)]
 mod core_models;
 mod effect_contracts;
+pub use effect_contracts::{PanicBasis, PanicEvidence, PanicStatus, RuntimeChecks};
 pub(crate) mod lock_order;
 pub(crate) mod purity;
 #[cfg(test)]
@@ -164,7 +165,7 @@ pub struct TypeChecker {
     pub(crate) verification_options: Option<crate::semantic::verification::Options>,
     pub(crate) verification_cache: crate::semantic::verification::ProofCache,
     pub(crate) verification: crate::semantic::verification::Verification,
-    pub(crate) panic_evidence: HashMap<FunctionId, serde_json::Value>,
+    pub(crate) panic_evidence: HashMap<FunctionId, PanicEvidence>,
     pub(crate) generics: generics::Generics,
     // Declaration-epoch caches: cleared before registering each program.
     marker_contracts: ObservedMap<String, Option<send_sync::Marker>>,

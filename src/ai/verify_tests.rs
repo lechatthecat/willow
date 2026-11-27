@@ -63,11 +63,27 @@ fn semantic_verify_signature_values() {
     assert!(r.complete);
     assert_eq!(r.signatures.len(), 1, "{r:?}");
     assert_eq!(
-        r.signatures.changed[0].before.as_ref().unwrap()["type"],
+        r.signatures.changed[0]
+            .before
+            .as_ref()
+            .unwrap()
+            .ty
+            .as_ref()
+            .unwrap()
+            .as_deref()
+            .unwrap(),
         "fn() -> i64"
     );
     assert_eq!(
-        r.signatures.changed[0].after.as_ref().unwrap()["type"],
+        r.signatures.changed[0]
+            .after
+            .as_ref()
+            .unwrap()
+            .ty
+            .as_ref()
+            .unwrap()
+            .as_deref()
+            .unwrap(),
         "fn() -> bool"
     );
 }
@@ -186,7 +202,10 @@ fn synthetic(n: usize) -> Baseline {
             (
                 format!("f{i}"),
                 Arc::new(Fact {
-                    signature: Some(json!({"type":"fn() -> i64","exported":true})),
+                    signature: Some(
+                        serde_json::from_value(json!({"type":"fn() -> i64","exported":true}))
+                            .unwrap(),
+                    ),
                     effects: Some(EffectState { may: 0, unknown: 0 }),
                     body: "one".into(),
                     callees: vec![],
@@ -338,7 +357,9 @@ fn semantic_verify_radix_matches_full_oracle() {
                 .get_mut(&format!("f{i}"))
                 .map(Arc::make_mut)
                 .unwrap()
-                .signature = Some(json!({"type":"fn() -> bool","exported":true}));
+                .signature = Some(
+                serde_json::from_value(json!({"type":"fn() -> bool","exported":true})).unwrap(),
+            );
         }
         b.reindex().unwrap();
         let expected: Vec<_> = a
@@ -2611,5 +2632,21 @@ fn semantic_verify_async_borrow_actual_dependencies_match_clean() {
             retained.incremental_stats["async_borrow_checks"], 0,
             "repeat {case}"
         );
+    }
+}
+
+#[test]
+fn declaration_signature_preserves_wire_extensions_and_nullable_fields() {
+    for value in [
+        json!({"aaa":1,"exported":true,"type":null,"zzz":["future"]}),
+        json!({"async":false,"constant_value":null,"constraint_parameter":null,"kind":"future-kind","exported":false,"public":true}),
+        json!({"type":"fn() -> i64","exported":true}),
+    ] {
+        let typed: DeclarationSignature = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_string(&typed).unwrap(),
+            serde_json::to_string(&value).unwrap()
+        );
+        assert_eq!(public_signature(Some(&typed)), value["exported"] == true);
     }
 }

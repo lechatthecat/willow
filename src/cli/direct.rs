@@ -1,7 +1,84 @@
 //! Human-oriented semantic commands; compiler APIs own resolution and queries.
 use super::*;
-use serde_json::{Value, json};
-use willow_compiler::ai::direct::{DirectSession, RenameMode, SelectorFilter};
+use serde::Serialize;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
+use willow_compiler::ai::direct::{DirectCommand, DirectSession, RenameMode, SelectorFilter};
+use willow_compiler::ai::{
+    SymbolKind,
+    direct::{DirectQueryData, DirectQueryResult, RenamePreviewResult, RenameResult},
+    query_result::{QueryData, Status, SymbolInfo},
+};
+
+#[derive(Serialize)]
+struct CommandOutput {
+    schema: u32,
+    kind: DirectCommand,
+    status: Status,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<CommandResult>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    location: Option<willow_compiler::ai::edit::RejectionLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<WarningCounts>,
+}
+#[derive(Serialize)]
+struct WarningCounts {
+    warnings: usize,
+}
+#[derive(Serialize)]
+#[serde(untagged)]
+enum CommandResult {
+    Query(Box<DirectQueryResult>),
+    Rename(RenameResult),
+    Summary(RenameSummary),
+    Diff {
+        #[serde(flatten)]
+        preview: RenamePreviewResult,
+        #[serde(flatten)]
+        summary: RenameSummary,
+    },
+}
+#[derive(Serialize)]
+struct RenameSummary {
+    files: usize,
+    edits: usize,
+    declarations: usize,
+    references: usize,
+    collisions: usize,
+    unresolved: usize,
+}
+impl From<&RenamePreviewResult> for RenameSummary {
+    fn from(preview: &RenamePreviewResult) -> Self {
+        Self {
+            files: preview.preview.files_changed,
+            edits: preview.edits,
+            declarations: preview.declarations_updated,
+            references: preview.references_updated,
+            collisions: 0,
+            unresolved: 0,
+        }
+    }
+}
+impl CommandOutput {
+    fn new(kind: DirectCommand, status: Status) -> Self {
+        Self {
+            schema: 1,
+            kind,
+            status,
+            revision: None,
+            result: None,
+            message: None,
+            location: None,
+            diagnostics: None,
+        }
+    }
+}
 
 // Includes lexical symbols omitted from the overview's declaration-only list.
 const SYMBOL_KINDS: &[&str] = &[
@@ -23,7 +100,7 @@ const SYMBOL_KINDS: &[&str] = &[
 ];
 
 pub(super) struct Options {
-    command: String,
+    command: DirectCommand,
     selector: String,
     format: OutputFormat,
     source: Option<String>,
@@ -51,7 +128,8 @@ impl<'a> Parser<'a> {
     pub(super) fn new(command: &str) -> Self {
         Self {
             options: Options {
-                command: command.to_owned(),
+                command: DirectCommand::parse(command)
+                    .expect("direct command selected by request parser"),
                 selector: String::new(),
                 format: OutputFormat::Human,
                 source: None,
@@ -85,7 +163,7 @@ impl<'a> Parser<'a> {
                 result.selector = arg.to_owned();
             } else {
                 anyhow::ensure!(
-                    result.command == "rename" && result.new_name.is_none(),
+                    result.command == DirectCommand::Rename && result.new_name.is_none(),
                     "unexpected positional argument"
                 );
                 result.new_name = Some(arg.to_owned());
@@ -165,11 +243,12 @@ impl<'a> Parser<'a> {
         let result = self.options;
         anyhow::ensure!(!result.selector.is_empty(), "missing selector");
         anyhow::ensure!(
-            result.command != "rename" || result.new_name.is_some(),
+            result.command != DirectCommand::Rename || result.new_name.is_some(),
             "rename requires a new name"
         );
         anyhow::ensure!(
-            result.command == "rename" || (!result.dry_run && !result.verbose && !result.diff),
+            result.command == DirectCommand::Rename
+                || (!result.dry_run && !result.verbose && !result.diff),
             "rename-only option"
         );
         anyhow::ensure!(!result.diff || result.dry_run, "--diff requires --dry-run");
@@ -179,7 +258,7 @@ impl<'a> Parser<'a> {
             "--source and --project-dir are mutually exclusive"
         );
         anyhow::ensure!(
-            result.max_chars.is_none() || result.command != "rename" || result.dry_run,
+            result.max_chars.is_none() || result.command != DirectCommand::Rename || result.dry_run,
             "--max-chars requires --dry-run for rename"
         );
         Ok(result)
@@ -197,7 +276,7 @@ impl Options {
 
     /// `warnings` counts checker warnings even when analysis or the query
     /// later fails, so every result can report the suppressed total.
-    fn execute(&self, warnings: &mut usize) -> Result<Value> {
+    fn execute(&self, warnings: &mut usize) -> Result<CommandOutput> {
         let (entry, root) = if let Some(source) = &self.source {
             (source.clone(), None)
         } else {
@@ -240,14 +319,14 @@ impl Options {
             show: self.warnings,
             count: warnings,
         };
-        let snapshot = if self.command == "rename" {
+        let snapshot = if self.command == DirectCommand::Rename {
             compiler.analysis_for_edit_with_emitter(emitter)?
         } else {
             compiler.overview_with_emitter(emitter)?
         };
         let mut session = DirectSession::new(snapshot)?;
-        if self.command == "rename" {
-            let mut result = session.rename_with_emitter(
+        if self.command == DirectCommand::Rename {
+            let mut result = session.rename_typed_with_emitter(
                 std::path::Path::new(&entry),
                 project,
                 &self.selector,
@@ -262,44 +341,44 @@ impl Options {
                 },
                 emitter,
             )?;
-            if self.dry_run && result["status"] == "ok" {
-                let mut summary = json!({
-                    "files": result["files_changed"],
-                    "edits": result["edits"],
-                    "declarations": result["declarations_updated"],
-                    "references": result["references_updated"],
-                    "collisions": 0,
-                    "unresolved": 0,
+            let mut output = CommandOutput::new(self.command, result.status());
+            if self.dry_run
+                && result.status() == Status::Ok
+                && let RenameResult::Preview(preview) = result
+            {
+                let summary = RenameSummary::from(&preview);
+                output.result = Some(if self.diff {
+                    CommandResult::Diff { preview, summary }
+                } else {
+                    CommandResult::Summary(summary)
                 });
-                if self.diff {
-                    result
-                        .as_object_mut()
-                        .unwrap()
-                        .extend(summary.as_object().unwrap().clone());
-                    summary = result;
-                }
-                return Ok(json!({"schema":1,"kind":"rename","status":"ok","result":summary}));
+                return Ok(output);
             }
-            if !self.verbose {
-                result.as_object_mut().unwrap().remove("transaction");
+            if !self.verbose
+                && let RenameResult::Applied(applied) = &mut result
+            {
+                applied.transaction = None;
             }
-            return Ok(
-                json!({"schema":1,"kind":"rename","status":result["status"],"result":result}),
-            );
+            output.result = Some(CommandResult::Rename(result));
+            return Ok(output);
         }
-        let mut result = session.query(&self.command, &self.selector, &self.filter, self.all)?;
-        if matches!(self.command.as_str(), "effects" | "impact")
+        let mut result =
+            session.query_typed(self.command, &self.selector, &self.filter, self.all)?;
+        if matches!(self.command, DirectCommand::Effects | DirectCommand::Impact)
             && self.format == OutputFormat::Human
         {
             session.display_function_targets(&mut result, self.absolute)?;
         }
-        session.display_locations(&mut result, self.absolute)?;
-        if !(self.explain || self.command == "effects" && self.format == OutputFormat::Human) {
+        session.display_query_locations(&mut result, self.absolute)?;
+        if !(self.explain
+            || self.command == DirectCommand::Effects && self.format == OutputFormat::Human)
+        {
             concise(&mut result);
         }
-        Ok(
-            json!({"schema":1,"kind":self.command,"status":result["status"],"revision":session.session.revision(),"result":result}),
-        )
+        let mut output = CommandOutput::new(self.command, result.status);
+        output.revision = Some(session.session.revision().to_owned());
+        output.result = Some(CommandResult::Query(Box::new(result)));
+        Ok(output)
     }
 }
 
@@ -325,107 +404,131 @@ impl willow_compiler::diagnostics::DiagnosticEmitter for WarningFilter<'_> {
     }
 }
 
-fn concise(value: &mut Value) {
-    match value {
-        Value::Object(fields) => {
-            for key in [
-                "fingerprint",
-                "body_fingerprint",
-                "flow",
-                "node",
-                "occurrences",
-                "callees",
-                "witness",
-                "compiler_witnesses",
-            ] {
-                if key != "witness" || !fields.contains_key("state") {
-                    fields.remove(key);
-                }
-            }
-            if fields.contains_key("type_display") {
-                fields.remove("type");
-            }
-            for value in fields.values_mut() {
-                concise(value);
+fn concise(value: &mut DirectQueryResult) {
+    match &mut value.data {
+        DirectQueryData::Semantic(QueryData::Symbol {
+            symbol: SymbolInfo::Function(function),
+            ..
+        }) => {
+            function.fingerprint = None;
+            function.body_fingerprint = None;
+            function.callees = None;
+        }
+        DirectQueryData::Semantic(QueryData::Type(typed)) => {
+            if typed.type_display.is_some() {
+                typed.ty = None;
             }
         }
-        Value::Array(values) => {
-            for value in values {
-                concise(value);
+        DirectQueryData::Semantic(QueryData::References {
+            references,
+            unresolved_candidates,
+            ..
+        }) => {
+            for reference in references
+                .iter_mut()
+                .chain(unresolved_candidates.iter_mut().flatten())
+            {
+                reference.fingerprint = None;
+                reference.flow = None;
+                reference.node = None;
+                reference.occurrences = None;
+            }
+        }
+        DirectQueryData::Semantic(QueryData::Effects(effects)) => {
+            effects.witness = None;
+            effects.compiler_witnesses = None;
+            if let Some(facts) = &mut effects.effect_evidence {
+                for fact in facts {
+                    fact.witness = None;
+                }
             }
         }
         _ => {}
     }
 }
 
-fn location(value: &Value) -> String {
+fn location(value: Option<&willow_compiler::ai::Location>) -> String {
+    let Some(value) = value else {
+        return "?:null:null".into();
+    };
+    let position = value.display.as_deref();
     format!(
         "{}:{}:{}",
-        value["path"].as_str().unwrap_or("?"),
-        value["line"],
-        value["column"]
+        value.path,
+        position.map_or_else(|| "null".into(), |p| p.line.to_string()),
+        position.map_or_else(|| "null".into(), |p| p.column.to_string())
+    )
+}
+fn selected_location(value: Option<&willow_compiler::ai::direct::SelectedLocation>) -> String {
+    let Some(value) = value else {
+        return "?:null:null".into();
+    };
+    format!(
+        "{}:{}:{}",
+        value.path,
+        value.line.map_or_else(|| "null".into(), |v| v.to_string()),
+        value
+            .column
+            .map_or_else(|| "null".into(), |v| v.to_string())
     )
 }
 fn counted(n: u64, noun: &str) -> String {
     format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
 }
-fn human(value: &Value, options: &Options) -> String {
+fn human(value: &CommandOutput, options: &Options) -> String {
     human_items(value, options).join("\n")
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
-fn human_items(value: &Value, options: &Options) -> Vec<String> {
-    let result = &value["result"];
-    if options.command == "rename" && options.dry_run && value["status"] == "ok" {
-        // Match the applied rename's counts, including declaration edits.
-        let summary = format!(
-            "{} / {} ({}, {}) / {} / {} unresolved",
-            counted(result["files"].as_u64().unwrap(), "file"),
-            counted(result["edits"].as_u64().unwrap_or(0), "edit"),
-            counted(result["declarations"].as_u64().unwrap_or(0), "declaration"),
-            counted(result["references"].as_u64().unwrap(), "reference"),
-            counted(result["collisions"].as_u64().unwrap(), "collision"),
-            result["unresolved"]
-        );
+#[allow(
+    clippy::too_many_lines,
+    reason = "One ordered presentation for each typed direct response"
+)]
+fn human_items(value: &CommandOutput, options: &Options) -> Vec<String> {
+    if let Some(CommandResult::Summary(summary) | CommandResult::Diff { summary, .. }) =
+        &value.result
+    {
         let mut output = Vec::new();
-        if let Some(changes) = result["changes"].as_array() {
+        if let Some(CommandResult::Diff { preview, .. }) = &value.result
+            && let Some(changes) = &preview.preview.changes
+        {
             for change in changes {
-                if let Some(diff) = change["diff"].as_str()
-                    && (!diff.is_empty() || output.is_empty())
-                {
+                let diff = &change.diff;
+                if !diff.is_empty() || output.is_empty() {
                     output.push(diff.strip_suffix('\n').unwrap_or(diff).to_owned());
                 }
             }
         }
-        output.push(summary);
+        output.push(format!(
+            "{} / {} ({}, {}) / {} / {} unresolved",
+            counted(summary.files as u64, "file"),
+            counted(summary.edits as u64, "edit"),
+            counted(summary.declarations as u64, "declaration"),
+            counted(summary.references as u64, "reference"),
+            counted(summary.collisions as u64, "collision"),
+            summary.unresolved
+        ));
         return output;
     }
-    if options.command == "rename" && result["status"] == "ok" {
-        let count = |key: &str, noun: &str| {
-            let n = result[key].as_u64().unwrap_or(0);
-            format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
-        };
-        let files = count("files_changed", "file");
+    if let Some(CommandResult::Rename(RenameResult::Applied(result))) = &value.result {
+        let files = counted(result.files_changed as u64, "file");
         let edits = format!(
             "{} ({}, {})",
-            count("edits", "edit"),
-            count("declarations_updated", "declaration"),
-            count("references_updated", "reference")
+            counted(result.edits as u64, "edit"),
+            counted(result.declarations_updated as u64, "declaration"),
+            counted(result.references_updated as u64, "reference")
         );
         let new_name = options.new_name.as_deref().unwrap();
         let mut output = format!(
             "Renamed {} -> {new_name}\n{files} changed\n{edits}\nValidation: passed",
             options.selector
         );
-        if let Some(warnings) = result["warnings"].as_array() {
-            for warning in warnings.iter().filter_map(Value::as_str) {
-                output.push_str(&format!("\nWarning: {warning}"));
-            }
+        for warning in result.warnings.iter().flatten() {
+            output.push_str(&format!("\nWarning: {warning}"));
         }
         if options.verbose {
             output.push_str(&format!(
                 "\nTransaction: {}",
-                result["transaction"].as_str().unwrap_or("?")
+                result.transaction.as_deref().unwrap_or("?")
             ));
         }
         return vec![output];
@@ -434,42 +537,60 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
         "{} {}: {}",
         options.command,
         options.selector,
-        value["status"].as_str().unwrap_or("error")
+        value.status.as_str()
     )];
-    if let Some(message) = value["message"].as_str() {
-        lines.push(message.into());
+    if let Some(message) = &value.message {
+        lines.push(message.clone());
     }
-    if let Some(reason) = result["reason"].as_str() {
+    let result = match &value.result {
+        Some(
+            CommandResult::Query(result) | CommandResult::Rename(RenameResult::Resolution(result)),
+        ) => result,
+        _ => return lines,
+    };
+    let reason = result.reason.as_deref().or_else(|| {
+        result
+            .effects()
+            .and_then(|effects| effects.reason.as_deref())
+    });
+    if let Some(reason) = reason {
         lines.push(reason.into());
     }
-    if let Some(candidates) = result["candidates"].as_array() {
-        for candidate in candidates {
-            lines.push(format!(
-                "  {} ({}) {}",
-                candidate["qualified_name"]
-                    .as_str()
-                    .or_else(|| candidate["selector"].as_str())
-                    .unwrap_or("?"),
-                candidate["kind"].as_str().unwrap_or("?"),
-                location(&candidate["location"])
-            ));
+    match &result.data {
+        DirectQueryData::Ambiguous { candidates } => {
+            for candidate in candidates {
+                lines.push(format!(
+                    "  {} ({}) {}",
+                    candidate
+                        .qualified_name
+                        .as_deref()
+                        .unwrap_or(&candidate.selector),
+                    candidate.kind,
+                    selected_location(candidate.location.as_ref())
+                ));
+            }
         }
-    }
-    if let Some(suggestions) = result["suggestions"].as_array() {
-        for suggestion in suggestions {
-            lines.push(format!(
-                "  suggestion: {}",
-                suggestion.as_str().unwrap_or("?")
-            ));
+        DirectQueryData::Unknown { suggestions } => {
+            for suggestion in suggestions {
+                lines.push(format!("  suggestion: {suggestion}"));
+            }
         }
+        _ => {}
     }
-    if let Some(references) = result["references"].as_array() {
+    if let DirectQueryData::Semantic(QueryData::References {
+        references,
+        coverage,
+        unresolved_candidates,
+    }) = &result.data
+    {
         for reference in references {
             lines.push(format!(
                 "  {} {}{}",
-                location(&reference["location"]),
-                reference["role"].as_str().unwrap_or("reference"),
-                if reference["certainty"] == "possible-dispatch" {
+                location(Some(&reference.location)),
+                reference.role,
+                if reference.certainty
+                    == Some(willow_compiler::ai::query_result::ReferenceCertainty::PossibleDispatch)
+                {
                     " (possible-dispatch)"
                 } else {
                     ""
@@ -478,79 +599,88 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
         }
         lines.push(format!(
             "total={} shown={} truncated={}",
-            result["total"], result["shown"], result["truncated"]
+            result.total.unwrap_or(0),
+            result.shown.unwrap_or(0),
+            result.truncated.unwrap_or(false)
         ));
         lines.push(format!(
             "Coverage: {}",
-            result["coverage"].as_str().unwrap_or("compiler-resolved")
+            coverage.as_deref().unwrap_or("compiler-resolved")
         ));
-    }
-    if let Some(candidates) = result["unresolved_candidates"].as_array() {
-        for candidate in candidates {
+        for candidate in unresolved_candidates.iter().flatten() {
             lines.push(format!(
                 "  {} indirect candidate: {}",
-                location(&candidate["location"]),
-                candidate["reason"].as_str().unwrap_or("unresolved target")
+                location(Some(&candidate.location)),
+                candidate.reason.as_deref().unwrap_or("unresolved target")
             ));
         }
     }
-    // Every query prints its symbol, then location, then type.
-    if let Some(selected) = result.get("selected").or_else(|| result.get("symbol")) {
-        // A position selector already repeats the location line below.
-        if let Some(name) = selected["qualified_name"]
-            .as_str()
-            .or_else(|| selected["selector"].as_str())
-        {
-            lines.push(format!(
-                "Symbol: {name} ({})",
-                selected["kind"].as_str().unwrap_or("function")
-            ));
+    let selected = result.selected.as_ref().or(match &result.data {
+        DirectQueryData::Resolved { symbol } | DirectQueryData::Impact { symbol, .. } => {
+            Some(symbol)
         }
-        if selected["location"].is_object() {
-            lines.push(location(&selected["location"]));
+        _ => None,
+    });
+    if let Some(selected) = selected {
+        let name = selected
+            .qualified_name
+            .as_deref()
+            .unwrap_or(&selected.selector);
+        lines.push(format!("Symbol: {name} ({})", selected.kind));
+        if selected.location.is_some() {
+            lines.push(selected_location(selected.location.as_ref()));
         }
         if options.show_id {
-            lines.push(format!("ID: {}", selected["id"].as_str().unwrap_or("?")));
+            lines.push(format!("ID: {}", selected.id));
         }
     }
-    if let Some(ty) = result["type_display"]
-        .as_str()
-        .or_else(|| result["symbol"]["type_display"].as_str())
+    let (typed, declared) = match &result.data {
+        DirectQueryData::Semantic(QueryData::Type(typed)) => (Some(typed), None),
+        DirectQueryData::Semantic(QueryData::Symbol {
+            symbol: SymbolInfo::Declaration(declared),
+            ..
+        }) => (None, Some(declared)),
+        _ => (None, None),
+    };
+    if let Some(ty) = result
+        .type_display
+        .as_deref()
+        .or_else(|| typed.and_then(|t| t.type_display.as_deref()))
+        .or_else(|| declared.and_then(|d| d.type_display.as_deref()))
     {
         lines.push(format!("Type: {ty}"));
     }
-    if let Some(payload) = result["payload_display"]
-        .as_array()
-        .or_else(|| result["symbol"]["payload_display"].as_array())
+    if let Some(payload) = typed
+        .map(|t| &t.payload_display)
+        .or_else(|| declared.map(|d| &d.payload_display))
+        .filter(|p| !p.is_empty())
     {
-        let payload: Vec<_> = payload.iter().filter_map(Value::as_str).collect();
         lines.push(format!("Payload: ({})", payload.join(", ")));
     }
-    if options.command == "type" {
-        match result["status"].as_str() {
-            Some("unknown") if willow_compiler::ai::direct::split_location(&options.selector).is_none() => lines.push("No symbol matches this selector and its filters. Use a qualified symbol name or file:line:column on an identifier or expression.".into()),
-            Some("unknown") => lines.push("No typed expression or declaration was found at this position (keywords, whitespace and comments have no type). Place the cursor on an expression or identifier, or use `willow type QUALIFIED_SYMBOL`.".into()),
-            Some("unanalyzed") => lines.push("A semantic expression or declaration was found, but its type is unavailable in this analysis. Run `willow check .` for diagnostics; try a typed expression or declaration identifier.".into()),
-            Some("ambiguous") => lines.push("Multiple semantic candidates overlap this position. Select a declaration identifier or a qualified symbol.".into()),
+    if options.command == DirectCommand::Type {
+        match result.status {
+            Status::Unknown if willow_compiler::ai::direct::split_location(&options.selector).is_none() => lines.push("No symbol matches this selector and its filters. Use a qualified symbol name or file:line:column on an identifier or expression.".into()),
+            Status::Unknown => lines.push("No typed expression or declaration was found at this position (keywords, whitespace and comments have no type). Place the cursor on an expression or identifier, or use `willow type QUALIFIED_SYMBOL`.".into()),
+            Status::Unanalyzed => lines.push("A semantic expression or declaration was found, but its type is unavailable in this analysis. Run `willow check .` for diagnostics; try a typed expression or declaration identifier.".into()),
+            Status::Ambiguous => lines.push("Multiple semantic candidates overlap this position. Select a declaration identifier or a qualified symbol.".into()),
             _ => {}
         }
     }
-    if result["effects"].is_array() {
-        effect_lines(result, options.all, options.explain, &mut lines);
+    if let Some(effects) = result.effects() {
+        effect_lines(effects, selected, options.all, options.explain, &mut lines);
     }
-    if let Some(nodes) = result["impact"]["nodes"].as_array() {
+    if let DirectQueryData::Impact { impact, symbol } = &result.data {
+        use willow_compiler::ai::{ImpactKind, ImpactRelation};
+        let nodes = &impact.nodes;
         lines.push(format!("Affected functions: {}", nodes.len()));
-        // Nodes arrive sorted by distance; label each relation group once so
-        // the code to edit for a signature change (definitions plus direct
-        // callers) reads without a second query.
-        let method = result["symbol"]["kind"] == "method";
-        let mut counts = [0usize; 3];
-        let group = |node: &Value| match node["relation"].as_str() {
-            Some("definition") => Some(0),
-            Some("direct-caller") => Some(1),
-            Some("indirect-caller") => Some(2),
-            _ => None,
+        let method = symbol.kind == SymbolKind::Method;
+        let group = |node: &willow_compiler::ai::ImpactNode| match node.relation {
+            Some(ImpactRelation::Definition) => Some(0),
+            Some(ImpactRelation::DirectCaller) => Some(1),
+            Some(ImpactRelation::IndirectCaller) => Some(2),
+            None => None,
         };
+        let mut counts = [0usize; 3];
         for node in nodes {
             if let Some(g) = group(node) {
                 counts[g] += 1;
@@ -574,23 +704,22 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
                     counts[g]
                 ));
             }
-            // Indirect callers are ordered by call distance, then name; the
-            // distance makes that order visible.
             lines.push(format!(
                 "  {}{}{}",
-                if node["kind"] == "lambda" {
+                if node.kind == Some(ImpactKind::Lambda) {
                     "lambda "
                 } else {
                     ""
                 },
-                node["selector"].as_str().unwrap_or("unknown symbol"),
-                match (group(node), node["distance"].as_u64()) {
-                    (Some(2), Some(distance)) => format!(" (distance {distance})"),
-                    _ => String::new(),
+                node.selector.as_deref().unwrap_or("unknown symbol"),
+                if group(node) == Some(2) {
+                    format!(" (distance {})", node.distance)
+                } else {
+                    String::new()
                 }
             ));
             let start = lines.len();
-            effect_state_lines(&node["effects"], &mut lines);
+            effect_state_lines(&node.effects, &mut lines);
             for line in &mut lines[start..] {
                 line.insert_str(0, "    ");
             }
@@ -603,24 +732,26 @@ fn human_items(value: &Value, options: &Options) -> Vec<String> {
             } else {
                 nodes.len().min(50)
             },
-            result["impact"]["truncated"] == true || (!options.all && nodes.len() > 50),
-            result["impact"]["unknown"]
+            impact.truncated || (!options.all && nodes.len() > 50),
+            impact.unknown
         ));
+        if let Some(reason) = impact.reason {
+            lines.push(reason.into());
+        }
     }
-    if let Some(reason) = result["impact"]["reason"].as_str() {
-        lines.push(reason.into());
-    }
-    // Human `--explain` stays line-oriented; `--format json --explain` keeps
-    // the full facts (fingerprints, flow, witnesses).
-    if options.explain && options.command == "type" && result["location"].is_object() {
-        lines.push(format!("Typed at: {}", location(&result["location"])));
+    if options.explain
+        && options.command == DirectCommand::Type
+        && let Some(typed) = typed
+        && typed.location.is_some()
+    {
+        lines.push(format!("Typed at: {}", location(typed.location.as_ref())));
     }
     lines
 }
 
-fn effect_names(bits: &Value) -> String {
+fn effect_names(bits: Option<u8>) -> String {
     use willow_abi::RuntimeEffects as E;
-    let Some(bits) = bits.as_u64() else {
+    let Some(bits) = bits else {
         return "unavailable".into();
     };
     let names: Vec<_> = [
@@ -633,7 +764,7 @@ fn effect_names(bits: &Value) -> String {
         (E::MAY_IO, "may-io"),
     ]
     .into_iter()
-    .filter_map(|(effect, name)| (bits & u64::from(effect.bits()) != 0).then_some(name))
+    .filter_map(|(effect, name)| (bits & effect.bits() != 0).then_some(name))
     .collect();
     if names.is_empty() {
         "none".into()
@@ -642,61 +773,65 @@ fn effect_names(bits: &Value) -> String {
     }
 }
 
-fn effect_state_lines(effects: &Value, lines: &mut Vec<String>) {
-    if let Some(effects) = effects.as_array() {
-        for effect in effects {
-            lines.push(format!(
-                "{}: {}",
-                effect_names(&effect["effect"]),
-                effect["state"].as_str().unwrap_or("unknown")
-            ));
-            if effect["witness"].is_object() {
-                lines.push(format!(
-                    "  Witness: {}",
-                    location(&effect["witness"]["location"])
-                ));
-            }
-            if let Some(reasons) = effect["unknown_reasons"].as_array() {
-                for reason in reasons {
-                    lines.push(format!(
-                        "  Unknown: {}",
-                        reason["code"].as_str().unwrap_or("missing-witness")
-                    ));
-                }
-            }
+fn effect_state_lines(
+    effects: &[willow_compiler::ai::query_result::EffectState],
+    lines: &mut Vec<String>,
+) {
+    use willow_compiler::ai::query_result::{State, UnknownReasonCode};
+    for effect in effects {
+        let state = match effect.state {
+            State::May => "may",
+            State::Unknown => "unknown",
+            State::None => "none",
+        };
+        lines.push(format!("{}: {state}", effect_names(Some(effect.effect))));
+        if let Some(witness) = &effect.witness {
+            lines.push(format!("  Witness: {}", location(Some(&witness.location))));
+        }
+        for reason in &effect.unknown_reasons {
+            let code = match reason.code {
+                UnknownReasonCode::IndirectCall => "indirect-call",
+                UnknownReasonCode::UnresolvedCallee => "unresolved-callee",
+                UnknownReasonCode::IncompleteFlow => "incomplete-flow",
+                UnknownReasonCode::MissingBody => "missing-body",
+                UnknownReasonCode::ExternalInterop => "external-interop",
+                UnknownReasonCode::MissingWitness => "missing-witness",
+                UnknownReasonCode::MissingSource => "missing-source",
+            };
+            lines.push(format!("  Unknown: {code}"));
         }
     }
 }
 
-fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String>) {
-    effect_state_lines(&result["effects"], lines);
-    if let Some(causes) = result["unknown_causes"].as_array() {
+fn effect_lines(
+    result: &willow_compiler::ai::query_result::EffectResult,
+    selected: Option<&willow_compiler::ai::direct::SelectedSymbol>,
+    all: bool,
+    explain: bool,
+    lines: &mut Vec<String>,
+) {
+    use willow_compiler::ai::evidence::AllocationPath;
+    effect_state_lines(&result.effects, lines);
+    if let Some(causes) = &result.unknown_causes {
         for cause in causes.iter().take(if all { usize::MAX } else { 50 }) {
-            lines.push(format!(
-                "Incomplete effect summary: {}",
-                cause["name"].as_str().unwrap_or("unknown")
-            ));
-            if let Some(sites) = cause["call_sites"].as_array() {
-                for site in sites {
-                    lines.push(format!(
-                        "  Unresolved call `{}` at {}",
-                        site["operation"].as_str().unwrap_or("unknown"),
-                        location(&site["location"])
-                    ));
-                }
+            lines.push(format!("Incomplete effect summary: {}", cause.name));
+            for site in cause.call_sites.iter().flatten() {
+                lines.push(format!(
+                    "  Unresolved call `{}` at {}",
+                    site.operation,
+                    location(Some(&site.location))
+                ));
             }
-            if let Some(locations) = cause["locations"].as_array() {
-                for loc in locations {
-                    lines.push(format!("  {}", location(loc)));
-                }
-                if locations.is_empty() {
-                    lines.push("  No declaration source is available.".into());
-                    if cause["caller_location"].is_object() {
-                        lines.push(format!(
-                            "  Referenced from caller at {}",
-                            location(&cause["caller_location"])
-                        ));
-                    }
+            for loc in &cause.locations {
+                lines.push(format!("  {}", location(Some(loc))));
+            }
+            if cause.locations.is_empty() {
+                lines.push("  No declaration source is available.".into());
+                if let Some(caller) = &cause.caller_location {
+                    lines.push(format!(
+                        "  Referenced from caller at {}",
+                        location(Some(caller))
+                    ));
                 }
             }
         }
@@ -710,36 +845,35 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
     if explain {
         lines.push(format!(
             "Conservative runtime bounds: {}",
-            effect_names(&result["bounds"]["runtime"])
+            effect_names(result.bounds.as_ref().map(|bounds| bounds.runtime))
         ));
         lines.push(format!(
             "Compiler bounds: {}",
-            effect_names(&result["bounds"]["compiler"])
+            effect_names(result.bounds.as_ref().and_then(|bounds| bounds.compiler))
         ));
     }
     if explain
-        && ["runtime", "compiler"].iter().any(|key| {
-            result["bounds"][key].as_u64().is_some_and(|bits| {
-                bits & u64::from(willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()) != 0
-            })
+        && result.bounds.as_ref().is_some_and(|bounds| {
+            (bounds.runtime | bounds.compiler.unwrap_or(0))
+                & willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits()
+                != 0
         })
     {
         lines.push("Preemption evidence is conservative (for example, a loop or recursion); it does not mean the entire function disables preemption.".into());
     }
-    let target = result["selected"]["selector"]
-        .as_str()
-        .unwrap_or("selected function");
-    if let Some(basis) = result["no_panic"]["basis"].as_str() {
+    let target = selected.map_or("selected function", |symbol| symbol.selector.as_str());
+    if let Some(Some(proof)) = &result.no_panic {
         lines.push(format!(
-            "no_panic: {} ({basis}; runtime checks retained)",
-            result["no_panic"]["status"].as_str().unwrap_or("UNPROVEN")
+            "no_panic: {} ({}; runtime checks retained)",
+            proof.status.as_str(),
+            proof.basis.as_str()
         ));
     }
-    let paths: Vec<_> = result["effect_evidence"]
-        .as_array()
-        .into_iter()
+    let paths: Vec<_> = result
+        .effect_evidence
+        .iter()
         .flatten()
-        .filter_map(|fact| fact.get("paths"))
+        .filter_map(|fact| fact.paths.as_ref())
         .collect();
     if !paths.is_empty() {
         lines.push(
@@ -750,13 +884,19 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
         } else {
             paths.len().min(50)
         };
+        let allocation = |value: &AllocationPath| match value {
+            AllocationPath::May => "may",
+            AllocationPath::None => "none",
+        };
         for path in &paths[..shown] {
             lines.push(format!(
                 "  {} at {}: normal may-allocate: {}; panic may-allocate: {}",
-                path["operation"].as_str().unwrap_or("builtin"),
-                location(&path["location"]),
-                path["normal"]["may_allocate"].as_str().unwrap_or("unknown"),
-                path["panic"]["may_allocate"].as_str().unwrap_or("unknown")
+                path.operation
+                    .as_ref()
+                    .map_or("builtin", |operation| operation.as_str()),
+                location(path.location.as_ref().and_then(Option::as_ref)),
+                allocation(&path.normal.may_allocate),
+                allocation(&path.panic.may_allocate),
             ));
         }
         if shown < paths.len() {
@@ -770,18 +910,20 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
         compact_effect_evidence(result, target, all, lines);
         return;
     }
-    for (label, key) in [
-        ("Runtime evidence", "effect_evidence"),
+    for (label, facts) in [
+        ("Runtime evidence", result.effect_evidence.as_deref()),
         (
             "Local evidence (compiler facts and runtime capabilities)",
-            "compiler_witnesses",
+            result
+                .compiler_witnesses
+                .as_ref()
+                .and_then(|facts| facts.as_deref()),
         ),
     ] {
-        let evidence: Vec<_> = result[key]
-            .as_array()
+        let evidence: Vec<_> = facts
             .into_iter()
             .flatten()
-            .filter(|fact| fact.get("paths").is_none())
+            .filter(|fact| fact.paths.is_none())
             .collect();
         lines.push(format!("{label} for {target}: {}", evidence.len()));
         let shown = if all {
@@ -790,35 +932,48 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
             evidence.len().min(50)
         };
         for fact in &evidence[..shown] {
-            let witness = &fact["witness"];
+            let witness = fact.witness.as_ref();
+            let cause = witness.and_then(|witness| witness.cause.as_ref());
             let mut detail = format!(
                 "  {}: {}",
-                effect_names(&fact["effect"]),
-                fact["status"]
-                    .as_str()
-                    .or_else(|| witness["kind"].as_str())
+                effect_names(Some(fact.effect)),
+                fact.status
+                    .as_ref()
+                    .map(|status| status.as_str())
+                    .or_else(|| witness.map(|witness| witness.kind.as_str()))
                     .unwrap_or("unavailable")
             );
-            let locked = locked_label(&witness["cause"]);
+            let locked = locked_label(cause);
             let chain = effect_call_chain(fact);
             for (name, value) in [
-                ("chain", &chain),
-                ("via", &fact["via_function"]),
-                ("target", &witness["target"]),
-                ("owner", &witness["owner"]),
-                ("operation", &witness["cause"]["operation"]),
-                ("locked", &locked),
-                ("reason", fact.get("reason").unwrap_or(&witness["reason"])),
+                ("chain", chain.as_deref()),
+                ("via", fact.via_function.as_deref()),
+                (
+                    "target",
+                    witness.and_then(|witness| witness.target.as_deref()),
+                ),
+                (
+                    "owner",
+                    witness.and_then(|witness| witness.owner.as_deref()),
+                ),
+                ("operation", cause.map(|cause| cause.operation.as_str())),
+                ("locked", locked.as_deref()),
+                (
+                    "reason",
+                    fact.reason
+                        .as_deref()
+                        .or_else(|| witness.and_then(|witness| witness.reason.as_deref())),
+                ),
             ] {
-                if let Some(value) = value.as_str() {
+                if let Some(value) = value {
                     detail.push_str(&format!("; {name}={value}"));
                 }
             }
             if let Some(task) = task_relationship_label(fact) {
                 detail.push_str(&format!("; {task}"));
             }
-            if witness["cause"]["location"].is_object() {
-                detail.push_str(&format!(" at {}", location(&witness["cause"]["location"])));
+            if let Some(at) = cause.and_then(|cause| cause.location()) {
+                detail.push_str(&format!(" at {}", location(Some(at))));
             }
             lines.push(detail);
         }
@@ -829,63 +984,59 @@ fn effect_lines(result: &Value, all: bool, explain: bool, lines: &mut Vec<String
             ));
         }
     }
-    lines.push(result["meaning"].as_str().unwrap_or("").into());
+    lines.push(result.meaning.unwrap_or("").into());
 }
 
-fn task_relationship_label(fact: &Value) -> Option<String> {
-    let task = &fact["task_relationship"];
-    let kind = task["kind"].as_str()?;
-    if task["location"] == fact["witness"]["cause"]["location"] {
+fn task_relationship_label(
+    fact: &willow_compiler::ai::evidence::ExplainedEffect,
+) -> Option<String> {
+    use willow_compiler::ai::evidence::TaskKind;
+    let task = fact.task_relationship.as_ref()?;
+    let kind = match task.kind {
+        TaskKind::Spawn => "spawn",
+        TaskKind::Await => "await",
+    };
+    if task.location.as_ref() == fact.witness.as_ref().and_then(|witness| witness.location()) {
         Some(format!("task={kind}"))
     } else {
         Some(format!(
             "task={kind}; task-site={}",
-            location(&task["location"])
+            location(task.location.as_ref())
         ))
     }
 }
 
-/// `table: Mutex<Map<i64, i64>>` for the value a `lock` statement acquires,
-/// with the RwLock mode (`(read)`/`(write)`) when it is not a Mutex lock.
-fn locked_label(cause: &Value) -> Value {
-    let lock = &cause["lock"];
-    if !lock.is_object() {
-        return Value::Null;
-    }
-    let mut label = match (lock["expression"].as_str(), lock["type_display"].as_str()) {
+/// Source operand and displayed lock type, retaining the read/write mode.
+fn locked_label(cause: Option<&willow_compiler::ai::evidence::Cause>) -> Option<String> {
+    let lock = cause?.lock.as_ref()?;
+    let mut label = match (lock.expression.as_deref(), lock.type_display.as_deref()) {
         (Some(expression), Some(ty)) => format!("{expression}: {ty}"),
         (Some(expression), None) => expression.to_owned(),
         (None, Some(ty)) => ty.to_owned(),
         (None, None) => "unknown".to_owned(),
     };
-    if let Some(mode) = lock["mode"].as_str().and_then(|m| m.strip_prefix("lock ")) {
+    if let Some(mode) = lock.mode.qualifier() {
         label.push_str(&format!(" ({mode})"));
     }
-    Value::from(label)
+    Some(label)
 }
 
-// A one-function chain only repeats `via=`; show chains that cross a call.
-fn effect_call_chain(fact: &Value) -> Value {
-    fact["call_chain"]
-        .as_array()
+fn effect_call_chain(fact: &willow_compiler::ai::evidence::ExplainedEffect) -> Option<String> {
+    fact.call_chain
+        .as_ref()
         .filter(|chain| chain.len() > 1)
-        .map(|chain| {
-            Value::from(
-                chain
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" -> "),
-            )
-        })
-        .unwrap_or(Value::Null)
+        .map(|chain| chain.join(" -> "))
 }
 
-// Preserve input order while indexing identities and reasons: expected O(input bytes).
-fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut Vec<String>) {
+// Preserve input order while indexing typed site identities and reasons: O(input bytes).
+fn compact_effect_evidence(
+    result: &willow_compiler::ai::query_result::EffectResult,
+    target: &str,
+    all: bool,
+    lines: &mut Vec<String>,
+) {
     use std::collections::{HashMap, HashSet};
-    // Facts merged at one site keep one field per key; distinct values of a
-    // key are listed together so a merged line never repeats `status=`/`kind=`.
+    use willow_compiler::ai::evidence::WitnessKind;
     const KEYS: [&str; 9] = [
         "status",
         "kind",
@@ -899,49 +1050,46 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
     ];
     #[derive(Default)]
     struct Entry {
-        bits: u64,
+        bits: u8,
         fields: [Vec<String>; KEYS.len()],
         location: Option<String>,
         reasons: Vec<usize>,
         seen: HashSet<(usize, String)>,
+        seen_reasons: HashSet<usize>,
     }
     let mut identities = HashMap::new();
     let mut entries: Vec<Entry> = Vec::new();
     let mut reason_ids = HashMap::new();
     let mut reasons = Vec::new();
-    // An unavailable compiler witness adds nothing for a bit the evidence explains.
-    let explained = result["effect_evidence"]
-        .as_array()
-        .into_iter()
+    let explained = result
+        .effect_evidence
+        .iter()
         .flatten()
-        .fold(0, |bits, fact| bits | fact["effect"].as_u64().unwrap_or(0));
-    for fact in ["effect_evidence", "compiler_witnesses"]
-        .into_iter()
-        .flat_map(|key| result[key].as_array().into_iter().flatten())
+        .fold(0, |bits, fact| bits | fact.effect);
+    for fact in result
+        .effect_evidence
+        .iter()
+        .flatten()
+        .chain(result.compiler_witnesses.iter().flatten().flatten())
     {
-        if fact.get("paths").is_some() {
-            continue; // Displayed in the explicitly separated builtin paths section.
+        if fact.paths.is_some() {
+            continue;
         }
-        let witness = &fact["witness"];
-        if witness["kind"] == "unavailable"
-            && fact["effect"]
-                .as_u64()
-                .is_some_and(|bits| bits & !explained == 0)
+        let witness = fact.witness.as_ref();
+        if witness.is_some_and(|witness| witness.kind == WitnessKind::Unavailable)
+            && fact.effect & !explained == 0
         {
             continue;
         }
-        let cause = &witness["cause"];
-        let index = if let (Some(operation), true) =
-            (cause["operation"].as_str(), cause["location"].is_object())
+        let cause = witness.and_then(|witness| witness.cause.as_ref());
+        let index = if let Some(cause) = cause
+            && let Some(at) = cause.location()
         {
-            *identities
-                .entry((operation, cause["location"].to_string()))
-                .or_insert_with(|| {
-                    entries.push(Entry::default());
-                    entries.len() - 1
-                })
+            *identities.entry((&cause.operation, at)).or_insert_with(|| {
+                entries.push(Entry::default());
+                entries.len() - 1
+            })
         } else {
-            // Missing locations must not merge independent transitive/unknown evidence.
             entries.push(Entry::default());
             entries.len() - 1
         };
@@ -949,44 +1097,48 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
             continue;
         }
         let entry = &mut entries[index];
-        entry.bits |= fact["effect"].as_u64().unwrap_or(0);
+        entry.bits |= fact.effect;
         let locked = locked_label(cause);
         let chain = effect_call_chain(fact);
-        let task = task_relationship_label(fact)
-            .map(|label| Value::from(label.trim_start_matches("task=")))
-            .unwrap_or(Value::Null);
+        let task = task_relationship_label(fact);
         for (key, value) in [
-            &fact["status"],
-            &witness["kind"],
-            &fact["via_function"],
-            &witness["target"],
-            &witness["owner"],
-            &cause["operation"],
-            &locked,
-            &task,
-            &chain,
+            fact.status.as_ref().map(|status| status.as_str()),
+            witness.map(|witness| witness.kind.as_str()),
+            fact.via_function.as_deref(),
+            witness.and_then(|witness| witness.target.as_deref()),
+            witness.and_then(|witness| witness.owner.as_deref()),
+            cause.map(|cause| cause.operation.as_str()),
+            locked.as_deref(),
+            task.as_deref()
+                .map(|label| label.trim_start_matches("task=")),
+            chain.as_deref(),
         ]
         .into_iter()
         .enumerate()
         {
-            if let Some(value) = value.as_str()
-                && entry.seen.insert((key, value.to_string()))
+            if let Some(value) = value
+                && entry.seen.insert((key, value.to_owned()))
             {
-                entry.fields[key].push(value.to_string());
+                entry.fields[key].push(value.to_owned());
             }
         }
-        if entry.location.is_none() && cause["location"].is_object() {
-            entry.location = Some(location(&cause["location"]));
+        if entry.location.is_none()
+            && let Some(at) = cause.and_then(|cause| cause.location())
+        {
+            entry.location = Some(location(Some(at)));
         }
-        for reason in [fact["reason"].as_str(), witness["reason"].as_str()]
-            .into_iter()
-            .flatten()
+        for reason in [
+            fact.reason.as_deref(),
+            witness.and_then(|witness| witness.reason.as_deref()),
+        ]
+        .into_iter()
+        .flatten()
         {
             let id = *reason_ids.entry(reason).or_insert_with(|| {
                 reasons.push(reason);
                 reasons.len()
             });
-            if entry.seen.insert((KEYS.len(), id.to_string())) {
+            if entry.seen_reasons.insert(id) {
                 entry.reasons.push(id);
             }
         }
@@ -1008,7 +1160,7 @@ fn compact_effect_evidence(result: &Value, target: &str, all: bool, lines: &mut 
         details.extend(entry.reasons.iter().map(|id| format!("reason=[{id}]")));
         lines.push(format!(
             "  {}: {}",
-            effect_names(&Value::from(entry.bits)),
+            effect_names(Some(entry.bits)),
             details.join("; ")
         ));
     }
@@ -1161,37 +1313,38 @@ fn json_items(
     }
 }
 
-fn render(value: &Value, options: &Options) -> Result<String> {
-    let Some(limit) = options.max_chars else {
-        return Ok(format!(
-            "{}\n",
-            if options.format == OutputFormat::Human {
-                human(value, options)
-            } else {
-                serde_json::to_string(value)?
-            }
-        ));
+fn render_json(value: &Value, limit: Option<usize>) -> Result<String> {
+    let Some(limit) = limit else {
+        return Ok(format!("{}\n", serde_json::to_string(value)?));
     };
-    let json = options.format != OutputFormat::Human;
     let mut text = String::new();
     let mut boundaries = Vec::new();
     let mut chars = 0;
-    if json {
-        json_items(value, &mut text, &mut boundaries, &mut chars, 0);
-        text.push('\n');
-    } else {
-        for item in human_items(value, options) {
-            chars += item.chars().count() + 1;
-            text.push_str(&item);
-            text.push('\n');
-            boundaries.push(Boundary {
-                end: text.len(),
-                chars,
-                closing: 0,
-            });
-        }
+    json_items(value, &mut text, &mut boundaries, &mut chars, 0);
+    text.push('\n');
+    capped_prefix(&text, &boundaries, limit, true)
+}
+fn render(value: &CommandOutput, options: &Options) -> Result<String> {
+    if options.format != OutputFormat::Human {
+        return render_json(&serde_json::to_value(value)?, options.max_chars);
     }
-    capped_prefix(&text, &boundaries, limit, json)
+    let Some(limit) = options.max_chars else {
+        return Ok(format!("{}\n", human(value, options)));
+    };
+    let mut text = String::new();
+    let mut boundaries = Vec::new();
+    let mut chars = 0;
+    for item in human_items(value, options) {
+        chars += item.chars().count() + 1;
+        text.push_str(&item);
+        text.push('\n');
+        boundaries.push(Boundary {
+            end: text.len(),
+            chars,
+            closing: 0,
+        });
+    }
+    capped_prefix(&text, &boundaries, limit, false)
 }
 
 pub(super) fn run(command: &str, parsed: Result<Options>, human_errors: bool) -> Result<i32> {
@@ -1199,27 +1352,39 @@ pub(super) fn run(command: &str, parsed: Result<Options>, human_errors: bool) ->
     let (mut value, code) = match &parsed {
         Ok(options) => match options.execute(&mut warnings) {
             Ok(value) => {
-                let code = if value["status"] == "ok" { 0 } else { 1 };
+                let code = if value.status == Status::Ok { 0 } else { 1 };
                 (value, code)
             }
             Err(error) => {
-                let mut value = json!({"schema":1,"kind":options.command,"status":"error","message":format!("{error:#}")});
+                let mut value = CommandOutput::new(options.command, Status::Error);
+                value.message = Some(format!("{error:#}"));
                 if let Some(rejection) =
                     error.downcast_ref::<willow_compiler::ai::edit::Rejection>()
                 {
-                    value["location"] = json!(rejection.location);
+                    let l = &rejection.location;
+                    value.location = Some(willow_compiler::ai::edit::RejectionLocation {
+                        path: l.path.clone(),
+                        start: l.start,
+                        end: l.end,
+                        line: l.line,
+                        column: l.column,
+                    });
                 }
                 (value, 1)
             }
         },
-        Err(error) => (
-            json!({"schema":1,"kind":command,"status":"invalid-arguments","message":format!("{error:#}")}),
-            2,
-        ),
+        Err(error) => {
+            let mut value = CommandOutput::new(
+                DirectCommand::parse(command).expect("direct dispatch validates command"),
+                Status::InvalidArguments,
+            );
+            value.message = Some(format!("{error:#}"));
+            (value, 2)
+        }
     };
     if let Ok(options) = &parsed {
         if warnings > 0 {
-            value["diagnostics"] = json!({"warnings": warnings});
+            value.diagnostics = Some(WarningCounts { warnings });
         }
         match render(&value, options) {
             Ok(output) => print!("{output}"),
@@ -1237,10 +1402,10 @@ pub(super) fn run(command: &str, parsed: Result<Options>, human_errors: bool) ->
     } else if human_errors {
         eprintln!(
             "{}",
-            value["message"].as_str().unwrap_or("invalid arguments")
+            value.message.as_deref().unwrap_or("invalid arguments")
         );
     } else {
-        println!("{}", serde_json::to_string(&value)?);
+        println!("{}", serde_json::to_string(&serde_json::to_value(&value)?)?);
     }
     Ok(code)
 }
@@ -1248,6 +1413,206 @@ pub(super) fn run(command: &str, parsed: Result<Options>, human_errors: bool) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use willow_compiler::ai::{
+        self,
+        evidence::{Cause, ExplainedEffect},
+        query_result::{EffectBounds, EffectResult, UnknownCause},
+    };
+
+    // Fixtures omit byte offsets when only presentation coordinates matter.
+    fn fixture_locations(value: &mut Value) {
+        match value {
+            Value::Object(object) => {
+                if object.get("path").is_some_and(Value::is_string) {
+                    object.entry("start").or_insert(json!(0));
+                    object.entry("end").or_insert(json!(0));
+                }
+                for value in object.values_mut() {
+                    fixture_locations(value);
+                }
+            }
+            Value::Array(values) => {
+                for value in values {
+                    fixture_locations(value);
+                }
+            }
+            _ => {}
+        }
+    }
+    fn fixture_location(value: &Value) -> Option<ai::Location> {
+        if value.is_null() {
+            return None;
+        }
+        let mut value = value.clone();
+        fixture_locations(&mut value);
+        Some(serde_json::from_value(value).unwrap())
+    }
+    fn fixture_cause(value: &Value) -> Cause {
+        let mut value = value.clone();
+        fixture_locations(&mut value);
+        serde_json::from_value(value).unwrap()
+    }
+    fn fixture_fact(value: &Value) -> ExplainedEffect {
+        let witness = value.get("witness").filter(|v| !v.is_null()).map(|v| {
+            let mut v = v.clone();
+            v.as_object_mut()
+                .unwrap()
+                .entry("kind")
+                .or_insert(json!("unknown"));
+            fixture_locations(&mut v);
+            serde_json::from_value(v).unwrap()
+        });
+        ExplainedEffect {
+            effect: value["effect"].as_u64().unwrap() as u8,
+            status: value["status"].as_str().map(Into::into),
+            witness,
+            via_function: value["via_function"].as_str().map(str::to_owned),
+            reason: value["reason"].as_str().map(str::to_owned),
+            paths: None,
+            task_relationship: None,
+            call_chain: None,
+        }
+    }
+    fn fixture_effects(value: &Value) -> EffectResult {
+        EffectResult {
+            schema: "willow.effects.v3",
+            effects: Vec::new(),
+            reason: None,
+            assumptions: None,
+            unknown_causes: value["unknown_causes"].as_array().map(|causes| {
+                causes
+                    .iter()
+                    .map(|cause| UnknownCause {
+                        function: String::new(),
+                        name: cause["name"].as_str().unwrap().into(),
+                        module: String::new(),
+                        locations: cause["locations"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .map(|location| fixture_location(location).unwrap())
+                            .collect(),
+                        unresolved: Vec::new(),
+                        call_sites: None,
+                        caller_location: fixture_location(&cause["caller_location"]),
+                        reason: None,
+                    })
+                    .collect()
+            }),
+            bounds: value.get("bounds").map(|bounds| EffectBounds {
+                runtime: bounds["runtime"].as_u64().unwrap() as u8,
+                compiler: bounds["compiler"].as_u64().map(|bits| bits as u8),
+            }),
+            effect_evidence: value["effect_evidence"]
+                .as_array()
+                .map(|facts| facts.iter().map(fixture_fact).collect()),
+            compiler_witnesses: value.get("compiler_witnesses").map(|facts| {
+                facts
+                    .as_array()
+                    .map(|facts| facts.iter().map(fixture_fact).collect())
+            }),
+            no_panic: None,
+            witness: None,
+            meaning: value["meaning"].as_str().map(|meaning| {
+                assert_eq!(meaning, "");
+                ""
+            }),
+        }
+    }
+    fn fixture_selected() -> willow_compiler::ai::direct::SelectedSymbol {
+        use willow_compiler::ai::direct::SelectedSymbol;
+        SelectedSymbol {
+            id: "α猫".into(),
+            identity: None,
+            kind: SymbolKind::Function,
+            location: None,
+            name: "α猫".into(),
+            qualified_name: None,
+            selector: "α猫".into(),
+        }
+    }
+    fn fixture_diff(diffs: Vec<&str>) -> CommandOutput {
+        let mut output = CommandOutput::new(DirectCommand::Rename, Status::Ok);
+        output.result = Some(CommandResult::Diff {
+            preview: RenamePreviewResult {
+                preview: ai::edit::RenamePreview {
+                    status: Status::Ok,
+                    files_changed: 1,
+                    work: Default::default(),
+                    dry_run: true,
+                    revision: String::new(),
+                    changes: Some(
+                        diffs
+                            .into_iter()
+                            .map(|diff| ai::edit::DiffChange {
+                                path: "α猫.wi".into(),
+                                diff: diff.into(),
+                            })
+                            .collect(),
+                    ),
+                },
+                edits: 3,
+                declarations_updated: 1,
+                references_updated: 2,
+                selected: fixture_selected(),
+            },
+            summary: RenameSummary {
+                files: 1,
+                edits: 3,
+                declarations: 1,
+                references: 2,
+                collisions: 0,
+                unresolved: 0,
+            },
+        });
+        output
+    }
+    fn fixture_command(command: DirectCommand) -> CommandOutput {
+        if command == DirectCommand::Rename {
+            return fixture_diff(vec!["--- α猫\n+++ β犬\n- old\n+ new\n"]);
+        }
+        let data = if command == DirectCommand::Impact {
+            DirectQueryData::Impact {
+                symbol: fixture_selected(),
+                impact: ai::Impact {
+                    schema: "willow.impact.v1",
+                    rust_dependencies: Vec::new(),
+                    dependency_boundary: Vec::new(),
+                    external_dependencies: Vec::new(),
+                    revision: String::new(),
+                    nodes: ["α猫", "β犬"]
+                        .into_iter()
+                        .map(|name| ai::ImpactNode {
+                            identity: None,
+                            id: name.into(),
+                            level: 0,
+                            distance: 0,
+                            graph_distance: 0,
+                            effects: Vec::new(),
+                            selector: Some(name.into()),
+                            kind: None,
+                            relation: None,
+                        })
+                        .collect(),
+                    truncated: false,
+                    unknown: false,
+                    reason: None,
+                    edge_visits: 0,
+                },
+            }
+        } else {
+            DirectQueryData::Unknown {
+                suggestions: vec!["α猫".into(), "β犬".into()],
+            }
+        };
+        let mut result = DirectQueryResult::new(Status::Ok, data);
+        result.selected = Some(fixture_selected());
+        result.type_display = Some("α猫\"\\[]{}".into());
+        let mut output = CommandOutput::new(command, Status::Ok);
+        output.result = Some(CommandResult::Query(Box::new(result)));
+        output
+    }
     #[test]
     fn max_chars_all_commands_unicode_boundaries_and_compatibility() {
         for command in ["refs", "symbol", "type", "effects", "impact", "rename"] {
@@ -1262,12 +1627,18 @@ mod tests {
                 "type_display":"α猫\"\\[]{}", "selected":{"selector":"α猫","kind":"function"},
                 "suggestions":["α猫","β犬"], "impact":{"nodes":[{"selector":"α猫"},{"selector":"β犬"}]}
             }});
+            let typed = fixture_command(options.command);
             for format in ["human", "json", "ndjson"] {
                 options.format = OutputFormat::parse(format).unwrap();
                 options.max_chars = None;
-                let baseline = render(&value, &options).unwrap();
+                let baseline = if format == "human" {
+                    render(&typed, &options)
+                } else {
+                    render_json(&value, options.max_chars)
+                }
+                .unwrap();
                 let expected = if format == "human" {
-                    human(&value, &options)
+                    human(&typed, &options)
                 } else {
                     serde_json::to_string(&value).unwrap()
                 };
@@ -1275,7 +1646,11 @@ mod tests {
                 let len = baseline.chars().count();
                 for cap in 0..=len + 1 {
                     options.max_chars = Some(cap);
-                    match render(&value, &options) {
+                    match if format == "human" {
+                        render(&typed, &options)
+                    } else {
+                        render_json(&value, options.max_chars)
+                    } {
                         Err(_) => assert!(cap < 40),
                         Ok(output) => {
                             assert!(
@@ -1370,7 +1745,7 @@ mod tests {
             (vec!["", ""], "\n"),
             (vec!["one", "", "two\n\n"], "one\ntwo\n\n"),
         ] {
-            let value = json!({"status":"ok","result":{"files":1,"edits":3,"declarations":1,"references":2,"collisions":0,"unresolved":0,"changes":diffs.into_iter().map(|diff| json!({"diff":diff})).collect::<Vec<_>>()}});
+            let value = fixture_diff(diffs);
             assert_eq!(
                 human(&value, &options),
                 format!(
@@ -1411,14 +1786,16 @@ mod tests {
     fn type_failure_kinds_have_distinct_explanations() {
         let options = Options::parse(&["type".into(), "main.wi:1:1".into()]).unwrap();
         for (status, reason) in [
-            ("unknown", "No typed expression"),
-            ("unanalyzed", "type is unavailable"),
-            ("ambiguous", "Multiple semantic candidates"),
+            (Status::Unknown, "No typed expression"),
+            (Status::Unanalyzed, "type is unavailable"),
+            (Status::Ambiguous, "Multiple semantic candidates"),
         ] {
-            let text = human(
-                &json!({"status":status,"result":{"status":status}}),
-                &options,
-            );
+            let mut value = CommandOutput::new(DirectCommand::Type, status);
+            value.result = Some(CommandResult::Query(Box::new(DirectQueryResult::new(
+                status,
+                DirectQueryData::Empty {},
+            ))));
+            let text = human(&value, &options);
             assert!(text.contains(reason), "{text}");
         }
     }
@@ -1433,7 +1810,13 @@ mod tests {
                 .collect();
             for all in [false, true] {
                 let mut lines = Vec::new();
-                effect_lines(&json!({"unknown_causes":causes}), all, false, &mut lines);
+                effect_lines(
+                    &fixture_effects(&json!({"unknown_causes":causes})),
+                    None,
+                    all,
+                    false,
+                    &mut lines,
+                );
                 let shown = if all { count } else { count.min(50) };
                 assert_eq!(
                     lines
@@ -1495,7 +1878,10 @@ mod tests {
             (lock("lock", None, Some("Mutex<i64>")), "Mutex<i64>"),
             (lock("lock read", None, None), "unknown (read)"),
         ] {
-            assert_eq!(locked_label(&cause), json!(label));
+            assert_eq!(
+                locked_label(Some(&fixture_cause(&cause))),
+                Some(label.into())
+            );
             // Compact and explained renderings both name the value once,
             // even when runtime and compiler evidence merge at one site.
             let fact = json!({"effect":4,"status":"compiler-fact",
@@ -1503,7 +1889,7 @@ mod tests {
             let value = json!({"effect_evidence":[fact],"compiler_witnesses":[fact],
                 "bounds":{"runtime":4,"compiler":4},"meaning":""});
             let mut lines = Vec::new();
-            compact_effect_evidence(&value, "arena::play", false, &mut lines);
+            compact_effect_evidence(&fixture_effects(&value), "arena::play", false, &mut lines);
             let line = &lines[1];
             assert!(
                 line.contains(&format!(
@@ -1513,7 +1899,7 @@ mod tests {
             );
             assert_eq!(line.matches("locked=").count(), 1, "{line}");
             let mut lines = Vec::new();
-            effect_lines(&value, false, true, &mut lines);
+            effect_lines(&fixture_effects(&value), None, false, true, &mut lines);
             let explained: Vec<_> = lines
                 .iter()
                 .filter(|l| l.contains("operation=lock"))
@@ -1527,11 +1913,16 @@ mod tests {
             );
         }
         // Other waits carry no lock and render no `locked=` field.
-        assert!(locked_label(&json!({"operation":"await"})).is_null());
+        assert!(locked_label(Some(&fixture_cause(&json!({"operation":"await"})))).is_none());
         let fact = json!({"effect":4,"witness":{"kind":"wait",
             "cause":{"operation":"await","location":at}}});
         let mut lines = Vec::new();
-        compact_effect_evidence(&json!({"effect_evidence":[fact]}), "f", false, &mut lines);
+        compact_effect_evidence(
+            &fixture_effects(&json!({"effect_evidence":[fact]})),
+            "f",
+            false,
+            &mut lines,
+        );
         assert!(!lines.join("\n").contains("locked="), "{lines:?}");
     }
 
@@ -1548,7 +1939,7 @@ mod tests {
             let value = json!({"effect_evidence":runtime,"compiler_witnesses":facts});
             for all in [false, true] {
                 let mut lines = Vec::new();
-                compact_effect_evidence(&value, "pool::worker", all, &mut lines);
+                compact_effect_evidence(&fixture_effects(&value), "pool::worker", all, &mut lines);
                 let text = lines.join("\n");
                 let shown = if all { count } else { count.min(50) };
                 assert_eq!(text.matches("operation=send").count(), shown);
@@ -1564,7 +1955,7 @@ mod tests {
             let repeated = vec![fact.clone(); count];
             let value = json!({"effect_evidence":repeated,"compiler_witnesses":repeated});
             let mut lines = Vec::new();
-            compact_effect_evidence(&value, "worker", true, &mut lines);
+            compact_effect_evidence(&fixture_effects(&value), "worker", true, &mut lines);
             assert_eq!(lines.len(), 4); // header, one site, two distinct reasons
             assert_eq!(lines[0], "Evidence for worker: 1");
         }
@@ -1577,7 +1968,7 @@ mod tests {
         let value = json!({"effect_evidence":[fact,other,file,column,
             {"effect":1,"status":"missing-witness"},{"effect":4,"status":"missing-witness"}]});
         let mut lines = Vec::new();
-        compact_effect_evidence(&value, "worker", true, &mut lines);
+        compact_effect_evidence(&fixture_effects(&value), "worker", true, &mut lines);
         assert_eq!(lines[0], "Evidence for worker: 6");
         let text = lines.join("\n");
         assert_eq!(text.matches("outer").count(), 1);
@@ -1599,7 +1990,7 @@ mod tests {
             let value =
                 json!({"effect_evidence":[first, second, first],"compiler_witnesses":[second]});
             let mut lines = Vec::new();
-            compact_effect_evidence(&value, "m::f", false, &mut lines);
+            compact_effect_evidence(&fixture_effects(&value), "m::f", false, &mut lines);
             assert_eq!(lines.len(), 3, "{lines:?}");
             assert_eq!(lines[0], "Evidence for m::f: 1");
             let line = &lines[1];
@@ -1644,13 +2035,13 @@ mod tests {
         ] {
             let value = json!({"effect_evidence":[site.clone()],"compiler_witnesses":compiler});
             let mut lines = Vec::new();
-            compact_effect_evidence(&value, "main::relay", true, &mut lines);
+            compact_effect_evidence(&fixture_effects(&value), "main::relay", true, &mut lines);
             assert_eq!(lines[0], format!("Evidence for main::relay: {entries}"));
             assert_eq!(lines.len(), entries + 1);
         }
         let value = json!({"compiler_witnesses":[unavailable(32)]});
         let mut lines = Vec::new();
-        compact_effect_evidence(&value, "main::relay", true, &mut lines);
+        compact_effect_evidence(&fixture_effects(&value), "main::relay", true, &mut lines);
         assert_eq!(
             lines,
             [
@@ -1667,7 +2058,7 @@ mod tests {
             let value = json!({"bounds":{"runtime":1,"compiler":0},"compiler_witnesses":facts});
             for all in [false, true] {
                 let mut lines = Vec::new();
-                effect_lines(&value, all, false, &mut lines);
+                effect_lines(&fixture_effects(&value), None, all, false, &mut lines);
                 let shown = if all { count } else { count.min(50) };
                 assert_eq!(
                     lines
@@ -1684,10 +2075,11 @@ mod tests {
             }
         }
         let bits = willow_abi::RuntimeEffects::NO_PREEMPT_REGION.bits();
-        assert_eq!(effect_names(&json!(bits)), "may-run-without-preemption");
+        assert_eq!(effect_names(Some(bits)), "may-run-without-preemption");
         let mut lines = Vec::new();
         effect_lines(
-            &json!({"bounds":{"runtime":bits,"compiler":0}}),
+            &fixture_effects(&json!({"bounds":{"runtime":bits,"compiler":0}})),
+            None,
             false,
             true,
             &mut lines,
@@ -1697,9 +2089,9 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("does not mean the entire function"))
         );
-        assert_eq!(effect_names(&json!(0)), "none");
-        assert_eq!(effect_names(&Value::Null), "unavailable");
-        assert_eq!(effect_names(&json!(63)).split(", ").count(), 6);
+        assert_eq!(effect_names(Some(0)), "none");
+        assert_eq!(effect_names(None), "unavailable");
+        assert_eq!(effect_names(Some(63)).split(", ").count(), 6);
     }
 }
 
@@ -1718,7 +2110,10 @@ mod kind_tests {
                     args.extend(["--kind".to_owned(), (*kind).to_owned()]);
                 }
                 let options = Options::parse(&args).unwrap();
-                assert_eq!(options.filter.kind.as_deref(), Some(*kind));
+                assert_eq!(
+                    options.filter.kind.as_ref().map(SymbolKind::as_str),
+                    Some(*kind)
+                );
             }
         }
     }

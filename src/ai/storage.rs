@@ -684,6 +684,7 @@ mod tests {
         let mut semantic = SemanticFacts::default();
         let id = serde_json::to_string(&[&file, "Box"]).unwrap();
         semantic.symbols.push(symbols::Symbol {
+            origin: Default::default(),
             source_name: None,
             details: Default::default(),
             identity: None,
@@ -691,6 +692,7 @@ mod tests {
             name: "Box".into(),
             kind: "class".into(),
             location: Some(Location {
+                display: None,
                 path: file.clone(),
                 start: 0,
                 end: 3,

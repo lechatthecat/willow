@@ -1,6 +1,6 @@
 //! One session-local helper/lock/panic fixpoint over typed callable identities.
 //! Imported facts use semantic names; linker spelling belongs to the backend.
-use super::query::QueryTable;
+use super::{incremental::SourceOwner, query::QueryTable};
 use crate::driver::OverflowChecks;
 use crate::qualified_name::QualifiedName;
 use crate::{
@@ -2210,7 +2210,7 @@ fn solve_unit_delta<N: std::fmt::Display>(
     // owner deltas and do not take that path.
     if source_changes
         .iter()
-        .any(|(owner, _)| !owner.starts_with("Function:"))
+        .any(|(owner, _)| owner.function_name().is_none())
     {
         return None;
     }
@@ -2244,7 +2244,7 @@ fn solve_unit_delta<N: std::fmt::Display>(
     let mut changed = delta.rescan_roots(&mut result, roots, &removed_roots, types)?;
     for (owner, exists) in source_changes {
         if !exists {
-            result.plan.source_roots.remove(&owner);
+            result.plan.source_roots.remove(owner.wire_key());
         }
     }
     let imports = import_aliases(program);
@@ -2334,7 +2334,7 @@ impl DeltaSolve<'_> {
     fn dirty_roots(
         &self,
         previous: &UnitEffects,
-        source_changes: &[(String, bool)],
+        source_changes: &[(SourceOwner, bool)],
     ) -> Option<DirtyRoots> {
         let (index, unit, locations) = (self.index, self.unit, self.locations);
         let mut inherited_changed = HashSet::new();
@@ -2365,7 +2365,7 @@ impl DeltaSolve<'_> {
                 previous
                     .plan
                     .source_roots
-                    .get(owner)
+                    .get(owner.wire_key())
                     .into_iter()
                     .flatten()
                     .copied()
@@ -2431,7 +2431,7 @@ impl DeltaSolve<'_> {
                 previous
                     .plan
                     .source_roots
-                    .get(owner)
+                    .get(owner.wire_key())
                     .into_iter()
                     .flatten()
                     .copied()

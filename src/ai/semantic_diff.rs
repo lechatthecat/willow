@@ -21,84 +21,268 @@ pub struct Options {
     pub base: String,
     pub fail_on_growth: bool,
 }
-#[derive(Debug, Serialize)]
-pub struct SemanticDiff {
-    pub schema: &'static str,
-    pub status: &'static str,
-    pub base: Value,
-    pub target: Value,
-    pub changes: Vec<Value>,
-    pub summary: Value,
+macro_rules! wire_enum {
+    ($name:ident { $($variant:ident => $wire:literal),+ $(,)? }) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+        pub enum $name {
+            $(#[serde(rename = $wire)] $variant),+
+        }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str(match self { $(Self::$variant => $wire),+ })
+            }
+        }
+    };
 }
-impl SemanticDiff {
+wire_enum!(ReportStatus { Complete => "complete", Incomplete => "incomplete" });
+wire_enum!(MatchKind {
+    Ambiguous => "ambiguous", Renamed => "renamed", Added => "added",
+    Removed => "removed", SignatureChanged => "signature-changed", Exact => "exact",
+});
+wire_enum!(ContractChange {
+    Unchanged => "unchanged", Added => "added", Removed => "removed",
+    Equivalent => "equivalent", Strengthened => "strengthened", Weakened => "weakened",
+    Changed => "changed",
+});
+wire_enum!(PublicApiChange {
+    Unknown => "unknown", Unchanged => "unchanged", Removed => "removed",
+    Added => "added", Renamed => "renamed", SignatureChanged => "signature-changed",
+});
+wire_enum!(TargetChange { Changed => "changed", Unchanged => "unchanged" });
+wire_enum!(Side { Base => "base", Target => "target" });
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CauseCertainty {
+    MissingSource,
+    ConservativeBound,
+    CompilerProven,
+    Other(String),
+}
+impl CauseCertainty {
+    fn as_str(&self) -> &str {
+        match self {
+            Self::MissingSource => "missing-source",
+            Self::ConservativeBound => "conservative-bound",
+            Self::CompilerProven => "compiler-proven",
+            Self::Other(value) => value,
+        }
+    }
+}
+impl From<&str> for CauseCertainty {
+    fn from(value: &str) -> Self {
+        match value {
+            "missing-source" => Self::MissingSource,
+            "conservative-bound" => Self::ConservativeBound,
+            "compiler-proven" => Self::CompilerProven,
+            _ => Self::Other(value.to_owned()),
+        }
+    }
+}
+impl Serialize for CauseCertainty {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+impl std::fmt::Display for CauseCertainty {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionDescription {
+    pub digest: String,
+    pub revision: String,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Sides<T> {
+    pub base: T,
+    pub target: T,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectDifference {
+    pub added: Vec<String>,
+    pub base: Vec<String>,
+    pub removed: Vec<String>,
+    pub target: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractDifference {
+    pub base: BTreeSet<String>,
+    pub base_violations: Vec<String>,
+    pub change: ContractChange,
+    pub target: BTreeSet<String>,
+    pub target_violations: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetDifference {
+    pub base: Option<Vec<String>>,
+    pub change: TargetChange,
+    pub target: Option<Vec<String>>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Cause {
+    pub certainty: CauseCertainty,
+    pub chain: Vec<String>,
+    pub effect: Vec<String>,
+    pub location: Option<super::super::Location>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub side: Option<Side>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CauseLeaf {
+    certainty: CauseCertainty,
+    location: Option<super::super::Location>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolChange {
+    pub cause: Vec<Cause>,
+    pub contract: Option<ContractDifference>,
+    pub effects: Option<EffectDifference>,
+    pub impacted_callers: Vec<String>,
+    #[serde(rename = "match")]
+    pub matching: MatchKind,
+    pub public_api: PublicApiChange,
+    /// Ambiguous records omit this field; matched records retain explicit null.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renamed_to: Option<Option<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<Sides<Option<DeclarationSignature>>>,
+    pub symbol: String,
+    pub targets: Option<TargetDifference>,
+}
+type AssumptionEvidence = BTreeMap<String, BTreeMap<String, super::super::assumptions::Assumption>>;
+
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct ReportSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub assumptions: Option<Sides<AssumptionEvidence>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub contract_violations: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostics: Option<Sides<Vec<DiagnosticFact>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effect_growth: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub impacted_callers: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub no_panic: Option<Sides<BTreeMap<String, crate::semantic::type_checker::PanicEvidence>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_violations: Option<usize>,
+    pub uncertainty: Vec<String>,
+}
+pub trait SummaryCounts {
+    fn contract_violations(&self) -> usize;
+    fn policy_violations(&self) -> usize;
+}
+impl SummaryCounts for ReportSummary {
+    fn contract_violations(&self) -> usize {
+        self.contract_violations.unwrap_or(0)
+    }
+    fn policy_violations(&self) -> usize {
+        self.policy_violations.unwrap_or(0)
+    }
+}
+
+// Legacy JSON objects used lexical key order. Sort only while serializing the
+// wire result; the analysis and human renderer retain concrete records.
+fn serialize_wire<S: serde::Serializer, T: Serialize>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serde_json::to_value(value)
+        .map_err(serde::ser::Error::custom)?
+        .serialize(serializer)
+}
+#[derive(Debug, Serialize)]
+#[serde(bound(serialize = "C: Serialize, S: Serialize"))]
+pub struct SemanticDiff<C = SymbolChange, S = ReportSummary> {
+    pub schema: &'static str,
+    pub status: ReportStatus,
+    pub base: Option<RevisionDescription>,
+    pub target: Option<RevisionDescription>,
+    #[serde(serialize_with = "serialize_wire")]
+    pub changes: Vec<C>,
+    #[serde(serialize_with = "serialize_wire")]
+    pub summary: S,
+}
+impl<C, S: SummaryCounts> SemanticDiff<C, S> {
     pub fn exit_code(&self) -> i32 {
-        if self.status == "incomplete" {
+        if self.status == ReportStatus::Incomplete {
             3
-        } else if self.summary["contract_violations"].as_u64().unwrap_or(0) != 0
-            || self.summary["policy_violations"].as_u64().unwrap_or(0) != 0
-        {
+        } else if self.summary.contract_violations() != 0 || self.summary.policy_violations() != 0 {
             1
         } else {
             0
         }
     }
+}
+impl SemanticDiff {
     pub fn incomplete(reason: String) -> Self {
         Self {
             schema: "willow.semantic-diff.v3",
-            status: "incomplete",
-            base: Value::Null,
-            target: Value::Null,
+            status: ReportStatus::Incomplete,
+            base: None,
+            target: None,
             changes: vec![],
-            summary: json!({"uncertainty":[reason]}),
+            summary: ReportSummary {
+                uncertainty: vec![reason],
+                ..Default::default()
+            },
         }
     }
     pub fn human(&self, explain: bool) -> String {
-        fn list(value: &Value) -> String {
-            value
-                .as_array()
-                .map(|items| {
-                    items
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(matching::human_name)
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                })
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| "none".into())
+        fn list<'a>(items: impl IntoIterator<Item = &'a String>) -> String {
+            let text = items
+                .into_iter()
+                .map(|item| matching::human_name(item))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if text.is_empty() { "none".into() } else { text }
         }
         let mut text = format!("Semantic verification: {}\n", self.status);
-        if let Some(digest) = self.base["digest"].as_str() {
-            text.push_str(&format!("Base digest: {digest}\n"));
+        if let Some(base) = &self.base {
+            text.push_str(&format!("Base digest: {}\n", base.digest));
         }
-        if let Some(digest) = self.target["digest"].as_str() {
-            text.push_str(&format!("Target digest: {digest}\n"));
+        if let Some(target) = &self.target {
+            text.push_str(&format!("Target digest: {}\n", target.digest));
         }
-        for side in ["base", "target"] {
-            if let Some(evidence) = self.summary["no_panic"][side].as_object() {
+        if let Some(evidence) = &self.summary.no_panic {
+            for (side, evidence) in [
+                (Side::Base, &evidence.base),
+                (Side::Target, &evidence.target),
+            ] {
                 for (name, proof) in evidence {
-                    if proof["status"] == "PROVEN" {
+                    if proof.status == crate::semantic::type_checker::PanicStatus::Proven {
                         text.push_str(&format!(
                             "no_panic {side} {}: {}\n",
                             matching::human_name(name),
-                            proof["basis"].as_str().unwrap_or("unproven")
+                            proof.basis.as_str()
                         ));
                     }
                 }
             }
         }
-        for side in ["base", "target"] {
-            if let Some(functions) = self.summary["assumptions"][side].as_object() {
+        if let Some(functions) = &self.summary.assumptions {
+            for (side, functions) in [
+                (Side::Base, &functions.base),
+                (Side::Target, &functions.target),
+            ] {
                 for (function, contracts) in functions {
-                    if let Some(contracts) = contracts.as_object() {
-                        for (contract, evidence) in contracts {
-                            text.push_str(&format!(
-                                "{contract} {side} {}: assumption at {}:{}\n",
-                                matching::human_name(function),
-                                evidence["location"]["path"].as_str().unwrap_or("?"),
-                                evidence["location"]["start"]
-                            ));
-                        }
+                    for (contract, evidence) in contracts {
+                        text.push_str(&format!(
+                            "{contract} {side} {}: assumption at {}:{}\n",
+                            matching::human_name(function),
+                            evidence
+                                .location
+                                .as_ref()
+                                .and_then(|location| location.path.as_deref())
+                                .unwrap_or("?"),
+                            evidence.location.as_ref().map_or_else(
+                                || "null".into(),
+                                |location| location.start.to_string()
+                            ),
+                        ));
                     }
                 }
             }
@@ -106,82 +290,88 @@ impl SemanticDiff {
         for change in &self.changes {
             text.push_str(&format!(
                 "{}: {}\n",
-                matching::human_name(change["symbol"].as_str().unwrap_or("?")),
-                change["match"].as_str().unwrap_or("?")
+                matching::human_name(&change.symbol),
+                change.matching
             ));
-            if let Some(target) = change["renamed_to"].as_str() {
+            if let Some(Some(target)) = &change.renamed_to {
                 text.push_str(&format!("  Renamed to: {}\n", matching::human_name(target)));
             }
             text.push_str(&format!(
                 "  Effects added: {}; removed: {}\n",
-                list(&change["effects"]["added"]),
-                list(&change["effects"]["removed"])
+                list(change.effects.iter().flat_map(|effects| &effects.added)),
+                list(change.effects.iter().flat_map(|effects| &effects.removed)),
             ));
+            let contract_change = change
+                .contract
+                .as_ref()
+                .map_or_else(|| "unknown".into(), |contract| contract.change.to_string());
             text.push_str(&format!(
-                "  Contract {}: {} -> {}\n",
-                change["contract"]["change"].as_str().unwrap_or("unknown"),
-                list(&change["contract"]["base"]),
-                list(&change["contract"]["target"])
+                "  Contract {contract_change}: {} -> {}\n",
+                list(change.contract.iter().flat_map(|contract| &contract.base)),
+                list(change.contract.iter().flat_map(|contract| &contract.target)),
             ));
             text.push_str(&format!(
                 "  Contract violations: base {}; target {}\n",
-                list(&change["contract"]["base_violations"]),
-                list(&change["contract"]["target_violations"])
+                list(
+                    change
+                        .contract
+                        .iter()
+                        .flat_map(|contract| &contract.base_violations)
+                ),
+                list(
+                    change
+                        .contract
+                        .iter()
+                        .flat_map(|contract| &contract.target_violations)
+                ),
             ));
-            if change["public_api"] != "unchanged" {
-                text.push_str(&format!(
-                    "  Public API: {}\n",
-                    change["public_api"].as_str().unwrap_or("unknown")
-                ));
+            if change.public_api != PublicApiChange::Unchanged {
+                text.push_str(&format!("  Public API: {}\n", change.public_api));
             }
-            if change["targets"]["change"] == "changed" {
+            if let Some(targets) = &change.targets
+                && targets.change == TargetChange::Changed
+            {
                 text.push_str(&format!(
                     "  Call targets: {} -> {}\n",
-                    list(&change["targets"]["base"]),
-                    list(&change["targets"]["target"])
+                    list(targets.base.iter().flatten()),
+                    list(targets.target.iter().flatten()),
                 ));
             }
             if explain {
-                for cause in change["cause"].as_array().into_iter().flatten() {
-                    let chain = cause["chain"]
-                        .as_array()
-                        .into_iter()
-                        .flatten()
-                        .filter_map(Value::as_str)
-                        .map(matching::human_name)
+                for cause in &change.cause {
+                    let chain = cause
+                        .chain
+                        .iter()
+                        .map(|name| matching::human_name(name))
                         .collect::<Vec<_>>()
                         .join(" -> ");
+                    let side = cause
+                        .side
+                        .map_or_else(|| "?".into(), |side| side.to_string());
                     text.push_str(&format!(
-                        "  cause: {} {} via {} ({})\n",
-                        cause["side"].as_str().unwrap_or("?"),
-                        list(&cause["effect"]),
-                        chain,
-                        cause["certainty"].as_str().unwrap_or("missing-source")
+                        "  cause: {side} {} via {chain} ({})\n",
+                        list(&cause.effect),
+                        cause.certainty
                     ));
-                    if let Some(path) = cause["location"]["path"].as_str() {
+                    if let Some(location) = &cause.location {
                         text.push_str(&format!(
-                            "    {path}:{}-{}\n",
-                            cause["location"]["start"], cause["location"]["end"]
+                            "    {}:{}-{}\n",
+                            location.path, location.start, location.end
                         ));
                     }
                 }
                 text.push_str(&format!(
                     "  Impacted callers: {}\n",
-                    list(&change["impacted_callers"])
+                    list(&change.impacted_callers)
                 ));
             }
         }
         text.push_str(&format!(
             "Contract violations: {}; policy violations: {}\n",
-            self.summary["contract_violations"].as_u64().unwrap_or(0),
-            self.summary["policy_violations"].as_u64().unwrap_or(0)
+            self.summary.contract_violations(),
+            self.summary.policy_violations(),
         ));
-        for reason in self.summary["uncertainty"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-        {
+        for reason in &self.summary.uncertainty {
             text.push_str(&format!("Incomplete: {}\n", matching::human_name(reason)));
         }
         text
@@ -191,6 +381,7 @@ impl SemanticDiff {
 pub(crate) struct Capture {
     baseline: Baseline,
     shapes: im::OrdMap<String, String>,
+    kinds: im::OrdMap<String, SymbolKind>,
     lambda_owners: im::OrdMap<String, im::OrdSet<String>>,
     retained: state::ReportState,
     fact_updates: usize,
@@ -203,19 +394,19 @@ pub(crate) struct Capture {
     causes: CausePaths,
     ambiguous: im::OrdSet<String>,
     contract_index: Option<Node>,
-    panic_evidence: im::OrdMap<String, Value>,
-    assumption_evidence: BTreeMap<String, Value>,
+    panic_evidence: im::OrdMap<String, crate::semantic::type_checker::PanicEvidence>,
+    assumption_evidence: AssumptionEvidence,
     violations: im::OrdSet<String>,
 }
 #[derive(Clone, Default)]
 struct CausePaths {
     next: im::OrdMap<(String, u8), String>,
-    leaves: im::OrdMap<(String, u8), Value>,
+    leaves: im::OrdMap<(String, u8), CauseLeaf>,
     unknown: im::OrdSet<String>,
     locations: im::OrdMap<(String, usize, String, u8), usize>,
 }
 impl CausePaths {
-    fn render(&self, key: &str, bit: u8) -> Value {
+    fn render(&self, key: &str, bit: u8) -> Cause {
         let mut chain = vec![key.to_owned()];
         let mut cursor = key;
         while let Some(target) = self.next.get(&(cursor.to_owned(), bit)) {
@@ -224,10 +415,22 @@ impl CausePaths {
         }
         let address = (cursor.to_owned(), bit);
         let leaf = self.leaves.get(&address);
-        let location = leaf.map_or(Value::Null, |v| v["location"].clone());
-        json!({"effect":effect_names(bit), "chain":chain,
-            "location":location,
-            "certainty":leaf.map_or(if self.unknown.contains(key) {"missing-source"} else {"conservative-bound"}, |v| v["certainty"].as_str().unwrap())})
+        Cause {
+            effect: effect_names(bit),
+            chain,
+            location: leaf.and_then(|leaf| leaf.location.clone()),
+            certainty: leaf.map_or_else(
+                || {
+                    if self.unknown.contains(key) {
+                        CauseCertainty::MissingSource
+                    } else {
+                        CauseCertainty::ConservativeBound
+                    }
+                },
+                |leaf| leaf.certainty.clone(),
+            ),
+            side: None,
+        }
     }
 }
 fn effect_names(bits: u8) -> Vec<String> {
@@ -275,6 +478,33 @@ impl Capture {
             ambiguous,
             contracts,
         } = names;
+        // Keep the kind chosen by the stable-key producer alongside each key.
+        // Function-only records use the producer's function namespace even when
+        // their internal identity describes a lambda or dispatch summary.
+        let mut kinds = im::OrdMap::new();
+        for symbol in &snapshot.semantic.symbols {
+            if matches!(
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Constructor
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+                    | SymbolKind::Variant
+                    | SymbolKind::Field
+                    | SymbolKind::StaticField
+                    | SymbolKind::Const
+            ) && let Some(key) = ids.get(&symbol.id)
+            {
+                kinds.insert(key.clone(), symbol.kind.clone());
+            }
+        }
+        for function in &snapshot.functions {
+            kinds
+                .entry(ids[&function.id].clone())
+                .or_insert(SymbolKind::Function);
+        }
         // Compiler waiting summaries apply async transmission masks. Legacy
         // graph aggregation is intentionally unchanged; use those summaries
         // here so merely creating a Task does not introduce a wait.
@@ -294,7 +524,7 @@ impl Capture {
                     .semantic
                     .panic_evidence
                     .get(&f.id)
-                    .is_some_and(|e| e["status"] == "PROVEN")
+                    .is_some_and(|e| e.status == crate::semantic::type_checker::PanicStatus::Proven)
                 {
                     bits &= !RuntimeEffects::MAY_PANIC
                         .union(RuntimeEffects::MAY_CHECKED_PANIC)
@@ -326,20 +556,32 @@ impl Capture {
             .iter()
             .enumerate()
             .filter_map(|(i, f)| {
-                let mut evidence = assumptions.output(i);
+                let output = assumptions.typed_output(i);
                 let contracts = contracts.get(&ids[&f.id])?;
-                evidence
-                    .as_object_mut()?
-                    .retain(|kind, value| contracts.contains(kind) && !value.is_null());
-                for value in evidence.as_object_mut()?.values_mut() {
-                    if let Some(path) = value["location"]["path"].as_str() {
-                        value["location"]["path"] = json!(relative(path, &snapshot.workspace));
-                    }
-                    if let Some(function) = value["function"].as_str().and_then(|id| ids.get(id)) {
-                        value["function"] = json!(function);
+                let mut evidence = BTreeMap::new();
+                for (contract, assumption) in [
+                    ("no_block", output.no_block),
+                    ("no_io", output.no_io),
+                    ("no_wait", output.no_wait),
+                ] {
+                    if contracts.contains(contract)
+                        && let Some(assumption) = assumption
+                    {
+                        let mut assumption = assumption.clone();
+                        if let Some(path) = assumption
+                            .location
+                            .as_mut()
+                            .and_then(|location| location.path.as_mut())
+                        {
+                            *path = relative(path, &snapshot.workspace);
+                        }
+                        if let Some(function) = ids.get(&assumption.function) {
+                            assumption.function = function.clone();
+                        }
+                        evidence.insert(contract.to_owned(), assumption);
                     }
                 }
-                (!evidence.as_object()?.is_empty()).then(|| (ids[&f.id].clone(), evidence))
+                (!evidence.is_empty()).then(|| (ids[&f.id].clone(), evidence))
             })
             .collect();
         let mut causes = CausePaths::default();
@@ -371,6 +613,7 @@ impl Capture {
         matching::update_shapes(&mut shapes, &mut lambda_owners, snapshot, &retained.ids)?;
         Ok(Self {
             shapes,
+            kinds,
             lambda_owners,
             fact_updates: snapshot.functions.len(),
             witness_updates,
@@ -555,40 +798,17 @@ fn compare(before: &Capture, after: &Capture, fail_on_growth: bool) -> Result<Se
     let keys = comparison_keys(before, after, &mut Work::default());
     compare_keys(before, after, fail_on_growth, keys)
 }
-fn compare_keys(
-    before: &Capture,
-    after: &Capture,
-    fail_on_growth: bool,
-    keys: BTreeSet<String>,
-) -> Result<SemanticDiff> {
-    let old = &before.baseline;
-    let new = &after.baseline;
-    let legacy = old.compare(new)?;
-    let (renames, keys) = matching::pairs(before, after, &keys)?;
+fn symbol_pairs<'a>(
+    old: &Baseline,
+    new: &Baseline,
+    keys: &'a BTreeSet<String>,
+    renames: &'a BTreeMap<String, String>,
+) -> Vec<(Option<&'a String>, Option<&'a String>)> {
     let renamed_targets: BTreeSet<_> = renames.values().collect();
-    let empty = BTreeSet::new();
-    let mut changes = Vec::new();
-    let mut old_panic = BTreeMap::new();
-    let mut new_panic = BTreeMap::new();
-    let mut growth = 0;
-    let mut emitted_hops = 0usize;
-    let mut uncertainty = Vec::new();
-    for stem in before.ambiguous.clone().union(after.ambiguous.clone()) {
-        uncertainty.push(format!("ambiguous symbol: {stem}"));
-        changes.push(json!({"symbol":stem,"match":"ambiguous","effects":null,"cause":[],"impacted_callers":[],"contract":null,"public_api":"unknown","targets":null}));
-    }
-    for key in before
-        .causes
-        .unknown
-        .clone()
-        .union(after.causes.unknown.clone())
-    {
-        uncertainty.push(format!("missing-source: {key}"));
-    }
     // Source and target identities are separate namespaces: a displaced lambda
     // may consume a key which is also the source of another correspondence.
     let mut comparisons = Vec::new();
-    for key in &keys {
+    for key in keys {
         if old.facts.contains_key(key) {
             let target = renames.get(key).or_else(|| {
                 (!matching::is_lambda(key) && new.facts.contains_key(key)).then_some(key)
@@ -602,6 +822,120 @@ fn compare_keys(
             comparisons.push((None, Some(key)));
         }
     }
+    comparisons
+}
+
+fn contract_difference(
+    base: &BTreeSet<String>,
+    target: &BTreeSet<String>,
+    base_violations: u8,
+    target_violations: u8,
+) -> ContractDifference {
+    let change = if base == target {
+        ContractChange::Unchanged
+    } else if base.is_empty() {
+        ContractChange::Added
+    } else if target.is_empty() {
+        ContractChange::Removed
+    } else {
+        let base_bits = contract_bits(base);
+        let target_bits = contract_bits(target);
+        if base_bits == target_bits {
+            ContractChange::Equivalent
+        } else if base_bits & !target_bits == 0 {
+            ContractChange::Strengthened
+        } else if target_bits & !base_bits == 0 {
+            ContractChange::Weakened
+        } else {
+            ContractChange::Changed
+        }
+    };
+    ContractDifference {
+        change,
+        base: base.clone(),
+        target: target.clone(),
+        base_violations: effect_names(base_violations),
+        target_violations: effect_names(target_violations),
+    }
+}
+
+fn comparison_causes(
+    sides: [(&Capture, &str, u8, Side); 2],
+    emitted_hops: &mut usize,
+) -> Result<Vec<Cause>> {
+    let mut causes = Vec::new();
+    for i in 0..RuntimeEffects::BIT_COUNT {
+        let bit = RuntimeEffects::from_bit(i).bits();
+        for (capture, key, bits, side) in sides {
+            if bits & bit != 0 {
+                let mut cause = capture.causes.render(key, bit);
+                *emitted_hops += cause.chain.len();
+                ensure!(
+                    *emitted_hops <= 1_000_000,
+                    "witness evidence exceeds output limit"
+                );
+                cause.side = Some(side);
+                causes.push(cause);
+            }
+        }
+    }
+    Ok(causes)
+}
+
+fn append_diagnostic_uncertainty(uncertainty: &mut Vec<String>, old: &Baseline, new: &Baseline) {
+    for (side, baseline) in [("base", old), ("target", new)] {
+        for diagnostic in &baseline.diagnostics {
+            if diagnostic.severity == "error" && diagnostic.code != "E2610" {
+                uncertainty.push(format!(
+                    "{side}: {}: {}",
+                    diagnostic.code, diagnostic.message
+                ));
+            }
+        }
+    }
+}
+
+fn compare_keys(
+    before: &Capture,
+    after: &Capture,
+    fail_on_growth: bool,
+    keys: BTreeSet<String>,
+) -> Result<SemanticDiff> {
+    let old = &before.baseline;
+    let new = &after.baseline;
+    let legacy = old.compare(new)?;
+    let (renames, keys) = matching::pairs(before, after, &keys)?;
+    let empty = BTreeSet::new();
+    let mut changes = Vec::new();
+    let mut old_panic = BTreeMap::new();
+    let mut new_panic = BTreeMap::new();
+    let mut growth = 0;
+    let mut emitted_hops = 0usize;
+    let mut uncertainty = Vec::new();
+    for stem in before.ambiguous.clone().union(after.ambiguous.clone()) {
+        uncertainty.push(format!("ambiguous symbol: {stem}"));
+        changes.push(SymbolChange {
+            symbol: stem,
+            matching: MatchKind::Ambiguous,
+            effects: None,
+            cause: vec![],
+            impacted_callers: vec![],
+            contract: None,
+            public_api: PublicApiChange::Unknown,
+            targets: None,
+            renamed_to: None,
+            signature: None,
+        });
+    }
+    for key in before
+        .causes
+        .unknown
+        .clone()
+        .union(after.causes.unknown.clone())
+    {
+        uncertainty.push(format!("missing-source: {key}"));
+    }
+    let comparisons = symbol_pairs(old, new, &keys, &renames);
     for (base_key, new_key) in comparisons {
         let key = base_key.or(new_key).expect("comparison identity");
         let target_key = new_key.unwrap_or(key);
@@ -658,73 +992,67 @@ fn compare_keys(
             continue;
         }
         let matching = if renamed {
-            "renamed"
+            MatchKind::Renamed
         } else if a.is_none() {
-            "added"
+            MatchKind::Added
         } else if b.is_none() {
-            "removed"
+            MatchKind::Removed
         } else if signature_a != signature_b {
-            "signature-changed"
+            MatchKind::SignatureChanged
         } else {
-            "exact"
+            MatchKind::Exact
         };
-        let contract_change = if ca == cb {
-            "unchanged"
-        } else if ca.is_empty() {
-            "added"
-        } else if cb.is_empty() {
-            "removed"
-        } else if contract_bits(ca) == contract_bits(cb) {
-            "equivalent"
-        } else if contract_bits(ca) & !contract_bits(cb) == 0 {
-            "strengthened"
-        } else if contract_bits(cb) & !contract_bits(ca) == 0 {
-            "weakened"
-        } else {
-            "changed"
-        };
-        let mut causes = Vec::new();
-        for i in 0..RuntimeEffects::BIT_COUNT {
-            let bit = RuntimeEffects::from_bit(i).bits();
-            for (capture, bits, side) in [
-                (before, removed | av, "base"),
-                (after, added | bv, "target"),
-            ] {
-                if bits & bit != 0 {
-                    let cause_key = if side == "base" { key } else { target_key };
-                    let mut cause = capture.causes.render(cause_key, bit);
-                    emitted_hops += cause["chain"].as_array().map_or(0, Vec::len);
-                    ensure!(
-                        emitted_hops <= 1_000_000,
-                        "witness evidence exceeds output limit"
-                    );
-                    cause["side"] = json!(side);
-                    causes.push(cause);
-                }
-            }
-        }
+        let contract = contract_difference(ca, cb, av, bv);
+        let causes = comparison_causes(
+            [
+                (before, key, removed | av, Side::Base),
+                (after, target_key, added | bv, Side::Target),
+            ],
+            &mut emitted_hops,
+        )?;
         let public_api = match (public_signature(signature_a), public_signature(signature_b)) {
-            (true, false) => "removed",
-            (false, true) => "added",
-            (true, true) if renamed => "renamed",
-            (true, true) if signature_a != signature_b => "signature-changed",
-            _ => "unchanged",
+            (true, false) => PublicApiChange::Removed,
+            (false, true) => PublicApiChange::Added,
+            (true, true) if renamed => PublicApiChange::Renamed,
+            (true, true) if signature_a != signature_b => PublicApiChange::SignatureChanged,
+            _ => PublicApiChange::Unchanged,
         };
-        changes.push(json!({"symbol":key,"match":matching,
-            "renamed_to": if base_key.is_some() && new_key.is_some() && target_key != key { Some(target_key) } else { None },
-            "signature":{"base":signature_a,"target":signature_b},
-            "effects":{"added":effect_names(added),"removed":effect_names(removed),"base":effect_names(ae),"target":effect_names(be)},
-            "cause":causes,"impacted_callers":[],
-            "contract":{"change":contract_change,"base":ca,"target":cb,"base_violations":effect_names(av),"target_violations":effect_names(bv)},
-            "public_api":public_api,
-            "targets":{"base":a.map(|f| &f.callees),"target":targets_b,
-                "change":if targets_changed {"changed"} else {"unchanged"}}}));
+        changes.push(SymbolChange {
+            symbol: key.clone(),
+            matching,
+            renamed_to: Some(
+                (base_key.is_some() && new_key.is_some() && target_key != key)
+                    .then(|| target_key.clone()),
+            ),
+            signature: Some(Sides {
+                base: signature_a.cloned(),
+                target: signature_b.cloned(),
+            }),
+            effects: Some(EffectDifference {
+                added: effect_names(added),
+                removed: effect_names(removed),
+                base: effect_names(ae),
+                target: effect_names(be),
+            }),
+            cause: causes,
+            impacted_callers: vec![],
+            contract: Some(contract),
+            public_api,
+            targets: Some(TargetDifference {
+                base: a.map(|f| f.callees.clone()),
+                target: targets_b.cloned(),
+                change: if targets_changed {
+                    TargetChange::Changed
+                } else {
+                    TargetChange::Unchanged
+                },
+            }),
+        });
     }
     impact::assign(&mut changes, old, new)?;
     let impacted: BTreeSet<_> = changes
         .iter()
-        .flat_map(|c| c["impacted_callers"].as_array().into_iter().flatten())
-        .filter_map(Value::as_str)
+        .flat_map(|change| &change.impacted_callers)
         .collect();
     let impacted_count = impacted.len();
     let violations = old
@@ -733,32 +1061,43 @@ fn compare_keys(
         .chain(&new.diagnostics)
         .filter(|d| d.code == "E2610")
         .count();
-    for (side, baseline) in [("base", old), ("target", new)] {
-        for diagnostic in &baseline.diagnostics {
-            if diagnostic.severity == "error" && diagnostic.code != "E2610" {
-                uncertainty.push(format!(
-                    "{side}: {}: {}",
-                    diagnostic.code, diagnostic.message
-                ));
-            }
-        }
-    }
+    append_diagnostic_uncertainty(&mut uncertainty, old, new);
     let status = if legacy.complete && uncertainty.is_empty() {
-        "complete"
+        ReportStatus::Complete
     } else {
-        "incomplete"
+        ReportStatus::Incomplete
     };
     Ok(SemanticDiff {
         schema: "willow.semantic-diff.v3",
         status,
-        base: Value::Null,
-        target: Value::Null,
+        base: None,
+        target: None,
         changes,
-        summary: json!({"contract_violations":violations,"policy_violations":if fail_on_growth {growth} else {0},
-            "effect_growth":growth,"impacted_callers":impacted_count,"uncertainty":uncertainty,
-            "no_panic":{"base":old_panic,"target":new_panic},
-            "assumptions":{"base":before.assumption_evidence,"target":after.assumption_evidence},
-            "diagnostics":{"base":old.diagnostics,"target":new.diagnostics}}),
+        summary: ReportSummary {
+            contract_violations: Some(violations),
+            policy_violations: Some(if fail_on_growth { growth } else { 0 }),
+            effect_growth: Some(growth),
+            impacted_callers: Some(impacted_count),
+            uncertainty,
+            no_panic: Some(Sides {
+                base: old_panic
+                    .into_iter()
+                    .map(|(key, proof)| (key.clone(), proof.clone()))
+                    .collect(),
+                target: new_panic
+                    .into_iter()
+                    .map(|(key, proof)| (key.clone(), proof.clone()))
+                    .collect(),
+            }),
+            assumptions: Some(Sides {
+                base: before.assumption_evidence.clone(),
+                target: after.assumption_evidence.clone(),
+            }),
+            diagnostics: Some(Sides {
+                base: old.diagnostics.clone(),
+                target: new.diagnostics.clone(),
+            }),
+        },
     })
 }
 pub fn verify(options: &Options) -> Result<SemanticDiff> {
@@ -776,9 +1115,12 @@ pub fn verify(options: &Options) -> Result<SemanticDiff> {
         );
         let old = before.map_or(&[][..], |c| c.baseline.diagnostics.as_slice());
         let new = after.map_or(&[][..], |c| c.baseline.diagnostics.as_slice());
-        report.summary["diagnostics"] = json!({"base":old,"target":new});
-        report.summary["contract_violations"] =
-            json!(old.iter().chain(new).filter(|d| d.code == "E2610").count());
+        report.summary.diagnostics = Some(Sides {
+            base: old.to_vec(),
+            target: new.to_vec(),
+        });
+        report.summary.contract_violations =
+            Some(old.iter().chain(new).filter(|d| d.code == "E2610").count());
         report
     };
     let base_analysis = resolve_entry(options, &before).and_then(|entry| {
@@ -808,18 +1150,24 @@ pub fn verify(options: &Options) -> Result<SemanticDiff> {
             },
         },
     };
-    report.base = json!({"revision":options.base,"digest":before_digest});
-    report.target = json!({"revision":"working-tree","digest":target_digest});
+    report.base = Some(RevisionDescription {
+        revision: options.base.clone(),
+        digest: before_digest,
+    });
+    report.target = Some(RevisionDescription {
+        revision: "working-tree".into(),
+        digest: target_digest.clone(),
+    });
     check_target(&mut report, &root, &target_digest)?;
     Ok(report)
 }
 fn check_target(report: &mut SemanticDiff, root: &Path, digest: &str) -> Result<()> {
     if hash_serialized(&tree::target(root)?)? != digest {
-        report.status = "incomplete";
-        report.summary["uncertainty"]
-            .as_array_mut()
-            .context("uncertainty array")?
-            .push(json!("snapshot changed during verification"));
+        report.status = ReportStatus::Incomplete;
+        report
+            .summary
+            .uncertainty
+            .push("snapshot changed during verification".into());
     }
     Ok(())
 }

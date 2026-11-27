@@ -1,21 +1,25 @@
 //! Shared caller reachability for every changed symbol.
 use super::*;
 
-pub(super) fn assign(changes: &mut [Value], before: &Baseline, after: &Baseline) -> Result<usize> {
+pub(super) fn assign(
+    changes: &mut [SymbolChange],
+    before: &Baseline,
+    after: &Baseline,
+) -> Result<usize> {
     let seeds: Vec<_> = changes
         .iter()
         .enumerate()
-        .filter(|(_, c)| c["match"] != "ambiguous")
-        .filter_map(|(i, c)| c["symbol"].as_str().map(|s| (i, s.to_owned())))
+        .filter(|(_, change)| change.matching != MatchKind::Ambiguous)
+        .map(|(i, change)| (i, change.symbol.clone()))
         .collect();
     if seeds.is_empty() {
         return Ok(0);
     }
     let mut aliases: BTreeMap<String, String> = BTreeMap::new();
     for change in changes.iter() {
-        if let (Some(old), Some(new)) = (change["symbol"].as_str(), change["renamed_to"].as_str()) {
-            aliases.insert(old.to_owned(), new.to_owned());
-            aliases.insert(new.to_owned(), old.to_owned());
+        if let Some(Some(new)) = &change.renamed_to {
+            aliases.insert(change.symbol.clone(), new.clone());
+            aliases.insert(new.clone(), change.symbol.clone());
         }
     }
     let mut reached: BTreeSet<String> = seeds.iter().map(|(_, s)| s.clone()).collect();
@@ -109,10 +113,7 @@ pub(super) fn assign(changes: &mut [Value], before: &Baseline, after: &Baseline)
                 if seed != name {
                     emitted += 1;
                     ensure!(emitted <= 1_000_000, "caller evidence exceeds output limit");
-                    changes[*change]["impacted_callers"]
-                        .as_array_mut()
-                        .context("caller evidence array")?
-                        .push(json!(name));
+                    changes[*change].impacted_callers.push(name.clone());
                 }
                 value &= value - 1;
             }

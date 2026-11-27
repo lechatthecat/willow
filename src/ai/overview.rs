@@ -1,5 +1,6 @@
 //! Bounded source structure projected from a single compiler query session.
 use super::{direct::DirectSession, symbols::Symbol};
+use crate::ai::SymbolKind;
 use crate::qualified_name::QualifiedName;
 use serde::Serialize;
 use std::{
@@ -24,7 +25,7 @@ pub const KINDS: &[&str] = &[
 #[derive(Clone, Serialize)]
 pub struct Entry {
     pub name: String,
-    pub kind: String,
+    pub kind: SymbolKind,
     pub selector: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub is_async: bool,
@@ -47,7 +48,7 @@ pub struct Counts {
     pub top_level_symbols: usize,
     pub members: usize,
     pub hidden_members: usize,
-    pub kinds: BTreeMap<String, usize>,
+    pub kinds: BTreeMap<SymbolKind, usize>,
 }
 #[derive(Clone, Serialize)]
 pub struct File {
@@ -102,6 +103,7 @@ impl Overview {
         kind: Option<&str>,
         absolute: bool,
     ) -> Self {
+        let kind = kind.map(SymbolKind::from);
         let snapshot = session.snapshot();
         let display = |path: &Path| {
             let path = if absolute {
@@ -173,13 +175,26 @@ impl Overview {
             let Some(&file) = files.get(loc.path.as_str()) else {
                 continue;
             };
-            if symbol.kind == "module" {
+            if symbol.kind == SymbolKind::Module {
                 output.files[file].module = symbol.name.clone();
             }
-            if !KINDS.contains(&symbol.kind.as_str()) || symbol.name.contains('$') {
+            if !matches!(
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Const
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+                    | SymbolKind::Field
+                    | SymbolKind::StaticField
+                    | SymbolKind::Method
+                    | SymbolKind::Constructor
+                    | SymbolKind::Variant
+            ) || symbol.name.contains('$')
+            {
                 continue;
             }
-            if !seen.insert((loc.path.as_str(), loc.start, loc.end, symbol.kind.as_str())) {
+            if !seen.insert((loc.path.as_str(), loc.start, loc.end, &symbol.kind)) {
                 continue;
             }
             candidates.push((file, symbol));
@@ -214,15 +229,18 @@ impl Overview {
         }
         for ((file, symbol), mut members) in top.into_iter().zip(children) {
             output.symbol_visits += 1;
-            if let Some(kind) = kind {
-                members.retain(|m| m.kind == kind);
-                if symbol.kind != kind && members.is_empty() {
+            if let Some(kind) = &kind {
+                members.retain(|m| m.kind == *kind);
+                if symbol.kind != *kind && members.is_empty() {
                     continue;
                 }
             }
             let file = &mut output.files[file];
             let mut projected = entry(session, symbol);
-            if matches!(symbol.kind.as_str(), "class" | "interface" | "enum") {
+            if matches!(
+                symbol.kind,
+                SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+            ) {
                 projected.member_count = Some(members.len());
             }
             file.counts.top_level_symbols += 1;
@@ -348,8 +366,12 @@ impl Overview {
 }
 fn is_top(s: &Symbol) -> bool {
     matches!(
-        s.kind.as_str(),
-        "function" | "const" | "class" | "enum" | "interface"
+        s.kind,
+        SymbolKind::Function
+            | SymbolKind::Const
+            | SymbolKind::Class
+            | SymbolKind::Enum
+            | SymbolKind::Interface
     )
 }
 fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
@@ -477,6 +499,7 @@ mod tests {
         }
         for i in (0..n).rev() {
             snapshot.semantic.symbols.push(Symbol {
+                origin: Default::default(),
                 identity: None,
                 id: format!("symbol:{i}"),
                 name: format!("f{i}"),
@@ -484,6 +507,7 @@ mod tests {
                 details: Default::default(),
                 kind: "function".into(),
                 location: Some(Location {
+                    display: None,
                     path: root
                         .join(format!("overview-{}.wi", i % file_count))
                         .to_string_lossy()
@@ -684,6 +708,7 @@ mod path_tests {
                 semantic: crate::ai::SemanticFacts::default(),
             };
             snapshot.semantic.symbols.push(Symbol {
+                origin: Default::default(),
                 identity: None,
                 id: "unicode".into(),
                 name: "計算".into(),
@@ -691,6 +716,7 @@ mod path_tests {
                 details: Default::default(),
                 kind: "function".into(),
                 location: Some(crate::ai::Location {
+                    display: None,
                     path: path.into(),
                     start: 0,
                     end: 6,

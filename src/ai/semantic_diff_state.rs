@@ -1,6 +1,7 @@
 //! Retained semantic-report projections. Updates visit the changed owners and
 //! their reverse closure; immutable maps preserve the baseline for comparison.
 use super::*;
+use crate::ai::{Location, SymbolKind, evidence::Certainty};
 use crate::qualified_name::QualifiedName;
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -24,24 +25,17 @@ impl RelocationIndex {
         }
         result
     }
-    pub(super) fn apply(&self, location: &mut Value) {
-        let Some(path) = location["path"].as_str() else {
+    pub(super) fn apply(&self, location: &mut Location) {
+        let Some(ranges) = self.0.get(&location.path) else {
             return;
         };
-        let Some(ranges) = self.0.get(path) else {
-            return;
-        };
-        let (Some(start), Some(end)) = (location["start"].as_u64(), location["end"].as_u64())
-        else {
-            return;
-        };
-        let at = ranges.partition_point(|(old, _, _)| *old <= start as usize);
+        let at = ranges.partition_point(|(old, _, _)| *old <= location.start);
         if let Some(&(old_start, old_end, new_start)) =
             at.checked_sub(1).and_then(|i| ranges.get(i))
-            && end as usize <= old_end
+            && location.end <= old_end
         {
-            location["start"] = json!(new_start + (start as usize - old_start));
-            location["end"] = json!(new_start + (end as usize - old_start));
+            location.start = new_start + (location.start - old_start);
+            location.end = new_start + (location.end - old_start);
         }
     }
 }
@@ -49,34 +43,23 @@ impl RelocationIndex {
 impl CausePaths {
     fn remove_leaf(&mut self, address: &(String, u8)) {
         if let Some(value) = self.leaves.remove(address)
-            && let (Some(path), Some(start)) = (
-                value["location"]["path"].as_str(),
-                value["location"]["start"].as_u64(),
-            )
+            && let Some(location) = value.location
         {
-            self.locations.remove(&(
-                path.to_owned(),
-                start as usize,
-                address.0.clone(),
-                address.1,
-            ));
+            self.locations
+                .remove(&(location.path, location.start, address.0.clone(), address.1));
         }
     }
-    fn insert_leaf(&mut self, address: (String, u8), value: Value) {
+    fn insert_leaf(&mut self, address: (String, u8), value: CauseLeaf) {
         self.remove_leaf(&address);
-        if let (Some(path), Some(start), Some(end)) = (
-            value["location"]["path"].as_str(),
-            value["location"]["start"].as_u64(),
-            value["location"]["end"].as_u64(),
-        ) {
+        if let Some(location) = &value.location {
             self.locations.insert(
                 (
-                    path.to_owned(),
-                    start as usize,
+                    location.path.clone(),
+                    location.start,
                     address.0.clone(),
                     address.1,
                 ),
-                end as usize,
+                location.end,
             );
         }
         self.leaves.insert(address, value);
@@ -118,7 +101,9 @@ impl CausePaths {
         for address in moved {
             if let Some(old) = self.leaves.get(&address) {
                 let mut value = old.clone();
-                maps.apply(&mut value["location"]);
+                if let Some(location) = &mut value.location {
+                    maps.apply(location);
+                }
                 if &value != old {
                     self.insert_leaf(address, value);
                 }
@@ -204,21 +189,43 @@ impl ReportState {
                     .get(&f.id)
                     .into_iter()
                     .flatten()
-                    .filter(|w| w["effect"] == bit && !w["witness"]["cause"]["location"].is_null())
-                    .min_by_key(|w| w.to_string());
-                if let Some(w) = witness {
-                    let mut location = w["witness"]["cause"]["location"].clone();
-                    if let Some(path) = location["path"].as_str() {
-                        location["path"] = json!(relative(path, &patch.workspace));
+                    .filter(|fact| fact.effect == bit && fact.witness.location().is_some())
+                    // Preserve the historical lexical wire-order tie break. This
+                    // serialization is an ordering key, never an internal query.
+                    .min_by_key(|fact| {
+                        serde_json::to_value(fact)
+                            .expect("witness serializes")
+                            .to_string()
+                    });
+                if let Some(fact) = witness {
+                    let witness = &fact.witness;
+                    let mut location = witness.location().cloned();
+                    if let Some(location) = &mut location {
+                        location.path = relative(&location.path, &patch.workspace);
                     }
-                    let certainty = if w["witness"]["cause"]["is_conservative"] == true {
-                        "conservative-bound"
+                    let certainty = if witness
+                        .cause
+                        .as_ref()
+                        .is_some_and(|cause| cause.is_conservative)
+                    {
+                        CauseCertainty::ConservativeBound
                     } else {
-                        w["witness"]["certainty"]
-                            .as_str()
-                            .unwrap_or("compiler-proven")
+                        match &witness.certainty {
+                            None => CauseCertainty::CompilerProven,
+                            Some(Certainty::ConservativeBound) => CauseCertainty::ConservativeBound,
+                            Some(Certainty::CompilerFact) => {
+                                CauseCertainty::Other("compiler-fact".into())
+                            }
+                            Some(Certainty::Other(value)) => CauseCertainty::from(value.as_str()),
+                        }
                     };
-                    causes.insert_leaf(address, json!({"location":location,"certainty":certainty}));
+                    causes.insert_leaf(
+                        address,
+                        CauseLeaf {
+                            location,
+                            certainty,
+                        },
+                    );
                 }
             }
         }
@@ -409,6 +416,7 @@ impl Capture {
         for id in removed_symbols.iter().chain(removed_functions) {
             if let Some(key) = self.retained.ids.get(id) {
                 self.shapes.remove(key);
+                self.kinds.remove(key);
                 self.panic_evidence.remove(key);
                 if matching::is_lambda(key)
                     && let Some(owner) = matching::scope(key)
@@ -447,17 +455,17 @@ impl Capture {
     fn update_symbol_declarations(&mut self, patch: &Snapshot) -> Result<()> {
         for symbol in &patch.semantic.symbols {
             if !matches!(
-                symbol.kind.as_str(),
-                "function"
-                    | "method"
-                    | "constructor"
-                    | "class"
-                    | "interface"
-                    | "enum"
-                    | "variant"
-                    | "field"
-                    | "static-field"
-                    | "const"
+                symbol.kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Constructor
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+                    | SymbolKind::Variant
+                    | SymbolKind::Field
+                    | SymbolKind::StaticField
+                    | SymbolKind::Const
             ) {
                 continue;
             }
@@ -485,6 +493,7 @@ impl Capture {
                     )
                 });
             self.retained.ids.insert(symbol.id.clone(), key.clone());
+            self.kinds.insert(key.clone(), symbol.kind.clone());
             let mut fact = self.baseline.facts.get(&key).map_or(
                 Fact {
                     signature: None,
@@ -529,6 +538,7 @@ impl Capture {
                     &f.name,
                 ]);
                 self.retained.ids.insert(f.id.clone(), key.clone());
+                self.kinds.insert(key.clone(), SymbolKind::Function);
                 self.baseline.facts.insert(
                     key,
                     Arc::new(Fact {
@@ -650,7 +660,7 @@ impl Capture {
                 });
             self.panic_evidence.remove(key);
             if let Some(evidence) = patch.semantic.panic_evidence.get(&f.id) {
-                if evidence["status"] == "PROVEN" {
+                if evidence.status == crate::semantic::type_checker::PanicStatus::Proven {
                     bits &= !RuntimeEffects::MAY_PANIC
                         .union(RuntimeEffects::MAY_CHECKED_PANIC)
                         .bits();
@@ -706,15 +716,20 @@ impl Capture {
         let mut old_sites = HashMap::new();
         for diagnostic in previous_diagnostics {
             for site in &diagnostic.locations {
-                let mut location = json!({"path":site.path,"start":site.start,"end":site.end});
+                let mut location = Location {
+                    display: None,
+                    path: site.path.clone(),
+                    start: site.start,
+                    end: site.end,
+                };
                 relocation.apply(&mut location);
                 old_sites.insert(
                     (
                         diagnostic.code.clone(),
                         diagnostic.message.clone(),
                         site.path.clone(),
-                        location["start"].as_u64().unwrap() as usize,
-                        location["end"].as_u64().unwrap() as usize,
+                        location.start,
+                        location.end,
                         site.anchor.clone(),
                     ),
                     site.owner.clone(),

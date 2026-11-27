@@ -1,5 +1,13 @@
 //! Compact compiler facts, structured control flow, and snapshot query adapter.
+use super::evidence::*;
+use super::operation::Operation;
+use super::query_result::{EffectBounds, EffectResult, Traversal, UnknownCause};
+use super::query_result::{
+    QueryData, QueryResult, ReferenceCertainty, ReferenceRecord, Status, SymbolInfo, SymbolRecord,
+    TypeRecord,
+};
 use super::*;
+use crate::ai::SymbolKind;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use serde_json::{Value, json};
@@ -22,10 +30,11 @@ pub struct SemanticFacts {
     pub references: Vec<symbols::Reference>,
     pub expressions: Vec<Expression>,
     pub flows: Vec<Flow>,
-    pub witnesses: BTreeMap<String, Vec<Value>>,
+    #[serde(serialize_with = "super::evidence::serialize_facts")]
+    pub witnesses: BTreeMap<String, Vec<EffectFact>>,
     pub compiler_effects: BTreeMap<String, u8>,
     #[serde(default)]
-    pub panic_evidence: BTreeMap<String, Value>,
+    pub panic_evidence: BTreeMap<String, crate::semantic::type_checker::PanicEvidence>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub effect_calls: BTreeMap<String, Vec<EffectCall>>,
     #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
@@ -44,7 +53,7 @@ pub struct EffectCall {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UnresolvedCall {
-    pub operation: String,
+    pub operation: Operation,
     pub location: Location,
 }
 
@@ -55,7 +64,7 @@ pub struct Expression {
     pub location: Location,
     pub ty: Option<Type>,
     pub target: Option<String>,
-    pub operation: Option<String>,
+    pub operation: Option<Operation>,
     pub fingerprint: String,
     pub flow: usize,
     pub node: usize,
@@ -96,35 +105,26 @@ pub(super) struct Captured {
     // Builtin calls stay out of `call_sites`, but their compiler boundary
     // witnesses still need the owning call span.
     pub builtin_calls: Vec<(FunctionId, Span, FunctionId)>,
-    pub witnesses: HashMap<FunctionId, Vec<Value>>,
+    pub witnesses: HashMap<FunctionId, Vec<EffectFact>>,
     pub compiler_effects: HashMap<FunctionId, u8>,
-    pub panic_evidence: HashMap<FunctionId, Value>,
+    pub panic_evidence: HashMap<FunctionId, crate::semantic::type_checker::PanicEvidence>,
     // Keep operation sites separate so capability replacement scans stay bounded.
-    suspension_sites: HashMap<FunctionId, Vec<Value>>,
-    builtin_sites: HashMap<FunctionId, Vec<Value>>,
+    suspension_sites: HashMap<FunctionId, Vec<EffectFact>>,
+    builtin_sites: HashMap<FunctionId, Vec<EffectFact>>,
 }
 #[path = "flow.rs"]
 mod flow;
 use flow::Body;
 // Prefer an explicit allocation over an incidental panic path or a propagated
 // capability. Equal-ranked witnesses retain stable traversal order.
-fn explicit_allocation(operation: Option<&str>) -> bool {
-    matches!(
-        operation,
-        Some(
-            "array-allocation"
-                | "enum-allocation"
-                | "object-allocation"
-                | "object-literal-allocation"
-                | "string-concatenation"
-                | "lambda-environment"
-        )
-    )
-}
-fn prefer_allocation(effect: u8, candidate: &Value, existing: &Value) -> bool {
+fn prefer_allocation(effect: u8, candidate: &Witness, existing: &Witness) -> bool {
     effect == RuntimeEffects::MAY_ALLOCATE.bits()
-        && explicit_allocation(candidate["cause"]["operation"].as_str())
-        && !explicit_allocation(existing["cause"]["operation"].as_str())
+        && candidate
+            .operation()
+            .is_some_and(CapabilityOperation::explicit_allocation)
+        && !existing
+            .operation()
+            .is_some_and(CapabilityOperation::explicit_allocation)
 }
 impl Captured {
     pub(super) fn map_types(&mut self, normalize: impl Fn(&Type) -> Type) {
@@ -145,67 +145,87 @@ impl Captured {
     ) {
         // Zero bits keep presentation facts out of effect-state propagation.
         // RuntimeEffects retain the union, including panic-path allocation.
-        self.builtin_sites.entry(function).or_default().push(json!({
-            "effect": 0,
-            "paths": {"normal":{"may_allocate":"none"},
-                "panic":{"may_allocate":if may_panic {"may"} else {"none"}},
-                "scope":"builtin operation only; argument evaluation and recovered continuation excluded"},
-            "witness": {"kind":"builtin-effect-paths", "cause":{"span":span,
-                "operation":format!("String.{method}")},
-                "reason": if may_panic { "Normal byte access allocates nothing; an invalid offset allocates a panic message and payload. The conservative allocation bound is retained, including for GC rooting across recover()." }
-                    else { "Scalar String builtin allocates neither on its normal path nor on a panic path." }}
-        }));
+        let mut witness = Witness::new(WitnessKind::BuiltinEffectPaths);
+        witness.cause = Some(Cause::captured(
+            span,
+            CapabilityOperation::Other(format!("String.{method}")),
+        ));
+        witness.reason = Some(if may_panic {
+            "Normal byte access allocates nothing; an invalid offset allocates a panic message and payload. The conservative allocation bound is retained, including for GC rooting across recover()."
+        } else { "Scalar String builtin allocates neither on its normal path nor on a panic path." }.into());
+        self.builtin_sites.entry(function).or_default().push(EffectFact {
+            effect: 0, witness,
+            paths: Some(BuiltinPaths {
+                normal: AllocationPaths { may_allocate: AllocationPath::None },
+                panic: AllocationPaths { may_allocate: if may_panic { AllocationPath::May } else { AllocationPath::None } },
+                scope: "builtin operation only; argument evaluation and recovered continuation excluded".into(),
+                operation: None, location: None,
+            }),
+        });
     }
     pub fn channel_site(&mut self, function: FunctionId, span: Span, operation: &str) {
-        self.suspension_sites.entry(function).or_default().push(json!({
-            "effect": RuntimeEffects::MAY_SUSPEND.bits(),
-            "witness": {"kind":"runtime-capability", "certainty":"conservative-bound",
-                "cause":{"span":span,"operation":operation},
-                "reason":"May park the task when the channel cannot proceed; this is not evidence of blocking an OS thread."}
-        }));
+        let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+        witness.certainty = Some(Certainty::ConservativeBound);
+        witness.cause = Some(Cause::captured(span, operation.into()));
+        witness.reason = Some("May park the task when the channel cannot proceed; this is not evidence of blocking an OS thread.".into());
+        self.suspension_sites
+            .entry(function)
+            .or_default()
+            .push(EffectFact {
+                effect: RuntimeEffects::MAY_SUSPEND.bits(),
+                witness,
+                paths: None,
+            });
     }
     pub fn capability(&mut self, function: FunctionId, bits: u8, span: Span, operation: &str) {
+        let operation = CapabilityOperation::from(operation);
         let witnesses = self.witnesses.entry(function).or_default();
         for bit in 0..RuntimeEffects::BIT_COUNT {
             let effect = RuntimeEffects::from_bit(bit).bits();
             if bits & effect == 0 {
                 continue;
             }
-            let existing = witnesses.iter().position(|w| w["effect"] == effect);
+            let existing = witnesses.iter().position(|w| w.effect == effect);
             if existing.is_some_and(|i| {
+                let witness = &witnesses[i].witness;
                 let replace = matches!(
-                    witnesses[i]["witness"]["kind"].as_str(),
-                    Some("unavailable" | "external-boundary")
+                    witness.kind,
+                    WitnessKind::Unavailable | WitnessKind::ExternalBoundary
                 ) || (effect == RuntimeEffects::MAY_ALLOCATE.bits()
-                    && explicit_allocation(Some(operation))
-                    && !explicit_allocation(
-                        witnesses[i]["witness"]["cause"]["operation"].as_str(),
-                    ));
+                    && operation.explicit_allocation()
+                    && !witness
+                        .operation()
+                        .is_some_and(CapabilityOperation::explicit_allocation));
                 !replace
             }) {
                 continue;
             }
-            let mut value = json!({"effect":effect,"witness":{"kind":"runtime-capability","certainty":"conservative-bound","cause":{"span":span,"operation":operation}}});
-            if effect == RuntimeEffects::MAY_BLOCK.bits() && operation == "await" {
-                value["witness"]["reason"] = json!(
-                    "conservative await bound for the checked operand type: waiting may park or block depending on the selected lowering; this summary does not establish which path executes"
-                );
+            let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+            witness.certainty = Some(Certainty::ConservativeBound);
+            let mut cause = Cause::captured(span, operation.clone());
+            if effect == RuntimeEffects::MAY_BLOCK.bits() && operation == CapabilityOperation::Await
+            {
+                witness.reason = Some("conservative await bound for the checked operand type: waiting may park or block depending on the selected lowering; this summary does not establish which path executes".into());
             }
-            if operation == "array-length-null-panic" {
-                value["witness"]["reason"] = json!(
-                    "Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver (or a malformed negative length) reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary."
-                );
+            if operation == CapabilityOperation::ArrayLengthNullPanic {
+                witness.reason = Some("Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver (or a malformed negative length) reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary.".into());
                 if effect == RuntimeEffects::MAY_ALLOCATE.bits() {
-                    value["witness"]["cause"]["operation"] = json!("panic-payload-allocation");
+                    cause.operation = CapabilityOperation::PanicPayloadAllocation;
                 }
             }
+            witness.cause = Some(cause);
+            let value = EffectFact {
+                effect,
+                witness,
+                paths: None,
+            };
             if let Some(i) = existing {
                 witnesses[i] = value;
             } else {
                 witnesses.push(value);
             }
         }
-        witnesses.sort_by_key(|w| w["effect"].as_u64().unwrap());
+        witnesses.sort_by_key(|w| w.effect);
     }
     /// Attach the awaited operand type and explain the await's bound. `parks`
     /// is true when the async lowering is known to suspend the task instead of
@@ -229,26 +249,28 @@ impl Captured {
         };
         // Summary witnesses retain one representative per effect. Preserve each
         // await independently, including when a lock already owns that bit.
+        let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+        witness.certainty = Some(Certainty::ConservativeBound);
+        witness.cause = Some(Cause::captured(span, CapabilityOperation::Await));
+        witness.awaited_type = Some(operand.map(str::to_owned));
+        witness.reason = Some(reason.clone());
         self.suspension_sites
             .entry(function)
             .or_default()
-            .push(json!({
-                "effect": RuntimeEffects::MAY_SUSPEND.bits(),
-                "witness": {"kind":"runtime-capability", "certainty":"conservative-bound",
-                    "cause":{"span":span,"operation":"await"},
-                    "awaited_type":operand, "reason":reason}
-            }));
+            .push(EffectFact {
+                effect: RuntimeEffects::MAY_SUSPEND.bits(),
+                witness,
+                paths: None,
+            });
         if let Some(witnesses) = self.witnesses.get_mut(&function) {
-            let site = json!(span);
             for entry in witnesses {
-                let witness = &mut entry["witness"];
-                // Panic witnesses reconstruct spans without line/column caches.
-                if ["file_id", "start", "end"]
-                    .iter()
-                    .all(|key| witness["cause"]["span"][key] == site[key])
-                {
-                    witness["awaited_type"] = json!(operand);
-                    witness["reason"] = json!(reason);
+                let witness = &mut entry.witness;
+                if witness.cause.as_ref().is_some_and(|cause| {
+                    matches!(cause.source, CauseSource::Captured { span: site }
+                    if (site.file_id, site.start, site.end) == (span.file_id, span.start, span.end))
+                }) {
+                    witness.awaited_type = Some(operand.map(str::to_owned));
+                    witness.reason = Some(reason.clone());
                 }
             }
         }
@@ -264,19 +286,6 @@ impl Captured {
 }
 /// Status of one effect witness: a witness without a source location is
 /// `missing-source`; runtime capabilities are conservative bounds.
-fn evidence_status(witness: &Value) -> &'static str {
-    if witness["kind"] == "unavailable" {
-        "missing-witness"
-    } else if witness.get("cause").is_some() && !witness["cause"]["location"].is_object() {
-        "missing-source"
-    } else if witness["kind"] == "runtime-capability" {
-        "conservative-bound"
-    } else if witness["kind"] == "external-boundary" {
-        "external-boundary"
-    } else {
-        "compiler-fact"
-    }
-}
 #[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
@@ -289,6 +298,7 @@ pub(super) fn finish(
 ) -> Result<SemanticFacts> {
     let location = |span: Span| -> Result<Location> {
         Ok(Location {
+            display: None,
             path: paths
                 .get(&crate::module::ModuleId(span.file_id.0))
                 .context("semantic source")?
@@ -396,7 +406,7 @@ pub(super) fn finish(
                     .entry(caller.id.clone())
                     .or_default()
                     .push(UnresolvedCall {
-                        operation: operation.clone(),
+                        operation: operation.clone().into(),
                         location: location(*span)?,
                     });
             }
@@ -425,14 +435,9 @@ pub(super) fn finish(
         {
             let function = &functions[&resolve(unit, *id)].id;
             let mut local_witnesses = Vec::with_capacity(witnesses.len());
-            for mut witness in witnesses.iter().cloned() {
-                if let Some(w) = witness.get_mut("witness")
-                    && let Some(target) = w.as_object_mut().and_then(|w| w.remove("target_key"))
-                {
-                    let target: FunctionId = serde_json::from_value(target)?;
-                    // Unit-local compiler summaries can treat an imported
-                    // implementation as external. The completed snapshot owns
-                    // its body and propagates its actual evidence instead.
+            for mut fact in witnesses.iter().cloned() {
+                let w = &mut fact.witness;
+                if let Some(target) = w.target_key.take() {
                     if functions
                         .get(&resolve(unit, target))
                         .is_some_and(|function| {
@@ -444,43 +449,34 @@ pub(super) fn finish(
                     let Some(site) =
                         boundary_sites.get(&(resolve(unit, *id), resolve(unit, target)))
                     else {
-                        // This summary inherited the boundary from a callee.
-                        // Do not create a second, unlocated seed on the wrapper.
                         continue;
                     };
-                    w["cause"] = json!({"location":location(*site)?,"operation":"external-call"});
+                    let mut cause = Cause::captured(*site, CapabilityOperation::ExternalCall);
+                    cause.source = CauseSource::Located {
+                        location: Some(location(*site)?),
+                    };
+                    w.cause = Some(cause);
                 }
-                if let Some(w) = witness.get_mut("witness")
-                    && let Some(owner) = w.as_object_mut().and_then(|w| w.remove("owner_key"))
-                {
-                    let owner: FunctionId = serde_json::from_value(owner)?;
-                    if let Some(function) = functions.get(&resolve(unit, owner)) {
-                        w["owner"] = json!(function.id);
-                    } else {
-                        w["owner"] = json!(owner.to_string());
-                    }
-                }
-                if let Some(cause) = witness.get_mut("witness").and_then(|w| w.get_mut("cause"))
-                    && let Some(span) = cause.get("span")
-                {
-                    let span: Span = serde_json::from_value(span.clone())?;
-                    cause.as_object_mut().unwrap().remove("span");
-                    cause.as_object_mut().unwrap().insert(
-                        "location".into(),
-                        location(span)
-                            .ok()
-                            .map_or(Value::Null, |l| serde_json::to_value(l).unwrap()),
+                if let Some(owner) = w.owner_key.take() {
+                    w.owner = Some(
+                        functions
+                            .get(&resolve(unit, owner))
+                            .map_or_else(|| owner.to_string(), |function| function.id.clone()),
                     );
-                    // A `lock` statement's operand span becomes a location the
-                    // direct layer spells from source.
-                    if let Some(target) = cause.pointer_mut("/lock/target") {
-                        let span: Span = serde_json::from_value(target.take())?;
-                        *target = location(span)
-                            .ok()
-                            .map_or(Value::Null, |l| serde_json::to_value(l).unwrap());
+                }
+                if let Some(cause) = &mut w.cause
+                    && let CauseSource::Captured { span } = cause.source
+                {
+                    cause.source = CauseSource::Located {
+                        location: location(span).ok(),
+                    };
+                    if let Some(lock) = &mut cause.lock
+                        && let Some(SourcePoint::Captured(span)) = lock.target
+                    {
+                        lock.target = location(span).ok().map(SourcePoint::Located);
                     }
                 }
-                local_witnesses.push(witness);
+                local_witnesses.push(fact);
             }
             result
                 .witnesses
@@ -513,7 +509,7 @@ pub(super) fn finish(
             });
             let mut expressions = HashMap::new();
             for (span, ty, target, operation, node) in &body.expressions {
-                let key = (*span, operation.as_deref());
+                let key = (*span, operation.as_ref());
                 if let Some(&i) = expressions.get(&key) {
                     let expression: &mut Expression = &mut result.expressions[i];
                     if expression.occurrences.last() != Some(node) {
@@ -571,22 +567,45 @@ pub(super) fn local_ranges(locations: &[Location]) -> Vec<(&str, usize, usize)> 
 
 /// One source site/effect is one explanation, even when both the compiler
 /// and runtime ABI observed it. Keep source-less evidence independent.
-fn deduplicate_evidence(facts: &mut Vec<Value>) {
+trait EvidenceSite {
+    fn effect(&self) -> u8;
+    fn witness(&self) -> Option<&Witness>;
+}
+impl EvidenceSite for EffectFact {
+    fn effect(&self) -> u8 {
+        self.effect
+    }
+    fn witness(&self) -> Option<&Witness> {
+        Some(&self.witness)
+    }
+}
+impl EvidenceSite for ExplainedEffect {
+    fn effect(&self) -> u8 {
+        self.effect
+    }
+    fn witness(&self) -> Option<&Witness> {
+        self.witness.as_ref()
+    }
+}
+fn deduplicate_evidence<T: EvidenceSite>(facts: &mut Vec<T>) {
     let mut seen = HashMap::new();
-    let mut unique: Vec<Value> = Vec::with_capacity(facts.len());
+    let mut unique = Vec::with_capacity(facts.len());
     for fact in facts.drain(..) {
-        let location = &fact["witness"]["cause"]["location"];
-        if !location.is_object() {
+        let Some(location) = fact.witness().and_then(Witness::location) else {
             unique.push(fact);
             continue;
-        }
-        let key = (fact["effect"].as_u64(), location.to_string());
+        };
+        let key = (
+            fact.effect(),
+            location.path.clone(),
+            location.start,
+            location.end,
+        );
         if let Some(&index) = seen.get(&key) {
-            // Channel capability has the precise parking explanation and a
-            // canonical operation name, unlike the generic compiler wait fact.
-            if fact["witness"]["cause"]["operation"]
-                .as_str()
-                .is_some_and(|op| op.starts_with("channel-"))
+            if fact
+                .witness()
+                .and_then(Witness::operation)
+                .is_some_and(CapabilityOperation::channel)
             {
                 unique[index] = fact;
             }
@@ -697,8 +716,8 @@ fn indirect_reference_index(
         if r.role == "call"
             && let Some(&s) = symbols.get(&r.target)
             && matches!(
-                snapshot.semantic.symbols[s].kind.as_str(),
-                "binding" | "parameter"
+                snapshot.semantic.symbols[s].kind,
+                SymbolKind::Binding | SymbolKind::Parameter
             )
             && let Some(ty) = &snapshot.semantic.symbols[s].ty
         {
@@ -935,22 +954,58 @@ impl QuerySession {
             .map(|&i| &self.snapshot.semantic.symbols[i])
             .collect()
     }
-    fn symbol_values(&self, symbols: &[&symbols::Symbol]) -> Vec<Value> {
+    fn symbol_values(&self, symbols: &[&symbols::Symbol]) -> Vec<SymbolRecord> {
         symbols.iter().map(|s| self.names.symbol(s)).collect()
     }
-    fn symbol_at(&self, file: &str, byte: usize) -> Value {
+    pub(super) fn type_query(&mut self, file: String, byte: usize) -> QueryResult {
+        self.queries += 1;
+        self.type_at(file, byte)
+    }
+    pub(super) fn symbol_query(&mut self, function: &str) -> QueryResult {
+        self.queries += 1;
+        self.symbol_info(function)
+    }
+    pub(super) fn references_query(&mut self, function: &str) -> QueryResult {
+        self.queries += 1;
+        self.function_references(function)
+    }
+    pub(super) fn effects_query(&mut self, function: &str) -> QueryResult {
+        self.queries += 1;
+        self.effects(function)
+    }
+    pub(super) fn symbol_at_query(&mut self, file: &str, byte: usize) -> QueryResult {
+        self.queries += 1;
+        self.symbol_at(file, byte)
+    }
+    fn symbol_at(&self, file: &str, byte: usize) -> QueryResult {
         let symbols = self.symbols_at(file, byte);
         if symbols.is_empty() {
-            json!({"status":"unknown"})
+            QueryResult::empty(Status::Unknown)
         } else if symbols.len() == 1 {
-            json!({"status":"ok","symbol":self.names.symbol(symbols[0])})
-        } else if let Some(alias) = symbols.iter().find(|s| s.kind == "import") {
-            json!({"status":"ok","symbol":self.names.symbol(alias),"resolved_symbols":self.symbol_values(&symbols)})
+            QueryResult::symbol(
+                Status::Ok,
+                SymbolInfo::Declaration(self.names.symbol(symbols[0])),
+            )
+        } else if let Some(alias) = symbols.iter().find(|s| s.kind == SymbolKind::Import) {
+            QueryResult {
+                status: Status::Ok,
+                data: QueryData::Symbol {
+                    symbol: SymbolInfo::Declaration(self.names.symbol(alias)),
+                    resolved_symbols: Some(self.symbol_values(&symbols)),
+                },
+            }
         } else {
-            json!({"status":"ambiguous","symbols":self.symbol_values(&symbols)})
+            QueryResult {
+                status: Status::Ambiguous,
+                data: QueryData::Symbols {
+                    symbols: self.symbol_values(&symbols),
+                    total: None,
+                    truncated: None,
+                },
+            }
         }
     }
-    fn declared_type_at(&self, file: &str, byte: usize) -> Value {
+    fn declared_type_at(&self, file: &str, byte: usize) -> QueryResult {
         let symbols = self.symbols_at(file, byte);
         let typed: Vec<_> = symbols.iter().filter(|s| s.ty.is_some()).collect();
         if let Some(first) = typed.first() {
@@ -972,35 +1027,55 @@ impl QuerySession {
                     }
                     display
                 };
-                let mut result = json!({"status":"ok","type":first.ty,"type_display":display,"location":first.location});
+                let mut result = TypeRecord {
+                    ty: Some(first.ty.clone()),
+                    type_display: Some(display),
+                    location: first.location.clone(),
+                    payload: vec![],
+                    payload_display: vec![],
+                };
                 if let [only] = typed[..] {
-                    self.names.payload(only, &mut result);
+                    (result.payload, result.payload_display) = self.names.payload(only);
                 }
-                result
+                QueryResult {
+                    status: Status::Ok,
+                    data: QueryData::Type(result),
+                }
             } else {
-                json!({"status":"ambiguous","symbols":self.symbol_values(&symbols)})
+                QueryResult {
+                    status: Status::Ambiguous,
+                    data: QueryData::Symbols {
+                        symbols: self.symbol_values(&symbols),
+                        total: None,
+                        truncated: None,
+                    },
+                }
             }
         } else {
-            json!({"status":if symbols.is_empty(){"unknown"}else{"unanalyzed"}})
+            QueryResult::empty(if symbols.is_empty() {
+                Status::Unknown
+            } else {
+                Status::Unanalyzed
+            })
         }
     }
     /// Spell each acquired lock's operand type like `type` does, in the module
     /// of the locking body: one decode and render per lock witness.
-    fn present_lock_types(&self, facts: &mut [Value]) {
+    fn present_lock_types(&self, facts: &mut [ExplainedEffect]) {
         for fact in facts {
-            let module = fact["witness"]["owner"]
-                .as_str()
+            let Some(witness) = &mut fact.witness else {
+                continue;
+            };
+            let module = witness
+                .owner
+                .as_deref()
                 .and_then(|owner| self.functions.get(owner))
                 .and_then(|&i| self.snapshot.functions[i].identity.as_ref())
                 .map(|identity| identity.module.as_str());
-            let Some(lock) = fact.pointer_mut("/witness/cause/lock") else {
-                continue;
-            };
-            if let Some(ty) = lock
-                .get("type")
-                .and_then(|ty| serde_json::from_value::<Type>(ty.clone()).ok())
+            if let Some(lock) = witness.cause.as_mut().and_then(|cause| cause.lock.as_mut())
+                && let Some(ty) = &lock.ty
             {
-                lock["type_display"] = json!(self.names.render(&ty, module));
+                lock.type_display = Some(self.names.render(ty, module));
             }
         }
     }
@@ -1015,7 +1090,7 @@ impl QuerySession {
     /// (`fn() -> Option<Patient>` through `PQueue<Patient>`), not the
     /// declaration's generic signature. Callee tokens never nest, so the
     /// nearest token starting at or before `byte` is the only candidate.
-    fn typed_call_at(&self, file: &str, byte: usize, module: Option<&str>) -> Option<Value> {
+    fn typed_call_at(&self, file: &str, byte: usize, module: Option<&str>) -> Option<QueryResult> {
         let calls = self.typed_calls.get(file)?;
         let p = calls.partition_point(|&(start, _, _)| start <= byte);
         let &(_, end, i) = calls.get(p.checked_sub(1)?)?;
@@ -1025,7 +1100,16 @@ impl QuerySession {
         let r = &self.snapshot.semantic.references[i];
         let ty = r.ty.as_ref()?;
         let display = self.names.render(ty, module);
-        Some(json!({"status":"ok","type":ty,"type_display":display,"location":r.location}))
+        Some(QueryResult {
+            status: Status::Ok,
+            data: QueryData::Type(TypeRecord {
+                ty: Some(Some(ty.clone())),
+                type_display: Some(display),
+                location: Some(r.location.clone()),
+                payload: vec![],
+                payload_display: vec![],
+            }),
+        })
     }
     pub fn revision(&self) -> &str {
         &self.snapshot.revision
@@ -1060,11 +1144,21 @@ impl QuerySession {
                 limit,
                 ..
             } => self.matching_symbols(&name, &prefix, &module, &symbol_kind, limit),
-            QueryRequest::SymbolAt { file, byte, .. } => self.symbol_at(&file, byte),
-            QueryRequest::TypeAt { file, byte, .. } => self.type_at(file, byte),
-            QueryRequest::SymbolInfo { function, .. } => self.symbol_info(&function),
-            QueryRequest::References { function, .. } => self.function_references(&function),
-            QueryRequest::Effects { function, .. } => self.effects(&function),
+            QueryRequest::SymbolAt { file, byte, .. } => {
+                serde_json::to_value(self.symbol_at(&file, byte)).unwrap()
+            }
+            QueryRequest::TypeAt { file, byte, .. } => {
+                serde_json::to_value(self.type_at(file, byte)).unwrap()
+            }
+            QueryRequest::SymbolInfo { function, .. } => {
+                serde_json::to_value(self.symbol_info(&function)).unwrap()
+            }
+            QueryRequest::References { function, .. } => {
+                serde_json::to_value(self.function_references(&function)).unwrap()
+            }
+            QueryRequest::Effects { function, .. } => {
+                serde_json::to_value(self.effects(&function)).unwrap()
+            }
         };
         json!({"revision":self.revision(),"result":data})
     }
@@ -1077,6 +1171,7 @@ impl QuerySession {
         symbol_kind: &Option<String>,
         limit: Option<usize>,
     ) -> Value {
+        let symbol_kind = symbol_kind.as_deref().map(SymbolKind::from);
         let matched: Vec<_> = self
             .snapshot
             .semantic
@@ -1103,7 +1198,7 @@ impl QuerySession {
 
     /// The type answer at one source byte: the narrowest typing segment,
     /// falling back to the declared type of the symbol there.
-    fn type_at(&mut self, file: String, byte: usize) -> Value {
+    fn type_at(&mut self, file: String, byte: usize) -> QueryResult {
         let file = if Path::new(&file).is_absolute() {
             file
         } else {
@@ -1140,17 +1235,35 @@ impl QuerySession {
             return self.declared_type_at(&file, byte);
         };
         let Some(index) = index else {
-            return json!({"status":"ambiguous"});
+            return QueryResult::empty(Status::Ambiguous);
         };
         let e = &self.snapshot.semantic.expressions[index];
         if let Some(ty) = &e.ty {
             let module = self.expression_module(index);
             let display = self.names.render(ty, module);
-            json!({"status":"ok","type":ty,"type_display":display,"location":e.location})
+            QueryResult {
+                status: Status::Ok,
+                data: QueryData::Type(TypeRecord {
+                    ty: Some(Some(ty.clone())),
+                    type_display: Some(display),
+                    location: Some(e.location.clone()),
+                    payload: vec![],
+                    payload_display: vec![],
+                }),
+            }
         } else {
             let declared = self.declared_type_at(&file, byte);
-            if declared["status"] == "unknown" {
-                json!({"status":"unanalyzed","type":e.ty,"location":e.location})
+            if declared.status == Status::Unknown {
+                QueryResult {
+                    status: Status::Unanalyzed,
+                    data: QueryData::Type(TypeRecord {
+                        ty: Some(e.ty.clone()),
+                        type_display: None,
+                        location: Some(e.location.clone()),
+                        payload: vec![],
+                        payload_display: vec![],
+                    }),
+                }
             } else {
                 declared
             }
@@ -1165,7 +1278,7 @@ impl QuerySession {
         byte: usize,
         segment: &Segment,
         write: bool,
-    ) -> Option<Value> {
+    ) -> Option<QueryResult> {
         // The instantiated type is spelled in the calling body,
         // whose enclosing expression names its module.
         let caller = segment
@@ -1189,27 +1302,36 @@ impl QuerySession {
                     matches!(&s.ty, Some(Type::Named(head) | Type::Generic(head, _)) if head == name)
                 })
             });
-        (!instantiated
-            && (write || matches!(declared["status"].as_str(), Some("ok" | "ambiguous"))))
-        .then_some(declared)
+        (!instantiated && (write || matches!(declared.status, Status::Ok | Status::Ambiguous)))
+            .then_some(declared)
     }
 
-    fn symbol_info(&self, function: &str) -> Value {
+    fn symbol_info(&self, function: &str) -> QueryResult {
         match self.functions.get(function) {
             Some(&i) => {
                 let f = &self.snapshot.functions[i];
-                json!({"status":if f.synthetic {"unanalyzed"}else if f.locations.len()>1 {"ambiguous"}else{"ok"}, "symbol":f})
+                QueryResult::symbol(
+                    if f.synthetic {
+                        Status::Unanalyzed
+                    } else if f.locations.len() > 1 {
+                        Status::Ambiguous
+                    } else {
+                        Status::Ok
+                    },
+                    SymbolInfo::Function(f.into()),
+                )
             }
             None => match self.symbols.get(function) {
-                Some(&i) => {
-                    json!({"status":"ok","symbol":self.names.symbol(&self.snapshot.semantic.symbols[i])})
-                }
-                None => json!({"status":"unknown"}),
+                Some(&i) => QueryResult::symbol(
+                    Status::Ok,
+                    SymbolInfo::Declaration(self.names.symbol(&self.snapshot.semantic.symbols[i])),
+                ),
+                None => QueryResult::empty(Status::Unknown),
             },
         }
     }
 
-    fn function_references(&self, function: &str) -> Value {
+    fn function_references(&self, function: &str) -> QueryResult {
         if let Some(indices) = self
             .symbol_references
             .get(function)
@@ -1217,46 +1339,78 @@ impl QuerySession {
         {
             let mut references: Vec<_> = indices
                 .iter()
-                .map(|&i| &self.snapshot.semantic.references[i])
+                .map(|&i| ReferenceRecord::from(&self.snapshot.semantic.references[i]))
                 .collect();
-            references.sort_by_key(|r| (&r.location.path, r.location.start, r.location.end));
-            return json!({"status":"ok", "references":references, "coverage":"compiler-resolved"});
+            references.sort_by(|a, b| {
+                (&a.location.path, a.location.start, a.location.end).cmp(&(
+                    &b.location.path,
+                    b.location.start,
+                    b.location.end,
+                ))
+            });
+            return QueryResult {
+                status: Status::Ok,
+                data: QueryData::References {
+                    references,
+                    coverage: Some("compiler-resolved".into()),
+                    unresolved_candidates: None,
+                },
+            };
         }
         let Some(&root) = self.functions.get(function) else {
-            return json!({"status":if self.symbols.contains_key(function) {"ok"} else {"unknown"},"references":[]});
+            return QueryResult {
+                status: if self.symbols.contains_key(function) {
+                    Status::Ok
+                } else {
+                    Status::Unknown
+                },
+                data: QueryData::References {
+                    references: vec![],
+                    coverage: None,
+                    unresolved_candidates: None,
+                },
+            };
         };
         let refs = merge_reference_locations(self.call_references(function, root));
         let unresolved = self.signature_matched_candidates(function);
         let mut coverage = String::from("compiler-resolved");
-        if refs.iter().any(|r| r["certainty"] == "possible-dispatch") {
+        if refs
+            .iter()
+            .any(|r| r.certainty == Some(ReferenceCertainty::PossibleDispatch))
+        {
             coverage.push_str(" and possible virtual dispatch");
         }
         if !unresolved.is_empty() {
             coverage.push_str("; indirect candidates are signature-matched, not resolved");
         }
-        json!({"status":if unresolved.is_empty(){"ok"}else{"incomplete"}, "references":refs,
-            "unresolved_candidates":unresolved,"coverage":coverage})
+        QueryResult {
+            status: if unresolved.is_empty() {
+                Status::Ok
+            } else {
+                Status::Incomplete
+            },
+            data: QueryData::References {
+                references: refs,
+                unresolved_candidates: Some(unresolved),
+                coverage: Some(coverage),
+            },
+        }
     }
 
     /// Calls of `root` and of every override reachable through dispatch
     /// callers, then every compiler-resolved token of `function`.
-    fn call_references(&self, function: &str, root: usize) -> Vec<Value> {
+    fn call_references(&self, function: &str, root: usize) -> Vec<ReferenceRecord> {
         let mut seen = std::collections::HashSet::from([root]);
         let mut pending = vec![root];
         let mut refs = Vec::new();
         while let Some(i) = pending.pop() {
             if let Some(indices) = self.references.get(&self.snapshot.functions[i].id) {
                 for &j in indices {
-                    let mut reference =
-                        serde_json::to_value(&self.snapshot.semantic.expressions[j]).unwrap();
-                    reference["identity"] = json!(self.snapshot.functions[i].identity);
-                    reference["role"] = json!("call");
-                    reference["certainty"] = json!(if i == root {
-                        "resolved"
-                    } else {
-                        "possible-dispatch"
-                    });
-                    refs.push(reference);
+                    refs.push(ReferenceRecord::expression(
+                        &self.snapshot.semantic.expressions[j],
+                        &self.snapshot.functions[i],
+                        i == root,
+                    ));
                 }
             }
             for &caller in &self.dispatch_callers[i] {
@@ -1270,8 +1424,8 @@ impl QuerySession {
         if let Some(indices) = self.symbol_references.get(function) {
             for &index in indices {
                 let reference = &self.snapshot.semantic.references[index];
-                let mut value = serde_json::to_value(reference).unwrap();
-                value["certainty"] = json!("resolved");
+                let mut value = ReferenceRecord::from(reference);
+                value.certainty = Some(ReferenceCertainty::Resolved);
                 refs.push(value);
             }
         }
@@ -1279,7 +1433,7 @@ impl QuerySession {
     }
 
     /// Indirect calls through a value of the selected callable's type.
-    fn signature_matched_candidates(&self, function: &str) -> Vec<Value> {
+    fn signature_matched_candidates(&self, function: &str) -> Vec<ReferenceRecord> {
         self
             .symbols
             .get(function)
@@ -1288,27 +1442,38 @@ impl QuerySession {
             .into_iter()
             .flatten()
             .map(|&i| {
-                let mut candidate =
-                    serde_json::to_value(&self.snapshot.semantic.references[i]).unwrap();
-                candidate["certainty"] = json!("signature-matched");
-                candidate["reason"] = json!("Indirect call through a binding or parameter with the same function type as the selected callable; the target is not resolved.");
+                let mut candidate = ReferenceRecord::from(&self.snapshot.semantic.references[i]);
+                candidate.certainty = Some(ReferenceCertainty::SignatureMatched);
+                candidate.reason = Some("Indirect call through a binding or parameter with the same function type as the selected callable; the target is not resolved.".into());
                 candidate
             })
             .collect()
     }
 
-    fn effects(&mut self, function: &str) -> Value {
+    fn effects(&mut self, function: &str) -> QueryResult {
         let Some(&i) = self.functions.get(function) else {
-            return json!({"schema":effect_states::SCHEMA,"effects":effect_states::Analysis::unavailable(),"status":if self.symbols.contains_key(function) {"unanalyzed"} else {"unknown"},
-                "reason":if self.symbols.get(function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == "method") {
-                    "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
-                } else { "No executable body is available for this symbol in the selected source graph." }});
+            return QueryResult {
+                status: if self.symbols.contains_key(function) { Status::Unanalyzed } else { Status::Unknown },
+                data: QueryData::Effects(EffectResult {
+                    schema: effect_states::SCHEMA, effects: effect_states::Analysis::typed_unavailable(),
+                    reason: Some(if self.symbols.get(function).is_some_and(|&i| self.snapshot.semantic.symbols[i].kind == SymbolKind::Method) {
+                        "This interface contract has no executable body. Query an implementing method for its effects; dispatch effects depend on the implementation."
+                    } else { "No executable body is available for this symbol in the selected source graph." }.into()),
+                    assumptions: None, unknown_causes: None, bounds: None, effect_evidence: None,
+                    no_panic: None, witness: None, compiler_witnesses: None, meaning: None,
+                }),
+            };
         };
         let states = self
             .effect_states
             .get_or_insert_with(|| effect_states::Analysis::new(&self.snapshot))
-            .output(i);
-        let assumptions = self.effect_states.as_ref().unwrap().assumptions(i);
+            .typed_output(i);
+        let assumptions = self
+            .effect_states
+            .as_ref()
+            .unwrap()
+            .typed_assumptions(i)
+            .into_owned();
         let mut walk = EffectWalk::new(self, i);
         walk.run();
         let missing = walk.complete_missing_witnesses();
@@ -1330,23 +1495,30 @@ impl QuerySession {
         self.present_lock_types(&mut evidence);
         self.attach_call_chains(&witness, &mut evidence);
         let compiler_witnesses = self.local_compiler_witnesses(f);
-        json!({"schema":effect_states::SCHEMA,"effects":states,"assumptions":assumptions,
-            "status":if f.unknown{"unknown"}else if missing{"incomplete"}else{"ok"},
-            "reason":f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }), "unknown_causes":unknown_causes, "bounds":{"runtime":f.runtime_effects,"compiler":self.snapshot.semantic.compiler_effects.get(&f.id)},"effect_evidence":evidence, "no_panic":self.snapshot.semantic.panic_evidence.get(&f.id),
-            "witness":witness, "compiler_witnesses":compiler_witnesses,
-            "meaning":"compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"})
+        QueryResult {
+            status: if f.unknown { Status::Unknown } else if missing { Status::Incomplete } else { Status::Ok },
+            data: QueryData::Effects(EffectResult {
+                schema: effect_states::SCHEMA, effects: states, assumptions: Some(assumptions),
+                reason: f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }).map(str::to_owned),
+                unknown_causes: Some(unknown_causes), bounds: Some(EffectBounds { runtime: f.runtime_effects, compiler: self.snapshot.semantic.compiler_effects.get(&f.id).copied() }),
+                effect_evidence: Some(evidence), no_panic: Some(self.snapshot.semantic.panic_evidence.get(&f.id).cloned()),
+                witness: Some(witness), compiler_witnesses: Some(compiler_witnesses),
+                meaning: Some("compiler facts and conservative runtime capability bounds; indirect-call bounds cover checked function values in this workspace, not arbitrary values supplied by future callers; external business effects and predicate feasibility are not implied"),
+            }),
+        }
     }
 
     /// The traversal is a parent-before-child spanning tree. Share parent
     /// links, compress synthetic dispatch hops once, and materialize only the
     /// paths actually emitted as evidence.
-    fn attach_call_chains(&self, witness: &[Value], evidence: &mut [Value]) {
+    fn attach_call_chains(&self, witness: &[Traversal], evidence: &mut [ExplainedEffect]) {
         let mut parents = HashMap::new();
         let mut executable = HashMap::new();
         for node in witness {
-            let id = node["function"].as_str().unwrap();
-            let parent = node["via"]
-                .as_str()
+            let id = node.function.as_str();
+            let parent = node
+                .via
+                .as_deref()
                 .and_then(|id| executable.get(id).copied())
                 .flatten();
             if self
@@ -1361,107 +1533,95 @@ impl QuerySession {
             }
         }
         for fact in evidence {
-            let owner = fact["witness"]["owner"]
-                .as_str()
+            let owner = fact
+                .witness
+                .as_ref()
+                .and_then(|w| w.owner.as_deref())
                 .filter(|id| parents.contains_key(id))
-                .or_else(|| fact["via_function"].as_str());
+                .or(fact.via_function.as_deref());
             let mut chain = Vec::new();
             let mut cursor = owner;
             while let Some(id) = cursor {
                 let Some(parent) = parents.get(id) else { break };
-                chain.push(id);
+                chain.push(id.to_owned());
                 cursor = *parent;
             }
             chain.reverse();
             if !chain.is_empty() {
-                fact["call_chain"] = json!(chain);
+                fact.call_chain = Some(chain);
             }
         }
     }
 
     /// Compiler witnesses located inside `f`'s own source ranges.
-    fn local_compiler_witnesses(&self, f: &Function) -> Option<Vec<Value>> {
-        let mut compiler_witnesses = self.snapshot.semantic.witnesses.get(&f.id).cloned();
-        if let Some(facts) = &mut compiler_witnesses {
-            let ranges = local_ranges(&f.locations);
-            facts.retain(|fact| {
-                let w = &fact["witness"];
-                let loc = &w["cause"]["location"];
-                let (Some(path), Some(start), Some(end)) = (
-                    loc["path"].as_str(),
-                    loc["start"].as_u64(),
-                    loc["end"].as_u64(),
-                ) else {
-                    return false;
-                };
-                let index = ranges.partition_point(|&(p, s, _)| (p, s as u64) <= (path, start));
-                w["owner"].as_str().is_none_or(|owner| owner == f.id)
-                    && index.checked_sub(1).is_some_and(|index| {
-                        let (p, _, e) = ranges[index];
-                        p == path && start <= end && end <= e as u64
-                    })
-            });
-            deduplicate_evidence(facts);
-            self.present_lock_types(facts);
-            // Every evidence line carries a status, local ones too.
-            for fact in facts.iter_mut() {
-                fact["status"] = json!(evidence_status(&fact["witness"]));
-                if fact["witness"]["cause"]["operation"] == "await"
-                    || fact["witness"].get("awaited_type").is_some()
-                {
-                    fact["task_relationship"] = json!({"kind":"await", "function":f.id,
-                        "location":fact["witness"]["cause"]["location"]});
-                }
+    fn local_compiler_witnesses(&self, f: &Function) -> Option<Vec<ExplainedEffect>> {
+        let stored = self.snapshot.semantic.witnesses.get(&f.id)?;
+        let ranges = local_ranges(&f.locations);
+        let mut facts = Vec::with_capacity(stored.len());
+        for fact in stored {
+            let w = &fact.witness;
+            let Some(loc) = w.location() else {
+                continue;
+            };
+            let index =
+                ranges.partition_point(|&(p, s, _)| (p, s) <= (loc.path.as_str(), loc.start));
+            if w.owner.as_deref().is_some_and(|owner| owner != f.id)
+                || !index.checked_sub(1).is_some_and(|index| {
+                    let (p, _, e) = ranges[index];
+                    p == loc.path && loc.start <= loc.end && loc.end <= e
+                })
+            {
+                continue;
             }
+            let mut explained = ExplainedEffect::new(fact.effect, w.clone(), String::new());
+            explained.via_function = None;
+            explained.paths = fact.paths.clone();
+            if w.operation() == Some(&CapabilityOperation::Await) || w.awaited_type.is_some() {
+                explained.task_relationship = Some(TaskRelationship {
+                    kind: TaskKind::Await,
+                    function: f.id.clone(),
+                    location: w.location().cloned(),
+                    target: None,
+                    reason: None,
+                });
+            }
+            facts.push(explained);
         }
-        compiler_witnesses
+        deduplicate_evidence(&mut facts);
+        self.present_lock_types(&mut facts);
+        Some(facts)
     }
 }
 
 /// One source occurrence is reported once: a resolved fact outranks possible
 /// dispatch, and records merge their fields. Sorted by location.
-fn merge_reference_locations(refs: Vec<Value>) -> Vec<Value> {
+fn merge_reference_locations(refs: Vec<ReferenceRecord>) -> Vec<ReferenceRecord> {
     let mut by_location = HashMap::new();
-    let mut unique: Vec<Value> = Vec::with_capacity(refs.len());
+    let mut unique: Vec<ReferenceRecord> = Vec::with_capacity(refs.len());
     for reference in refs {
-        let key = reference["location"].to_string();
-        match by_location.get(&key) {
-            None => {
-                by_location.insert(key, unique.len());
+        let l = &reference.location;
+        let key = (l.path.clone(), l.start, l.end);
+        match by_location.entry(key) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(unique.len());
                 unique.push(reference);
             }
-            Some(&i) => {
-                let resolved =
-                    reference["certainty"] == "resolved" && unique[i]["certainty"] != "resolved";
-                let existing = unique[i].as_object_mut().unwrap();
-                for (field, value) in reference.as_object().unwrap() {
-                    if resolved && !value.is_null() {
-                        existing.insert(field.clone(), value.clone());
-                    } else {
-                        existing.entry(field.clone()).or_insert(value.clone());
-                    }
-                }
+            std::collections::hash_map::Entry::Occupied(entry) => {
+                unique[*entry.get()].merge(reference);
             }
         }
     }
     unique.sort_by(|a, b| {
-        let key = |v: &Value| {
-            (
-                v["location"]["start"].as_u64(),
-                v["location"]["end"].as_u64(),
-            )
-        };
-        a["location"]["path"]
-            .as_str()
-            .cmp(&b["location"]["path"].as_str())
-            .then_with(|| key(a).cmp(&key(b)))
+        let a = &a.location;
+        let b = &b.location;
+        (&a.path, a.start, a.end).cmp(&(&b.path, b.start, b.end))
     });
     unique
 }
 
 /// A deferred edge to a function value supplied from outside the queried
 /// function: target, reaching function, indirect-call origin and call site.
-type ForeignEdge = (usize, usize, usize, Option<Value>);
+type ForeignEdge = (usize, usize, usize, Option<TaskRelationship>);
 
 /// The evidence walk of one `Effects` query: breadth-first over callees of
 /// `root`, each body visited once.
@@ -1479,23 +1639,23 @@ struct EffectWalk<'a> {
     foreign: std::collections::VecDeque<ForeignEdge>,
     unlocated_foreign: std::collections::VecDeque<ForeignEdge>,
     origins: HashMap<usize, usize>,
-    call_sites: HashMap<usize, Option<Value>>,
-    task_routes: HashMap<usize, Value>,
+    call_sites: HashMap<usize, Option<Witness>>,
+    task_routes: HashMap<usize, TaskRelationship>,
     // Shared dispatch nodes carry a call site, not a task boundary. Only an
     // async executable candidate starts one.
-    dispatch_sites: HashMap<usize, Value>,
+    dispatch_sites: HashMap<usize, TaskRelationship>,
     // Prefer a synchronous path when a body is reachable both in this task
     // and in a spawned task. Each body still runs through the evidence walk
     // only once.
-    tasks: std::collections::VecDeque<(usize, usize, Value)>,
+    tasks: std::collections::VecDeque<(usize, usize, TaskRelationship)>,
     // Some compiler graph edges bypass a shared dispatch node. Defer these
     // until its source-bearing path has been visited.
     unlocated_tasks: std::collections::VecDeque<(usize, usize)>,
-    witness: Vec<Value>,
-    evidence: BTreeMap<u64, Value>,
-    unknown_causes: Vec<Value>,
-    suspension_sites: Vec<Value>,
-    builtin_sites: Vec<Value>,
+    witness: Vec<Traversal>,
+    evidence: BTreeMap<u8, ExplainedEffect>,
+    unknown_causes: Vec<UnknownCause>,
+    suspension_sites: Vec<ExplainedEffect>,
+    builtin_sites: Vec<ExplainedEffect>,
     edge_visits: usize,
 }
 impl<'a> EffectWalk<'a> {
@@ -1514,9 +1674,13 @@ impl<'a> EffectWalk<'a> {
             dispatch_sites: HashMap::new(),
             tasks: Default::default(),
             unlocated_tasks: Default::default(),
-            witness: vec![
-                json!({"function":f.id,"via":null,"reason":f.unknown_reason(),"unresolved":f.unresolved}),
-            ],
+            witness: vec![Traversal {
+                function: f.id.clone(),
+                via: None,
+                reason: f.unknown_reason().map(str::to_owned),
+                unresolved: f.unresolved.clone(),
+                runtime_effects: None,
+            }],
             evidence: BTreeMap::new(),
             unknown_causes: Vec::new(),
             suspension_sites: Vec::new(),
@@ -1535,9 +1699,15 @@ impl<'a> EffectWalk<'a> {
     }
 
     /// The witness line of `k` reached from `j`.
-    fn reached(&self, k: usize, j: usize) -> Value {
+    fn reached(&self, k: usize, j: usize) -> Traversal {
         let functions = &self.session.snapshot.functions;
-        json!({"function":functions[k].id,"via":functions[j].id,"runtime_effects":functions[k].runtime_effects,"reason":functions[k].unknown_reason(),"unresolved":functions[k].unresolved})
+        Traversal {
+            function: functions[k].id.clone(),
+            via: Some(functions[j].id.clone()),
+            runtime_effects: Some(functions[k].runtime_effects),
+            reason: functions[k].unknown_reason().map(str::to_owned),
+            unresolved: functions[k].unresolved.clone(),
+        }
     }
 
     /// Next body to visit: direct callees first, then spawned tasks, then
@@ -1566,14 +1736,16 @@ impl<'a> EffectWalk<'a> {
                 if let Some(route) = self.task_routes.get(&j) {
                     self.task_routes.insert(k, route.clone());
                 } else if session.async_functions.contains(&k) {
-                    let mut route = call.unwrap_or_else(|| {
-                        json!({
-                            "kind":"spawn", "function":session.snapshot.functions[j].id,
-                            "location":null,
-                            "reason":"No source call site is available for this async graph edge."
-                        })
+                    let mut route = call.unwrap_or_else(|| TaskRelationship {
+                        kind: TaskKind::Spawn,
+                        function: session.snapshot.functions[j].id.clone(),
+                        location: None,
+                        target: None,
+                        reason: Some(
+                            "No source call site is available for this async graph edge.".into(),
+                        ),
                     });
-                    route["target"] = json!(session.snapshot.functions[k].id);
+                    route.target = Some(session.snapshot.functions[k].id.clone());
                     self.task_routes.insert(k, route);
                 } else if session.snapshot.functions[k].synthetic
                     && let Some(call) = call
@@ -1588,9 +1760,15 @@ impl<'a> EffectWalk<'a> {
                 }
                 self.task_routes.insert(
                     k,
-                    json!({"kind":"spawn", "function":session.snapshot.functions[j].id,
-                    "target":session.snapshot.functions[k].id, "location":null,
-                    "reason":"No source call site is available for this async graph edge."}),
+                    TaskRelationship {
+                        kind: TaskKind::Spawn,
+                        function: session.snapshot.functions[j].id.clone(),
+                        target: Some(session.snapshot.functions[k].id.clone()),
+                        location: None,
+                        reason: Some(
+                            "No source call site is available for this async graph edge.".into(),
+                        ),
+                    },
                 );
                 self.witness.push(self.reached(k, j));
                 return Some((k, Some(j)));
@@ -1606,12 +1784,26 @@ impl<'a> EffectWalk<'a> {
         if cause.unknown
             && (!cause.unresolved.is_empty() || (cause.synthetic && session.callees[j].is_empty()))
         {
-            self.unknown_causes.push(json!({"function":cause.id,
-                "name":cause.name, "module":cause.module,
-                "locations":cause.locations, "unresolved":cause.unresolved,
-                "call_sites":session.snapshot.semantic.unresolved_calls.get(&cause.id),
-                "caller_location":if cause.locations.is_empty() { via.and_then(|v: usize| session.snapshot.functions[v].locations.first()) } else { None },
-                "reason":cause.unknown_reason()}));
+            self.unknown_causes.push(UnknownCause {
+                function: cause.id.clone(),
+                name: cause.name.clone(),
+                module: cause.module.clone(),
+                locations: cause.locations.clone(),
+                unresolved: cause.unresolved.clone(),
+                call_sites: session
+                    .snapshot
+                    .semantic
+                    .unresolved_calls
+                    .get(&cause.id)
+                    .cloned(),
+                caller_location: if cause.locations.is_empty() {
+                    via.and_then(|v| session.snapshot.functions[v].locations.first())
+                        .cloned()
+                } else {
+                    None
+                },
+                reason: cause.unknown_reason().map(str::to_owned),
+            });
         }
     }
 
@@ -1630,66 +1822,70 @@ impl<'a> EffectWalk<'a> {
             return;
         };
         for fact in facts {
-            let Some(effect) = fact["effect"].as_u64() else {
-                continue;
-            };
-            if effect == 0 && fact["witness"]["kind"] == "builtin-effect-paths" {
-                let mut paths = fact["paths"].clone();
-                paths["operation"] = fact["witness"]["cause"]["operation"].clone();
-                paths["location"] = fact["witness"]["cause"]["location"].clone();
-                self.builtin_sites.push(json!({"effect":0,
-                    "paths":paths,
-                    "status":evidence_status(&fact["witness"]),
-                    "via_function":session.snapshot.functions[j].id,
-                    "witness":fact["witness"]}));
+            let effect = fact.effect;
+            if effect == 0 && fact.witness.kind == WitnessKind::BuiltinEffectPaths {
+                let mut explained = ExplainedEffect::new(
+                    0,
+                    fact.witness.clone(),
+                    session.snapshot.functions[j].id.clone(),
+                );
+                explained.paths = fact.paths.clone().map(|mut paths| {
+                    paths.operation = fact.witness.operation().cloned();
+                    paths.location = Some(fact.witness.location().cloned());
+                    paths
+                });
+                self.builtin_sites.push(explained);
                 continue;
             }
-            let (fact, via_function) = match origin {
-                None => (fact, j),
+            let (witness, via_function) = match origin {
+                None => (&fact.witness, j),
                 Some(origin) => {
                     let site = self.call_sites.entry(origin).or_insert_with(|| {
-                        session
-                            .snapshot
-                            .semantic
-                            .witnesses
-                            .get(&session.snapshot.functions[origin].id)?
-                            .iter()
-                            .find(|fact| fact["witness"]["cause"]["operation"] == "indirect-call")
+                        session.snapshot.semantic.witnesses.get(&session.snapshot.functions[origin].id)?
+                            .iter().find(|fact| fact.witness.operation() == Some(&CapabilityOperation::IndirectCall))
                             .map(|fact| {
-                                let mut witness = fact["witness"].clone();
-                                witness["reason"] = json!("Bound from function values reaching this indirect call; their bodies belong to the code that supplies them.");
-                                json!({"witness": witness})
+                                let mut witness = fact.witness.clone();
+                                witness.reason = Some("Bound from function values reaching this indirect call; their bodies belong to the code that supplies them.".into());
+                                witness
                             })
                     });
-                    // Without a recorded call site, the foreign
-                    // body remains the only available citation.
                     match site {
                         Some(site) => (&*site, origin),
-                        None => (fact, j),
+                        None => (&fact.witness, j),
                     }
                 }
             };
-            if f.runtime_effects & effect as u8 == 0 || fact["witness"]["kind"] == "unavailable" {
+            if f.runtime_effects & effect == 0 || witness.kind == WitnessKind::Unavailable {
                 continue;
             }
-            let suspension = effect == u64::from(RuntimeEffects::MAY_SUSPEND.bits());
+            let suspension = effect == RuntimeEffects::MAY_SUSPEND.bits();
             if !suspension
-                && self.evidence.get(&effect).is_some_and(|entry: &Value| {
-                    !prefer_allocation(effect as u8, &fact["witness"], &entry["witness"])
+                && self.evidence.get(&effect).is_some_and(|entry| {
+                    entry
+                        .witness
+                        .as_ref()
+                        .is_none_or(|existing| !prefer_allocation(effect, witness, existing))
                 })
             {
                 continue;
             }
-            let mut explained = json!({"effect":effect,
-                "status":evidence_status(&fact["witness"]),
-                "via_function":session.snapshot.functions[via_function].id,"witness":fact["witness"]});
+            let mut explained = ExplainedEffect::new(
+                effect,
+                witness.clone(),
+                session.snapshot.functions[via_function].id.clone(),
+            );
             if let Some(route) = self.task_routes.get(&j) {
-                explained["task_relationship"] = route.clone();
-            } else if fact["witness"]["cause"]["operation"] == "await"
-                || fact["witness"].get("awaited_type").is_some()
+                explained.task_relationship = Some(route.clone());
+            } else if witness.operation() == Some(&CapabilityOperation::Await)
+                || witness.awaited_type.is_some()
             {
-                explained["task_relationship"] = json!({"kind":"await", "function":session.snapshot.functions[via_function].id,
-                    "location":fact["witness"]["cause"]["location"]});
+                explained.task_relationship = Some(TaskRelationship {
+                    kind: TaskKind::Await,
+                    function: session.snapshot.functions[via_function].id.clone(),
+                    location: witness.location().cloned(),
+                    target: None,
+                    reason: None,
+                });
             }
             if suspension {
                 self.suspension_sites.push(explained);
@@ -1736,9 +1932,12 @@ impl<'a> EffectWalk<'a> {
             let call = if asynchronous || target.synthetic {
                 sites
                     .get(target.id.as_str())
-                    .map(|site| {
-                        json!({"kind":"spawn", "function":cause.id,
-                            "target":target.id, "location":site.location})
+                    .map(|site| TaskRelationship {
+                        kind: TaskKind::Spawn,
+                        function: cause.id.clone(),
+                        target: Some(target.id.clone()),
+                        location: Some(site.location.clone()),
+                        reason: None,
                     })
                     .or_else(|| self.dispatch_sites.get(&j).cloned())
             } else {
@@ -1755,7 +1954,7 @@ impl<'a> EffectWalk<'a> {
                 if asynchronous {
                     if let Some(mut route) = self.task_routes.get(&j).cloned().or(call) {
                         if !self.task_routes.contains_key(&j) {
-                            route["target"] = json!(target.id);
+                            route.target = Some(target.id.clone());
                         }
                         self.tasks.push_back((k, j, route));
                     } else {
@@ -1785,7 +1984,7 @@ impl<'a> EffectWalk<'a> {
             .evidence
             .values()
             .chain(&self.suspension_sites)
-            .any(|e| e["status"] == "missing-source");
+            .any(|e| e.status == Some(EvidenceStatus::MissingSource));
         for bit in 0..RuntimeEffects::BIT_COUNT {
             let effect = RuntimeEffects::from_bit(bit).bits();
             if f.runtime_effects & effect == 0
@@ -1794,14 +1993,16 @@ impl<'a> EffectWalk<'a> {
             {
                 continue;
             }
-            self.evidence.entry(effect as u64).or_insert_with(|| {
+            self.evidence.entry(effect).or_insert_with(|| {
                 missing = true;
-                json!({"effect":effect,"status":"missing-witness", "reason":
-                    if f.unknown {
+                ExplainedEffect { effect, status: Some(EvidenceStatus::MissingWitness), witness: None,
+                    via_function: None, paths: None, task_relationship: None, call_chain: None,
+                    reason: Some(if f.unknown {
                         "Retained as a conservative capability of an unresolved call or dispatch candidate; no operation witness is available. This does not prove that this function suspends or blocks, including when its declaration is synchronous."
                     } else {
                         "Retained from the compiler/runtime capability summary, but no operation witness is available. This is an upper bound, not proof that this function performs the effect."
-                    }})
+                    }.into()) }
+
             });
         }
         missing
@@ -1960,8 +2161,8 @@ impl RiskPaths {
             let Some(operation) = &e.operation else {
                 continue;
             };
-            let kind = if operation == "wait:timeout" { 1 }
-                else if (operation.starts_with("call:") || operation.starts_with("method:") || operation.starts_with("static:"))
+            let kind = if matches!(operation, Operation::Timeout) { 1 }
+                else if operation.is_call()
                     && e.ty.as_ref().is_some_and(|ty| matches!(ty, Type::Bool) || matches!(ty,Type::Generic(name,_) if Builtin::from_name(QualifiedName::new(name).last_segment()) == Some(Builtin::Result))) { 2 }
                 else { 0 };
             for &node in &e.occurrences {
@@ -2007,17 +2208,12 @@ impl RiskPaths {
             let Some(operation) = &e.operation else {
                 continue;
             };
-            if e.target.is_none()
-                && functions[e.function.as_str()].unknown
-                && (operation.starts_with("call:")
-                    || operation.starts_with("method:")
-                    || operation.starts_with("static:"))
-            {
+            if e.target.is_none() && functions[e.function.as_str()].unknown && operation.is_call() {
                 unresolved_retry_calls = true;
             }
             // One union per caller, not per repeated virtual call site. The
             // caller graph may include other calls, so this is only a candidate.
-            if operation.starts_with("method:") && dispatch_owners.insert(&e.function) {
+            if matches!(operation, Operation::Method(_)) && dispatch_owners.insert(&e.function) {
                 for target in &functions[e.function.as_str()].callees {
                     call_edge_visits += 1;
                     if !call_paths.contains_key(target) {
@@ -2075,7 +2271,7 @@ impl Snapshot {
         let baseline = RiskPaths::new(before, false);
         // Independent capacities preserve multiset matching without pairing an
         // unreachable duplicate with a reachable one based on source order.
-        let mut old = HashMap::<(&str, &str, &str), [usize; 3]>::new();
+        let mut old = HashMap::<(&str, &Operation, &str), [usize; 3]>::new();
         for e in &before.semantic.expressions {
             if let Some(operation) = &e.operation {
                 let (reachable, repeating) = baseline.state(e);
@@ -2125,8 +2321,7 @@ impl Snapshot {
         }
         for e in &self.semantic.expressions {
             if let Some(op) = &e.operation {
-                let direct_call =
-                    (op.starts_with("call:") || op.starts_with("static:")) && e.target.is_some();
+                let direct_call = op.is_direct_call() && e.target.is_some();
                 if !direct_call {
                     may_effect[index.by_id[e.function.as_str()]] = true;
                 }
@@ -2153,7 +2348,7 @@ impl Snapshot {
                 continue;
             };
             let count = old
-                .entry((&e.function, e.operation.as_deref().unwrap(), &e.fingerprint))
+                .entry((&e.function, e.operation.as_ref().unwrap(), &e.fingerprint))
                 .or_default();
             let new = count[0] == 0;
             count[0] = count[0].saturating_sub(1);
@@ -2184,8 +2379,8 @@ impl Snapshot {
                 .as_ref()
                 .and_then(|t| index.by_id.get(t.as_str()))
                 .is_some_and(|&i| !may_effect[i])
-                && (operation.starts_with("call:") || operation.starts_with("static:"));
-            let direct_effect = operation.starts_with("io:") || operation.starts_with("write:");
+                && operation.is_direct_call();
+            let direct_effect = matches!(operation, Operation::Io(_) | Operation::Write(_));
             operations.push(json!({"function":e.function,"location":e.location,"operation":operation,"new_operation":new,"new_execution":new_execution,"new_repetition":new_repetition,
                 "new_side_effect":if !new_effect {"not-new"}else if pure_call || !reachable_here {"proven-absent"}else if direct_effect {"proven-operation"}else{"conservative-candidate"},
                 "retry_reachability":if !flow.complete {"unanalyzed"}else if local_repeat {"structural-cycle"}else if inherited {"conservative-call-path"}else if unresolved_retry_calls {"unanalyzed"}else{"no-structural-cycle"},
@@ -2220,6 +2415,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(path, start, end)| Location {
+            display: None,
             path: path.into(),
             start,
             end,
@@ -2546,7 +2742,7 @@ mod tests {
                 .witnesses
                 .values()
                 .flatten()
-                .filter(|w| w["witness"]["kind"] == "external-boundary")
+                .filter(|w| w.witness.kind == WitnessKind::ExternalBoundary)
                 .count();
             assert_eq!(
                 seeds, n,
@@ -2739,7 +2935,7 @@ mod tests {
             // Presentation facts must have no influence on ANY internal bit or
             // effect-state propagation. Compare with those facts removed.
             for facts in baseline.semantic.witnesses.values_mut() {
-                facts.retain(|f| f.get("paths").is_none());
+                facts.retain(|f| f.paths.is_none());
             }
             let function = snapshot
                 .functions

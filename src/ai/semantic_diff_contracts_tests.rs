@@ -1,3 +1,4 @@
+use super::super::tests::wire;
 use super::*;
 use std::{fs, process::Command};
 fn git(root: &Path, args: &[&str]) -> String {
@@ -43,7 +44,7 @@ fn contract_policy_lock_and_source_changed_together_need_approval() {
     assert_eq!(initial.schema, "willow.semantic-diff.v4");
     assert_eq!(initial.exit_code(), 0, "{initial:?}");
     assert_eq!(
-        initial.summary["approval"]["contract_status"],
+        wire(&initial.summary)["approval"]["contract_status"],
         "contract_digest_unchanged"
     );
     fs::write(
@@ -57,13 +58,13 @@ fn contract_policy_lock_and_source_changed_together_need_approval() {
     p.write_lock = false;
     let second = verify(&o, &p).unwrap();
     assert_eq!(second.exit_code(), 1, "{second:?}");
-    assert_eq!(second.changes[0]["contract_preserved"], "PROVEN");
+    assert_eq!(wire(&second.changes[0])["contract_preserved"], "PROVEN");
     assert_eq!(
-        second.summary["approval"]["approval_status"],
+        wire(&second.summary)["approval"]["approval_status"],
         "approval_required"
     );
     assert_eq!(
-        second.summary["approval"]["specification_provenance"],
+        wire(&second.summary)["approval"]["specification_provenance"],
         "UNVERIFIED"
     );
     let again = verify(&o, &p).unwrap();
@@ -400,7 +401,7 @@ fn proof_no_panic_verify_edit_and_lock_evidence() {
     let legacy = super::super::verify(&o).unwrap();
     assert_eq!(legacy.exit_code(), 0, "{legacy:?}");
     assert!(
-        legacy.summary["no_panic"]
+        wire(&legacy.summary)["no_panic"]
             .to_string()
             .contains("solver-proof"),
         "{legacy:?}"
@@ -420,7 +421,9 @@ fn proof_no_panic_verify_edit_and_lock_evidence() {
     let report = super::super::verify(&o).unwrap();
     assert_ne!(report.exit_code(), 0, "{report:?}");
     assert!(
-        report.summary["diagnostics"].to_string().contains("E2610"),
+        wire(&report.summary)["diagnostics"]
+            .to_string()
+            .contains("E2610"),
         "{report:?}"
     );
 }
@@ -446,13 +449,16 @@ fn proof_no_panic_verify_edit_dependency_and_output_bounds() {
         assert_eq!(report.exit_code(), 0, "{report:?}");
         for side in ["base", "target"] {
             assert_eq!(
-                report.summary["no_panic"][side].as_object().unwrap().len(),
+                wire(&report.summary)["no_panic"][side]
+                    .as_object()
+                    .unwrap()
+                    .len(),
                 1
             );
         }
         println!(
             "proof-output unrelated={n} evidence_entries=2 bytes={}",
-            report.summary["no_panic"].to_string().len()
+            wire(&report.summary)["no_panic"].to_string().len()
         );
     }
     let (dir, mut options, _) = fixture();
@@ -465,13 +471,13 @@ fn proof_no_panic_verify_edit_dependency_and_output_bounds() {
     let report = super::super::verify(&options).unwrap();
     assert_ne!(report.exit_code(), 0, "{report:?}");
     assert!(
-        report.summary["diagnostics"]["target"]
+        wire(&report.summary)["diagnostics"]["target"]
             .to_string()
             .contains("E2610"),
         "{report:?}"
     );
     assert!(
-        report.summary["no_panic"]["target"]
+        wire(&report.summary)["no_panic"]["target"]
             .as_object()
             .unwrap()
             .values()

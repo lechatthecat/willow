@@ -60,8 +60,12 @@ pub struct Lock {
 pub struct Digests {
     pub contract: String,
     pub semantics: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub no_panic: Option<Json>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "crate::ai::evidence::present_nullable"
+    )]
+    pub no_panic: Option<Option<crate::semantic::type_checker::PanicEvidence>>,
 }
 impl Lock {
     pub fn digest(&self) -> String {
@@ -287,7 +291,6 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
                             .panic_evidence
                             .get(&crate::semantic::ids::FunctionId::free(&f.name))
                             .cloned()
-                            .unwrap_or(Json::Null)
                     }),
                 },
             )
@@ -315,8 +318,121 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum Preservation {
+    Unknown,
+    NotPreserved,
+    Proven,
+}
+impl Preservation {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "UNKNOWN",
+            Self::NotPreserved => "NOT_PRESERVED",
+            Self::Proven => "PROVEN",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum BehaviorEquivalence {
+    Unsupported,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ComparisonObligationKind {
+    RequiresDomain,
+    PreconditionNotStrengthened,
+    EnsuresDomain,
+    PostconditionNotWeakened,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SolverResult {
+    Sat,
+    Unsat,
+    Unknown,
+}
+impl From<Answer> for SolverResult {
+    fn from(answer: Answer) -> Self {
+        match answer {
+            Answer::Sat => Self::Sat,
+            Answer::Unsat => Self::Unsat,
+            Answer::Unknown => Self::Unknown,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonObligation {
+    pub counterexample_candidate: Option<String>,
+    pub expected_solver_result: SolverResult,
+    pub kind: ComparisonObligationKind,
+    pub result: SolverResult,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonPurity {
+    pub base_declared: bool,
+    pub base_proven: bool,
+    pub target_declared: bool,
+    pub target_proven: bool,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonVerification {
+    pub base: Option<Status>,
+    pub declaration_changed: bool,
+    pub target: Option<Status>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ProofDependencies {
+    pub digests: Vec<String>,
+    pub functions: Vec<String>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonDependencies {
+    pub base: Option<ProofDependencies>,
+    pub target: Option<ProofDependencies>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonChange {
+    pub base: Option<Digests>,
+    pub behavior_equivalent: BehaviorEquivalence,
+    pub contract_preserved: Preservation,
+    pub implementation_verified: bool,
+    pub input_symbols: BTreeMap<String, String>,
+    pub obligations: Vec<ComparisonObligation>,
+    pub proof_dependencies: ComparisonDependencies,
+    pub proof_dependencies_changed: bool,
+    pub purity: ComparisonPurity,
+    pub semantic_identity_changed: bool,
+    pub symbol: String,
+    pub target: Option<Digests>,
+    pub unknown_reasons: Vec<String>,
+    pub verification: ComparisonVerification,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ComparisonWork {
+    pub base_bytes: usize,
+    pub base_edges: usize,
+    pub comparison_queries: usize,
+    pub predicate_bytes: usize,
+    pub target_bytes: usize,
+    pub target_edges: usize,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Comparison {
+    pub changes: Vec<ComparisonChange>,
+    pub contract_violations: usize,
+    pub uncertainty: Vec<String>,
+    pub work: ComparisonWork,
+}
+
 pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
+    serde_json::to_value(compare_typed(a, b, options)).expect("contract comparison serializes")
+}
+
+#[allow(clippy::too_many_lines, reason = "split pending")]
+pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Comparison {
     let old: BTreeMap<_, _> = a
         .program
         .items
@@ -415,7 +531,7 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         {
             continue;
         }
-        let mut status = "UNKNOWN";
+        let mut status = Preservation::Unknown;
         let mut obligations = Vec::new();
         let mut reasons = Vec::new();
         let mut input_symbols = BTreeMap::new();
@@ -425,13 +541,13 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         let pure_b = fb.is_some_and(|f| has(f, EffectContractKind::Pure));
         if let (Some(fa), Some(fb)) = (fa, fb) {
             if signature(fa) != signature(fb) {
-                status = "NOT_PRESERVED";
+                status = Preservation::NotPreserved;
                 reasons.push("signature changed".to_owned());
             } else if data_changed {
-                status = "NOT_PRESERVED";
+                status = Preservation::NotPreserved;
                 reasons.push("data declarations or immutable domains changed".into());
             } else if pure_a && (!pure_b || b.purity_losses.contains(key)) {
-                status = "NOT_PRESERVED";
+                status = Preservation::NotPreserved;
                 reasons.push("purity guarantee lost".into());
             } else if a.errors.is_empty() && b.errors.is_empty() && a.purity_losses.is_empty() {
                 let result = (|| -> VerificationResult<bool> {
@@ -475,25 +591,30 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     let mut preserved = true;
                     for (kind, formula) in [
                         (
-                            "requires_domain",
+                            ComparisonObligationKind::RequiresDomain,
                             format!("(and {domain} (not (and {ps_a} {ps_b})))"),
                         ),
                         (
-                            "precondition_not_strengthened",
+                            ComparisonObligationKind::PreconditionNotStrengthened,
                             format!("(and {domain} {pre_a} (not {pre_b}))"),
                         ),
                         (
-                            "ensures_domain",
+                            ComparisonObligationKind::EnsuresDomain,
                             format!("(and {domain} {pre_a} (not (and {ss_a} {ss_b})))"),
                         ),
                         (
-                            "postcondition_not_weakened",
+                            ComparisonObligationKind::PostconditionNotWeakened,
                             format!("(and {domain} {pre_a} {post_b} (not {post_a}))"),
                         ),
                     ] {
                         comparison_queries += 1;
                         let (answer, candidate) = s.query(&formula, &args)?;
-                        obligations.push(json!({"kind":kind,"result":answer.as_str(),"expected_solver_result":Answer::Unsat.as_str(),"counterexample_candidate":candidate}));
+                        obligations.push(ComparisonObligation {
+                            kind,
+                            result: answer.into(),
+                            expected_solver_result: SolverResult::Unsat,
+                            counterexample_candidate: candidate,
+                        });
                         match answer {
                             Answer::Unknown => {
                                 return Err(
@@ -507,19 +628,19 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
                     Ok(preserved)
                 })();
                 match result {
-                    Ok(true) => status = "PROVEN",
-                    Ok(false) => status = "NOT_PRESERVED",
+                    Ok(true) => status = Preservation::Proven,
+                    Ok(false) => status = Preservation::NotPreserved,
                     Err(e) => reasons.push(e.message.into_owned()),
                 }
             }
         } else {
-            status = "NOT_PRESERVED";
+            status = Preservation::NotPreserved;
             reasons.push("declaration added or removed; no preservation claim".into());
         }
-        if status == "UNKNOWN" {
+        if status == Preservation::Unknown {
             unknown.push(format!("{key}: {}", reasons.join("; ")));
         }
-        if status == "NOT_PRESERVED" {
+        if status == Preservation::NotPreserved {
             violations += 1;
         }
         let proof_a = reports_a.get(key).map(|r| &r.status);
@@ -535,15 +656,60 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
         ) {
             violations += 1;
         }
-        if b.purity_losses.contains(key) && status != "NOT_PRESERVED" {
+        if b.purity_losses.contains(key) && status != Preservation::NotPreserved {
             violations += 1;
         }
         let da = a.lock.functions.get(key);
         let db = b.lock.functions.get(key);
-        changes.push(json!({"symbol":key,"contract_preserved":status,"implementation_verified":proof_b==Some(&Status::Proven),"behavior_equivalent":"UNSUPPORTED","purity":{"base_declared":pure_a,"target_declared":pure_b,"base_proven":pure_a && !a.purity_losses.contains(key) && a.errors.is_empty(),"target_proven":pure_b && !b.purity_losses.contains(key) && b.errors.is_empty()},"verification":{"base":proof_a,"target":proof_b,"declaration_changed":fa.is_some_and(|f|has(f,EffectContractKind::Verified))!=fb.is_some_and(|f|has(f,EffectContractKind::Verified))},"semantic_identity_changed":a.semantic_identities.get(key)!=b.semantic_identities.get(key),"proof_dependencies_changed":da.map(|d|&d.semantics)!=db.map(|d|&d.semantics),"proof_dependencies":{"base":reports_a.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests})),"target":reports_b.get(key).map(|r|json!({"functions":r.dependencies,"digests":r.dependency_digests}))},"base":da,"target":db,"obligations":obligations,"input_symbols":input_symbols,"unknown_reasons":reasons}));
+        let dependencies = |report: &&Report| ProofDependencies {
+            functions: report.dependencies.clone(),
+            digests: report.dependency_digests.clone(),
+        };
+        changes.push(ComparisonChange {
+            symbol: key.to_owned(),
+            contract_preserved: status,
+            implementation_verified: proof_b == Some(&Status::Proven),
+            behavior_equivalent: BehaviorEquivalence::Unsupported,
+            purity: ComparisonPurity {
+                base_declared: pure_a,
+                target_declared: pure_b,
+                base_proven: pure_a && !a.purity_losses.contains(key) && a.errors.is_empty(),
+                target_proven: pure_b && !b.purity_losses.contains(key) && b.errors.is_empty(),
+            },
+            verification: ComparisonVerification {
+                base: proof_a.cloned(),
+                target: proof_b.cloned(),
+                declaration_changed: fa.is_some_and(|f| has(f, EffectContractKind::Verified))
+                    != fb.is_some_and(|f| has(f, EffectContractKind::Verified)),
+            },
+            semantic_identity_changed: a.semantic_identities.get(key)
+                != b.semantic_identities.get(key),
+            proof_dependencies_changed: da.map(|d| &d.semantics) != db.map(|d| &d.semantics),
+            proof_dependencies: ComparisonDependencies {
+                base: reports_a.get(key).map(dependencies),
+                target: reports_b.get(key).map(dependencies),
+            },
+            base: da.cloned(),
+            target: db.cloned(),
+            obligations,
+            input_symbols,
+            unknown_reasons: reasons,
+        });
     }
     functions.clear();
-    json!({"changes":changes,"contract_violations":violations,"uncertainty":unknown,"work":{"comparison_queries":comparison_queries,"predicate_bytes":predicate_bytes,"base_edges":a.dependency_edges,"target_edges":b.dependency_edges,"base_bytes":a.canonical_bytes,"target_bytes":b.canonical_bytes}})
+    Comparison {
+        changes,
+        contract_violations: violations,
+        uncertainty: unknown,
+        work: ComparisonWork {
+            comparison_queries,
+            predicate_bytes,
+            base_edges: a.dependency_edges,
+            target_edges: b.dependency_edges,
+            base_bytes: a.canonical_bytes,
+            target_bytes: b.canonical_bytes,
+        },
+    }
 }
 
 #[cfg(test)]

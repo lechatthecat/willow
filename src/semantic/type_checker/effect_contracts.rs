@@ -5,6 +5,51 @@ use crate::semantic::call_graph::CallGraph;
 use crate::semantic::effects::{EffectFacts, RuntimeEffects};
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum PanicStatus {
+    Proven,
+    Unproven,
+}
+impl PanicStatus {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Proven => "PROVEN",
+            Self::Unproven => "UNPROVEN",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PanicBasis {
+    EffectAnalysis,
+    SolverProof,
+    Unproven,
+}
+impl PanicBasis {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::EffectAnalysis => "effect-analysis",
+            Self::SolverProof => "solver-proof",
+            Self::Unproven => "unproven",
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeChecks {
+    Retained,
+}
+/// Evidence for the entry contract; runtime guards remain in generated code.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PanicEvidence {
+    pub basis: PanicBasis,
+    pub contract_digest: Option<String>,
+    pub dependency_digests: Option<Vec<String>>,
+    pub runtime_checks: RuntimeChecks,
+    pub status: PanicStatus,
+}
+
 const CONTRACT_BITS: [RuntimeEffects; 6] = [
     RuntimeEffects::MAY_BLOCK,
     RuntimeEffects::MAY_SUSPEND,
@@ -1090,6 +1135,48 @@ impl TypeChecker {
         declarations
     }
 
+    fn record_panic_evidence(&mut self, facts: &EffectFacts<EffectWitness>) -> HashSet<FunctionId> {
+        // Runtime guards remain in generated code. A whole-function proof is
+        // conditional on this entry's requires; callers without their own proof
+        // must still account for those guards. Keep the exported lattice raw.
+        let proven: HashMap<_, _> = self
+            .verification
+            .reports
+            .iter()
+            .filter(|r| r.status == crate::semantic::verification::Status::Proven)
+            .map(|r| (FunctionId::free(&r.function), r))
+            .collect();
+        let panic = RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC);
+        self.panic_evidence = facts
+            .iter()
+            .map(|(&id, summary)| {
+                let report = proven.get(&id);
+                let effect_only = !summary.intersects(panic);
+                (
+                    id,
+                    PanicEvidence {
+                        status: if effect_only || report.is_some() {
+                            PanicStatus::Proven
+                        } else {
+                            PanicStatus::Unproven
+                        },
+                        basis: if effect_only {
+                            PanicBasis::EffectAnalysis
+                        } else if report.is_some() {
+                            PanicBasis::SolverProof
+                        } else {
+                            PanicBasis::Unproven
+                        },
+                        runtime_checks: RuntimeChecks::Retained,
+                        contract_digest: report.map(|r| r.contract_digest.clone()),
+                        dependency_digests: report.map(|r| r.dependency_digests.clone()),
+                    },
+                )
+            })
+            .collect();
+        proven.into_keys().collect()
+    }
+
     pub(super) fn report_effect_contracts(
         &mut self,
         program: &Program,
@@ -1130,29 +1217,7 @@ impl TypeChecker {
             facts,
             declarations.iter().map(|(id, _)| *id),
         );
-        // Runtime guards remain in generated code. A whole-function proof is
-        // conditional on this entry's requires; callers without their own proof
-        // must still account for those guards. Keep the exported lattice raw.
-        let proven: HashMap<_, _> = self
-            .verification
-            .reports
-            .iter()
-            .filter(|r| r.status == crate::semantic::verification::Status::Proven)
-            .map(|r| (FunctionId::free(&r.function), r))
-            .collect();
-        let panic = RuntimeEffects::MAY_PANIC.union(RuntimeEffects::MAY_CHECKED_PANIC);
-        self.panic_evidence = contract_facts.iter().map(|(&id, summary)| {
-            let report = proven.get(&id);
-            let effect_only = !summary.intersects(panic);
-            (id, serde_json::json!({
-                "status": if effect_only || report.is_some() { "PROVEN" } else { "UNPROVEN" },
-                "basis": if effect_only { "effect-analysis" } else if report.is_some() { "solver-proof" } else { "unproven" },
-                "runtime_checks": "retained",
-                "contract_digest": report.map(|r| &r.contract_digest),
-                "dependency_digests": report.map(|r| &r.dependency_digests),
-            }))
-        }).collect();
-        let proven: HashSet<_> = proven.into_keys().collect();
+        let proven = self.record_panic_evidence(&contract_facts);
         let contract_facts = std::sync::Arc::new(contract_facts);
         let facts = &contract_facts;
         let graph = &graph;
@@ -1283,8 +1348,8 @@ impl TypeChecker {
             if let Some(evidence) = self.panic_evidence.get(&id) {
                 diagnostic = diagnostic.with_note(format!(
                     "no_panic evidence: {} ({})",
-                    evidence["status"].as_str().unwrap_or("UNPROVEN"),
-                    evidence["basis"].as_str().unwrap_or("unproven")
+                    evidence.status.as_str(),
+                    evidence.basis.as_str()
                 ));
             }
             diagnostic = diagnostic.with_note(format!(

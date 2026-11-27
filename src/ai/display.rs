@@ -1,6 +1,7 @@
 //! Source-like type spellings for query results. The `ty` wire tree stays the
 //! compiler's exact value; `type_display` is a readable, canonical projection.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::qualified_name::QualifiedName;
 
 /// Canonical names: `$pkg<hash>::m::T` of the root package becomes `m::T`,
@@ -38,8 +39,12 @@ impl TypeNames {
                 QualifiedName::from_segments([package.as_str(), &identity.module, &identity.symbol])
             }
         };
-        let is_type =
-            |s: &symbols::Symbol| matches!(s.kind.as_str(), "class" | "enum" | "interface");
+        let is_type = |s: &symbols::Symbol| {
+            matches!(
+                s.kind,
+                SymbolKind::Class | SymbolKind::Enum | SymbolKind::Interface
+            )
+        };
         let mut local = HashMap::new();
         let mut imports = HashMap::new();
         let mut import_ids = HashMap::new();
@@ -52,7 +57,7 @@ impl TypeNames {
                     (identity.module.clone(), s.name.clone()),
                     canonical(identity),
                 );
-            } else if s.kind == "import" {
+            } else if s.kind == SymbolKind::Import {
                 if let Some(l) = &s.location {
                     imports.insert((&l.path, l.start, l.end), (&identity.module, &s.name));
                 }
@@ -216,13 +221,20 @@ impl TypeNames {
             // instantiation, not a generic declaration of its own.
             if matches!(ty, Type::Fn(..))
                 && !matches!(
-                    symbol.kind.as_str(),
-                    "field" | "binding" | "parameter" | "static" | "const"
+                    symbol.kind,
+                    SymbolKind::Field
+                        | SymbolKind::Binding
+                        | SymbolKind::Parameter
+                        | SymbolKind::Static
+                        | SymbolKind::Const
                 )
             {
                 display.insert_str(2, &binder);
             } else if matches!(ty, Type::Named(_))
-                && matches!(symbol.kind.as_str(), "class" | "interface" | "enum")
+                && matches!(
+                    symbol.kind,
+                    SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+                )
             {
                 display.push_str(&binder);
             }
@@ -233,34 +245,25 @@ impl TypeNames {
         display
     }
 
-    /// Serialize a declaration with its readable type beside the exact `ty`.
-    pub(super) fn symbol(&self, symbol: &symbols::Symbol) -> serde_json::Value {
-        let mut value = serde_json::to_value(symbol).expect("symbol serializes");
-        // Binders are snapshot storage; `type_display` presents them.
-        if let Some(object) = value.as_object_mut() {
-            object.remove("binders");
-        }
-        if let Some(ty) = &symbol.ty {
-            value["type_display"] = self.declaration(symbol, ty).into();
-        }
-        self.payload(symbol, &mut value);
-        value
+    /// Present a declaration without converting compiler facts to JSON.
+    pub(super) fn symbol(&self, symbol: &symbols::Symbol) -> query_result::SymbolRecord {
+        let mut result = query_result::SymbolRecord::from(symbol);
+        result.type_display = symbol.ty.as_ref().map(|ty| self.declaration(symbol, ty));
+        (result.payload, result.payload_display) = self.payload(symbol);
+        result
     }
 
-    /// A payload variant's value type is its enum; its payload types travel
-    /// beside it as exact `payload` and readable `payload_display` lists.
-    pub(super) fn payload(&self, symbol: &symbols::Symbol, value: &mut serde_json::Value) {
-        let payload = &symbol.details.payload;
-        if payload.is_empty() {
-            return;
-        }
+    pub(super) fn payload(&self, symbol: &symbols::Symbol) -> (Vec<Type>, Vec<String>) {
         let module = symbol.identity.as_ref().map(|i| i.module.as_str());
-        value["payload"] = serde_json::to_value(payload).expect("types serialize");
-        value["payload_display"] = payload
-            .iter()
-            .map(|ty| self.render(ty, module))
-            .collect::<Vec<_>>()
-            .into();
+        (
+            symbol.details.payload.clone(),
+            symbol
+                .details
+                .payload
+                .iter()
+                .map(|ty| self.render(ty, module))
+                .collect(),
+        )
     }
 }
 
@@ -287,6 +290,7 @@ mod tests {
                 Box::new(Type::I64),
             );
             let symbol = symbols::Symbol {
+                origin: Default::default(),
                 identity: None,
                 id: "generic".into(),
                 name: "generic".into(),
@@ -303,10 +307,14 @@ mod tests {
             let value = names().symbol(&symbol);
             assert_eq!(TYPE_VISITS.with(|count| count.get()), n + 2);
             assert_eq!(
-                value["type_display"],
-                format!("fn<{}>({}) -> i64", params.join(", "), params.join(", "))
+                value.type_display,
+                Some(format!(
+                    "fn<{}>({}) -> i64",
+                    params.join(", "),
+                    params.join(", ")
+                ))
             );
-            assert_eq!(value["ty"], serde_json::to_value(&ty).unwrap());
+            assert_eq!(value.ty.as_ref(), Some(&ty));
             assert_eq!(symbol.ty.as_ref(), Some(&ty));
             let mut asynchronous = symbol.clone();
             asynchronous.details.is_async = true;
@@ -314,10 +322,10 @@ mod tests {
             let async_value = names().symbol(&asynchronous);
             assert_eq!(TYPE_VISITS.with(|count| count.get()), n + 2);
             assert_eq!(
-                async_value["type_display"],
-                format!("async {}", value["type_display"].as_str().unwrap())
+                async_value.type_display,
+                Some(format!("async {}", value.type_display.as_deref().unwrap()))
             );
-            assert_eq!(async_value["ty"], value["ty"]);
+            assert_eq!(async_value.ty, value.ty);
         }
     }
 

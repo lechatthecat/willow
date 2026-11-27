@@ -1,6 +1,8 @@
 //! Compiler-owned bridge boundaries. Rust internals are deliberately opaque.
 use super::*;
+use crate::rust_bridge_ir::{NonblockingReview, Record, RustBridgeSymbol, Scalar};
 use serde_json::{Value, json};
+use std::borrow::Cow;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,50 +18,226 @@ pub struct InteropGraph {
 pub struct RustCrateIdentity {
     pub name: String,
     pub version: Option<String>,
-    pub source: Value,
+    pub source: RustCrateSource,
+}
+
+/// Known dependency source formats are typed; unknown externally supplied source
+/// metadata stays opaque and is returned without interpreting its contents.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum RustCrateSource {
+    Project(ProjectSource),
+    Local { kind: LocalSourceKind, path: String },
+    Remote(String),
+    Other(Value),
+}
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LocalSourceKind {
+    Local,
+}
+fn required_optional<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProjectSource {
+    #[serde(deserialize_with = "required_optional")]
+    pub git: Option<String>,
+    #[serde(deserialize_with = "required_optional")]
+    pub path: Option<String>,
+    #[serde(deserialize_with = "required_optional")]
+    pub registry: Option<String>,
+    #[serde(deserialize_with = "required_optional")]
+    pub rev: Option<String>,
+    #[serde(deserialize_with = "required_optional")]
+    pub tag: Option<String>,
+}
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BoundaryKind {
+    Rust,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct DependencyBoundary {
+    pub kind: BoundaryKind,
+    #[serde(rename = "crate")]
+    pub crate_identity: Option<RustCrateIdentity>,
+    pub crate_scope: &'static str,
+    pub bridge: String,
+    pub function: String,
+    pub identity: Option<SymbolIdentity>,
+    pub coverage: &'static str,
+}
+#[derive(Debug, Clone, Copy, Serialize)]
+pub enum BridgeKind {
+    #[serde(rename = "rust-bridge")]
+    RustBridge,
+}
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeStatus {
+    Ok,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BridgeEvidenceKind {
+    Assumption,
+    Unknown,
+}
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BridgeTrust {
+    DeveloperDeclared,
+    Undeclared,
+}
+#[derive(Serialize)]
+pub struct BridgeQuery<'a> {
+    pub schema: u32,
+    pub kind: BridgeKind,
+    pub status: BridgeStatus,
+    pub bridges: Vec<BridgeRecord<'a>>,
+    pub crate_candidates: &'a [RustCrateIdentity],
+}
+#[derive(Serialize)]
+pub struct BridgeSignature<'a> {
+    pub inputs: Cow<'a, [Scalar]>,
+    pub output: Cow<'a, Scalar>,
+}
+#[derive(Serialize)]
+pub struct BridgeAssumptions {
+    pub no_block: bool,
+    pub no_io: bool,
+}
+#[derive(Serialize)]
+pub struct AssumptionLocation {
+    pub path: Option<String>,
+    pub start: usize,
+    pub end: usize,
+}
+#[derive(Serialize)]
+pub struct BridgeRecord<'a> {
+    pub schema: u32,
+    pub kind: BridgeKind,
+    pub symbol: &'a str,
+    pub function: &'a str,
+    pub identity: &'a Option<SymbolIdentity>,
+    #[serde(rename = "crate")]
+    pub crate_identity: Option<&'a RustCrateIdentity>,
+    pub rust_adapter: &'a Option<String>,
+    pub abi_symbol: &'a str,
+    pub effects: u8,
+    #[serde(rename = "async")]
+    pub is_async: bool,
+    pub nonblocking: Option<&'a NonblockingReview>,
+    pub assume_no_block: bool,
+    pub no_io: bool,
+    pub assumptions: BridgeAssumptions,
+    pub review_current: bool,
+    pub evidence_kind: BridgeEvidenceKind,
+    pub assumption_location: Option<AssumptionLocation>,
+    pub trust: BridgeTrust,
+    pub official_verified: bool,
+    pub signature: BridgeSignature<'a>,
+    pub declaration: &'a [Location],
+    pub declaration_text: &'a str,
+    pub coverage: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub records: Option<Cow<'a, [Record]>>,
 }
 
 impl InteropGraph {
     pub fn query(&self, selector: Option<&str>) -> Value {
-        let bridges: Vec<_> = self
+        serde_json::to_value(self.query_typed(selector)).expect("bridge query serializes")
+    }
+    pub fn query_typed(&self, selector: Option<&str>) -> BridgeQuery<'_> {
+        let records: Vec<_> = self
             .bridges
             .iter()
             .filter(|b| selector.is_none_or(|s| s == b.function || s == b.symbol.willow_function))
-            .collect();
-        let records: Vec<_> = bridges.iter().map(|b| {
-            let mut record = json!({
-            "schema":2,"kind":"rust-bridge","symbol":b.symbol.willow_function,
-            "function":b.function,"identity":b.identity,
-            "crate": if self.crates.len() == 1 { json!(self.crates[0]) } else { Value::Null },
-            "rust_adapter":self.rust_adapter,
-            "abi_symbol":b.symbol.abi_symbol,
-            "effects":b.symbol.effects,
-            "async":b.symbol.is_async,
-            "nonblocking":if b.symbol.native.is_some() { None } else { b.symbol.nonblocking.as_ref() },
-            "assume_no_block":b.symbol.native.is_some() && b.symbol.nonblocking.is_some(),
-            "no_io":b.symbol.no_io,
-            "assumptions": {"no_block": b.symbol.nonblocking.is_some(), "no_io": b.symbol.no_io},
-            "review_current": b.symbol.review_current,
-            "evidence_kind": if b.symbol.review_current && b.symbol.has_assumptions() { "assumption" } else { "unknown" },
-            "assumption_location": b.symbol.assumption_span.map(|span| json!({"path":b.symbol.native.as_ref().map(|n| n.source_path.to_string_lossy().into_owned()).or_else(|| b.declaration.first().map(|l| l.path.clone())), "start":span.start,"end":span.end})),
-            "trust":if b.symbol.nonblocking.is_some() || b.symbol.no_io {"developer_declared"} else {"undeclared"},
-            "official_verified":false,
-            "signature":{"inputs":b.symbol.input_types,"output":b.symbol.output_type},
-            "declaration":b.declaration,"declaration_text":b.declaration_text,
-            "coverage":"conservative adapter dependency set; Rust internals are opaque"
-            });
-            if !b.symbol.records.is_empty() {
-                record["records"] = json!(b.symbol.records);
-            }
-            if b.symbol.native.is_some() {
-                native_signature_names(&b.symbol, &mut record["signature"]);
-                if let Some(records) = record.get_mut("records") {
-                    native_signature_names(&b.symbol, records);
+            .map(|b| {
+                let mut signature = BridgeSignature {
+                    inputs: Cow::Borrowed(b.symbol.input_types.as_slice()),
+                    output: Cow::Borrowed(&b.symbol.output_type),
+                };
+                let mut records = (!b.symbol.records.is_empty())
+                    .then(|| Cow::Borrowed(b.symbol.records.as_slice()));
+                if b.symbol.native.is_some() {
+                    native_signature_names(
+                        &b.symbol,
+                        signature.inputs.to_mut(),
+                        signature.output.to_mut(),
+                        records
+                            .as_mut()
+                            .map_or(&mut [], |records| records.to_mut().as_mut_slice()),
+                    );
                 }
-            }
-            record
-        }).collect();
-        json!({"schema":2,"kind":"rust-bridge","status":if selector.is_some() && records.is_empty() {"unknown"} else {"ok"},"bridges":records,"crate_candidates":self.crates})
+                BridgeRecord {
+                    schema: 2,
+                    kind: BridgeKind::RustBridge,
+                    symbol: &b.symbol.willow_function,
+                    function: &b.function,
+                    identity: &b.identity,
+                    crate_identity: (self.crates.len() == 1).then(|| &self.crates[0]),
+                    rust_adapter: &self.rust_adapter,
+                    abi_symbol: &b.symbol.abi_symbol,
+                    effects: b.symbol.effects,
+                    is_async: b.symbol.is_async,
+                    nonblocking: if b.symbol.native.is_some() {
+                        None
+                    } else {
+                        b.symbol.nonblocking.as_deref()
+                    },
+                    assume_no_block: b.symbol.native.is_some() && b.symbol.nonblocking.is_some(),
+                    no_io: b.symbol.no_io,
+                    assumptions: BridgeAssumptions {
+                        no_block: b.symbol.nonblocking.is_some(),
+                        no_io: b.symbol.no_io,
+                    },
+                    review_current: b.symbol.review_current,
+                    evidence_kind: if b.symbol.review_current && b.symbol.has_assumptions() {
+                        BridgeEvidenceKind::Assumption
+                    } else {
+                        BridgeEvidenceKind::Unknown
+                    },
+                    assumption_location: b.symbol.assumption_span.map(|span| AssumptionLocation {
+                        path: b
+                            .symbol
+                            .native
+                            .as_ref()
+                            .map(|n| n.source_path.to_string_lossy().into_owned())
+                            .or_else(|| b.declaration.first().map(|l| l.path.clone())),
+                        start: span.start,
+                        end: span.end,
+                    }),
+                    trust: if b.symbol.nonblocking.is_some() || b.symbol.no_io {
+                        BridgeTrust::DeveloperDeclared
+                    } else {
+                        BridgeTrust::Undeclared
+                    },
+                    official_verified: false,
+                    signature,
+                    declaration: &b.declaration,
+                    declaration_text: &b.declaration_text,
+                    coverage: "conservative adapter dependency set; Rust internals are opaque",
+                    records,
+                }
+            })
+            .collect();
+        BridgeQuery {
+            schema: 2,
+            kind: BridgeKind::RustBridge,
+            status: if selector.is_some() && records.is_empty() {
+                BridgeStatus::Unknown
+            } else {
+                BridgeStatus::Ok
+            },
+            bridges: records,
+            crate_candidates: &self.crates,
+        }
     }
 
     pub(crate) fn load_project(&mut self, root: &Path) -> Result<()> {
@@ -90,11 +268,27 @@ impl InteropGraph {
         } else {
             None
         };
-        self.crates = manifest.rust_dependencies.iter().map(|(name, spec)| RustCrateIdentity {
-            name:name.clone(),
-            version:lock.as_ref().and_then(|l| l.dependencies.get(name)).cloned(),
-            source:json!({"path":spec.path.as_ref().map(|p| root.join(p)),"git":spec.git,"rev":spec.rev,"tag":spec.tag,"registry":spec.version.as_ref().map(|_| "crates.io")}),
-        }).collect();
+        self.crates = manifest
+            .rust_dependencies
+            .iter()
+            .map(|(name, spec)| RustCrateIdentity {
+                name: name.clone(),
+                version: lock
+                    .as_ref()
+                    .and_then(|l| l.dependencies.get(name))
+                    .cloned(),
+                source: RustCrateSource::Project(ProjectSource {
+                    path: spec
+                        .path
+                        .as_ref()
+                        .map(|p| root.join(p).to_string_lossy().into_owned()),
+                    git: spec.git.clone(),
+                    rev: spec.rev.clone(),
+                    tag: spec.tag.clone(),
+                    registry: spec.version.as_ref().map(|_| "crates.io".into()),
+                }),
+            })
+            .collect();
         Ok(())
     }
 
@@ -115,25 +309,30 @@ impl InteropGraph {
                             .context("Rust crate version missing")?
                             .into(),
                     ),
-                    source: d["source"].clone(),
+                    source: serde_json::from_value(d["source"].clone())?,
                 })
             })
             .collect::<Result<_>>()?;
         Ok(())
     }
 
-    pub fn boundaries(&self, functions: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<Value> {
+    pub fn boundaries(
+        &self,
+        functions: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Vec<DependencyBoundary> {
         let reached: std::collections::HashSet<String> =
             functions.into_iter().map(|f| f.as_ref().into()).collect();
         self.bridges
             .iter()
             .filter(|b| reached.contains(&b.function))
-            .map(|b| {
-                json!({"kind":"rust",
-                "crate":if self.crates.len() == 1 { json!(self.crates[0]) } else { Value::Null },
-                "crate_scope":"rust_dependencies",
-                "bridge":b.symbol.willow_function,"function":b.function,"identity":b.identity,
-                "coverage":"conservative adapter dependency set"})
+            .map(|b| DependencyBoundary {
+                kind: BoundaryKind::Rust,
+                crate_identity: (self.crates.len() == 1).then(|| self.crates[0].clone()),
+                crate_scope: "rust_dependencies",
+                bridge: b.symbol.willow_function.clone(),
+                function: b.function.clone(),
+                identity: b.identity.clone(),
+                coverage: "conservative adapter dependency set",
             })
             .collect()
     }
@@ -141,28 +340,32 @@ impl InteropGraph {
 
 /// Wire names disambiguate independent Rust modules inside the generated crate.
 /// Query consumers need the qualified Willow names they can write in source.
-fn native_signature_names(symbol: &crate::rust_bridge_ir::RustBridgeSymbol, value: &mut Value) {
+fn native_signature_names(
+    symbol: &RustBridgeSymbol,
+    inputs: &mut [Scalar],
+    output: &mut Scalar,
+    records: &mut [Record],
+) {
     let namespace = crate::qualified_name::QualifiedName::new(&symbol.willow_function).qualifier();
-    let mut pending = vec![value];
-    while let Some(value) = pending.pop() {
-        match value {
-            Value::Array(values) => pending.extend(values),
-            Value::Object(values) => {
-                for (key, value) in values {
-                    if matches!(key.as_str(), "Record" | "Opaque" | "name")
-                        && let Value::String(name) = value
-                    {
-                        let local = symbol.willow_record_name(name);
-                        *name = namespace.map_or_else(
-                            || local.to_owned(),
-                            |namespace| {
-                                crate::qualified_name::QualifiedName::join(namespace, local)
-                            },
-                        );
-                    } else {
-                        pending.push(value);
-                    }
-                }
+    let rename = |name: &mut String| {
+        let local = symbol.willow_record_name(name);
+        *name = namespace.map_or_else(
+            || local.to_owned(),
+            |namespace| crate::qualified_name::QualifiedName::join(namespace, local),
+        );
+    };
+    let mut pending: Vec<_> = inputs.iter_mut().chain(std::iter::once(output)).collect();
+    for record in records {
+        rename(&mut record.name);
+        pending.extend(record.fields.iter_mut().map(|(_, ty)| ty));
+    }
+    while let Some(ty) = pending.pop() {
+        match ty {
+            Scalar::Record(name) | Scalar::Opaque(name) => rename(name),
+            Scalar::Array(inner) | Scalar::Option(inner) => pending.push(inner),
+            Scalar::Result(ok, error) => {
+                pending.push(ok);
+                pending.push(error);
             }
             _ => {}
         }
@@ -283,6 +486,35 @@ impl<'a> CallerIndex<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dependency_source_shapes_preserve_wire_bytes_and_unknown_fields() {
+        for wire in [
+            json!({"git":null,"path":"/work/native","registry":null,"rev":null,"tag":null}),
+            json!({"kind":"local","path":"/work/native"}),
+            json!("registry+https://example.invalid/index"),
+            json!(null),
+            json!({"path":"/work/native"}),
+            json!({"kind":"local","path":"/work/native","future":{"path":"other"}}),
+        ] {
+            let typed: RustCrateSource = serde_json::from_value(wire.clone()).unwrap();
+            assert_eq!(
+                serde_json::to_string(&typed).unwrap(),
+                serde_json::to_string(&wire).unwrap()
+            );
+        }
+        let project: RustCrateSource = serde_json::from_value(
+            json!({"git":null,"path":"/work/native","registry":null,"rev":null,"tag":null}),
+        )
+        .unwrap();
+        assert!(matches!(project, RustCrateSource::Project(_)));
+        let local: RustCrateSource =
+            serde_json::from_value(json!({"kind":"local","path":"/work/native"})).unwrap();
+        assert!(matches!(local, RustCrateSource::Local { .. }));
+        let partial: RustCrateSource =
+            serde_json::from_value(json!({"path":"/work/native"})).unwrap();
+        assert!(matches!(partial, RustCrateSource::Other(_)));
+    }
 
     #[test]
     fn native_query_uses_willow_names_in_nested_record_and_handle_types() {

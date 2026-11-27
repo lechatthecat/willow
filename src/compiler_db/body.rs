@@ -1,4 +1,5 @@
 //! Evictable body query values. Only artifact references remain resident.
+use super::incremental::SourceOwner;
 use super::normalize::{LambdaSplit, StdCollectionImports};
 use super::{ids::BodyIndex, query::QueryTable};
 use crate::parser::ast::{
@@ -803,7 +804,7 @@ impl BodyQueries {
             self.reused.set(self.reused.get() + 1);
         }
     }
-    pub(crate) fn source_body_changes(&self, unit: crate::module::UnitId) -> Vec<String> {
+    pub(crate) fn source_body_changes(&self, unit: crate::module::UnitId) -> Vec<SourceOwner> {
         self.tracking
             .borrow()
             .as_ref()
@@ -813,7 +814,7 @@ impl BodyQueries {
     pub(crate) fn source_owner_span(
         &self,
         unit: crate::module::UnitId,
-        owner: &str,
+        owner: &SourceOwner,
     ) -> Option<crate::diagnostics::Span> {
         self.tracking
             .borrow()
@@ -823,7 +824,7 @@ impl BodyQueries {
     pub(crate) fn effect_source_changes(
         &self,
         unit: crate::module::UnitId,
-    ) -> Option<Vec<(String, bool)>> {
+    ) -> Option<Vec<(SourceOwner, bool)>> {
         self.tracking
             .borrow()
             .as_ref()

@@ -2,12 +2,58 @@
 //! Two shared witnesses per callable bound propagation independently of the
 //! number of foreign declarations reachable through repeated calls or cycles.
 use super::{Snapshot, graph};
-use serde_json::{Value, json};
+use serde::Serialize;
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::VecDeque;
+
+/// Attribute spans can lack a source path; retain the nullable wire field.
+#[derive(Debug, Clone, Serialize)]
+pub struct AssumptionLocation {
+    #[serde(flatten)]
+    pub display: Option<Box<super::DisplayPosition>>,
+    pub end: usize,
+    pub path: Option<String>,
+    pub start: usize,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssumedEffect {
+    NoBlock,
+    NoIo,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssumptionKind {
+    Assumption,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Assumption {
+    pub effect: AssumedEffect,
+    pub function: String,
+    pub kind: AssumptionKind,
+    pub location: Option<AssumptionLocation>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct Assumptions<T = Assumption> {
+    pub no_block: Option<T>,
+    pub no_io: Option<T>,
+    pub no_wait: Option<T>,
+}
+impl Assumptions<&Assumption> {
+    pub fn into_owned(self) -> Assumptions {
+        Assumptions {
+            no_block: self.no_block.cloned(),
+            no_io: self.no_io.cloned(),
+            no_wait: self.no_wait.cloned(),
+        }
+    }
+}
 
 pub(crate) struct Analysis {
     witnesses: Vec<[Option<usize>; 2]>,
-    evidence: Vec<Value>,
+    evidence: Vec<Assumption>,
     pub edge_visits: usize,
 }
 
@@ -39,7 +85,14 @@ impl Analysis {
                 }
                 let declaration = bridge.declaration.first();
                 let location = bridge.symbol.assumption_span.map_or_else(
-                    || json!(declaration),
+                    || {
+                        declaration.map(|location| AssumptionLocation {
+                            display: None,
+                            path: Some(location.path.clone()),
+                            start: location.start,
+                            end: location.end,
+                        })
+                    },
                     |span| {
                         let path = bridge
                             .symbol
@@ -47,16 +100,21 @@ impl Analysis {
                             .as_ref()
                             .and_then(|native| native.source_path.to_str())
                             .or_else(|| declaration.map(|location| location.path.as_str()));
-                        json!({"path":path,"start":span.start,"end":span.end})
+                        Some(AssumptionLocation {
+                            display: None,
+                            path: path.map(str::to_owned),
+                            start: span.start,
+                            end: span.end,
+                        })
                     },
                 );
                 let witness = result.evidence.len();
-                result.evidence.push(json!({
-                    "kind":"assumption",
-                    "effect":(["no_block", "no_io"][effect]),
-                    "function":bridge.function,
-                    "location":location,
-                }));
+                result.evidence.push(Assumption {
+                    kind: AssumptionKind::Assumption,
+                    effect: [AssumedEffect::NoBlock, AssumedEffect::NoIo][effect],
+                    function: bridge.function.clone(),
+                    location,
+                });
                 result.witnesses[function][effect] = Some(witness);
             }
         }
@@ -89,13 +147,16 @@ impl Analysis {
 
     /// One representative dependency per asserted effect, not a success claim.
     /// Callers combine these with their checked contract/capability result.
-    pub fn output(&self, function: usize) -> Value {
+    pub fn typed_output(&self, function: usize) -> Assumptions<&Assumption> {
         let [block, io] = self.witnesses[function];
-        json!({
-            "no_block":block.map(|id| &self.evidence[id]),
-            "no_io":io.map(|id| &self.evidence[id]),
-            "no_wait":block.map(|id| &self.evidence[id]),
-        })
+        Assumptions {
+            no_block: block.map(|id| &self.evidence[id]),
+            no_io: io.map(|id| &self.evidence[id]),
+            no_wait: block.map(|id| &self.evidence[id]),
+        }
+    }
+    pub fn output(&self, function: usize) -> Value {
+        serde_json::to_value(self.typed_output(function)).expect("assumptions serialize")
     }
 }
 
@@ -140,6 +201,7 @@ mod tests {
             function: format!("f{function}"),
             identity: None,
             declaration: vec![crate::ai::Location {
+                display: None,
                 path: "native.rs".into(),
                 start: function * 100,
                 end: function * 100 + 50,

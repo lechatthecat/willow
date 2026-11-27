@@ -3,7 +3,139 @@ use super::*;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::analysis_symbols::{Declaration, Facts};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+/// Declaration categories used by semantic queries. Unknown wire spellings are
+/// retained for snapshot compatibility but never interpreted as a known kind.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SymbolKind {
+    Module,
+    Import,
+    Function,
+    Const,
+    Class,
+    Interface,
+    Enum,
+    Field,
+    StaticField,
+    Static,
+    Method,
+    Constructor,
+    Variant,
+    Parameter,
+    Binding,
+    TypeParameter,
+    BuiltinType,
+    BuiltinFunction,
+    BuiltinMethod,
+    Unknown(String),
+}
+
+impl SymbolKind {
+    /// Wire/display spelling; semantic decisions must match enum variants.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Module => "module",
+            Self::Import => "import",
+            Self::Function => "function",
+            Self::Const => "const",
+            Self::Class => "class",
+            Self::Interface => "interface",
+            Self::Enum => "enum",
+            Self::Field => "field",
+            Self::StaticField => "static-field",
+            Self::Static => "static",
+            Self::Method => "method",
+            Self::Constructor => "constructor",
+            Self::Variant => "variant",
+            Self::Parameter => "parameter",
+            Self::Binding => "binding",
+            Self::TypeParameter => "type-parameter",
+            Self::BuiltinType => "builtin-type",
+            Self::BuiltinFunction => "builtin-function",
+            Self::BuiltinMethod => "builtin-method",
+            Self::Unknown(value) => value,
+        }
+    }
+}
+
+impl SymbolKind {
+    fn known(value: &str) -> Option<Self> {
+        Some(match value {
+            "module" => Self::Module,
+            "import" => Self::Import,
+            "function" => Self::Function,
+            "const" => Self::Const,
+            "class" => Self::Class,
+            "interface" => Self::Interface,
+            "enum" => Self::Enum,
+            "field" => Self::Field,
+            "static-field" => Self::StaticField,
+            "static" => Self::Static,
+            "method" => Self::Method,
+            "constructor" => Self::Constructor,
+            "variant" => Self::Variant,
+            "parameter" => Self::Parameter,
+            "binding" => Self::Binding,
+            "type-parameter" => Self::TypeParameter,
+            "builtin-type" => Self::BuiltinType,
+            "builtin-function" => Self::BuiltinFunction,
+            "builtin-method" => Self::BuiltinMethod,
+            _ => return None,
+        })
+    }
+}
+
+impl From<String> for SymbolKind {
+    fn from(value: String) -> Self {
+        Self::known(&value).unwrap_or(Self::Unknown(value))
+    }
+}
+
+impl From<&str> for SymbolKind {
+    fn from(value: &str) -> Self {
+        Self::known(value).unwrap_or_else(|| Self::Unknown(value.to_owned()))
+    }
+}
+
+impl Ord for SymbolKind {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.as_str()
+            .cmp(other.as_str())
+            .then_with(|| matches!(self, Self::Unknown(_)).cmp(&matches!(other, Self::Unknown(_))))
+    }
+}
+
+impl PartialOrd for SymbolKind {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl std::fmt::Display for SymbolKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl Serialize for SymbolKind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for SymbolKind {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        String::deserialize(deserializer).map(Self::from)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SymbolOrigin {
+    #[default]
+    Source,
+    Builtin,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Symbol {
     #[serde(default)]
@@ -14,6 +146,8 @@ pub struct Symbol {
     /// display metadata, not an additional persisted semantic fact.
     #[serde(skip)]
     pub source_name: Option<String>,
+    #[serde(skip)]
+    pub origin: SymbolOrigin,
     /// Only the declaration binders persist: a restored snapshot must render
     /// declarations exactly like the live session.
     #[serde(
@@ -23,9 +157,47 @@ pub struct Symbol {
         with = "binders"
     )]
     pub details: DeclarationDetails,
-    pub kind: String,
+    pub kind: SymbolKind,
     pub location: Option<Location>,
     pub ty: Option<Type>,
+}
+
+impl Symbol {
+    pub fn is_builtin(&self) -> bool {
+        self.origin == SymbolOrigin::Builtin
+    }
+}
+
+impl<'de> Deserialize<'de> for Symbol {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Origin was historically encoded only in the stable ID. Decode it at
+        // the snapshot boundary so live consumers use the typed classification.
+        #[derive(Deserialize)]
+        #[serde(remote = "Symbol", deny_unknown_fields)]
+        struct StoredSymbol {
+            #[serde(default)]
+            identity: Option<SymbolIdentity>,
+            id: String,
+            name: String,
+            #[serde(skip)]
+            source_name: Option<String>,
+            #[serde(skip)]
+            origin: SymbolOrigin,
+            #[serde(default, rename = "binders", with = "binders")]
+            details: DeclarationDetails,
+            kind: SymbolKind,
+            location: Option<Location>,
+            ty: Option<Type>,
+        }
+
+        let mut symbol = StoredSymbol::deserialize(deserializer)?;
+        symbol.origin = if symbol.id.starts_with("builtin:") {
+            SymbolOrigin::Builtin
+        } else {
+            SymbolOrigin::Source
+        };
+        Ok(symbol)
+    }
 }
 /// Live declaration presentation metadata, captured before bodies are offloaded.
 /// It does not alter persisted symbol facts or selector identities.
@@ -466,7 +638,7 @@ pub(super) fn declarations_of<'a>(
         }
     }
     let mut declare = |name: &str, kind: &str, span: Span, ty: Option<Type>| {
-        let ty = if kind == "type-parameter" {
+        let ty = if SymbolKind::from(kind) == SymbolKind::TypeParameter {
             ty
         } else {
             types.get(&span).cloned().or(ty)
@@ -611,6 +783,7 @@ pub(super) fn select(
     }
     let (start, end) = occurrences[if last { end - 1 } else { start }];
     Some(Location {
+        display: None,
         path: paths.get(&unit)?.clone(),
         start,
         end,
@@ -647,6 +820,7 @@ pub(super) fn finish(
         .filter_map(|(span, owner)| {
             Some((
                 Location {
+                    display: None,
                     path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
                     start: span.start,
                     end: span.end,
@@ -680,6 +854,7 @@ pub(super) fn finish(
     let points: Vec<_> = declarations
         .iter()
         .map(|d| Location {
+            display: None,
             path: paths
                 .get(&crate::module::ModuleId(d.span.file_id.0))
                 .cloned()
@@ -698,13 +873,21 @@ pub(super) fn finish(
         let (_, owner_name): (serde::de::IgnoredAny, String) =
             serde_json::from_str(&owner).expect("compiler owner identity");
         let name = QualifiedName::new(&d.name).last_segment();
+        let kind = SymbolKind::from(d.kind.as_str());
         let source_name = if matches!(
-            d.kind.as_str(),
-            "field" | "static-field" | "variant" | "parameter" | "binding" | "type-parameter"
+            kind,
+            SymbolKind::Field
+                | SymbolKind::StaticField
+                | SymbolKind::Variant
+                | SymbolKind::Parameter
+                | SymbolKind::Binding
+                | SymbolKind::TypeParameter
         ) && owner_name != "module"
         {
             QualifiedName::join(&owner_name, name)
-        } else if matches!(d.kind.as_str(), "method" | "constructor") && owner_name != "module" {
+        } else if matches!(kind, SymbolKind::Method | SymbolKind::Constructor)
+            && owner_name != "module"
+        {
             owner_name
         } else {
             name.to_owned()
@@ -727,13 +910,14 @@ pub(super) fn finish(
     }
     let mut symbols = BTreeMap::new();
     let mut register = |d: &Declaration| {
+        let kind = SymbolKind::from(d.kind.as_str());
         // An import declares its final alias token, even when it repeats the
         // target spelling (`import m::value as value`).
-        let location = select(d.span, &d.name, d.kind == "import", names, paths);
+        let location = select(d.span, &d.name, kind == SymbolKind::Import, names, paths);
         let raw_path = paths.get(&crate::module::ModuleId(d.span.file_id.0));
         // Constructor overloads share a lowered dispatch function but remain distinct
         // source declarations. Keep their compiler owner/ordinal identities.
-        let function = if matches!(d.kind.as_str(), "function" | "method") {
+        let function = if matches!(kind, SymbolKind::Function | SymbolKind::Method) {
             raw_path
                 .and_then(|p| {
                     callable.get(&(
@@ -747,6 +931,11 @@ pub(super) fn finish(
         } else {
             None
         };
+        let origin = if function.is_none() && location.is_none() {
+            SymbolOrigin::Builtin
+        } else {
+            SymbolOrigin::Source
+        };
         let id = function
             .map(str::to_owned)
             .unwrap_or_else(|| match &location {
@@ -758,29 +947,30 @@ pub(super) fn finish(
             id: id.clone(),
             name: d.name.clone(),
             source_name: source_names.get(&declaration_key(d)).cloned(),
-            kind: if d.kind == "function"
+            origin,
+            kind: if kind == SymbolKind::Function
                 && captures
                     .get(&crate::module::ModuleId(d.span.file_id.0))
                     .and_then(|unit| unit.symbol_details.get(&d.span))
                     .is_some_and(|details| details.is_const)
             {
-                "const".into()
+                SymbolKind::Const
             } else {
-                d.kind.clone()
+                kind.clone()
             },
             // Type-parameter declarations share their container span. Do not
             // clone the whole generic parameter list onto each parameter.
             details: if matches!(
-                d.kind.as_str(),
-                "function"
-                    | "method"
-                    | "constructor"
-                    | "class"
-                    | "interface"
-                    | "enum"
-                    | "variant"
-                    | "field"
-                    | "static-field"
+                kind,
+                SymbolKind::Function
+                    | SymbolKind::Method
+                    | SymbolKind::Constructor
+                    | SymbolKind::Class
+                    | SymbolKind::Interface
+                    | SymbolKind::Enum
+                    | SymbolKind::Variant
+                    | SymbolKind::Field
+                    | SymbolKind::StaticField
             ) {
                 captures
                     .get(&crate::module::ModuleId(d.span.file_id.0))
@@ -817,6 +1007,7 @@ pub(super) fn finish(
                     // The type checker retains the member's exact parser token;
                     // no name search through the qualifier or payload is needed.
                     let location = Location {
+                        display: None,
                         path: path.clone(),
                         start: r.span.start,
                         end: r.span.end,
@@ -848,7 +1039,9 @@ pub(super) fn finish(
             // Method `member` evidence denotes calls, including receivers without
             // a separate expression-call record. Keep other kinds unchanged:
             // module constant reads also use `member` with a function target.
-            let role = if r.role == "member" && r.target.kind == "method" {
+            let role = if r.role == "member"
+                && SymbolKind::from(r.target.kind.as_str()) == SymbolKind::Method
+            {
                 "call"
             } else {
                 &r.role
@@ -901,6 +1094,94 @@ pub(super) fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn symbol_origin_restores_legacy_snapshots_without_wire_changes() {
+        for (wire, builtin) in [
+            (
+                r#"{"identity":null,"id":"builtin:builtin-type:i64","name":"i64","kind":"builtin-type","location":null,"ty":null}"#,
+                true,
+            ),
+            (
+                r#"{"identity":null,"id":"builtin:builtin-function:print","name":"print","kind":"builtin-function","location":null,"ty":null}"#,
+                true,
+            ),
+            (
+                r#"{"identity":null,"id":"symbol:example","name":"Example","binders":{"own":["T"],"owner":["U"]},"kind":"class","location":null,"ty":null}"#,
+                false,
+            ),
+            (
+                r#"{"identity":null,"id":"symbol:future","name":"future","kind":"future-kind","location":null,"ty":null}"#,
+                false,
+            ),
+        ] {
+            let mut symbol: Symbol = serde_json::from_str(wire).unwrap();
+            assert_eq!(symbol.is_builtin(), builtin);
+            assert_eq!(serde_json::to_string(&symbol).unwrap(), wire);
+            symbol.id = "changed-id".into();
+            assert_eq!(symbol.is_builtin(), builtin);
+        }
+        for extra in ["origin", "unexpected"] {
+            let wire = format!(
+                r#"{{"id":"symbol:example","name":"example","kind":"function","location":null,"ty":null,"{extra}":null}}"#
+            );
+            assert!(serde_json::from_str::<Symbol>(&wire).is_err());
+        }
+    }
+
+    #[test]
+    fn symbol_kinds_preserve_wire_spellings_and_unknown_values() {
+        for spelling in [
+            "module",
+            "import",
+            "function",
+            "const",
+            "class",
+            "interface",
+            "enum",
+            "field",
+            "static-field",
+            "method",
+            "constructor",
+            "variant",
+            "parameter",
+            "binding",
+            "type-parameter",
+            "builtin-method",
+            "future-kind",
+            "",
+            "日本語",
+        ] {
+            let wire = serde_json::to_string(spelling).unwrap();
+            let kind: SymbolKind = serde_json::from_str(&wire).unwrap();
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+            assert_eq!(kind.as_str(), spelling);
+            assert_eq!(kind, SymbolKind::from(spelling.to_owned()));
+        }
+        assert_eq!(SymbolKind::from("function"), SymbolKind::Function);
+        assert!(matches!(
+            SymbolKind::from("future-kind"),
+            SymbolKind::Unknown(_)
+        ));
+        let mut kinds = [
+            SymbolKind::StaticField,
+            SymbolKind::Function,
+            SymbolKind::Class,
+        ];
+        kinds.sort();
+        assert_eq!(
+            kinds,
+            [
+                SymbolKind::Class,
+                SymbolKind::Function,
+                SymbolKind::StaticField
+            ]
+        );
+        assert_ne!(
+            SymbolKind::Function.cmp(&SymbolKind::Unknown("function".into())),
+            std::cmp::Ordering::Equal
+        );
+    }
 
     #[test]
     fn generic_method_binders_share_owner_storage() {
@@ -1000,7 +1281,7 @@ mod tests {
             assert_eq!(
                 symbols
                     .iter()
-                    .find(|s| s.kind == "interface")
+                    .find(|s| s.kind == SymbolKind::Interface)
                     .unwrap()
                     .details
                     .type_params,

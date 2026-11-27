@@ -1,5 +1,6 @@
 //! Live semantic rename relationships and indexed source patches.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::lexer::{Lexer, token::TokenKind};
 use crate::qualified_name::QualifiedName;
 use crate::semantic::{analysis_symbols::Declaration, symbols::SymbolTable};
@@ -354,7 +355,10 @@ impl<'a> Index<'a> {
             .semantic
             .symbols
             .iter()
-            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter") && s.location.is_some())
+            .filter(|s| {
+                matches!(s.kind, SymbolKind::Binding | SymbolKind::Parameter)
+                    && s.location.is_some()
+            })
             .collect();
         let ranges: Vec<_> = snapshot
             .functions
@@ -489,8 +493,13 @@ impl<'a> Index<'a> {
     pub fn supports(&self, id: &str) -> bool {
         self.symbols.get(id).is_some_and(|s| {
             matches!(
-                s.kind.as_str(),
-                "method" | "field" | "static-field" | "variant" | "binding" | "parameter"
+                s.kind,
+                SymbolKind::Method
+                    | SymbolKind::Field
+                    | SymbolKind::StaticField
+                    | SymbolKind::Variant
+                    | SymbolKind::Binding
+                    | SymbolKind::Parameter
             )
         })
     }
@@ -510,7 +519,7 @@ impl<'a> Index<'a> {
             !self.renamed.contains(id),
             "duplicate rename of dispatch family"
         );
-        let local = matches!(selected.kind.as_str(), "binding" | "parameter");
+        let local = matches!(selected.kind, SymbolKind::Binding | SymbolKind::Parameter);
         if local {
             let range = self
                 .local_ranges
@@ -617,7 +626,7 @@ impl<'a> Index<'a> {
                 QualifiedName::new(symbol.source_name.as_deref().unwrap_or(&symbol.name))
                     .qualifier()
             };
-            let message = if selected.kind == "variant" {
+            let message = if selected.kind == SymbolKind::Variant {
                 format!(
                     "rename destination conflicts with a variant in enum {}",
                     owner(selected).unwrap_or("selected enum")
@@ -772,6 +781,7 @@ mod tests {
                     let id = format!("s{i}");
                     scopes.insert(id.clone(), vec![(i, i + 1)]);
                     symbols.push(symbols::Symbol {
+                        origin: Default::default(),
                         id,
                         identity: None,
                         source_name: None,
@@ -780,6 +790,7 @@ mod tests {
                         kind: kind.into(),
                         ty: None,
                         location: Some(Location {
+                            display: None,
                             path: path.clone(),
                             start: t.span.start,
                             end: t.span.end,
@@ -858,6 +869,7 @@ mod tests {
                     .collect();
                 let symbols: Vec<_> = (0..n)
                     .map(|i| symbols::Symbol {
+                        origin: Default::default(),
                         id: format!("s{i}"),
                         identity: None,
                         source_name: None,
@@ -866,6 +878,7 @@ mod tests {
                         kind: "method".into(),
                         ty: None,
                         location: Some(Location {
+                            display: None,
                             path: absolute.clone(),
                             start: spans[if shape == "shared" { 0 } else { 2 * i }].start,
                             end: spans[if shape == "shared" { 0 } else { 2 * i }].end,
@@ -879,6 +892,7 @@ mod tests {
                         role: "member".into(),
                         ty: None,
                         location: Location {
+                            display: None,
                             path: absolute.clone(),
                             start: spans[if shape == "shared" { i + 1 } else { 2 * i + 1 }].start,
                             end: spans[if shape == "shared" { i + 1 } else { 2 * i + 1 }].end,
@@ -969,6 +983,7 @@ mod tests {
                 .map(|t| &t.span)
                 .collect();
             let symbol = |id: String, name: &str, span: &Span| symbols::Symbol {
+                origin: Default::default(),
                 id,
                 identity: None,
                 source_name: None,
@@ -977,6 +992,7 @@ mod tests {
                 kind: "method".into(),
                 ty: None,
                 location: Some(Location {
+                    display: None,
                     path: absolute.clone(),
                     start: span.start,
                     end: span.end,

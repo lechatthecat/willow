@@ -38,6 +38,7 @@ constant_inventory_measure!(
     super::tracked::Durability,
     Source,
     BodyBinding,
+    SourceOwner,
     CompactJson,
     im::OrdSet<FunctionId>,
     im::HashSet<BodyId>
@@ -261,6 +262,85 @@ struct Source {
     text: String,
 }
 
+/// Classification accompanies the existing cache key; consumers never decode
+/// declaration kinds from that key. The serialized identity remains unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SourceOwnerKind {
+    Function,
+    Other,
+}
+#[derive(Debug, Clone)]
+pub(crate) struct SourceOwner {
+    wire: String,
+    kind: SourceOwnerKind,
+}
+impl SourceOwner {
+    pub(crate) fn function(name: &str) -> Self {
+        Self {
+            wire: format!("Function:{name}"),
+            kind: SourceOwnerKind::Function,
+        }
+    }
+    pub(crate) fn function_name(&self) -> Option<&str> {
+        match self.kind {
+            SourceOwnerKind::Function => Some(&self.wire["Function:".len()..]),
+            SourceOwnerKind::Other => None,
+        }
+    }
+    pub(crate) fn wire_key(&self) -> &str {
+        &self.wire
+    }
+}
+impl PartialEq for SourceOwner {
+    fn eq(&self, other: &Self) -> bool {
+        self.wire == other.wire
+    }
+}
+impl Eq for SourceOwner {}
+impl Ord for SourceOwner {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.wire.cmp(&other.wire)
+    }
+}
+impl PartialOrd for SourceOwner {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl std::hash::Hash for SourceOwner {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.wire.hash(state);
+    }
+}
+impl std::borrow::Borrow<str> for SourceOwner {
+    fn borrow(&self) -> &str {
+        self.wire_key()
+    }
+}
+impl serde::Serialize for SourceOwner {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.wire_key())
+    }
+}
+impl<'de> serde::Deserialize<'de> for SourceOwner {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = <String as serde::Deserialize>::deserialize(deserializer)?;
+        // Persisted caches use the original textual declaration keys. Decode
+        // their tag once at this boundary, just as AST capture supplies it below.
+        let kind = if wire.starts_with("Function:") {
+            SourceOwnerKind::Function
+        } else {
+            SourceOwnerKind::Other
+        };
+        Ok(Self { wire, kind })
+    }
+}
+impl Retained for SourceOwner {
+    fn heap_bytes(&self) -> usize {
+        self.wire.heap_bytes()
+    }
+}
+
 pub(crate) type TokenInventory = Vec<(String, Span)>;
 pub(crate) type TokenPairs = (TokenInventory, TokenInventory);
 
@@ -272,8 +352,8 @@ pub(crate) struct SyntaxQueries {
     pub(crate) dispatch_classes: InventoryMap<UnitId, std::collections::BTreeSet<String>>,
     captured: InventoryMap<PathBuf, Source>,
     source_paths: InventoryMap<UnitId, PathBuf>,
-    owner_changes: InventoryMap<PathBuf, Vec<(String, bool)>>,
-    source_body_changes: InventoryMap<PathBuf, Vec<String>>,
+    owner_changes: InventoryMap<PathBuf, Vec<(SourceOwner, bool)>>,
+    source_body_changes: InventoryMap<PathBuf, Vec<SourceOwner>>,
     advanced: bool,
     bodies: InventoryMap<BodyId, BodyBinding>,
     prepared: HashMap<BodyId, PreparedBody>,
@@ -683,19 +763,19 @@ impl SyntaxQueries {
         })
     }
     /// Source body deltas include unchecked templates, which have no TypedBody memo.
-    pub(crate) fn source_body_changes(&self, unit: UnitId) -> Vec<String> {
+    pub(crate) fn source_body_changes(&self, unit: UnitId) -> Vec<SourceOwner> {
         self.source_paths
             .get(&unit)
             .and_then(|path| self.source_body_changes.get(path))
             .cloned()
             .unwrap_or_default()
     }
-    pub(crate) fn source_owner_span(&self, unit: UnitId, owner: &str) -> Option<Span> {
+    pub(crate) fn source_owner_span(&self, unit: UnitId, owner: &SourceOwner) -> Option<Span> {
         let path = self.source_paths.get(&unit)?;
         let parsed = self.table.peek(&QueryNode::Parse(path.clone()))?;
         parsed.get::<ParsedValue>().owner_spans.get(owner).copied()
     }
-    pub(crate) fn effect_source_changes(&self, unit: UnitId) -> Option<Vec<(String, bool)>> {
+    pub(crate) fn effect_source_changes(&self, unit: UnitId) -> Option<Vec<(SourceOwner, bool)>> {
         let path = self.source_paths.get(&unit)?;
         if self
             .table
@@ -1280,11 +1360,11 @@ impl SyntaxQueries {
         // otherwise-equal syntax/signature query through one Parse dependency.
         for (owner, (signature, body)) in &parsed.owners {
             self.capture_input(
-                InputNode::SyntaxSignature(path.to_owned(), owner.clone()),
+                InputNode::SyntaxSignature(path.to_owned(), owner.wire_key().to_owned()),
                 signature.clone().into_query(),
             )?;
             self.capture_input(
-                InputNode::BodySyntax(path.to_owned(), owner.clone()),
+                InputNode::BodySyntax(path.to_owned(), owner.wire_key().to_owned()),
                 body.clone().into_query(),
             )?;
         }
@@ -1292,11 +1372,11 @@ impl SyntaxQueries {
             for owner in previous.get::<ParsedValue>().owners.keys() {
                 if !parsed.owners.contains_key(owner) {
                     self.capture_input(
-                        InputNode::SyntaxSignature(path.to_owned(), owner.clone()),
+                        InputNode::SyntaxSignature(path.to_owned(), owner.wire_key().to_owned()),
                         value(Value::Null)?,
                     )?;
                     self.capture_input(
-                        InputNode::BodySyntax(path.to_owned(), owner.clone()),
+                        InputNode::BodySyntax(path.to_owned(), owner.wire_key().to_owned()),
                         value(Value::Null)?,
                     )?;
                 }
@@ -1354,9 +1434,9 @@ struct ParsedValue {
     declarations: CompactJson,
     imports: CompactJson,
     // Precomputed per-owner projections keep lookups independent of file size.
-    owners: HashMap<String, (CompactJson, CompactJson)>,
+    owners: HashMap<SourceOwner, (CompactJson, CompactJson)>,
     #[serde(default)]
-    owner_spans: HashMap<String, Span>,
+    owner_spans: HashMap<SourceOwner, Span>,
 }
 impl PartialEq for ParsedValue {
     fn eq(&self, other: &Self) -> bool {
@@ -1493,7 +1573,12 @@ fn declarations(mut syntax: Value) -> Value {
     super::syntax::semantic(&syntax)
 }
 // One inventory per parse; projection lookups never scan the file again.
-fn index_declarations(items: &Value, prefix: &str, index: &mut serde_json::Map<String, Value>) {
+fn index_declarations(
+    items: &Value,
+    prefix: &str,
+    root_kind: Option<SourceOwnerKind>,
+    index: &mut std::collections::BTreeMap<SourceOwner, Value>,
+) {
     let Some(items) = items.as_array() else {
         return;
     };
@@ -1512,7 +1597,15 @@ fn index_declarations(items: &Value, prefix: &str, index: &mut serde_json::Map<S
             .get("name")
             .and_then(Value::as_str)
             .unwrap_or(&fallback);
-        let owner = format!("{prefix}{kind}:{name}");
+        let owner_kind = root_kind.unwrap_or(if kind == "Function" {
+            SourceOwnerKind::Function
+        } else {
+            SourceOwnerKind::Other
+        });
+        let owner = SourceOwner {
+            wire: format!("{prefix}{kind}:{name}"),
+            kind: owner_kind,
+        };
         let body = declaration
             .get("body")
             .or_else(|| declaration.get("default_body"))
@@ -1521,7 +1614,12 @@ fn index_declarations(items: &Value, prefix: &str, index: &mut serde_json::Map<S
             .unwrap_or(Value::Null);
         index.insert(owner.clone(), serde_json::json!({"signature": declarations(declaration.clone()), "body": super::syntax::semantic(&body), "span": declaration.get("span")}));
         for field in ["methods", "static_methods", "constructors", "fields"] {
-            index_declarations(&declaration[field], &format!("{owner}/{field}"), index);
+            index_declarations(
+                &declaration[field],
+                &format!("{}/{field}", owner.wire_key()),
+                Some(owner_kind),
+                index,
+            );
         }
     }
 }
@@ -1592,8 +1690,8 @@ impl QueryProvider for SyntaxProvider<'_> {
                     }
                 };
                 let parsed = serde_json::to_value((program, diagnostics, lexer_failed))?;
-                let mut index = serde_json::Map::new();
-                index_declarations(&parsed[0]["items"], "", &mut index);
+                let mut index = std::collections::BTreeMap::new();
+                index_declarations(&parsed[0]["items"], "", None, &mut index);
                 let owner_spans = index
                     .iter()
                     .filter_map(|(owner, projection)| {
@@ -1653,7 +1751,7 @@ impl QueryProvider for SyntaxProvider<'_> {
                 // An owner never observed in this file still has to track its
                 // possible future addition. A captured removal uses Null above.
                 let parsed = query_ready!(table.evaluate(self, QueryNode::Parse(path.clone())));
-                match parsed.get::<ParsedValue>().owners.get(owner) {
+                match parsed.get::<ParsedValue>().owners.get(owner.as_str()) {
                     Some((signature, body)) => {
                         Ok((if matches!(node, QueryNode::BodySyntax(_, _)) {
                             body
@@ -1859,6 +1957,50 @@ impl Retained for EffectInventoryValue {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_owner_classification_preserves_wire_keys_and_borrowed_lookup() {
+        for (key, function) in [
+            ("Function:f", Some("f")),
+            ("Function:名前", Some("名前")),
+            ("Function:f/methods:m", Some("f/methods:m")),
+            ("Class:C/methods:m", None),
+            ("Interface:I/methods:f", None),
+            ("FunctionLike:f", None),
+            ("", None),
+        ] {
+            let wire = serde_json::to_string(key).unwrap();
+            let owner: SourceOwner = serde_json::from_str(&wire).unwrap();
+            assert_eq!(owner.function_name(), function);
+            assert_eq!(owner.wire_key(), key);
+            assert_eq!(serde_json::to_string(&owner).unwrap(), wire);
+            let map = HashMap::from([(owner.clone(), 42)]);
+            assert_eq!(map.get(key), Some(&42));
+            let encoded = serde_json::to_value(&map).unwrap();
+            assert_eq!(encoded, serde_json::json!({key: 42}));
+            let restored: HashMap<SourceOwner, i32> = serde_json::from_value(encoded).unwrap();
+            assert_eq!(restored.get(key), Some(&42));
+            assert_eq!(restored.keys().next().unwrap().function_name(), function);
+            if let Some(name) = function {
+                assert_eq!(owner, SourceOwner::function(name));
+            }
+        }
+        let mut index = std::collections::BTreeMap::new();
+        index_declarations(
+            &serde_json::json!([
+                {"Function": {"name": "f", "body": null}},
+                {"Class": {"name": "C", "methods": [{"name": "m", "body": null}]}}
+            ]),
+            "",
+            None,
+            &mut index,
+        );
+        let function = index.get_key_value("Function:f").unwrap().0;
+        assert_eq!(function.function_name(), Some("f"));
+        let method = index.get_key_value("Class:C/methods:m").unwrap().0;
+        assert_eq!(method.function_name(), None);
+    }
+
     #[test]
     fn derived_typed_wire_ownership_schema_and_green_hits() {
         for size in [0, 1, 8, 64, 256] {
@@ -2183,11 +2325,11 @@ mod tests {
         next.parse(path, FileId::ENTRY, edited).unwrap();
         assert_eq!(
             next.source_body_changes(UnitId::ENTRY),
-            vec!["Function:identity"]
+            vec![SourceOwner::function("identity")]
         );
         assert!(next.changed_bodies_in(UnitId::ENTRY).is_empty());
         assert_eq!(
-            next.source_owner_span(UnitId::ENTRY, "Function:identity")
+            next.source_owner_span(UnitId::ENTRY, &SourceOwner::function("identity"))
                 .unwrap()
                 .start,
             edited.find("fn identity").unwrap()
@@ -2195,7 +2337,7 @@ mod tests {
         next.parse(path, FileId::ENTRY, edited).unwrap();
         assert_eq!(
             next.source_body_changes(UnitId::ENTRY),
-            vec!["Function:identity"]
+            vec![SourceOwner::function("identity")]
         );
         let mut moved = next.candidate().unwrap();
         let moved_source = format!("\n{edited}");
@@ -2203,7 +2345,7 @@ mod tests {
         assert!(moved.source_body_changes(UnitId::ENTRY).is_empty());
         assert_eq!(
             moved
-                .source_owner_span(UnitId::ENTRY, "Function:identity")
+                .source_owner_span(UnitId::ENTRY, &SourceOwner::function("identity"))
                 .unwrap()
                 .start,
             moved_source.find("fn identity").unwrap()
@@ -2212,11 +2354,11 @@ mod tests {
         removed.parse(path, FileId::ENTRY, "fn main() {}").unwrap();
         assert_eq!(
             removed.source_body_changes(UnitId::ENTRY),
-            vec!["Function:identity"]
+            vec![SourceOwner::function("identity")]
         );
         assert!(
             removed
-                .source_owner_span(UnitId::ENTRY, "Function:identity")
+                .source_owner_span(UnitId::ENTRY, &SourceOwner::function("identity"))
                 .is_none()
         );
     }

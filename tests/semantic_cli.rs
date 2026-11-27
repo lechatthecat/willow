@@ -4113,7 +4113,8 @@ fn generic_import_source_provenance_matches_project_and_standalone() {
                             .semantic
                             .symbols
                             .iter()
-                            .any(|s| s.kind == "builtin-type" && s.name == "coll"),
+                            .any(|s| s.kind == willow_compiler::ai::SymbolKind::BuiltinType
+                                && s.name == "coll"),
                         "phantom namespace for {import} project={project}"
                     );
                 }
@@ -4129,7 +4130,9 @@ fn generic_import_source_provenance_matches_project_and_standalone() {
                     .semantic
                     .symbols
                     .iter()
-                    .find(|s| s.name == "fold" && s.kind == "function")
+                    .find(|s| {
+                        s.name == "fold" && s.kind == willow_compiler::ai::SymbolKind::Function
+                    })
                     .unwrap();
                 let calls: Vec<_> = snapshot
                     .semantic

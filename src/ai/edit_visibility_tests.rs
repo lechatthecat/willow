@@ -210,7 +210,11 @@ fn process_kill_at_every_apply_boundary_recovers_the_correct_state() {
         );
         assert_eq!(
             w.load(&id).unwrap().state,
-            if committed { "applied" } else { "aborted" }
+            if committed {
+                PlanState::Applied
+            } else {
+                PlanState::Aborted
+            }
         );
         assert!(w.apply(&id, &mut crate::diagnostics::HumanEmitter).is_err());
         println!("killed stage={stage} committed={committed} files=4");

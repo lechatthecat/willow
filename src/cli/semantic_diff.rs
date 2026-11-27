@@ -117,23 +117,31 @@ pub(super) fn run(parsed: Result<VerifyEdit>) -> Result<i32> {
             return Ok(2);
         }
     };
-    let report = if let Some(policy) = policy {
-        contracts::verify(&options, &policy).unwrap_or_else(|error| {
-            let mut r = SemanticDiff::incomplete(format!("{error:#}"));
-            r.schema = "willow.semantic-diff.v4";
-            r
-        })
-    } else {
-        verify(&options).unwrap_or_else(|error| SemanticDiff::incomplete(format!("{error:#}")))
+    // The parsed policy selects a concrete report type. Rendering never needs
+    // to inspect its schema string, and neither report needs boxing or copying.
+    let (output, exit_code) = match policy {
+        Some(policy) => {
+            let report = contracts::verify(&options, &policy)
+                .unwrap_or_else(|error| contracts::incomplete(format!("{error:#}")));
+            let output = if json {
+                serde_json::to_string(&report)?
+            } else {
+                serde_json::to_string_pretty(&report)?
+            };
+            (format!("{output}\n"), report.exit_code())
+        }
+        None => {
+            let report = verify(&options)
+                .unwrap_or_else(|error| SemanticDiff::incomplete(format!("{error:#}")));
+            let output = if json {
+                format!("{}\n", serde_json::to_string(&report)?)
+            } else {
+                report.human(explain)
+            };
+            (output, report.exit_code())
+        }
     };
     use std::io::Write;
-    let output = if json {
-        format!("{}\n", serde_json::to_string(&report)?)
-    } else if report.schema == "willow.semantic-diff.v4" {
-        format!("{}\n", serde_json::to_string_pretty(&report)?)
-    } else {
-        report.human(explain)
-    };
     if std::io::stdout()
         .lock()
         .write_all(output.as_bytes())
@@ -141,7 +149,7 @@ pub(super) fn run(parsed: Result<VerifyEdit>) -> Result<i32> {
     {
         return Ok(3);
     }
-    Ok(report.exit_code())
+    Ok(exit_code)
 }
 
 #[cfg(test)]

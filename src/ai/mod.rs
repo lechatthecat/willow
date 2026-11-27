@@ -6,13 +6,16 @@ mod dispatch;
 mod display;
 pub mod edit;
 mod effect_states;
+pub mod evidence;
 pub(crate) mod generics;
 mod graph;
 mod indirect;
 mod interfaces;
 pub mod interop;
+pub mod operation;
 pub mod overview;
 mod packages;
+pub mod query_result;
 mod rename;
 pub mod verify;
 pub use packages::{ModuleEvidence, ModuleIdentity, SymbolIdentity, UpdateDelta};
@@ -26,10 +29,11 @@ pub(crate) use incremental_snapshot::{
     VerificationSnapshotUpdate, capture_incremental, incremental_snapshot,
 };
 pub(crate) mod symbols;
-pub use graph::{Direction, Impact, ImpactNode, Limits};
+pub use graph::{Direction, Impact, ImpactKind, ImpactNode, ImpactRelation, Limits};
 pub use semantic::{QueryRequest, QuerySession, SemanticFacts};
 pub(crate) use storage::check_size;
 pub use storage::{Difference, FunctionChange, compact_output_paths, expand_output_paths};
+pub use symbols::SymbolKind;
 
 use crate::qualified_name::QualifiedName;
 use crate::{
@@ -73,12 +77,20 @@ pub(crate) fn source_path(path: &Path) -> Result<std::path::PathBuf> {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(deny_unknown_fields)]
 pub struct Location {
     pub path: String,
     pub start: usize,
     pub end: usize,
+    #[serde(flatten)]
+    pub display: Option<Box<DisplayPosition>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct DisplayPosition {
+    pub line: usize,
+    pub column: usize,
 }
 
 /// The key is meaningful only with this snapshot's revision. Matching keys across
@@ -165,7 +177,7 @@ pub(crate) fn hash_serialized(value: &impl Serialize) -> Result<String> {
 
 pub(crate) fn capture_panic_evidence(
     unit: &mut CapturedUnit,
-    evidence: HashMap<FunctionId, serde_json::Value>,
+    evidence: HashMap<FunctionId, crate::semantic::type_checker::PanicEvidence>,
 ) {
     unit.semantic.panic_evidence = evidence;
 }
@@ -449,23 +461,58 @@ fn capture_compiler_effects(
             id,
             summary.effects().intersection(RuntimeEffects::ALL).bits(),
         );
+        use crate::compiler_db::effects::EffectWitness;
+        use evidence::{
+            CapabilityOperation as Op, Cause, CauseSource, EffectFact, LockRecord, SourcePoint,
+            Witness, WitnessKind as Kind,
+        };
         let witnesses = (0..RuntimeEffects::BIT_COUNT).filter_map(|bit| {
             let effect = RuntimeEffects::from_bit(bit);
             if !summary.contains(effect) { return None; }
             let witness = match summary.witness(effect) {
-                Some(crate::compiler_db::effects::EffectWitness::Lock(w)) => serde_json::json!({"kind":"wait", "owner_key":w.owner, "cause":w.cause}),
-                Some(crate::compiler_db::effects::EffectWitness::Panic {owner, source}) => serde_json::json!({"kind":"panic", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"panic-guard"}}),
-                Some(crate::compiler_db::effects::EffectWitness::Allocation {owner, source}) => serde_json::json!({"kind":"allocation", "owner_key":owner, "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0), "operation":"allocation"}}),
-                Some(crate::compiler_db::effects::EffectWitness::External(target)) => serde_json::json!({"kind":"external-boundary","target":target.to_string(),"target_key":target}),
-                Some(crate::compiler_db::effects::EffectWitness::Helper { reason, owner, source }) => serde_json::json!({"kind":"nonpreemptible", "owner_key":owner, "reason":format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"), "cause":{"span":Span::in_file(crate::diagnostics::FileId(source.0),source.1,source.2,0,0),"operation":match reason { crate::semantic::concurrency::NonpreemptibleReason::Loop => "synchronous-loop", crate::semantic::concurrency::NonpreemptibleReason::Recursion => "synchronous-recursion" }}}),
-                None => serde_json::json!({"kind":"unavailable"}),
+                Some(EffectWitness::Lock(w)) => {
+                    let mut witness = Witness::new(Kind::Wait);
+                    witness.owner_key = Some(w.owner);
+                    witness.cause = Some(Cause {
+                        source: CauseSource::Captured { span: w.cause.span },
+                        operation: Op::from(w.cause.operation.as_ref()),
+                        kind: Some(w.cause.kind),
+                        is_conservative: w.cause.is_conservative,
+                        lock: w.cause.lock.as_ref().map(|lock| Box::new(LockRecord {
+                            mode: lock.mode.as_ref().into(), target: Some(SourcePoint::Captured(lock.target)),
+                            ty: lock.r#type.clone(), type_display: None, expression: None,
+                        })),
+                    });
+                    witness
+                }
+                Some(EffectWitness::Panic {owner, source}) | Some(EffectWitness::Allocation {owner, source}) => {
+                    let panic = matches!(summary.witness(effect), Some(EffectWitness::Panic { .. }));
+                    let mut witness = Witness::new(if panic { Kind::Panic } else { Kind::Allocation });
+                    witness.owner_key = Some(*owner);
+                    witness.cause = Some(Cause::captured(Span::in_file(crate::diagnostics::FileId(source.0), source.1, source.2, 0, 0), if panic { Op::PanicGuard } else { Op::Allocation }));
+                    witness
+                }
+                Some(EffectWitness::External(target)) => {
+                    let mut witness = Witness::new(Kind::ExternalBoundary);
+                    witness.target = Some(target.to_string());
+                    witness.target_key = Some(*target);
+                    witness
+                }
+                Some(EffectWitness::Helper { reason, owner, source }) => {
+                    let mut witness = Witness::new(Kind::Nonpreemptible);
+                    witness.owner_key = Some(*owner);
+                    witness.reason = Some(format!("{reason:?}: synchronous helper may run in a nonpreemptible region; loop safepoints are separate potential preemption points, subject to runtime/platform gating"));
+                    witness.cause = Some(Cause::captured(Span::in_file(crate::diagnostics::FileId(source.0), source.1, source.2, 0, 0), match reason {
+                        crate::semantic::concurrency::NonpreemptibleReason::Loop => Op::SynchronousLoop,
+                        crate::semantic::concurrency::NonpreemptibleReason::Recursion => Op::SynchronousRecursion,
+                    }));
+                    witness
+                }
+                None => Witness::new(Kind::Unavailable),
             };
-            // Fixed-point witnesses may belong to a callee. Capture only
-            // this body's facts; query traversal explains transitive ones.
-            if witness.get("owner_key").is_some_and(|owner| *owner != serde_json::json!(id)) {
-                return None;
-            }
-            Some(serde_json::json!({"effect":effect.bits(), "witness":witness}))
+            if witness.owner_key.is_some_and(|owner| owner != id) { return None; }
+            // Keep compiler identities typed until snapshot source resolution.
+            Some(EffectFact { effect: effect.bits(), witness, paths: None })
         }).collect();
         result.semantic.witnesses.insert(id, witnesses);
     }
@@ -1582,6 +1629,7 @@ fn attach_rename_calls(
                 && let Some(path) = paths.get(&crate::module::ModuleId(span.file_id.0))
             {
                 node.rename_calls.push(Location {
+                    display: None,
                     path: path.clone(),
                     start: span.start,
                     end: span.end,
@@ -1645,11 +1693,13 @@ fn attach_declaration(
             node.body_location = paths
                 .get(&crate::module::ModuleId(body.file_id.0))
                 .map(|path| Location {
+                    display: None,
                     path: path.clone(),
                     start: body.start,
                     end: body.end,
                 });
             node.locations.push(Location {
+                display: None,
                 path: path.clone(),
                 start: span.start,
                 end: span.end,
@@ -1915,6 +1965,7 @@ fn attach_interface_calls(
                 .push(semantic::EffectCall {
                     target,
                     location: Location {
+                        display: None,
                         path: path.clone(),
                         start: span.start,
                         end: span.end,
@@ -1989,6 +2040,7 @@ fn attach_item_imports(
     for (unit, target, item, span) in item_imports {
         if let Some(&i) = by_source.get(&(paths[&target].clone(), item.to_owned())) {
             functions[i].rename_imports.push(Location {
+                display: None,
                 path: paths[&unit].clone(),
                 start: span.start,
                 end: span.end,
@@ -2167,6 +2219,7 @@ impl SymbolSources<'_> {
                 .filter_map(|(span, owner)| {
                     Some((
                         Location {
+                            display: None,
                             path: paths.get(&crate::module::ModuleId(span.file_id.0))?.clone(),
                             start: span.start,
                             end: span.end,

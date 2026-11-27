@@ -1,20 +1,84 @@
 //! Witness-backed effects, independent of conservative safety capability bits.
+use super::evidence::{CapabilityOperation, WitnessKind};
 use super::*;
-use serde_json::{Value, json};
+#[cfg(test)]
+use serde_json::Value;
+#[cfg(test)]
+use serde_json::json;
 use std::collections::VecDeque;
 
 pub const SCHEMA: &str = "willow.effects.v3";
 const COUNT: usize = RuntimeEffects::BIT_COUNT as usize;
 const MISSING_WITNESS: usize = 5;
-const REASONS: [&str; 7] = [
-    "indirect-call",
-    "unresolved-callee",
-    "incomplete-flow",
-    "missing-body",
-    "external-interop",
-    "missing-witness",
-    "missing-source",
+const REASONS: [UnknownReasonCode; 7] = [
+    UnknownReasonCode::IndirectCall,
+    UnknownReasonCode::UnresolvedCallee,
+    UnknownReasonCode::IncompleteFlow,
+    UnknownReasonCode::MissingBody,
+    UnknownReasonCode::ExternalInterop,
+    UnknownReasonCode::MissingWitness,
+    UnknownReasonCode::MissingSource,
 ];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnknownReasonCode {
+    IndirectCall,
+    UnresolvedCallee,
+    IncompleteFlow,
+    MissingBody,
+    ExternalInterop,
+    MissingWitness,
+    MissingSource,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum State {
+    May,
+    Unknown,
+    None,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidenceKind {
+    CompilerProven,
+    Unknown,
+    Assumption,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct UnknownReason {
+    pub code: UnknownReasonCode,
+    pub location: Option<Location>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct WitnessEvidence {
+    pub function: String,
+    pub location: Location,
+    pub operation: Option<CapabilityOperation>,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct EffectState<W = WitnessEvidence, R = UnknownReason, A = assumptions::Assumption> {
+    pub assumption: Option<A>,
+    pub effect: u8,
+    pub evidence_kind: EvidenceKind,
+    pub state: State,
+    pub unknown_reasons: Vec<R>,
+    pub witness: Option<W>,
+}
+type EffectView<'a> =
+    EffectState<&'a WitnessEvidence, &'a UnknownReason, &'a assumptions::Assumption>;
+impl EffectView<'_> {
+    fn into_owned(self) -> EffectState {
+        EffectState {
+            assumption: self.assumption.cloned(),
+            effect: self.effect,
+            evidence_kind: self.evidence_kind,
+            state: self.state,
+            unknown_reasons: self.unknown_reasons.into_iter().cloned().collect(),
+            witness: self.witness.cloned(),
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct Fact {
@@ -42,7 +106,8 @@ impl Fact {
 pub(super) struct Analysis {
     facts: Vec<[Fact; COUNT]>,
     assumptions: super::assumptions::Analysis,
-    evidence: Vec<Value>,
+    witnesses: Vec<WitnessEvidence>,
+    reasons: Vec<UnknownReason>,
     pub edge_visits: usize,
 }
 impl Analysis {
@@ -53,7 +118,8 @@ impl Analysis {
             facts: (0..snapshot.functions.len())
                 .map(|_| std::array::from_fn(|_| Fact::default()))
                 .collect(),
-            evidence: Vec::new(),
+            witnesses: Vec::new(),
+            reasons: Vec::new(),
             edge_visits: 0,
         };
         let mut declared_absent = vec![RuntimeEffects::NONE; snapshot.functions.len()];
@@ -91,7 +157,7 @@ impl Analysis {
                     result.reason(
                         i,
                         RuntimeEffects::ALL.bits(),
-                        if site.operation == "indirect-call" {
+                        if matches!(site.operation, super::operation::Operation::IndirectCall) {
                             0
                         } else {
                             1
@@ -113,20 +179,16 @@ impl Analysis {
             let ranges = super::semantic::local_ranges(&f.locations);
             if let Some(facts) = snapshot.semantic.witnesses.get(&f.id) {
                 for fact in facts {
-                    let Some(bits) = fact["effect"].as_u64().and_then(|b| u8::try_from(b).ok())
-                    else {
-                        continue;
-                    };
-                    let w = &fact["witness"];
-                    let location =
-                        serde_json::from_value::<Location>(w["cause"]["location"].clone()).ok();
-                    let reason = if w["kind"] == "external-boundary"
-                        || w["cause"]["operation"] == "extern rust"
+                    let bits = fact.effect;
+                    let w = &fact.witness;
+                    let location = w.location().cloned();
+                    let reason = if w.kind == WitnessKind::ExternalBoundary
+                        || w.operation() == Some(&CapabilityOperation::ExternRust)
                     {
                         Some(4)
-                    } else if w["cause"]["operation"] == "indirect-call" {
+                    } else if w.operation() == Some(&CapabilityOperation::IndirectCall) {
                         Some(0)
-                    } else if w["kind"] == "unavailable" {
+                    } else if w.kind == WitnessKind::Unavailable {
                         Some(5)
                     } else if location.is_none() {
                         Some(6)
@@ -139,7 +201,7 @@ impl Analysis {
                     }
                     // Compiler summaries may cite another body's operation.
                     // Only local facts seed evidence; graph edges propagate it.
-                    if w["owner"].as_str().is_some_and(|owner| owner != f.id) {
+                    if w.owner.as_deref().is_some_and(|owner| owner != f.id) {
                         continue;
                     }
                     let location = location.unwrap();
@@ -158,8 +220,12 @@ impl Analysis {
                     {
                         continue;
                     }
-                    let id = result.evidence.len();
-                    result.evidence.push(json!({"function":f.id, "location":location, "operation":w["cause"]["operation"]}));
+                    let id = result.witnesses.len();
+                    result.witnesses.push(WitnessEvidence {
+                        function: f.id.clone(),
+                        location,
+                        operation: w.operation().cloned(),
+                    });
                     for bit in 0..COUNT {
                         if bits & (1 << bit) != 0 && result.facts[i][bit].witness.is_none() {
                             result.facts[i][bit].witness = Some(id);
@@ -248,37 +314,95 @@ impl Analysis {
         }) {
             return;
         }
-        let id = self.evidence.len();
-        self.evidence
-            .push(json!({"code":REASONS[reason], "location":location}));
+        let id = self.reasons.len();
+        self.reasons.push(UnknownReason {
+            code: REASONS[reason],
+            location: location.cloned(),
+        });
         for bit in 0..COUNT {
             if bits & (1 << bit) != 0 && self.facts[function][bit].reasons[reason].is_none() {
                 self.facts[function][bit].reasons[reason] = Some(id);
             }
         }
     }
-    pub fn assumptions(&self, function: usize) -> Value {
-        self.assumptions.output(function)
+    pub fn typed_assumptions(
+        &self,
+        function: usize,
+    ) -> assumptions::Assumptions<&assumptions::Assumption> {
+        self.assumptions.typed_output(function)
     }
+    fn output_view(&self, function: usize) -> Vec<EffectView<'_>> {
+        let assumptions = self.typed_assumptions(function);
+        self.facts[function]
+            .iter()
+            .enumerate()
+            .map(|(bit, fact)| {
+                let assumption = if (1 << bit) == RuntimeEffects::MAY_IO.bits() {
+                    assumptions.no_io
+                } else if (1 << bit) == RuntimeEffects::MAY_BLOCK.bits() {
+                    assumptions.no_block
+                } else {
+                    None
+                };
+                let reasons: Vec<_> = fact
+                    .reasons
+                    .iter()
+                    .flatten()
+                    .map(|&i| &self.reasons[i])
+                    .collect();
+                EffectState {
+                    effect: 1u8 << bit,
+                    state: if fact.witness.is_some() {
+                        State::May
+                    } else if !reasons.is_empty() {
+                        State::Unknown
+                    } else {
+                        State::None
+                    },
+                    evidence_kind: if fact.witness.is_some() {
+                        EvidenceKind::CompilerProven
+                    } else if !reasons.is_empty() {
+                        EvidenceKind::Unknown
+                    } else if assumption.is_some() {
+                        EvidenceKind::Assumption
+                    } else {
+                        EvidenceKind::CompilerProven
+                    },
+                    assumption,
+                    witness: fact.witness.map(|i| &self.witnesses[i]),
+                    unknown_reasons: reasons,
+                }
+            })
+            .collect()
+    }
+    pub fn typed_output(&self, function: usize) -> Vec<EffectState> {
+        self.output_view(function)
+            .into_iter()
+            .map(EffectView::into_owned)
+            .collect()
+    }
+    #[cfg(test)]
     pub fn output(&self, function: usize) -> Value {
-        let assumptions = self.assumptions(function);
-        Value::Array(self.facts[function].iter().enumerate().map(|(bit, fact)| {
-            let assumption = if (1 << bit) == RuntimeEffects::MAY_IO.bits() { &assumptions["no_io"] }
-                else if (1 << bit) == RuntimeEffects::MAY_BLOCK.bits() { &assumptions["no_block"] } else { &Value::Null };
-            let reasons: Vec<_> = fact.reasons.iter().flatten().map(|&i| &self.evidence[i]).collect();
-            json!({"effect":1u8 << bit, "state":if fact.witness.is_some() {"may"} else if !reasons.is_empty() {"unknown"} else {"none"},
-                "evidence_kind":if fact.witness.is_some() { "compiler-proven" } else if !reasons.is_empty() { "unknown" } else if !assumption.is_null() { "assumption" } else { "compiler-proven" }, "assumption":assumption, "witness":fact.witness.map(|i| &self.evidence[i]), "unknown_reasons":reasons})
-        }).collect())
+        serde_json::to_value(self.output_view(function)).expect("effect states serialize")
     }
+    pub fn typed_unavailable() -> Vec<EffectState> {
+        (0..COUNT)
+            .map(|bit| EffectState {
+                effect: 1u8 << bit,
+                state: State::Unknown,
+                evidence_kind: EvidenceKind::Unknown,
+                assumption: None,
+                witness: None,
+                unknown_reasons: vec![UnknownReason {
+                    code: UnknownReasonCode::MissingBody,
+                    location: None,
+                }],
+            })
+            .collect()
+    }
+    #[cfg(test)]
     pub fn unavailable() -> Value {
-        Value::Array(
-            (0..COUNT)
-                .map(|bit| {
-                    json!({"effect":1u8 << bit, "state":"unknown", "evidence_kind":"unknown", "assumption":null, "witness":null,
-            "unknown_reasons":[{"code":"missing-body", "location":null}]})
-                })
-                .collect(),
-        )
+        serde_json::to_value(Self::typed_unavailable()).expect("effect states serialize")
     }
 }
 
@@ -291,6 +415,7 @@ mod tests {
             .map(|i| {
                 let id = format!("f{i}");
                 let location = Location {
+                    display: None,
                     path: "test.wi".into(),
                     start: i * 10,
                     end: i * 10 + 10,
@@ -335,9 +460,9 @@ mod tests {
     }
     fn witness(s: &mut Snapshot, i: usize, bit: u8, kind: &str, operation: &str) {
         s.functions[i].runtime_effects |= bit;
-        s.semantic.witnesses.entry(format!("f{i}")).or_default().push(json!({"effect":bit,"witness":{
+        s.semantic.witnesses.entry(format!("f{i}")).or_default().push(serde_json::from_value(json!({"effect":bit,"witness":{
             "kind":kind,"cause":{"operation":operation,"location":{"path":"test.wi","start":i*10+1,"end":i*10+2}}
-        }}));
+        }})).unwrap());
     }
     fn link(s: &mut Snapshot, caller: usize, callee: usize) {
         let id = s.functions[callee].id.clone();
@@ -411,6 +536,7 @@ mod tests {
             vec![semantic::UnresolvedCall {
                 operation: "callee".into(),
                 location: Location {
+                    display: None,
                     path: "test.wi".into(),
                     start: 3,
                     end: 7,
@@ -449,8 +575,12 @@ mod tests {
     fn missing_source_is_unknown() {
         let mut s = fixture(1);
         witness(&mut s, 0, 1, "panic", "panic");
-        s.semantic.witnesses.get_mut("f0").unwrap()[0]["witness"]["cause"]["location"] =
-            Value::Null;
+        s.semantic.witnesses.get_mut("f0").unwrap()[0]
+            .witness
+            .cause
+            .as_mut()
+            .unwrap()
+            .source = super::super::evidence::CauseSource::Located { location: None };
         assert!(reason(&output(&s, 0), "missing-source"));
     }
     #[test]
@@ -546,7 +676,7 @@ mod tests {
     fn foreign_owner_is_not_local_evidence() {
         let mut s = fixture(1);
         witness(&mut s, 0, 1, "panic", "panic");
-        s.semantic.witnesses.get_mut("f0").unwrap()[0]["witness"]["owner"] = json!("foreign");
+        s.semantic.witnesses.get_mut("f0").unwrap()[0].witness.owner = Some("foreign".into());
         assert_eq!(output(&s, 0)[0]["state"], "unknown");
     }
     #[test]

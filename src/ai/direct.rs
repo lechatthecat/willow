@@ -1,12 +1,202 @@
 //! Source-facing selectors over one immutable compiler query session.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
 use std::path::PathBuf;
 
+/// Source-facing command names. Keep both reference spellings on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DirectCommand {
+    Refs,
+    References,
+    Symbol,
+    Type,
+    Effects,
+    Impact,
+    Rename,
+}
+impl DirectCommand {
+    pub fn parse(command: &str) -> Option<Self> {
+        Some(match command {
+            "refs" => Self::Refs,
+            "references" => Self::References,
+            "symbol" => Self::Symbol,
+            "type" => Self::Type,
+            "effects" => Self::Effects,
+            "impact" => Self::Impact,
+            "rename" => Self::Rename,
+            _ => return None,
+        })
+    }
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Refs => "refs",
+            Self::References => "references",
+            Self::Symbol => "symbol",
+            Self::Type => "type",
+            Self::Effects => "effects",
+            Self::Impact => "impact",
+            Self::Rename => "rename",
+        }
+    }
+}
+impl std::fmt::Display for DirectCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A source location before or after direct-command presentation conversion.
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectedLocation {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<usize>,
+    pub end: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<usize>,
+    pub path: String,
+    pub start: usize,
+}
+impl From<Location> for SelectedLocation {
+    fn from(location: Location) -> Self {
+        Self {
+            column: None,
+            end: location.end,
+            line: None,
+            path: location.path,
+            start: location.start,
+        }
+    }
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct SelectedSymbol {
+    pub id: String,
+    pub identity: Option<SymbolIdentity>,
+    pub kind: SymbolKind,
+    pub location: Option<SelectedLocation>,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub qualified_name: Option<String>,
+    pub selector: String,
+}
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "lowercase")]
+pub enum Resolution {
+    Ok {
+        symbol: Box<SelectedSymbol>,
+    },
+    Unknown {
+        reason: String,
+        suggestions: Vec<String>,
+    },
+    Ambiguous {
+        candidates: Vec<SelectedSymbol>,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DirectQueryResult {
+    pub status: super::query_result::Status,
+    #[serde(flatten)]
+    pub data: DirectQueryData,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub selected: Option<SelectedSymbol>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub type_display: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shown: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<&'static str>,
+}
+#[derive(Debug, Clone, Serialize)]
+#[serde(untagged)]
+pub enum DirectQueryData {
+    Semantic(super::query_result::QueryData),
+    Unknown {
+        suggestions: Vec<String>,
+    },
+    Ambiguous {
+        candidates: Vec<SelectedSymbol>,
+    },
+    Resolved {
+        symbol: SelectedSymbol,
+    },
+    Impact {
+        impact: Impact,
+        symbol: SelectedSymbol,
+    },
+    Empty {},
+}
+impl DirectQueryResult {
+    pub fn new(status: super::query_result::Status, data: DirectQueryData) -> Self {
+        Self {
+            status,
+            data,
+            selected: None,
+            reason: None,
+            type_display: None,
+            total: None,
+            shown: None,
+            truncated: None,
+            schema: None,
+        }
+    }
+    pub fn effects(&self) -> Option<&super::query_result::EffectResult> {
+        match &self.data {
+            DirectQueryData::Semantic(super::query_result::QueryData::Effects(effects)) => {
+                Some(effects)
+            }
+            _ => None,
+        }
+    }
+    pub fn effects_mut(&mut self) -> Option<&mut super::query_result::EffectResult> {
+        match &mut self.data {
+            DirectQueryData::Semantic(super::query_result::QueryData::Effects(effects)) => {
+                Some(effects)
+            }
+            _ => None,
+        }
+    }
+}
+impl From<super::query_result::QueryResult> for DirectQueryResult {
+    fn from(result: super::query_result::QueryResult) -> Self {
+        Self::new(result.status, DirectQueryData::Semantic(result.data))
+    }
+}
+impl From<Resolution> for DirectQueryResult {
+    fn from(resolution: Resolution) -> Self {
+        use super::query_result::Status;
+        match resolution {
+            Resolution::Ok { symbol } => {
+                Self::new(Status::Ok, DirectQueryData::Resolved { symbol: *symbol })
+            }
+            Resolution::Unknown {
+                reason,
+                suggestions,
+            } => {
+                let mut result =
+                    Self::new(Status::Unknown, DirectQueryData::Unknown { suggestions });
+                result.reason = Some(reason);
+                result
+            }
+            Resolution::Ambiguous { candidates } => {
+                Self::new(Status::Ambiguous, DirectQueryData::Ambiguous { candidates })
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct SelectorFilter {
-    pub kind: Option<String>,
+    pub kind: Option<SymbolKind>,
     pub module: Option<String>,
     pub package: Option<String>,
 }
@@ -176,6 +366,7 @@ impl DirectSession {
                 lambda_symbols.insert(
                     f.id.clone(),
                     symbols::Symbol {
+                        origin: Default::default(),
                         identity: f.identity.clone(),
                         id: f.id.clone(),
                         name: f.name.clone(),
@@ -201,7 +392,7 @@ impl DirectSession {
             .semantic
             .symbols
             .iter()
-            .filter(|s| s.kind == "constructor")
+            .filter(|s| s.kind == SymbolKind::Constructor)
             .filter_map(|s| {
                 let owner = s.source_name.as_deref()?.rsplit_once('#')?.0;
                 let path = s.location.as_ref()?.path.as_str();
@@ -222,7 +413,7 @@ impl DirectSession {
             .semantic
             .symbols
             .iter()
-            .filter(|s| s.kind == "method" && session.function_names.contains_key(&s.id))
+            .filter(|s| s.kind == SymbolKind::Method && session.function_names.contains_key(&s.id))
             .map(|s| (s.id.clone(), session.selector(s)))
             .collect();
         session.function_names.extend(names);
@@ -233,7 +424,7 @@ impl DirectSession {
             .semantic
             .symbols
             .iter()
-            .filter(|s| s.kind == "method")
+            .filter(|s| s.kind == SymbolKind::Method)
             .map(|s| (s.id.as_str(), session.selector(s)))
             .collect();
         let declarations: HashMap<_, _> = session
@@ -292,7 +483,7 @@ impl DirectSession {
         reason = "Preserve the exported rename_with_emitter API"
     )]
     pub fn rename_with_emitter(
-        mut self,
+        self,
         entry: &Path,
         project: bool,
         selector: &str,
@@ -301,6 +492,24 @@ impl DirectSession {
         mode: impl Into<RenameMode>,
         emitter: &mut dyn crate::diagnostics::DiagnosticEmitter,
     ) -> Result<Value> {
+        Ok(serde_json::to_value(self.rename_typed_with_emitter(
+            entry, project, selector, filter, name, mode, emitter,
+        )?)?)
+    }
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "Preserve the exported rename_with_emitter API"
+    )]
+    pub fn rename_typed_with_emitter(
+        mut self,
+        entry: &Path,
+        project: bool,
+        selector: &str,
+        filter: &SelectorFilter,
+        name: &str,
+        mode: impl Into<RenameMode>,
+        emitter: &mut dyn crate::diagnostics::DiagnosticEmitter,
+    ) -> Result<RenameResult> {
         let mode = mode.into();
         self.session
             .snapshot
@@ -308,57 +517,55 @@ impl DirectSession {
             .as_ref()
             .context("edit requires live analysis inputs")?
             .verify_manifest_entry()?;
-        let mut resolved = self.resolve(selector, filter)?;
-        // Compiler-owned source is never an edit target, so its declarations
-        // do not compete with a project symbol of the same name.
-        if resolved["status"] == "ambiguous"
-            && let Some(candidates) = resolved["candidates"].as_array()
-        {
+        let mut resolved = self.resolve_typed(selector, filter)?;
+        if let Resolution::Ambiguous { candidates } = &resolved {
             let mut editable = candidates.iter().filter(|candidate| {
-                candidate["location"]["path"]
-                    .as_str()
-                    .is_none_or(|path| bundled_source(path).is_none())
+                candidate
+                    .location
+                    .as_ref()
+                    .is_none_or(|location| bundled_source(&location.path).is_none())
             });
             if let (Some(only), None) = (editable.next(), editable.next()) {
-                resolved = json!({"status":"ok","symbol":only.clone()});
+                resolved = Resolution::Ok {
+                    symbol: Box::new(only.clone()),
+                };
             }
         }
-        if resolved["status"] != "ok" {
-            self.display_locations(&mut resolved, false)?;
-            return Ok(resolved);
-        }
-        let id = resolved["symbol"]["id"]
-            .as_str()
-            .context("resolved symbol lacks identity")?
-            .to_owned();
+        let Resolution::Ok { symbol } = resolved else {
+            let mut result = DirectQueryResult::from(resolved);
+            self.display_query_locations(&mut result, false)?;
+            return Ok(RenameResult::Resolution(Box::new(result)));
+        };
+        let symbol = *symbol;
+        let id = symbol.id.clone();
+        let mut selected = symbol.clone();
+        self.display_selected(&mut selected, false)?;
         if !self.function_names.contains_key(&id)
             && !matches!(
-                resolved["symbol"]["kind"].as_str(),
-                Some("field" | "static-field" | "variant" | "method" | "binding" | "parameter")
+                symbol.kind,
+                SymbolKind::Field
+                    | SymbolKind::StaticField
+                    | SymbolKind::Variant
+                    | SymbolKind::Method
+                    | SymbolKind::Binding
+                    | SymbolKind::Parameter
             )
         {
-            self.display_locations(&mut resolved, false)?;
-            let symbol = &resolved["symbol"];
-            let loc = &symbol["location"];
             let message = format!(
                 "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields, enum variants and local bindings; this symbol kind is not supported. No files changed",
-                symbol["kind"].as_str().unwrap_or("symbol")
+                symbol.kind
             );
-            if let (Some(path), Some(start), Some(end), Some(line), Some(column)) = (
-                loc["path"].as_str(),
-                loc["start"].as_u64(),
-                loc["end"].as_u64(),
-                loc["line"].as_u64(),
-                loc["column"].as_u64(),
-            ) {
+            if let Some(location) = &selected.location
+                && let (Some(line), Some(column)) = (location.line, location.column)
+            {
                 return Err(edit::Rejection {
                     message,
                     location: edit::RejectionLocation {
-                        path: path.into(),
-                        start: start.try_into()?,
-                        end: end.try_into()?,
-                        line: line.try_into()?,
-                        column: column.try_into()?,
+                        path: location.path.clone(),
+                        start: location.start,
+                        end: location.end,
+                        line,
+                        column,
                     },
                 }
                 .into());
@@ -372,28 +579,23 @@ impl DirectSession {
                 name: name.to_owned(),
             }],
         };
-        // Keep the selected declaration's pre-edit canonical identity in both
-        // results, matching refs. Display conversion must not alter the raw
-        // source location used by rename history below.
-        let mut displayed = resolved.clone();
-        self.display_locations(&mut displayed, false)?;
-        let selected = displayed["symbol"].take();
         if !matches!(mode, RenameMode::Apply) {
-            let mut preview = edit::preview_analyzed(
+            let preview = edit::preview_analyzed(
                 &self.session.snapshot,
                 request,
                 matches!(mode, RenameMode::Diff),
             )?;
-            let summary = rename_summary(&preview);
-            preview
-                .as_object_mut()
-                .context("rename preview is not an object")?
-                .extend(summary);
-            preview["selected"] = selected;
-            return Ok(preview);
+            let edits = preview.work.patches;
+            let declarations_updated = preview.work.declarations;
+            let references_updated = edits.saturating_sub(declarations_updated);
+            return Ok(RenameResult::Preview(RenamePreviewResult {
+                preview,
+                edits,
+                declarations_updated,
+                references_updated,
+                selected,
+            }));
         }
-        // History keeps the internal selector (a local's `@byte` anchor
-        // included) rather than its displayed spelling.
         let rename_selector = self
             .session
             .snapshot
@@ -401,40 +603,46 @@ impl DirectSession {
             .symbols
             .iter()
             .chain(self.lambda_symbols.values())
-            .find(|symbol| resolved["symbol"]["id"] == symbol.id.as_str())
+            .find(|candidate| symbol.id == candidate.id)
             .map(|symbol| self.selector(symbol))
-            .or_else(|| resolved["symbol"]["selector"].as_str().map(str::to_owned))
-            .context("rename selector")?;
-        let rename_location =
-            serde_json::from_value::<super::Location>(resolved["symbol"]["location"].clone())?;
+            .unwrap_or_else(|| symbol.selector.clone());
+        let rename_location = symbol.location.context("rename selector")?;
+        let rename_location = Location {
+            path: rename_location.path,
+            start: rename_location.start,
+            end: rename_location.end,
+            display: None,
+        };
         let workspace = edit::Workspace::open(Path::new(self.workspace()))?;
-        let preview = workspace.prepare_analyzed(
+        let preview = workspace.prepare_analyzed_typed(
             entry,
             project,
             request,
             edit::ChangeFormat::Diff,
             self.session.snapshot,
         )?;
-        let transaction = preview["transaction"]
-            .as_str()
-            .context("missing transaction identity")?;
+        let transaction = &preview.transaction;
         workspace.validate(transaction, emitter)?;
         workspace.apply_with_rollback(transaction, emitter)?;
-        let mut result = json!({"status":"ok","old":selector,"new":name,"validation":"passed","transaction":transaction,"selected":selected});
-        // Source publication has committed. Advisory history failure must not
-        // make callers believe the rename failed or invite an unsafe retry.
-        if let Err(error) =
-            workspace.remember_rename(transaction, &rename_selector, &rename_location)
-        {
-            result["warnings"] = json!([format!(
-                "Rename succeeded, but rename history could not be saved; stale-selector suggestions may be unavailable: {error:#}"
-            )]);
-        }
-        result
-            .as_object_mut()
-            .unwrap()
-            .extend(rename_summary(&preview));
-        Ok(result)
+        let warnings = workspace.remember_rename(transaction, &rename_selector, &rename_location).err().map(|error| vec![format!(
+            "Rename succeeded, but rename history could not be saved; stale-selector suggestions may be unavailable: {error:#}"
+        )]);
+        Ok(RenameResult::Applied(RenameApplied {
+            status: query_result::Status::Ok,
+            old: selector.to_owned(),
+            new: name.to_owned(),
+            validation: "passed",
+            transaction: Some(preview.transaction),
+            selected,
+            warnings,
+            files_changed: preview.changes.len(),
+            edits: preview.work.patches,
+            declarations_updated: preview.work.declarations,
+            references_updated: preview
+                .work
+                .patches
+                .saturating_sub(preview.work.declarations),
+        }))
     }
     fn source(&mut self, path: &str) -> Result<&SourceIndex> {
         if !self.sources.contains_key(path) {
@@ -482,10 +690,10 @@ impl DirectSession {
         }
         // A module names its namespace, not a member within that namespace.
         // Prefixing it again makes `main::main` collide with the entry function.
-        if symbol.kind == "module" {
+        if symbol.kind == SymbolKind::Module {
             return symbol.name.clone();
         }
-        if symbol.kind == "method"
+        if symbol.kind == SymbolKind::Method
             && let (Some(name), Some(location)) = (&symbol.source_name, &symbol.location)
         {
             let module = symbol
@@ -591,29 +799,39 @@ impl DirectSession {
         }
         Ok(reason)
     }
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub fn resolve(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Value> {
-        let revision = self.session.revision().to_owned();
+        Ok(serde_json::to_value(self.resolve_typed(selector, filter)?)?)
+    }
+    #[allow(clippy::too_many_lines, reason = "split pending")]
+    pub fn resolve_typed(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Resolution> {
         let mut location_reason = None;
         let located = if let Some((file, byte)) = self.location(selector)? {
-            let mut result = self.session.query(QueryRequest::SymbolAt {
-                revision,
-                file: file.clone(),
-                byte,
-            })["result"]
-                .take();
-            let symbols = result
-                .get_mut("resolved_symbols")
-                .map(Value::take)
-                .or_else(|| result.get_mut("symbols").map(Value::take))
-                .unwrap_or_else(|| json!([result["symbol"].take()]));
-            let mut ids: std::collections::HashSet<String> = symbols
-                .as_array()
-                .into_iter()
-                .flatten()
-                .filter(|s| s["kind"] != "import" || result.get("resolved_symbols").is_none())
-                .filter_map(|s| s["id"].as_str().map(str::to_owned))
-                .collect();
+            use super::query_result::{QueryData, SymbolInfo};
+            let result = self.session.symbol_at_query(&file, byte);
+            let mut ids: std::collections::HashSet<String> = match result.data {
+                QueryData::Symbol {
+                    resolved_symbols: Some(symbols),
+                    ..
+                } => symbols
+                    .into_iter()
+                    .filter(|symbol| symbol.kind != SymbolKind::Import)
+                    .map(|symbol| symbol.id)
+                    .collect(),
+                QueryData::Symbol {
+                    symbol,
+                    resolved_symbols: None,
+                } => {
+                    let id = match symbol {
+                        SymbolInfo::Function(function) => function.id,
+                        SymbolInfo::Declaration(symbol) => symbol.id,
+                    };
+                    std::collections::HashSet::from([id])
+                }
+                QueryData::Symbols { symbols, .. } => {
+                    symbols.into_iter().map(|symbol| symbol.id).collect()
+                }
+                _ => std::collections::HashSet::new(),
+            };
             // Lambda opening tokens have callable locations but no declaration
             // symbols. Match only the opening byte, never shadow inner symbols.
             ids.extend(
@@ -681,7 +899,7 @@ impl DirectSession {
             }
             // Builtin member calls are rename evidence, not name-selectable
             // symbols: `len` must not become ambiguous with `Array::len`.
-            if located.is_none() && symbol.kind == "builtin-method" {
+            if located.is_none() && symbol.kind == SymbolKind::BuiltinMethod {
                 continue;
             }
             if filter.kind.as_ref().is_some_and(|k| k != &symbol.kind)
@@ -711,7 +929,7 @@ impl DirectSession {
             let qualified = self.selector(symbol);
             // Preserve reusable overload selectors, but accept and suggest the
             // source constructor spelling rather than its internal ordinal.
-            let source_selector = if symbol.kind == "constructor" {
+            let source_selector = if symbol.kind == SymbolKind::Constructor {
                 qualified
                     .rsplit_once('#')
                     .map_or(qualified.as_str(), |(name, _)| name)
@@ -724,12 +942,20 @@ impl DirectSession {
             };
             if located.is_some()
                 || matches_name(&qualified)
-                || (symbol.kind == "constructor" && matches_name(source_selector))
+                || (symbol.kind == SymbolKind::Constructor && matches_name(source_selector))
                 || local_name.is_some_and(matches_name)
                 || selector == symbol.name
             {
-                candidates.push(json!({"id":symbol.id,"selector":qualified,"name":symbol.name,"kind":symbol.kind,"location":symbol.location,"identity":symbol.identity}));
-            } else if symbol.kind != "import" {
+                candidates.push(SelectedSymbol {
+                    id: symbol.id.clone(),
+                    selector: qualified,
+                    name: symbol.name.clone(),
+                    kind: symbol.kind.clone(),
+                    location: symbol.location.clone().map(SelectedLocation::from),
+                    identity: symbol.identity.clone(),
+                    qualified_name: None,
+                });
+            } else if symbol.kind != SymbolKind::Import {
                 // Imports alias declarations owned elsewhere; suggest those
                 // declarations rather than the importing module's alias.
                 let qualified = source_selector;
@@ -829,7 +1055,7 @@ impl DirectSession {
                 .semantic
                 .symbols
                 .iter()
-                .filter(|symbol| matches!(symbol.kind.as_str(), "binding" | "parameter"))
+                .filter(|symbol| matches!(symbol.kind, SymbolKind::Binding | SymbolKind::Parameter))
                 .map(|symbol| self.selector(symbol)),
         );
         // At most five labels are resolved, against cached sources. Lambda
@@ -843,43 +1069,38 @@ impl DirectSession {
         let mut spellings = HashMap::new();
         for candidate in &candidates {
             *spellings
-                .entry(candidate["selector"].as_str().unwrap().to_owned())
+                .entry(candidate.selector.clone())
                 .or_insert(0usize) += 1;
         }
         for candidate in &mut candidates {
-            if spellings[candidate["selector"].as_str().unwrap()] > 1
-                && let (Some(path), Some(start)) = (
-                    candidate["location"]["path"].as_str(),
-                    candidate["location"]["start"].as_u64(),
-                )
+            if spellings[&candidate.selector] > 1
+                && let Some(location) = &candidate.location
             {
-                let label = self.source_label(path, start.try_into()?)?;
-                candidate["qualified_name"] = candidate["selector"].take();
-                candidate["selector"] = json!(label);
+                let label = self.source_label(&location.path, location.start)?;
+                candidate.qualified_name = Some(std::mem::replace(&mut candidate.selector, label));
             }
         }
         Ok(match candidates.len() {
-            0 => {
-                let mut result = json!({"status":"unknown","reason":"No symbol matches this selector and its filters.","suggestions":suggestions});
-                if let Some(reason) = location_reason {
-                    result["reason"] = json!(reason);
-                } else if located.is_some() {
-                    result["reason"] = json!(
+            0 => Resolution::Unknown {
+                reason: location_reason.unwrap_or_else(|| {
+                    if located.is_some() {
                         "A symbol exists at this position, but it does not match the selected filters."
-                    );
-                }
-                result
-            }
-            1 => json!({"status":"ok","symbol":candidates.remove(0)}),
-            _ => json!({"status":"ambiguous","candidates":candidates}),
+                    } else {
+                        "No symbol matches this selector and its filters."
+                    }.to_owned()
+                }),
+                suggestions,
+            },
+            1 => Resolution::Ok { symbol: Box::new(candidates.remove(0)) },
+            _ => Resolution::Ambiguous { candidates },
         })
     }
     /// Byte offsets anchor local identities but are not source spellings. A
     /// unique local is selected by its scoped name; a shadowed one by position.
-    fn display_local_candidates(&mut self, candidates: &mut [Value]) -> Result<()> {
+    fn display_local_candidates(&mut self, candidates: &mut [SelectedSymbol]) -> Result<()> {
         let mut counts: HashMap<String, usize> = candidates
             .iter()
-            .filter_map(|c| local_plain(c["kind"].as_str()?, c["selector"].as_str()?))
+            .filter_map(|candidate| local_plain(&candidate.kind, &candidate.selector))
             .map(|plain| (plain.to_owned(), 0))
             .collect();
         if counts.is_empty() {
@@ -891,7 +1112,7 @@ impl DirectSession {
             .semantic
             .symbols
             .iter()
-            .filter(|s| matches!(s.kind.as_str(), "binding" | "parameter"))
+            .filter(|s| matches!(s.kind, SymbolKind::Binding | SymbolKind::Parameter))
         {
             if let Some(count) = local_plain(&symbol.kind, &self.selector(symbol))
                 .and_then(|plain| counts.get_mut(plain))
@@ -900,23 +1121,16 @@ impl DirectSession {
             }
         }
         for candidate in candidates {
-            let Some(plain) = candidate["kind"]
-                .as_str()
-                .zip(candidate["selector"].as_str())
-                .and_then(|(kind, selector)| local_plain(kind, selector))
-                .map(str::to_owned)
+            let Some(plain) = local_plain(&candidate.kind, &candidate.selector).map(str::to_owned)
             else {
                 continue;
             };
             if counts[&plain] == 1 {
-                candidate["selector"] = json!(plain);
-            } else if let (Some(path), Some(start)) = (
-                candidate["location"]["path"].as_str(),
-                candidate["location"]["start"].as_u64(),
-            ) {
-                let label = self.source_label(path, start.try_into()?)?;
-                candidate["qualified_name"] = json!(plain);
-                candidate["selector"] = json!(label);
+                candidate.selector = plain;
+            } else if let Some(location) = &candidate.location {
+                let label = self.source_label(&location.path, location.start)?;
+                candidate.qualified_name = Some(plain);
+                candidate.selector = label;
             }
         }
         Ok(())
@@ -928,65 +1142,69 @@ impl DirectSession {
         filter: &SelectorFilter,
         all: bool,
     ) -> Result<Value> {
+        let command = DirectCommand::parse(command).context("unsupported direct command")?;
+        Ok(serde_json::to_value(
+            self.query_typed(command, selector, filter, all)?,
+        )?)
+    }
+    pub fn query_typed(
+        &mut self,
+        command: DirectCommand,
+        selector: &str,
+        filter: &SelectorFilter,
+        all: bool,
+    ) -> Result<DirectQueryResult> {
+        use super::query_result::{QueryData, QueryResult, Status, SymbolInfo};
         let revision = self.session.revision().to_owned();
-        if command == "type"
+        if command == DirectCommand::Type
             && let Some((file, byte)) = self.location(selector)?
         {
             if filter.kind.is_some() || filter.module.is_some() || filter.package.is_some() {
-                let resolved = self.resolve(selector, filter)?;
-                if resolved["status"] != "ok" {
-                    return Ok(resolved);
+                let resolved = self.resolve_typed(selector, filter)?;
+                if !matches!(resolved, Resolution::Ok { .. }) {
+                    return Ok(resolved.into());
                 }
             }
-            let mut result = if self.source(&file)?.is_between_tokens(byte) {
-                json!({"status":"unknown"})
+            let mut result: DirectQueryResult = if self.source(&file)?.is_between_tokens(byte) {
+                QueryResult::empty(Status::Unknown)
             } else {
-                self.session.query(QueryRequest::TypeAt {
-                    revision,
-                    file: file.clone(),
-                    byte,
-                })["result"]
-                    .take()
-            };
-            if result["status"] == "unknown" {
-                result["reason"] = json!(format!(
+                self.session.type_query(file.clone(), byte)
+            }
+            .into();
+            if result.status == Status::Unknown {
+                result.reason = Some(format!(
                     "No typed expression or declaration at this position. {}",
                     self.missing_symbol_reason(&file, byte)?
                 ));
             }
             return Ok(result);
         }
-        let mut resolved = self.resolve(selector, filter)?;
-        if resolved["status"] != "ok" {
-            if command == "effects" {
-                // No selected declaration means there are no effects to describe.
-                resolved["schema"] = json!(super::effect_states::SCHEMA);
+        let resolved = self.resolve_typed(selector, filter)?;
+        let Resolution::Ok { symbol } = resolved else {
+            let mut result: DirectQueryResult = resolved.into();
+            if command == DirectCommand::Effects {
+                result.schema = Some(super::effect_states::SCHEMA);
             }
-            return Ok(resolved);
-        }
-        let declaration = resolved["symbol"]["id"]
-            .as_str()
-            .context("resolved symbol lacks identity")?;
-        let function = if matches!(command, "effects" | "impact") {
+            return Ok(result);
+        };
+        let symbol = *symbol;
+        let function = if matches!(command, DirectCommand::Effects | DirectCommand::Impact) {
             self.constructor_bodies
-                .get(declaration)
-                .map(String::as_str)
-                .unwrap_or(declaration)
+                .get(&symbol.id)
+                .unwrap_or(&symbol.id)
         } else {
-            declaration
+            &symbol.id
         }
-        .to_owned();
-        if command == "impact" {
-            // Seed the shared rename family for every method, including executable
-            // class methods: overrides and their callers are affected together.
+        .clone();
+        if command == DirectCommand::Impact {
             let mut seeds = vec![function.clone()];
-            if !self.function_names.contains_key(&function)
-                || resolved["symbol"]["kind"] == "method"
-            {
-                if resolved["symbol"]["kind"] != "method" {
-                    return Ok(
-                        json!({"status":"unanalyzed","reason":"Impact requires a function or method.","selected":resolved["symbol"]}),
-                    );
+            if !self.function_names.contains_key(&function) || symbol.kind == SymbolKind::Method {
+                if symbol.kind != SymbolKind::Method {
+                    let mut result =
+                        DirectQueryResult::new(Status::Unanalyzed, DirectQueryData::Empty {});
+                    result.reason = Some("Impact requires a function or method.".into());
+                    result.selected = Some(symbol);
+                    return Ok(result);
                 }
                 let mut links = HashMap::<&str, Vec<&str>>::new();
                 for (a, b) in &self.session.snapshot.semantic.rename_links {
@@ -1012,110 +1230,106 @@ impl DirectSession {
                         .map(|f| f.id.clone()),
                 );
                 if seeds.is_empty() {
-                    return Ok(
-                        json!({"status":"unanalyzed","reason":"This interface contract has no analyzed implementation in the selected source graph.","selected":resolved["symbol"]}),
-                    );
+                    let mut result =
+                        DirectQueryResult::new(Status::Unanalyzed, DirectQueryData::Empty {});
+                    result.reason = Some("This interface contract has no analyzed implementation in the selected source graph.".into());
+                    result.selected = Some(symbol);
+                    return Ok(result);
                 }
             }
-            let impact = self.session.snapshot.impact(
+            let mut impact = self.session.snapshot.impact(
                 &seeds,
                 Direction::Callers,
                 Limits::default(),
                 Some(&revision),
             )?;
-            let mut impact = serde_json::to_value(impact)?;
-            if let Some(nodes) = impact["nodes"].as_array_mut() {
-                for node in nodes.iter_mut() {
-                    let id = node["id"].as_str().unwrap_or_default();
-                    let lambda = self.lambda_symbols.contains_key(id);
-                    if let Some(name) = self.function_names.get(id) {
-                        node["selector"] = json!(name);
-                    }
-                    if lambda {
-                        node["kind"] = json!("lambda");
-                    }
-                    // Seeds are the definitions whose signature changes; distance 1
-                    // bodies call one of them directly (dispatch unions add no hop).
-                    node["relation"] = json!(match node["distance"].as_u64() {
-                        Some(0) => "definition",
-                        Some(1) => "direct-caller",
-                        _ => "indirect-caller",
-                    });
+            for node in &mut impact.nodes {
+                node.selector = self.function_names.get(&node.id).cloned();
+                if self.lambda_symbols.contains_key(&node.id) {
+                    node.kind = Some(super::graph::ImpactKind::Lambda);
                 }
-                // Within one distance, named functions sort by selector and
-                // lambdas by source position (not by opaque id hash).
-                nodes.sort_by_cached_key(|node| {
-                    let lambda = node["id"]
-                        .as_str()
-                        .and_then(|id| self.lambda_symbols.get(id))
-                        .and_then(|s| s.location.as_ref());
-                    (
-                        node["distance"].as_u64(),
-                        lambda.is_some(),
-                        lambda.map_or_else(
-                            || node["selector"].as_str().unwrap_or_default().to_owned(),
-                            |l| l.path.clone(),
-                        ),
-                        lambda.map_or(0, |l| l.start),
-                    )
+                node.relation = Some(match node.distance {
+                    0 => super::graph::ImpactRelation::Definition,
+                    1 => super::graph::ImpactRelation::DirectCaller,
+                    _ => super::graph::ImpactRelation::IndirectCaller,
                 });
             }
-            return Ok(json!({"status":"ok","impact":impact,"symbol":resolved["symbol"]}));
-        }
-        let request = match command {
-            "refs" | "references" => QueryRequest::References { revision, function },
-            "effects" => QueryRequest::Effects { revision, function },
-            "symbol" | "type" => QueryRequest::SymbolInfo { revision, function },
-            _ => anyhow::bail!("unsupported direct command"),
-        };
-        let mut result = self.session.query(request)["result"].take();
-        if matches!(command, "refs" | "references") && resolved["symbol"]["kind"] == "method" {
-            let coverage = result["coverage"].as_str().unwrap_or("compiler-resolved");
-            result["coverage"] = json!(format!(
-                "{coverage}; override and implementation declarations are excluded; impact lists them with direct and indirect callers"
+            impact.nodes.sort_by_cached_key(|node| {
+                let lambda = self
+                    .lambda_symbols
+                    .get(&node.id)
+                    .and_then(|s| s.location.as_ref());
+                (
+                    node.distance,
+                    lambda.is_some(),
+                    lambda.map_or_else(
+                        || node.selector.as_deref().unwrap_or_default().to_owned(),
+                        |l| l.path.clone(),
+                    ),
+                    lambda.map_or(0, |l| l.start),
+                )
+            });
+            return Ok(DirectQueryResult::new(
+                Status::Ok,
+                DirectQueryData::Impact { impact, symbol },
             ));
         }
-        if command == "symbol" && result["symbol"].get("type_display").is_none() {
-            let location = &resolved["symbol"]["location"];
-            if let (Some(file), Some(byte)) =
-                (location["path"].as_str(), location["start"].as_u64())
-            {
-                let typed = self.session.query(QueryRequest::TypeAt {
-                    revision: self.session.revision().to_owned(),
-                    file: file.to_owned(),
-                    byte: byte.try_into()?,
-                });
-                if let Some(display) = typed["result"].get("type_display") {
-                    result["type_display"] = display.clone();
-                }
+        let mut queried = match command {
+            DirectCommand::Refs | DirectCommand::References => {
+                self.session.references_query(&function)
+            }
+            DirectCommand::Effects => self.session.effects_query(&function),
+            DirectCommand::Symbol | DirectCommand::Type => self.session.symbol_query(&function),
+            _ => anyhow::bail!("unsupported direct command"),
+        };
+        if matches!(command, DirectCommand::Refs | DirectCommand::References)
+            && symbol.kind == SymbolKind::Method
+            && let QueryData::References { coverage, .. } = &mut queried.data
+        {
+            *coverage = Some(format!(
+                "{}; override and implementation declarations are excluded; impact lists them with direct and indirect callers",
+                coverage.as_deref().unwrap_or("compiler-resolved")
+            ));
+        }
+        let mut type_display = None;
+        let has_display = matches!(&queried.data,
+            QueryData::Symbol { symbol: SymbolInfo::Declaration(declaration), .. }
+                if declaration.type_display.is_some());
+        if command == DirectCommand::Symbol
+            && !has_display
+            && let Some(location) = &symbol.location
+        {
+            let typed = self
+                .session
+                .type_query(location.path.clone(), location.start);
+            if let QueryData::Type(typed) = typed.data {
+                type_display = typed.type_display;
             }
         }
-        if command == "type" {
-            let location = &resolved["symbol"]["location"];
-            if let (Some(file), Some(byte)) =
-                (location["path"].as_str(), location["start"].as_u64())
-            {
-                result = self.session.query(QueryRequest::TypeAt {
-                    revision: self.session.revision().to_owned(),
-                    file: file.to_owned(),
-                    byte: byte.try_into()?,
-                })["result"]
-                    .take();
-            }
+        if command == DirectCommand::Type
+            && let Some(location) = &symbol.location
+        {
+            queried = self
+                .session
+                .type_query(location.path.clone(), location.start);
         }
-        result["selected"] = resolved["symbol"].clone();
-        if let Some(references) = result.get_mut("references").and_then(Value::as_array_mut) {
+        let mut result: DirectQueryResult = queried.into();
+        result.type_display = type_display;
+        result.selected = Some(symbol);
+        if let DirectQueryData::Semantic(QueryData::References { references, .. }) =
+            &mut result.data
+        {
             let total = references.len();
             if !all {
                 references.truncate(50);
             }
             let shown = references.len();
-            result["total"] = json!(total);
-            result["shown"] = json!(shown);
-            result["truncated"] = json!(shown < total);
+            result.total = Some(total);
+            result.shown = Some(shown);
+            result.truncated = Some(shown < total);
         }
-        if command == "effects" {
-            self.spell_lock_targets(&mut result)?;
+        if let Some(effects) = result.effects_mut() {
+            self.spell_lock_targets(effects)?;
         }
         Ok(result)
     }
@@ -1123,76 +1337,73 @@ impl DirectSession {
     /// `locked=table: Mutex<..>` without a source lookup. Whitespace collapses
     /// and long operands are shortened; the location keeps the exact range.
     /// Linear in the operand text of the reported witnesses.
-    fn spell_lock_targets(&mut self, result: &mut Value) -> Result<()> {
+    fn spell_lock_targets(&mut self, result: &mut super::query_result::EffectResult) -> Result<()> {
+        use super::evidence::SourcePoint;
         const LIMIT: usize = 80;
-        for key in ["effect_evidence", "compiler_witnesses"] {
-            let Some(facts) = result[key].as_array_mut() else {
+        for fact in result
+            .effect_evidence
+            .iter_mut()
+            .flatten()
+            .chain(result.compiler_witnesses.iter_mut().flatten().flatten())
+        {
+            let Some(lock) = fact
+                .witness
+                .as_mut()
+                .and_then(|w| w.cause.as_mut())
+                .and_then(|cause| cause.lock.as_mut())
+            else {
                 continue;
             };
-            for fact in facts {
-                let Some(lock) = fact.pointer_mut("/witness/cause/lock") else {
-                    continue;
-                };
-                let target = &lock["target"];
-                let (Some(path), Some(start), Some(end)) = (
-                    target["path"].as_str(),
-                    target["start"].as_u64(),
-                    target["end"].as_u64(),
-                ) else {
-                    continue;
-                };
-                let path = path.to_owned();
-                let text = self
-                    .source(&path)?
-                    .text
-                    .get(usize::try_from(start)?..usize::try_from(end)?)
-                    .context("invalid-location: lock operand is outside its source")?;
-                // A member chain split across lines reads as `a.b`, not `a .b`.
-                let mut expression = String::with_capacity(text.len());
-                for piece in text.split_whitespace() {
-                    if !expression.is_empty()
-                        && !expression.ends_with('.')
-                        && !piece.starts_with(['.', '?'])
-                    {
-                        expression.push(' ');
-                    }
-                    expression.push_str(piece);
+            let Some(SourcePoint::Located(target)) = &lock.target else {
+                continue;
+            };
+            let text = self
+                .source(&target.path)?
+                .text
+                .get(target.start..target.end)
+                .context("invalid-location: lock operand is outside its source")?;
+            let mut expression = String::with_capacity(text.len());
+            for piece in text.split_whitespace() {
+                if !expression.is_empty()
+                    && !expression.ends_with('.')
+                    && !piece.starts_with(['.', '?'])
+                {
+                    expression.push(' ');
                 }
-                if let Some((cut, _)) = expression.char_indices().nth(LIMIT) {
-                    expression.truncate(cut);
-                    expression.push('…');
-                }
-                lock["expression"] = json!(expression);
+                expression.push_str(piece);
             }
+            if let Some((cut, _)) = expression.char_indices().nth(LIMIT) {
+                expression.truncate(cut);
+                expression.push('…');
+            }
+            lock.expression = Some(expression);
         }
         Ok(())
     }
-    /// Human-only labels. Persisted names (and their IDs, fingerprints and legacy
-    /// selectors) retain byte offsets; displayed lambda anchors are selectors too.
-    pub fn display_function_targets(&mut self, result: &mut Value, absolute: bool) -> Result<()> {
-        // Only index locations needed by this response, once per distinct lambda.
+    /// Human-only labels. Persisted names and snapshot identities are untouched.
+    pub fn display_function_targets(
+        &mut self,
+        result: &mut DirectQueryResult,
+        absolute: bool,
+    ) -> Result<()> {
         let mut ids = std::collections::HashSet::new();
-        for key in ["selected", "symbol"] {
-            if let Some(id) = result[key]["id"].as_str() {
-                ids.insert(id);
-            }
+        if let Some(selected) = &result.selected {
+            ids.insert(selected.id.as_str());
         }
-        if let Some(nodes) = result["impact"]["nodes"].as_array() {
-            ids.extend(nodes.iter().filter_map(|node| node["id"].as_str()));
+        if let DirectQueryData::Impact { impact, symbol } = &result.data {
+            ids.insert(symbol.id.as_str());
+            ids.extend(impact.nodes.iter().map(|node| node.id.as_str()));
         }
-        for key in ["effect_evidence", "compiler_witnesses"] {
-            if let Some(facts) = result[key].as_array() {
-                for fact in facts {
-                    ids.extend(fact["via_function"].as_str());
-                    ids.extend(fact["witness"]["owner"].as_str());
-                    ids.extend(
-                        fact["call_chain"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str),
-                    );
-                }
+        if let Some(effects) = result.effects() {
+            for fact in effects
+                .effect_evidence
+                .iter()
+                .flatten()
+                .chain(effects.compiler_witnesses.iter().flatten().flatten())
+            {
+                ids.extend(fact.via_function.as_deref());
+                ids.extend(fact.witness.as_ref().and_then(|w| w.owner.as_deref()));
+                ids.extend(fact.call_chain.iter().flatten().map(String::as_str));
             }
         }
         let lambdas: Vec<_> = ids
@@ -1217,44 +1428,345 @@ impl DirectSession {
             };
             labels.insert(id, format!("{path}:{line}:{column}"));
         }
-        for key in ["selected", "symbol"] {
-            if let Some(label) = result[key]["id"].as_str().and_then(|id| labels.get(id)) {
-                result[key]["selector"] = json!(label);
-            }
+        if let Some(selected) = &mut result.selected
+            && let Some(label) = labels.get(&selected.id)
+        {
+            selected.selector.clone_from(label);
         }
-        if let Some(nodes) = result["impact"]["nodes"].as_array_mut() {
-            for node in nodes {
-                if let Some(label) = node["id"].as_str().and_then(|id| labels.get(id)) {
-                    node["selector"] = json!(label);
+        if let DirectQueryData::Impact { impact, symbol } = &mut result.data {
+            if let Some(label) = labels.get(&symbol.id) {
+                symbol.selector.clone_from(label);
+            }
+            for node in &mut impact.nodes {
+                if let Some(label) = labels.get(&node.id) {
+                    node.selector = Some(label.clone());
                 }
             }
         }
         let name = |id: &str| labels.get(id).or_else(|| self.function_names.get(id));
-        if let Some(causes) = result["unknown_causes"].as_array_mut() {
-            for cause in causes {
-                if let Some(name) = cause["function"].as_str().and_then(name) {
-                    cause["name"] = json!(name);
+        if let Some(effects) = result.effects_mut() {
+            for cause in effects.unknown_causes.iter_mut().flatten() {
+                if let Some(name) = name(&cause.function) {
+                    cause.name.clone_from(name);
+                }
+            }
+            for fact in effects
+                .effect_evidence
+                .iter_mut()
+                .flatten()
+                .chain(effects.compiler_witnesses.iter_mut().flatten().flatten())
+            {
+                for step in fact.call_chain.iter_mut().flatten() {
+                    if let Some(label) = name(step) {
+                        step.clone_from(label);
+                    }
+                }
+                if let Some(via) = &mut fact.via_function
+                    && let Some(label) = name(via)
+                {
+                    via.clone_from(label);
+                }
+                if let Some(owner) = fact.witness.as_mut().and_then(|w| w.owner.as_mut())
+                    && let Some(label) = name(owner)
+                {
+                    owner.clone_from(label);
                 }
             }
         }
-        for key in ["effect_evidence", "compiler_witnesses"] {
-            if let Some(facts) = result[key].as_array_mut() {
-                for fact in facts {
-                    if let Some(chain) = fact["call_chain"].as_array_mut() {
-                        for step in chain {
-                            if let Some(label) = step.as_str().and_then(name) {
-                                *step = json!(label);
+        Ok(())
+    }
+    fn display_path(&self, path: &mut String, absolute: bool) {
+        if !absolute && let Ok(relative) = Path::new(path).strip_prefix(self.workspace()) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            *path = if relative.is_empty() {
+                ".".into()
+            } else {
+                relative
+            };
+        }
+    }
+    fn display_identity(&self, identity: &mut Option<SymbolIdentity>, absolute: bool) {
+        if let Some(identity) = identity {
+            self.display_symbol_identity(identity, absolute);
+        }
+    }
+    fn display_symbol_identity(&self, identity: &mut SymbolIdentity, absolute: bool) {
+        use crate::package::PackageSourceIdentity;
+        self.display_path(&mut identity.module, absolute);
+        match &mut identity.package.source {
+            PackageSourceIdentity::Path { path } => {
+                if !absolute && let Ok(relative) = path.strip_prefix(self.workspace()) {
+                    let relative = relative.to_string_lossy().replace('\\', "/");
+                    *path = if relative.is_empty() {
+                        PathBuf::from(".")
+                    } else {
+                        PathBuf::from(relative)
+                    };
+                }
+            }
+            PackageSourceIdentity::GitSubdirectory { path, .. } => {
+                self.display_path(path, absolute)
+            }
+            PackageSourceIdentity::Git { .. } => {}
+        }
+    }
+    fn display_rust_crate(
+        &mut self,
+        dependency: &mut interop::RustCrateIdentity,
+        absolute: bool,
+    ) -> Result<()> {
+        use interop::RustCrateSource;
+        match &mut dependency.source {
+            RustCrateSource::Project(source) => {
+                if let Some(path) = &mut source.path {
+                    self.display_path(path, absolute);
+                }
+            }
+            RustCrateSource::Local { path, .. } => self.display_path(path, absolute),
+            RustCrateSource::Remote(_) => {}
+            RustCrateSource::Other(value) => self.display_locations(value, absolute)?,
+        }
+        Ok(())
+    }
+    fn display_location(&mut self, location: &mut Location, absolute: bool) -> Result<()> {
+        let (line, column) = self.source(&location.path)?.position(location.start)?;
+        location.display = Some(Box::new(super::DisplayPosition { line, column }));
+        if !absolute {
+            location.path = Path::new(&location.path)
+                .strip_prefix(self.workspace())
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| location.path.clone());
+        }
+        Ok(())
+    }
+    fn display_selected(&mut self, symbol: &mut SelectedSymbol, absolute: bool) -> Result<()> {
+        self.display_identity(&mut symbol.identity, absolute);
+        if let Some(location) = &mut symbol.location {
+            let (line, column) = self.source(&location.path)?.position(location.start)?;
+            location.line = Some(line);
+            location.column = Some(column);
+            if !absolute {
+                location.path = Path::new(&location.path)
+                    .strip_prefix(self.workspace())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| location.path.clone());
+            }
+        }
+        Ok(())
+    }
+    fn display_assumption(
+        &mut self,
+        assumption: &mut super::assumptions::Assumption,
+        absolute: bool,
+    ) -> Result<()> {
+        if let Some(location) = &mut assumption.location
+            && let Some(path) = &mut location.path
+        {
+            let (line, column) = self.source(path)?.position(location.start)?;
+            location.display = Some(Box::new(super::DisplayPosition { line, column }));
+            if !absolute {
+                *path = Path::new(path)
+                    .strip_prefix(self.workspace())
+                    .map(|p| p.to_string_lossy().replace('\\', "/"))
+                    .unwrap_or_else(|_| path.clone());
+            }
+        }
+        Ok(())
+    }
+    fn display_effect_state(
+        &mut self,
+        state: &mut super::effect_states::EffectState,
+        absolute: bool,
+    ) -> Result<()> {
+        if let Some(assumption) = &mut state.assumption {
+            self.display_assumption(assumption, absolute)?;
+        }
+        if let Some(witness) = &mut state.witness {
+            self.display_location(&mut witness.location, absolute)?;
+        }
+        for reason in &mut state.unknown_reasons {
+            if let Some(location) = &mut reason.location {
+                self.display_location(location, absolute)?;
+            }
+        }
+        Ok(())
+    }
+    fn display_effect(
+        &mut self,
+        fact: &mut super::evidence::ExplainedEffect,
+        absolute: bool,
+    ) -> Result<()> {
+        use super::evidence::SourcePoint;
+        if let Some(witness) = &mut fact.witness
+            && let Some(cause) = &mut witness.cause
+        {
+            if let Some(location) = cause.location_mut() {
+                self.display_location(location, absolute)?;
+            }
+            if let Some(lock) = &mut cause.lock
+                && let Some(SourcePoint::Located(location)) = &mut lock.target
+            {
+                self.display_location(location, absolute)?;
+            }
+        }
+        if let Some(paths) = &mut fact.paths
+            && let Some(Some(location)) = &mut paths.location
+        {
+            self.display_location(location, absolute)?;
+        }
+        if let Some(task) = &mut fact.task_relationship
+            && let Some(location) = &mut task.location
+        {
+            self.display_location(location, absolute)?;
+        }
+        Ok(())
+    }
+    fn display_effects(
+        &mut self,
+        effects: &mut super::query_result::EffectResult,
+        absolute: bool,
+    ) -> Result<()> {
+        for state in &mut effects.effects {
+            self.display_effect_state(state, absolute)?;
+        }
+        if let Some(assumptions) = &mut effects.assumptions {
+            for assumption in [
+                &mut assumptions.no_block,
+                &mut assumptions.no_io,
+                &mut assumptions.no_wait,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                self.display_assumption(assumption, absolute)?;
+            }
+        }
+        for cause in effects.unknown_causes.iter_mut().flatten() {
+            self.display_path(&mut cause.module, absolute);
+            for location in &mut cause.locations {
+                self.display_location(location, absolute)?;
+            }
+            for site in cause.call_sites.iter_mut().flatten() {
+                self.display_location(&mut site.location, absolute)?;
+            }
+            if let Some(location) = &mut cause.caller_location {
+                self.display_location(location, absolute)?;
+            }
+        }
+        for fact in effects
+            .effect_evidence
+            .iter_mut()
+            .flatten()
+            .chain(effects.compiler_witnesses.iter_mut().flatten().flatten())
+        {
+            self.display_effect(fact, absolute)?;
+        }
+        Ok(())
+    }
+    fn display_symbol_record(
+        &mut self,
+        symbol: &mut super::query_result::SymbolRecord,
+        absolute: bool,
+    ) -> Result<()> {
+        self.display_identity(&mut symbol.identity, absolute);
+        if let Some(location) = &mut symbol.location {
+            self.display_location(location, absolute)?;
+        }
+        Ok(())
+    }
+    fn display_reference(
+        &mut self,
+        reference: &mut super::query_result::ReferenceRecord,
+        absolute: bool,
+    ) -> Result<()> {
+        self.display_identity(&mut reference.identity, absolute);
+        self.display_location(&mut reference.location, absolute)
+    }
+    pub fn display_query_locations(
+        &mut self,
+        result: &mut DirectQueryResult,
+        absolute: bool,
+    ) -> Result<()> {
+        use super::query_result::{QueryData, SymbolInfo};
+        if let Some(selected) = &mut result.selected {
+            self.display_selected(selected, absolute)?;
+        }
+        match &mut result.data {
+            DirectQueryData::Resolved { symbol } => self.display_selected(symbol, absolute)?,
+            DirectQueryData::Ambiguous { candidates } => {
+                for candidate in candidates {
+                    self.display_selected(candidate, absolute)?;
+                }
+            }
+            DirectQueryData::Impact { impact, symbol } => {
+                self.display_selected(symbol, absolute)?;
+                for node in &mut impact.nodes {
+                    self.display_identity(&mut node.identity, absolute);
+                    for state in &mut node.effects {
+                        self.display_effect_state(state, absolute)?;
+                    }
+                }
+                for dependency in &mut impact.rust_dependencies {
+                    self.display_rust_crate(dependency, absolute)?;
+                }
+                for boundary in &mut impact.dependency_boundary {
+                    if let Some(dependency) = &mut boundary.crate_identity {
+                        self.display_rust_crate(dependency, absolute)?;
+                    }
+                    self.display_identity(&mut boundary.identity, absolute);
+                }
+                for dependency in &mut impact.external_dependencies {
+                    self.display_symbol_identity(&mut dependency.from, absolute);
+                    self.display_symbol_identity(&mut dependency.target, absolute);
+                }
+            }
+            DirectQueryData::Semantic(data) => match data {
+                QueryData::Symbol {
+                    symbol,
+                    resolved_symbols,
+                } => {
+                    match symbol {
+                        SymbolInfo::Declaration(symbol) => {
+                            self.display_symbol_record(symbol, absolute)?
+                        }
+                        SymbolInfo::Function(function) => {
+                            self.display_identity(&mut function.identity, absolute);
+                            self.display_path(&mut function.module, absolute);
+                            for location in &mut function.locations {
+                                self.display_location(location, absolute)?;
                             }
                         }
                     }
-                    if let Some(name) = fact["via_function"].as_str().and_then(name) {
-                        fact["via_function"] = json!(name);
-                    }
-                    if let Some(name) = fact["witness"]["owner"].as_str().and_then(name) {
-                        fact["witness"]["owner"] = json!(name);
+                    for symbol in resolved_symbols.iter_mut().flatten() {
+                        self.display_symbol_record(symbol, absolute)?;
                     }
                 }
-            }
+                QueryData::Symbols { symbols, .. } => {
+                    for symbol in symbols {
+                        self.display_symbol_record(symbol, absolute)?;
+                    }
+                }
+                QueryData::Type(typed) => {
+                    if let Some(location) = &mut typed.location {
+                        self.display_location(location, absolute)?;
+                    }
+                }
+                QueryData::References {
+                    references,
+                    unresolved_candidates,
+                    ..
+                } => {
+                    for reference in references
+                        .iter_mut()
+                        .chain(unresolved_candidates.iter_mut().flatten())
+                    {
+                        self.display_reference(reference, absolute)?;
+                    }
+                }
+                QueryData::Effects(effects) => self.display_effects(effects, absolute)?,
+                QueryData::Empty {} => {}
+            },
+            DirectQueryData::Unknown { .. } | DirectQueryData::Empty {} => {}
         }
         Ok(())
     }
@@ -1367,6 +1879,7 @@ mod tests {
                             module: path.into(),
                             name: format!("<lambda main@{start}:{}>", start + 4),
                             locations: vec![Location {
+                                display: None,
                                 path: path.into(),
                                 start,
                                 end: start + 4,
@@ -1389,27 +1902,53 @@ mod tests {
             let mut once = 0;
             for repeats in [1, 8] {
                 session.sources[path].search_steps.set(0);
-                let facts: Vec<_> = (0..n * repeats)
+                use super::super::{
+                    evidence::{ExplainedEffect, Witness, WitnessKind},
+                    query_result::{EffectResult, QueryData, Status},
+                };
+                let facts = (0..n * repeats)
                     .map(|i| {
-                        json!({
-                            "via_function": format!("f{}", i % n),
-                            "witness": {"owner": format!("f{}", i % n)}
-                        })
+                        let id = format!("f{}", i % n);
+                        let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+                        witness.owner = Some(id.clone());
+                        ExplainedEffect::new(1, witness, id)
                     })
                     .collect();
-                let mut result = json!({"effect_evidence":facts});
+                let effects = EffectResult {
+                    schema: super::super::effect_states::SCHEMA,
+                    effects: vec![],
+                    reason: None,
+                    assumptions: None,
+                    unknown_causes: None,
+                    bounds: None,
+                    effect_evidence: Some(facts),
+                    no_panic: None,
+                    witness: None,
+                    compiler_witnesses: None,
+                    meaning: None,
+                };
+                let mut result = DirectQueryResult::new(
+                    Status::Ok,
+                    DirectQueryData::Semantic(QueryData::Effects(effects)),
+                );
                 session
                     .display_function_targets(&mut result, false)
                     .unwrap();
-                for (i, fact) in result["effect_evidence"]
-                    .as_array()
+                for (i, fact) in result
+                    .effects()
+                    .unwrap()
+                    .effect_evidence
+                    .as_ref()
                     .unwrap()
                     .iter()
                     .enumerate()
                 {
                     let anchor = format!("main.wi:{}:2", i % n + 1);
-                    assert_eq!(fact["via_function"], anchor);
-                    assert_eq!(fact["witness"]["owner"], anchor);
+                    assert_eq!(fact.via_function.as_deref(), Some(anchor.as_str()));
+                    assert_eq!(
+                        fact.witness.as_ref().unwrap().owner.as_deref(),
+                        Some(anchor.as_str())
+                    );
                 }
                 let steps = session.sources[path].search_steps.get();
                 if repeats == 1 {
@@ -1482,8 +2021,8 @@ mod tests {
 }
 
 /// A local's scoped name without its internal `@byte` identity anchor.
-fn local_plain<'a>(kind: &str, selector: &'a str) -> Option<&'a str> {
-    matches!(kind, "binding" | "parameter")
+fn local_plain<'a>(kind: &SymbolKind, selector: &'a str) -> Option<&'a str> {
+    matches!(kind, SymbolKind::Binding | SymbolKind::Parameter)
         .then(|| selector.rsplit_once('@'))
         .flatten()
         .filter(|(_, offset)| !offset.is_empty() && offset.bytes().all(|b| b.is_ascii_digit()))
@@ -1586,22 +2125,6 @@ fn selector_typo_distance(a: &str, b: &[char]) -> Option<usize> {
     }
     let distance = previous[b.len() + limit - a.len()];
     (distance <= limit).then_some(distance)
-}
-
-/// File and edit counts shared by rename dry-run previews and applied renames.
-fn rename_summary(preview: &Value) -> serde_json::Map<String, Value> {
-    let changes = preview["files_changed"]
-        .as_u64()
-        .unwrap_or_else(|| preview["changes"].as_array().map_or(0, Vec::len) as u64);
-    let edits = preview["work"]["patches"].as_u64().unwrap_or(0);
-    let declarations = preview["work"]["declarations"].as_u64().unwrap_or(0);
-    let references = edits.saturating_sub(declarations);
-    serde_json::Map::from_iter([
-        ("files_changed".to_owned(), json!(changes)),
-        ("edits".to_owned(), json!(edits)),
-        ("declarations_updated".to_owned(), json!(declarations)),
-        ("references_updated".to_owned(), json!(references)),
-    ])
 }
 
 #[cfg(test)]
@@ -1801,4 +2324,46 @@ mod typo_tests {
             }
         }
     }
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+pub enum RenameResult {
+    Resolution(Box<DirectQueryResult>),
+    Preview(RenamePreviewResult),
+    Applied(RenameApplied),
+}
+impl RenameResult {
+    pub fn status(&self) -> query_result::Status {
+        match self {
+            Self::Resolution(r) => r.status,
+            Self::Preview(r) => r.preview.status,
+            Self::Applied(r) => r.status,
+        }
+    }
+}
+#[derive(Serialize)]
+pub struct RenamePreviewResult {
+    #[serde(flatten)]
+    pub preview: edit::RenamePreview,
+    pub edits: usize,
+    pub declarations_updated: usize,
+    pub references_updated: usize,
+    pub selected: SelectedSymbol,
+}
+#[derive(Serialize)]
+pub struct RenameApplied {
+    pub status: query_result::Status,
+    pub old: String,
+    pub new: String,
+    pub validation: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transaction: Option<String>,
+    pub selected: SelectedSymbol,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warnings: Option<Vec<String>>,
+    pub files_changed: usize,
+    pub edits: usize,
+    pub declarations_updated: usize,
+    pub references_updated: usize,
 }

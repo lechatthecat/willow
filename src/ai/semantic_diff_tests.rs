@@ -1,6 +1,11 @@
 use super::*;
 use std::{fs, path::PathBuf, process::Command};
 
+/// Assert the public wire contract independently of the internal report types.
+pub(super) fn wire(value: &impl serde::Serialize) -> serde_json::Value {
+    serde_json::to_value(value).unwrap()
+}
+
 pub(super) fn captures(a: &str, b: &str) -> (Capture, Capture) {
     captures_mode(a, b, true)
 }
@@ -47,12 +52,15 @@ fn semantic_diff_public_signature_add_remove_and_rename() {
     ] {
         let r = report(a, b);
         assert_eq!(r.exit_code(), 0, "{r:?}");
-        assert!(r.changes.iter().any(|v| v["public_api"] == kind), "{r:?}");
+        assert!(
+            r.changes.iter().map(wire).any(|v| v["public_api"] == kind),
+            "{r:?}"
+        );
     }
     let r = report("pub fn f() {} fn main() {}", "pub fn g() {} fn main() {}");
     assert_eq!(r.changes.len(), 1, "{r:?}");
-    assert_eq!(r.changes[0]["match"], "renamed");
-    assert_eq!(r.changes[0]["public_api"], "renamed");
+    assert_eq!(wire(&r.changes[0])["match"], "renamed");
+    assert_eq!(wire(&r.changes[0])["public_api"], "renamed");
 }
 #[test]
 fn semantic_diff_contract_strength_and_weakness() {
@@ -85,7 +93,10 @@ fn semantic_diff_contract_strength_and_weakness() {
         let r = report(&src(a), &src(b));
         assert_eq!(r.exit_code(), 0, "{r:?}");
         assert!(
-            r.changes.iter().any(|v| v["contract"]["change"] == kind),
+            r.changes
+                .iter()
+                .map(wire)
+                .any(|v| v["contract"]["change"] == kind),
             "{r:?}"
         );
     }
@@ -100,7 +111,7 @@ fn semantic_diff_existing_and_new_contract_violations() {
     ] {
         let r = report(a, bad);
         assert_eq!(r.exit_code(), 1, "{r:?}");
-        assert!(r.summary["contract_violations"].as_u64().unwrap() > 0);
+        assert!(wire(&r.summary)["contract_violations"].as_u64().unwrap() > 0);
     }
     let r = report(bad, "fn main() {}");
     assert_eq!(
@@ -122,6 +133,7 @@ fn semantic_diff_helper_growth_policy_and_witness() {
     let c = r
         .changes
         .iter()
+        .map(wire)
         .find(|v| v["symbol"].as_str().unwrap().contains("::middle"))
         .unwrap();
     assert!(
@@ -154,6 +166,7 @@ fn semantic_diff_removal_and_uncertainty() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|v| !v["effects"]["removed"].as_array().unwrap().is_empty())
     );
     let r = report("fn main() {}", "fn main() { let n: i64 = true; }");
@@ -166,7 +179,10 @@ fn semantic_diff_contracts_on_members() {
         "pub class A { @effects(no_wait) pub fn f(self) {} } fn main() {}",
     );
     assert!(
-        r.changes.iter().any(|v| v["contract"]["change"] == "added"),
+        r.changes
+            .iter()
+            .map(wire)
+            .any(|v| v["contract"]["change"] == "added"),
         "{r:?}"
     );
 }
@@ -211,7 +227,7 @@ fn semantic_diff_git_uncommitted_input_read_only_and_deterministic() {
     let status = git(&dir.0, &["status", "--porcelain"]);
     let r = verify(&opts).unwrap();
     assert_eq!(r.exit_code(), 0, "{r:?}");
-    assert_ne!(r.base["digest"], r.target["digest"]);
+    assert_ne!(wire(&r.base)["digest"], wire(&r.target)["digest"]);
     assert_eq!(git(&dir.0, &["status", "--porcelain"]), status);
     assert_eq!(
         serde_json::to_value(&r).unwrap(),
@@ -269,6 +285,7 @@ fn semantic_diff_async_creation_does_not_suspend_caller() {
     if let Some(make) = r
         .changes
         .iter()
+        .map(wire)
         .find(|v| v["symbol"].as_str().unwrap().contains("::make"))
     {
         assert!(
@@ -351,6 +368,7 @@ fn semantic_diff_project_and_imported_helper() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|v| v["symbol"].as_str().unwrap().contains("::caller")
                 && !v["effects"]["added"].as_array().unwrap().is_empty()),
         "{r:?}"
@@ -372,6 +390,7 @@ fn semantic_diff_indirect_targets_change() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|v| v["targets"]["base"] != v["targets"]["target"]),
         "{r:?}"
     );
@@ -385,8 +404,8 @@ fn semantic_diff_ambiguous_symbols_are_not_paired() {
     let r = compare(&a, &b, true).unwrap();
     assert_eq!(r.exit_code(), 3);
     assert_eq!(r.changes.len(), 1);
-    assert_eq!(r.changes[0]["match"], "ambiguous");
-    assert!(r.changes[0]["effects"].is_null());
+    assert_eq!(wire(&r.changes[0])["match"], "ambiguous");
+    assert!(wire(&r.changes[0])["effects"].is_null());
 }
 #[test]
 fn semantic_diff_generic_contract_is_reported() {
@@ -395,7 +414,10 @@ fn semantic_diff_generic_contract_is_reported() {
         "@effects(no_wait) fn identity<T>(x:T) -> T { return x; } fn main() { identity(1); }",
     );
     assert!(
-        r.changes.iter().any(|v| v["contract"]["change"] == "added"),
+        r.changes
+            .iter()
+            .map(wire)
+            .any(|v| v["contract"]["change"] == "added"),
         "{r:?}"
     );
 }
@@ -407,7 +429,8 @@ fn semantic_diff_shifted_witness_locations_are_relative() {
     let locations: Vec<_> = r
         .changes
         .iter()
-        .flat_map(|v| v["cause"].as_array().unwrap())
+        .map(wire)
+        .flat_map(|v| v["cause"].as_array().unwrap().clone())
         .filter(|v| !v["location"].is_null())
         .collect();
     assert!(!locations.is_empty());
@@ -425,8 +448,8 @@ fn semantic_diff_failure_preserves_digests() {
     fs::write(dir.0.join("main.wi"), "fn main( {").unwrap();
     let r = verify(&opts).unwrap();
     assert_eq!(r.exit_code(), 3);
-    assert!(r.base["digest"].is_string());
-    assert!(r.target["digest"].is_string());
+    assert!(wire(&r.base)["digest"].is_string());
+    assert!(wire(&r.target)["digest"].is_string());
     assert!(
         !serde_json::to_string(&r)
             .unwrap()
@@ -458,13 +481,14 @@ fn semantic_diff_fanout_and_cycles_have_finite_paths() {
     let leaf = r
         .changes
         .iter()
+        .map(wire)
         .find(|v| v["symbol"].as_str().unwrap().contains("::leaf"))
         .unwrap();
     assert_eq!(leaf["impacted_callers"].as_array().unwrap().len(), 3);
     let a =
         "fn a(c: BlockingCell<i64>) { b(c); } fn b(c: BlockingCell<i64>) { a(c); } fn main() {}";
     let r = report(a, &a.replace("a(c);", "c.get(); a(c);"));
-    assert!(r.changes.iter().all(|v| {
+    assert!(r.changes.iter().map(wire).all(|v| {
         v["cause"]
             .as_array()
             .unwrap()
@@ -486,11 +510,11 @@ fn semantic_diff_digest_check_detects_changes_additions_and_removals() {
             _ => fs::remove_file(dir.0.join("main.wi")).unwrap(),
         }
         let mut report = SemanticDiff::incomplete(String::new());
-        report.status = "complete";
+        report.status = ReportStatus::Complete;
         check_target(&mut report, &dir.0, &digest).unwrap();
         assert_eq!(report.exit_code(), 3, "{case}");
         assert!(
-            report.summary["uncertainty"]
+            wire(&report.summary)["uncertainty"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("snapshot changed during verification"))
@@ -523,7 +547,7 @@ fn semantic_diff_witness_storage_is_linear_on_deep_chains() {
             &format!("main.wi::function::node{}#0", n - 1),
             RuntimeEffects::MAY_BLOCK.bits(),
         );
-        assert_eq!(chain["chain"].as_array().unwrap().len(), n + 1);
+        assert_eq!(wire(&chain)["chain"].as_array().unwrap().len(), n + 1);
         eprintln!("witness-storage n={n} next_hops={edges}");
     }
 }
@@ -538,7 +562,13 @@ fn semantic_diff_public_visibility_and_equivalent_contracts() {
             &format!("{a} fn main() {{}}"),
             &format!("{b} fn main() {{}}"),
         );
-        assert!(r.changes.iter().any(|v| v["public_api"] == status), "{r:?}");
+        assert!(
+            r.changes
+                .iter()
+                .map(wire)
+                .any(|v| v["public_api"] == status),
+            "{r:?}"
+        );
     }
     let r = report(
         "@effects(no_wait) fn main() {}",
@@ -547,6 +577,7 @@ fn semantic_diff_public_visibility_and_equivalent_contracts() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|v| v["contract"]["change"] == "equivalent"),
         "{r:?}"
     );
@@ -565,12 +596,26 @@ fn semantic_diff_shared_caller_work_on_dense_graphs() {
             );
         }
         let mut changes: Vec<_> = (0..n)
-            .map(|i| json!({"symbol":format!("node{i:03}"),"match":"exact","impacted_callers":[]}))
+            .map(|i| SymbolChange {
+                cause: vec![],
+                contract: None,
+                effects: None,
+                impacted_callers: vec![],
+                matching: MatchKind::Exact,
+                public_api: PublicApiChange::Unchanged,
+                renamed_to: Some(None),
+                signature: None,
+                symbol: format!("node{i:03}"),
+                targets: None,
+            })
             .collect();
         let unions = impact::assign(&mut changes, &a.baseline, &b.baseline).unwrap();
         assert_eq!(unions, n * (n - 1) / 2 * n.div_ceil(64));
         for (i, c) in changes.iter().enumerate() {
-            assert_eq!(c["impacted_callers"].as_array().unwrap().len(), n - i - 1);
+            assert_eq!(
+                wire(c)["impacted_callers"].as_array().unwrap().len(),
+                n - i - 1
+            );
         }
         eprintln!("caller-work n={n} word_unions={unions}");
     }
@@ -590,9 +635,9 @@ fn semantic_diff_failed_target_preserves_baseline_contract_errors() {
     fs::write(dir.0.join("main.wi"), "fn main( {").unwrap();
     let r = verify(&opts).unwrap();
     assert_eq!(r.exit_code(), 3);
-    assert!(r.summary["contract_violations"].as_u64().unwrap() > 0);
+    assert!(wire(&r.summary)["contract_violations"].as_u64().unwrap() > 0);
     assert!(
-        r.summary["diagnostics"]["base"]
+        wire(&r.summary)["diagnostics"]["base"]
             .as_array()
             .unwrap()
             .iter()
@@ -617,6 +662,7 @@ fn main() {}";
             expected
                 .changes
                 .iter()
+                .map(wire)
                 .any(|change| change["effects"][delta]
                     .as_array()
                     .is_some_and(|bits| bits.iter().any(|bit| bit == "may-allocate"))),
@@ -648,6 +694,7 @@ fn main() {}";
             expected
                 .changes
                 .iter()
+                .map(wire)
                 .any(|change| change["effects"][delta]
                     .as_array()
                     .is_some_and(|bits| bits.iter().any(|bit| bit == "may-allocate"))),
@@ -669,6 +716,7 @@ fn semantic_diff_virtual_dispatch_target_set_changes() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|v| v["match"] == "exact" && v["targets"]["base"] != v["targets"]["target"]),
         "{r:?}"
     );
@@ -694,11 +742,11 @@ fn semantic_diff_review_manifest_deletion_preserves_baseline_scope() {
     let r = verify(&opts).unwrap();
     assert_eq!(r.exit_code(), 3, "{r:?}");
     assert!(
-        r.summary["contract_violations"].as_u64().unwrap() > 0,
+        wire(&r.summary)["contract_violations"].as_u64().unwrap() > 0,
         "{r:?}"
     );
     assert!(
-        r.summary["diagnostics"]["base"]
+        wire(&r.summary)["diagnostics"]["base"]
             .as_array()
             .unwrap()
             .iter()
@@ -711,7 +759,7 @@ fn semantic_diff_review_manifest_deletion_preserves_baseline_scope() {
         "{r:?}"
     );
     assert!(
-        r.summary["uncertainty"]
+        wire(&r.summary)["uncertainty"]
             .as_array()
             .unwrap()
             .iter()
@@ -748,6 +796,7 @@ fn semantic_diff_review_nested_entry_uses_captured_root() {
     let leaf = r
         .changes
         .iter()
+        .map(wire)
         .find(|v| v["symbol"] == "src/helper.wi::function::leaf#0")
         .expect("root-relative helper identity");
     assert!(
@@ -759,6 +808,7 @@ fn semantic_diff_review_nested_entry_uses_captured_root() {
     let caller = r
         .changes
         .iter()
+        .map(wire)
         .find(|v| v["symbol"] == "src/main.wi::function::caller#0")
         .unwrap();
     assert!(
@@ -774,7 +824,7 @@ fn semantic_diff_review_nested_entry_uses_captured_root() {
         "{r:?}"
     );
     assert!(
-        r.summary["diagnostics"]["target"]
+        wire(&r.summary)["diagnostics"]["target"]
             .as_array()
             .unwrap()
             .iter()
@@ -826,7 +876,7 @@ fn semantic_diff_review_manifest_entry_change_preserves_original_scope() {
     let r = verify(&opts).unwrap();
     assert_eq!(r.exit_code(), 3, "{r:?}");
     assert!(
-        r.summary["diagnostics"]["base"]
+        wire(&r.summary)["diagnostics"]["base"]
             .as_array()
             .unwrap()
             .iter()
@@ -839,7 +889,7 @@ fn semantic_diff_review_manifest_entry_change_preserves_original_scope() {
         "{r:?}"
     );
     assert!(
-        r.summary["uncertainty"]
+        wire(&r.summary)["uncertainty"]
             .as_array()
             .unwrap()
             .iter()
@@ -850,7 +900,7 @@ fn semantic_diff_review_manifest_entry_change_preserves_original_scope() {
         opts.entry = Some(entry.into());
         let r = verify(&opts).unwrap();
         assert_eq!(
-            r.summary["diagnostics"]["base"]
+            wire(&r.summary)["diagnostics"]["base"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -861,7 +911,7 @@ fn semantic_diff_review_manifest_entry_change_preserves_original_scope() {
         // An explicit override keeps the same entry in both trees. Existing
         // configuration compatibility rules may still reject the manifest edit.
         assert!(
-            r.summary["uncertainty"]
+            wire(&r.summary)["uncertainty"]
                 .as_array()
                 .unwrap()
                 .iter()
@@ -2404,10 +2454,10 @@ fn semantic_diff_rename_five_kinds() {
         assert_eq!(r.exit_code(), 0, "{individual}: {r:?}");
         assert_eq!(r.changes.len(), [1, 1, 2, 1, 0, 5][individual], "{r:?}");
         assert!(
-            r.changes.iter().all(|c| c["match"] == "renamed"),
+            r.changes.iter().map(wire).all(|c| c["match"] == "renamed"),
             "{individual}: {r:?}"
         );
-        assert!(r.changes.iter().all(|c| c["effects"]["added"] == json!([]) && c["effects"]["removed"] == json!([])), "{r:?}");
+        assert!(r.changes.iter().map(wire).all(|c| c["effects"]["added"] == json!([]) && c["effects"]["removed"] == json!([])), "{r:?}");
         let text = r.human(true);
         assert!(
             !text.contains("$dispatch$")
@@ -2524,12 +2574,16 @@ fn semantic_diff_rename_boundaries() {
         let r = report(source, target);
         assert_eq!(r.exit_code(), 0, "{label}: {r:?}");
         assert_eq!(
-            r.changes.iter().filter(|c| c["match"] == "renamed").count(),
+            r.changes
+                .iter()
+                .map(wire)
+                .filter(|c| c["match"] == "renamed")
+                .count(),
             renamed,
             "{label}: {r:?}"
         );
         assert_eq!(
-            r.changes.iter().any(|c| c["match"] == "added"),
+            r.changes.iter().map(wire).any(|c| c["match"] == "added"),
             added,
             "{label}: {r:?}"
         );
@@ -2545,7 +2599,12 @@ fn semantic_diff_rename_preserves_effect_and_contract_evidence() {
     let b = "@effects(no_wait) fn g(c:BlockingCell<i64>) { c.get(); } fn main() {}";
     let r = report(a, b);
     assert_eq!(r.exit_code(), 1, "{r:?}");
-    let change = r.changes.iter().find(|c| c["match"] == "renamed").unwrap();
+    let change = r
+        .changes
+        .iter()
+        .map(wire)
+        .find(|c| c["match"] == "renamed")
+        .unwrap();
     assert_eq!(change["contract"]["change"], "added");
     assert!(
         !change["contract"]["target_violations"]
@@ -2578,7 +2637,12 @@ fn semantic_diff_rename_does_not_hide_effect_growth_or_retargeting() {
     let (before, after) = captures(&a, &b);
     let r = compare(&before, &after, true).unwrap();
     assert_eq!(r.exit_code(), 1, "{r:?}");
-    let change = r.changes.iter().find(|c| c["match"] == "renamed").unwrap();
+    let change = r
+        .changes
+        .iter()
+        .map(wire)
+        .find(|c| c["match"] == "renamed")
+        .unwrap();
     assert!(
         change["effects"]["added"]
             .as_array()
@@ -2665,10 +2729,10 @@ fn semantic_diff_rename_lambda_owner_correspondence() {
             let r = compare(&before, &after, false).unwrap();
             assert_eq!(r.exit_code(), 0, "{r:?}");
             assert_eq!(r.changes.len(), 1, "{r:?}");
-            assert_eq!(r.changes[0]["match"], "renamed");
-            assert_eq!(r.changes[0]["effects"]["added"], json!([]));
-            assert_eq!(r.changes[0]["effects"]["removed"], json!([]));
-            assert_eq!(r.changes[0]["targets"]["change"], "unchanged");
+            assert_eq!(wire(&r.changes[0])["match"], "renamed");
+            assert_eq!(wire(&r.changes[0])["effects"]["added"], json!([]));
+            assert_eq!(wire(&r.changes[0])["effects"]["removed"], json!([]));
+            assert_eq!(wire(&r.changes[0])["targets"]["change"], "unchanged");
         }
     }
 }
@@ -2710,6 +2774,7 @@ fn semantic_diff_rename_lambda_collision_preserves_effect_growth() {
     assert!(
         r.changes
             .iter()
+            .map(wire)
             .any(|c| c["symbol"].as_str().is_some_and(matching::is_lambda)
                 && c["effects"]["added"]
                     .as_array()
@@ -2728,7 +2793,10 @@ fn semantic_diff_panic_allocation_helper_violations() {
         let result = report(&before, &after);
         assert_eq!(result.exit_code(), 1, "{result:?}");
         assert!(
-            result.summary["contract_violations"].as_u64().unwrap() > 0,
+            wire(&result.summary)["contract_violations"]
+                .as_u64()
+                .unwrap()
+                > 0,
             "{result:?}"
         );
     }

@@ -1,6 +1,7 @@
 //! Package projections of existing compiler evidence. No dependency resolution
 //! or build scheduling takes place in semantic queries.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::package::PackageIdentity;
 use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
@@ -34,13 +35,43 @@ pub struct ModuleEvidence {
 pub struct UpdateDelta {
     pub schema: u32,
     pub ok: bool,
-    pub kind: String,
+    pub kind: DeltaKind,
     #[serde(default)]
     pub packages_added: Vec<PackageIdentity>,
     #[serde(default)]
     pub changes: Vec<DirectChange>,
     #[serde(default)]
     pub transitive_changes: Vec<Change>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeltaKind {
+    Mutation,
+    Other(String),
+}
+impl Serialize for DeltaKind {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.serialize_str(match self {
+            Self::Mutation => "package.mutation",
+            Self::Other(s) => s,
+        })
+    }
+}
+impl<'de> Deserialize<'de> for DeltaKind {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Self, D::Error> {
+        Ok(match String::deserialize(d)?.as_str() {
+            "package.mutation" => Self::Mutation,
+            s => Self::Other(s.into()),
+        })
+    }
+}
+impl From<&str> for DeltaKind {
+    fn from(s: &str) -> Self {
+        if s == "package.mutation" {
+            Self::Mutation
+        } else {
+            Self::Other(s.into())
+        }
+    }
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirectChange {
@@ -158,27 +189,30 @@ pub(super) fn attach(
         // have an implementation owner or an internal `$default$` function name.
         symbol.identity = by_id
             .get(symbol.id.as_str())
-            .filter(|_| symbol.kind != "method")
+            .filter(|_| symbol.kind != SymbolKind::Method)
             .and_then(|i| (*i).clone())
             .or_else(|| {
                 symbol.location.as_ref().and_then(|l| {
                     let owner = units_by_path
                         .get(l.path.as_str())
                         .and_then(|u| owners.at(u.file_id(), l.start));
-                    let name = match symbol.kind.as_str() {
+                    let name = match symbol.kind {
                         // A source anchor distinguishes nested/sibling scopes and
                         // repeated bindings without encoding a whole scope chain.
-                        "parameter" | "binding" => QualifiedName::join(
+                        SymbolKind::Parameter | SymbolKind::Binding => QualifiedName::join(
                             owner.unwrap_or("<module>"),
                             format_args!("{}:{}@{}", symbol.kind, symbol.name, l.start),
                         ),
-                        "field" | "static-field" | "variant" | "type-parameter" => {
-                            QualifiedName::join(
-                                owner.unwrap_or("<module>"),
-                                format_args!("{}:{}", symbol.kind, symbol.name),
-                            )
+                        SymbolKind::Field
+                        | SymbolKind::StaticField
+                        | SymbolKind::Variant
+                        | SymbolKind::TypeParameter => QualifiedName::join(
+                            owner.unwrap_or("<module>"),
+                            format_args!("{}:{}", symbol.kind, symbol.name),
+                        ),
+                        SymbolKind::Method | SymbolKind::Constructor => {
+                            owner.unwrap_or(&symbol.name).to_owned()
                         }
-                        "method" | "constructor" => owner.unwrap_or(&symbol.name).to_owned(),
                         _ => symbol.name.clone(),
                     };
                     identity(&l.path, &name)
@@ -273,12 +307,24 @@ impl<'a> OwnerIndex<'a> {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DependencyRelation {
+    Callee,
+}
+#[derive(Debug, Clone, Serialize)]
+pub struct ExternalDependency {
+    pub from: SymbolIdentity,
+    pub target: SymbolIdentity,
+    pub relation: DependencyRelation,
+}
+
 impl Snapshot {
     pub(super) fn external_dependencies(
         &self,
         index: &graph::Index<'_>,
         distances: &[usize],
-    ) -> Vec<Value> {
+    ) -> Vec<ExternalDependency> {
         let mut edges = Vec::new();
         for (i, f) in self.functions.iter().enumerate() {
             if distances[i] == usize::MAX {
@@ -289,7 +335,11 @@ impl Snapshot {
                 if let (Some(from), Some(to)) = (&f.identity, &target.identity)
                     && from.package != to.package
                 {
-                    edges.push(json!({"from":from,"target":to,"relation":"callee"}));
+                    edges.push(ExternalDependency {
+                        from: from.clone(),
+                        target: to.clone(),
+                        relation: DependencyRelation::Callee,
+                    });
                 }
             }
         }
@@ -359,7 +409,7 @@ impl PackageIndex {
     }
 
     pub fn affected(&self, snapshot: &Snapshot, delta: &UpdateDelta, tests: &[String]) -> Value {
-        if delta.schema != 1 || !delta.ok || delta.kind != "package.mutation" {
+        if delta.schema != 1 || !delta.ok || delta.kind != DeltaKind::Mutation {
             return json!({"status":"invalid-delta"});
         }
         let mut changed: HashSet<&PackageIdentity> = delta.packages_added.iter().collect();

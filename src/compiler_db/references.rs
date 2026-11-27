@@ -137,6 +137,7 @@ mod tests {
     #[test]
     fn review_owner_identity_is_stable_across_offsets_and_nested_ranges() {
         let location = |path: &str, start, end| Location {
+            display: None,
             path: path.into(),
             start,
             end,

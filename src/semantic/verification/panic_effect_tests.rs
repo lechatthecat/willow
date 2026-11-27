@@ -153,9 +153,9 @@ fn proof_no_panic_acceptance_matrix() {
         }
         let evidence = &checker.panic_evidence[&FunctionId::free("f")];
         if accepted {
-            assert_eq!(evidence["status"], "PROVEN", "{name}");
+            assert_eq!(evidence.status.as_str(), "PROVEN", "{name}");
             assert_eq!(
-                evidence["basis"],
+                evidence.basis.as_str(),
                 if name == "plain scalar" {
                     "effect-analysis"
                 } else {
@@ -234,7 +234,9 @@ fn proof_no_panic_unknown_is_not_evidence() {
             checker.errors
         );
         assert_eq!(
-            checker.panic_evidence[&FunctionId::free("f")]["status"],
+            checker.panic_evidence[&FunctionId::free("f")]
+                .status
+                .as_str(),
             "UNPROVEN"
         );
     }
@@ -292,7 +294,14 @@ fn proof_no_panic_contract_and_data_changes_invalidate() {
     let first = comparison::capture(parse(source), &options(), &mut cache);
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     assert_eq!(
-        first.lock.functions["f"].no_panic.as_ref().unwrap()["basis"],
+        first.lock.functions["f"]
+            .no_panic
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .basis
+            .as_str(),
         "solver-proof"
     );
     let repeated = comparison::capture(parse(source), &options(), &mut cache);
@@ -309,7 +318,14 @@ fn proof_no_panic_contract_and_data_changes_invalidate() {
         changed.errors
     );
     assert_eq!(
-        changed.lock.functions["f"].no_panic.as_ref().unwrap()["status"],
+        changed.lock.functions["f"]
+            .no_panic
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status
+            .as_str(),
         "UNPROVEN"
     );
     assert_ne!(
@@ -344,7 +360,14 @@ fn proof_no_panic_contract_and_data_changes_invalidate() {
             .any(|r| r.status != Status::Proven)
     );
     assert_eq!(
-        mutable.lock.functions["f"].no_panic.as_ref().unwrap()["status"],
+        mutable.lock.functions["f"]
+            .no_panic
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status
+            .as_str(),
         "UNPROVEN"
     );
 }
@@ -381,7 +404,9 @@ fn proof_no_panic_deep_shared_call_counts_and_diagnostics() {
         options(),
     );
     assert_eq!(
-        checker.panic_evidence[&FunctionId::free("f")]["status"],
+        checker.panic_evidence[&FunctionId::free("f")]
+            .status
+            .as_str(),
         "PROVEN",
         "{:?}",
         checker.errors

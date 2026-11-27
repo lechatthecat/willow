@@ -5,7 +5,7 @@ type CapturedExpression = (
     Span,
     Option<Type>,
     Option<FunctionId>,
-    Option<String>,
+    Option<Operation>,
     usize,
 );
 pub(super) struct Body {
@@ -138,12 +138,11 @@ impl Body {
     }
     fn capture(&mut self, e: &Expr, node: usize, types: &CaptureContext<'_>) {
         let operation = match e {
-            Expr::Call(c) => Some(format!("call:{}", c.callee)),
-            Expr::StaticCall(c) => Some(QualifiedName::join(
-                format_args!("static:{}", c.class),
-                &c.method,
-            )),
-            Expr::MethodCall(c) => Some(format!("method:{}", c.method)),
+            Expr::Call(c) => Some(Operation::Call(c.callee.clone())),
+            Expr::StaticCall(c) => {
+                Some(Operation::Static(QualifiedName::join(&c.class, &c.method)))
+            }
+            Expr::MethodCall(c) => Some(Operation::Method(c.method.to_string())),
             Expr::Print(..) => Some("io:print".into()),
             Expr::Await(_) => Some("wait:await".into()),
             Expr::Select(_) => Some("wait:select".into()),

@@ -2,6 +2,7 @@
 //! the radix index skips equal subtrees, and caller traversal visits each reached
 //! edge once. Loading/capturing a baseline still costs its serialized input size.
 use super::*;
+use crate::ai::SymbolKind;
 use crate::diagnostics::{Diagnostic, DiagnosticEmitter, source_map::SourceLookup};
 use crate::qualified_name::QualifiedName;
 use serde_json::{Value, json};
@@ -206,7 +207,7 @@ pub struct EffectState {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Fact {
-    signature: Option<Value>,
+    signature: Option<DeclarationSignature>,
     effects: Option<EffectState>,
     body: String,
     callees: Vec<String>,
@@ -451,22 +452,162 @@ impl Node {
     }
 }
 
-fn declaration_signature(s: &symbols::Symbol, names: &display::TypeNames) -> Value {
+/// Persisted declaration signature. Optional fields retain older partial records.
+#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
+pub struct DeclarationSignature {
+    #[serde(default, rename = "async", skip_serializing_if = "Option::is_none")]
+    pub is_async: Option<bool>,
+    #[serde(default, rename = "const", skip_serializing_if = "Option::is_none")]
+    pub is_const: Option<bool>,
+    #[serde(
+        default,
+        rename = "constant_value",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::evidence::present_nullable"
+    )]
+    pub constant_value: Option<Option<crate::parser::ast::ConstValue>>,
+    #[serde(
+        default,
+        rename = "constraint_alternatives",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub constraint_alternatives: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "constraint_parameter",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::evidence::present_nullable"
+    )]
+    pub constraint_parameter: Option<Option<String>>,
+    #[serde(default, rename = "exported", skip_serializing_if = "Option::is_none")]
+    pub exported: Option<bool>,
+    #[serde(default, rename = "extends", skip_serializing_if = "Option::is_none")]
+    pub extends: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "implements",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub implements: Option<Vec<String>>,
+    #[serde(default, rename = "kind", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SymbolKind>,
+    #[serde(default, rename = "mutable", skip_serializing_if = "Option::is_none")]
+    pub mutable: Option<bool>,
+    #[serde(default, rename = "open", skip_serializing_if = "Option::is_none")]
+    pub open: Option<bool>,
+    #[serde(default, rename = "override", skip_serializing_if = "Option::is_none")]
+    pub is_override: Option<bool>,
+    #[serde(
+        default,
+        rename = "parameter_modes",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parameter_modes: Option<Vec<String>>,
+    #[serde(
+        default,
+        rename = "parameters",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub parameters: Option<Vec<String>>,
+    #[serde(default, rename = "payload", skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Vec<String>>,
+    #[serde(default, rename = "protected", skip_serializing_if = "Option::is_none")]
+    pub protected: Option<bool>,
+    #[serde(default, rename = "public", skip_serializing_if = "Option::is_none")]
+    pub public: Option<bool>,
+    #[serde(default, rename = "static", skip_serializing_if = "Option::is_none")]
+    pub is_static: Option<bool>,
+    #[serde(
+        default,
+        rename = "type",
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "super::evidence::present_nullable"
+    )]
+    pub ty: Option<Option<String>>,
+    #[serde(
+        default,
+        rename = "type_parameters",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub type_parameters: Option<Vec<String>>,
+    #[serde(flatten)]
+    extra: BTreeMap<String, Value>,
+}
+
+impl Serialize for DeclarationSignature {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        let mut extra = self.extra.iter().peekable();
+        // Merge preserved wire extensions with known fields without a JSON tree.
+        macro_rules! field {
+            ($key:literal, $field:ident) => {
+                while extra.peek().is_some_and(|(key, _)| key.as_str() < $key) {
+                    let (key, value) = extra.next().unwrap();
+                    map.serialize_entry(key, value)?;
+                }
+                if let Some(value) = &self.$field {
+                    map.serialize_entry($key, value)?;
+                }
+            };
+        }
+        field!("async", is_async);
+        field!("const", is_const);
+        field!("constant_value", constant_value);
+        field!("constraint_alternatives", constraint_alternatives);
+        field!("constraint_parameter", constraint_parameter);
+        field!("exported", exported);
+        field!("extends", extends);
+        field!("implements", implements);
+        field!("kind", kind);
+        field!("mutable", mutable);
+        field!("open", open);
+        field!("override", is_override);
+        field!("parameter_modes", parameter_modes);
+        field!("parameters", parameters);
+        field!("payload", payload);
+        field!("protected", protected);
+        field!("public", public);
+        field!("static", is_static);
+        field!("type", ty);
+        field!("type_parameters", type_parameters);
+        for (key, value) in extra {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
+}
+
+fn declaration_signature(s: &symbols::Symbol, names: &display::TypeNames) -> DeclarationSignature {
     let module = s.identity.as_ref().map(|i| i.module.as_str());
     let types = |ts: &[Type]| {
         ts.iter()
             .map(|t| names.render(t, module))
             .collect::<Vec<_>>()
     };
-    let signature = json!({"kind":s.kind,"type":s.ty.as_ref().map(|ty| names.render(ty,module)),
-                "exported":s.details.public_api,"public":s.details.is_public,"protected":s.details.is_protected,
-                "static":s.details.is_static,"mutable":s.details.is_mut,"open":s.details.is_open,"override":s.details.is_override,
-                "parameters":types(&s.details.parameters),"parameter_modes":s.details.parameter_modes,
-                "constraint_parameter":s.details.constraint_parameter,"constraint_alternatives":types(&s.details.constraint_alternatives),
-                "constant_value":s.details.constant_value,"async":s.details.is_async,"const":s.details.is_const,"type_parameters":s.details.type_params,
-                "extends":types(&s.details.extends),
-                "implements":types(&s.details.implements),"payload":types(&s.details.payload)});
-    signature
+    DeclarationSignature {
+        is_async: Some(s.details.is_async),
+        is_const: Some(s.details.is_const),
+        constant_value: Some(s.details.constant_value.clone()),
+        constraint_alternatives: Some(types(&s.details.constraint_alternatives)),
+        constraint_parameter: Some(s.details.constraint_parameter.clone()),
+        exported: Some(s.details.public_api),
+        extends: Some(types(&s.details.extends)),
+        implements: Some(types(&s.details.implements)),
+        kind: Some(s.kind.clone()),
+        mutable: Some(s.details.is_mut),
+        open: Some(s.details.is_open),
+        is_override: Some(s.details.is_override),
+        parameter_modes: Some(s.details.parameter_modes.clone()),
+        parameters: Some(types(&s.details.parameters)),
+        payload: Some(types(&s.details.payload)),
+        protected: Some(s.details.is_protected),
+        public: Some(s.details.is_public),
+        is_static: Some(s.details.is_static),
+        ty: Some(s.ty.as_ref().map(|ty| names.render(ty, module))),
+        type_parameters: Some(s.details.type_params.clone()),
+        extra: BTreeMap::new(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -532,9 +673,9 @@ pub struct PublicApi {
 }
 #[derive(Debug, Default, Serialize)]
 pub struct Signatures {
-    pub added: Vec<Change<Value>>,
-    pub removed: Vec<Change<Value>>,
-    pub changed: Vec<Change<Value>>,
+    pub added: Vec<Change<DeclarationSignature>>,
+    pub removed: Vec<Change<DeclarationSignature>>,
+    pub changed: Vec<Change<DeclarationSignature>>,
 }
 impl Signatures {
     pub fn is_empty(&self) -> bool {
@@ -543,7 +684,7 @@ impl Signatures {
     pub fn len(&self) -> usize {
         self.added.len() + self.removed.len() + self.changed.len()
     }
-    pub fn iter(&self) -> impl Iterator<Item = &Change<Value>> {
+    pub fn iter(&self) -> impl Iterator<Item = &Change<DeclarationSignature>> {
         self.added.iter().chain(&self.removed).chain(&self.changed)
     }
 }
@@ -561,8 +702,8 @@ pub struct Report {
     pub public_api: PublicApi,
     pub work: Work,
 }
-fn public_signature(value: Option<&Value>) -> bool {
-    value.is_some_and(|v| v["exported"] == true)
+fn public_signature(value: Option<&DeclarationSignature>) -> bool {
+    value.is_some_and(|v| v.exported == Some(true))
 }
 fn configuration_inputs(root: &Path, inputs: &mut im::OrdMap<String, String>) -> Result<()> {
     for name in [
@@ -756,17 +897,17 @@ impl Baseline {
             .iter()
             .filter(|s| {
                 matches!(
-                    s.kind.as_str(),
-                    "function"
-                        | "method"
-                        | "constructor"
-                        | "class"
-                        | "interface"
-                        | "enum"
-                        | "variant"
-                        | "field"
-                        | "static-field"
-                        | "const"
+                    s.kind,
+                    SymbolKind::Function
+                        | SymbolKind::Method
+                        | SymbolKind::Constructor
+                        | SymbolKind::Class
+                        | SymbolKind::Interface
+                        | SymbolKind::Enum
+                        | SymbolKind::Variant
+                        | SymbolKind::Field
+                        | SymbolKind::StaticField
+                        | SymbolKind::Const
                 )
             })
             .collect();
@@ -781,7 +922,7 @@ impl Baseline {
             let name = s.source_name.as_deref().unwrap_or(&s.name);
             let stem = QualifiedName::from_segments([
                 relative(&location.path, &snapshot.workspace).as_str(),
-                &s.kind,
+                s.kind.as_str(),
                 name,
             ]);
             let ordinal = ordinals.entry(stem.clone()).or_insert(0usize);
@@ -826,11 +967,18 @@ impl Baseline {
             if f.unknown {
                 for witness in snapshot.semantic.witnesses.get(&f.id).into_iter().flatten() {
                     if matches!(
-                        witness["witness"]["kind"].as_str(),
-                        Some("runtime-capability" | "panic" | "nonpreemptible" | "wait")
-                    ) && witness["witness"]["cause"]["is_conservative"] != true
+                        witness.witness.kind,
+                        super::evidence::WitnessKind::RuntimeCapability
+                            | super::evidence::WitnessKind::Panic
+                            | super::evidence::WitnessKind::Nonpreemptible
+                            | super::evidence::WitnessKind::Wait
+                    ) && !witness
+                        .witness
+                        .cause
+                        .as_ref()
+                        .is_some_and(|cause| cause.is_conservative)
                     {
-                        bits |= witness["effect"].as_u64().unwrap_or(0) as u8;
+                        bits |= witness.effect;
                     }
                 }
             }

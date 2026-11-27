@@ -1,7 +1,10 @@
 //! Retained verification projections. Source-coordinate repair is separate from
 //! semantic rebuilding; only changed bodies and their callers are projected.
 use super::*;
-use crate::compiler_db::{body::BodyQueries, effects::EffectQueries, ids::BodyOwner};
+use crate::ai::SymbolKind;
+use crate::compiler_db::{
+    body::BodyQueries, effects::EffectQueries, ids::BodyOwner, incremental::SourceOwner,
+};
 use crate::qualified_name::QualifiedName;
 use std::{
     cell::RefCell,
@@ -807,7 +810,7 @@ pub(crate) fn capture_incremental(
         if (known.items != program.items.len() || bodies.declarations_changed(unit))
             && source_changes
                 .iter()
-                .any(|(owner, _)| !owner.starts_with("Function:"))
+                .any(|(owner, _)| owner.function_name().is_none())
         {
             return Err(SnapshotRetry::FullCapture);
         }
@@ -820,9 +823,7 @@ pub(crate) fn capture_incremental(
         let mut source_only_spans = HashSet::new();
         for (owner, exists) in source_changes {
             plan.owner_checks += 1;
-            let name = owner
-                .strip_prefix("Function:")
-                .ok_or(SnapshotRetry::FullCapture)?;
+            let name = owner.function_name().ok_or(SnapshotRetry::FullCapture)?;
             let key = (unit, FunctionId::free(name));
             if exists {
                 if let Some(group) = plan.source_keys.get(&key) {
@@ -838,7 +839,7 @@ pub(crate) fn capture_incremental(
             }
         }
         for owner in bodies.source_body_changes(unit) {
-            let Some(name) = owner.strip_prefix("Function:") else {
+            let Some(name) = owner.function_name() else {
                 continue;
             };
             let key = (unit, FunctionId::free(name));
@@ -871,7 +872,7 @@ pub(crate) fn capture_incremental(
                 && matches!(root.kind, RootKind::Function)
                 && let Some(span) = bodies.source_owner_span(
                     unit,
-                    &format!("Function:{}", generics::source_spelling(&root.key.1.name())),
+                    &SourceOwner::function(&generics::source_spelling(&root.key.1.name())),
                 )
             {
                 source_only_spans.insert(span);
@@ -1185,7 +1186,10 @@ pub(crate) fn capture_incremental(
                 if owners.insert(target.span) {
                     if let Some(owner) = plan.symbol_owners.get(&target.span) {
                         captured.symbol_owners.push((target.span, owner.clone()));
-                    } else if matches!(target.kind.as_str(), "class" | "interface" | "enum") {
+                    } else if matches!(
+                        SymbolKind::from(target.kind.as_str()),
+                        SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum
+                    ) {
                         captured.symbol_owners.push((
                             target.span,
                             QualifiedName::new(&target.name).last_segment().to_owned(),
@@ -1288,9 +1292,16 @@ fn split(snapshot: &Snapshot) -> (Snapshot, HashMap<String, Projection>) {
         })
         .collect();
     let owners = owner_index(snapshot);
+    let builtin_ids: HashSet<_> = snapshot
+        .semantic
+        .symbols
+        .iter()
+        .filter(|symbol| symbol.is_builtin())
+        .map(|symbol| symbol.id.as_str())
+        .collect();
     let mut builtin_owners: HashMap<&str, HashSet<&str>> = HashMap::new();
     for reference in &snapshot.semantic.references {
-        if reference.target.starts_with("builtin:")
+        if builtin_ids.contains(reference.target.as_str())
             && let Some(owner) = owners.get(&(
                 reference.location.path.clone(),
                 reference.location.start,
@@ -1394,53 +1405,148 @@ fn split(snapshot: &Snapshot) -> (Snapshot, HashMap<String, Projection>) {
     metadata.semantic.instances = Default::default();
     (metadata, records)
 }
-// Reserve the maximum decimal width of every coordinate when a projection is
-// produced. Lazy source relocation can then never grow its encoded size budget.
-fn bounded_encoded(value: &serde_json::Value) -> Result<usize> {
-    fn coordinate_slack(value: &serde_json::Value) -> usize {
-        match value {
-            serde_json::Value::Object(fields) => fields
-                .iter()
-                .map(|(key, value)| {
-                    if matches!(key.as_str(), "start" | "end") && value.is_u64() {
-                        20usize.saturating_sub(value.to_string().len())
-                    } else {
-                        coordinate_slack(value)
-                    }
-                })
-                .sum(),
-            serde_json::Value::Array(values) => values.iter().map(coordinate_slack).sum(),
-            _ => 0,
+// Reserve the maximum decimal width of every serialized coordinate when a
+// projection is produced. Relocation cannot grow this retained size budget.
+fn coordinate_slack(start: usize, end: usize) -> usize {
+    fn slack(value: usize) -> usize {
+        20 - value
+            .checked_ilog10()
+            .map_or(1, |digits| digits as usize + 1)
+    }
+    slack(start) + slack(end)
+}
+fn location_slack(location: &Location) -> usize {
+    coordinate_slack(location.start, location.end)
+}
+fn span_slack(span: &Span) -> usize {
+    coordinate_slack(span.start, span.end)
+}
+fn function_slack(function: &Function) -> usize {
+    // Body and rename locations are live-only and absent from the wire.
+    function.locations.iter().map(location_slack).sum()
+}
+
+// Unknown external dependency metadata is opaque. Preserve its historical wire
+// accounting here; compiler-owned evidence is visited through concrete fields.
+fn external_metadata_slack(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                if matches!(key.as_str(), "start" | "end")
+                    && let Some(number) = value.as_u64()
+                {
+                    20 - number
+                        .checked_ilog10()
+                        .map_or(1, |digits| digits as usize + 1)
+                } else {
+                    external_metadata_slack(value)
+                }
+            })
+            .sum(),
+        serde_json::Value::Array(values) => values.iter().map(external_metadata_slack).sum(),
+        _ => 0,
+    }
+}
+fn semantic_slack(semantic: &SemanticFacts) -> usize {
+    use super::evidence::{CauseSource, SourcePoint};
+    let mut slack = 0;
+    for symbol in &semantic.symbols {
+        slack += symbol.location.as_ref().map_or(0, location_slack);
+    }
+    slack += semantic
+        .references
+        .iter()
+        .map(|r| location_slack(&r.location))
+        .sum::<usize>();
+    slack += semantic
+        .expressions
+        .iter()
+        .map(|e| location_slack(&e.location))
+        .sum::<usize>();
+    slack += semantic
+        .flows
+        .iter()
+        .flat_map(|f| &f.nodes)
+        .map(|n| location_slack(&n.location))
+        .sum::<usize>();
+    for fact in semantic.witnesses.values().flatten() {
+        if let Some(cause) = &fact.witness.cause {
+            slack += match &cause.source {
+                CauseSource::Captured { span } => span_slack(span),
+                CauseSource::Located { location } => location.as_ref().map_or(0, location_slack),
+            };
+            if let Some(target) = cause.lock.as_ref().and_then(|lock| lock.target.as_ref()) {
+                slack += match target {
+                    SourcePoint::Captured(span) => span_slack(span),
+                    SourcePoint::Located(location) => location_slack(location),
+                };
+            }
+        }
+        if let Some(location) = fact
+            .paths
+            .as_ref()
+            .and_then(|paths| paths.location.as_ref())
+            .and_then(Option::as_ref)
+        {
+            slack += location_slack(location);
         }
     }
-    Ok(serde_json::to_vec(value)?.len() + coordinate_slack(value))
+    slack += semantic
+        .effect_calls
+        .values()
+        .flatten()
+        .map(|call| location_slack(&call.location))
+        .sum::<usize>();
+    slack += semantic
+        .unresolved_calls
+        .values()
+        .flatten()
+        .map(|call| location_slack(&call.location))
+        .sum::<usize>();
+    for bridge in &semantic.interop.bridges {
+        slack += bridge.declaration.iter().map(location_slack).sum::<usize>();
+        slack += bridge.symbol.assumption_span.as_ref().map_or(0, span_slack);
+    }
+    slack += semantic
+        .rust_bridges
+        .iter()
+        .filter_map(|bridge| bridge.assumption_span.as_ref())
+        .map(span_slack)
+        .sum::<usize>();
+    for dependency in &semantic.interop.crates {
+        if let super::interop::RustCrateSource::Other(value) = &dependency.source {
+            slack += external_metadata_slack(value);
+        }
+    }
+    slack
+}
+fn snapshot_slack(snapshot: &Snapshot) -> usize {
+    snapshot.functions.iter().map(function_slack).sum::<usize>()
+        + semantic_slack(&snapshot.semantic)
+}
+fn bounded_encoded(value: &impl Serialize, coordinate_slack: usize) -> Result<usize> {
+    struct ByteCount(usize);
+    impl std::io::Write for ByteCount {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 += bytes.len();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    // Object key order does not affect byte length. Count directly without a
+    // whole-record JSON tree or encoded buffer allocation.
+    let mut count = ByteCount(0);
+    serde_json::to_writer(&mut count, value)?;
+    Ok(count.0 + coordinate_slack)
 }
 fn encoded(record: &Projection) -> Result<usize> {
-    bounded_encoded(&serde_json::to_value((&record.function, &record.semantic))?)
-}
-fn relocate_value(value: &mut serde_json::Value, maps: &RelocationBatch) {
-    if value.get("path").is_some()
-        && value.get("start").is_some()
-        && value.get("end").is_some()
-        && let Ok(mut location) = serde_json::from_value::<Location>(value.clone())
-    {
-        maps.location(&mut location);
-        *value = serde_json::to_value(location).unwrap();
-        return;
-    }
-    match value {
-        serde_json::Value::Array(a) => {
-            for v in a {
-                relocate_value(v, maps)
-            }
-        }
-        serde_json::Value::Object(o) => {
-            for v in o.values_mut() {
-                relocate_value(v, maps)
-            }
-        }
-        _ => {}
-    }
+    bounded_encoded(
+        &(&record.function, &record.semantic),
+        function_slack(&record.function) + semantic_slack(&record.semantic),
+    )
 }
 fn relocate_projection(record: &mut Projection, maps: &RelocationBatch) {
     for l in &mut record.function.locations {
@@ -1467,7 +1573,24 @@ fn relocate_projection(record: &mut Projection, maps: &RelocationBatch) {
     }
     for ws in record.semantic.witnesses.values_mut() {
         for w in ws {
-            relocate_value(w, maps);
+            if let Some(cause) = &mut w.witness.cause {
+                if let Some(location) = cause.location_mut() {
+                    maps.location(location);
+                }
+                if let Some(lock) = &mut cause.lock
+                    && let Some(super::evidence::SourcePoint::Located(location)) = &mut lock.target
+                {
+                    maps.location(location);
+                }
+            }
+            if let Some(location) = w
+                .paths
+                .as_mut()
+                .and_then(|paths| paths.location.as_mut())
+                .and_then(Option::as_mut)
+            {
+                maps.location(location);
+            }
         }
     }
     for cs in record.semantic.effect_calls.values_mut() {
@@ -1660,7 +1783,7 @@ fn full_snapshot(
     state.dispatch = dispatch.into_inner();
     state.indirect = indirect;
     state.replace_instances(instances.into_inner(), &HashSet::new());
-    state.bytes = bounded_encoded(&serde_json::to_value(&metadata)?)?;
+    state.bytes = bounded_encoded(&metadata, snapshot_slack(&metadata))?;
     state.header = Some(Header::from(&full));
     state.insert_symbol_types(&full.semantic.symbols);
     state.metadata = Some(Arc::new(metadata));
@@ -2089,7 +2212,7 @@ fn retain_changed_symbols(patch: &mut Snapshot, changed_ids: &HashSet<String>) {
         ranges.sort_unstable();
     }
     patch.semantic.symbols.retain(|s| {
-        if s.id.starts_with("builtin:") {
+        if s.is_builtin() {
             return true;
         }
         s.location.as_ref().is_some_and(|l| {
@@ -2108,7 +2231,7 @@ fn retain_changed_symbols(patch: &mut Snapshot, changed_ids: &HashSet<String>) {
 impl VerificationSnapshotState {
     fn insert_symbol_types(&mut self, symbols: &[symbols::Symbol]) {
         for symbol in symbols {
-            if !symbol.id.starts_with("builtin:") {
+            if !symbol.is_builtin() {
                 self.symbol_types
                     .insert(symbol.id.clone(), Arc::new(symbol.ty.clone()));
             }
@@ -2255,6 +2378,7 @@ impl VerificationSnapshotState {
             self.anchors.insert(
                 root_anchor(*body),
                 Location {
+                    display: None,
                     path: self.units[&root.key.0].path.clone(),
                     start: root.span.start,
                     end: root.span.end,
@@ -2265,6 +2389,7 @@ impl VerificationSnapshotState {
             self.anchors.insert(
                 declaration_anchor(key),
                 Location {
+                    display: None,
                     path: self.units[&key.0].path.clone(),
                     start: span.start,
                     end: span.end,
@@ -2560,6 +2685,7 @@ impl VerificationSnapshotState {
             self.anchors.insert(
                 root_anchor(*body),
                 Location {
+                    display: None,
                     path: self.units[&root.key.0].path.clone(),
                     start: root.span.start,
                     end: root.span.end,
@@ -2582,6 +2708,7 @@ impl VerificationSnapshotState {
             self.anchors.insert(
                 declaration_anchor(key),
                 Location {
+                    display: None,
                     path: self.units[&key.0].path.clone(),
                     start: span.start,
                     end: span.end,
@@ -2892,5 +3019,252 @@ impl VerificationSnapshotState {
             self.anchors.remove(&root_anchor(body));
             self.descendants.remove(&body);
         }
+    }
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    // Independent oracle for the previous JSON-boundary accounting algorithm.
+    fn legacy_bound(value: &impl Serialize) -> usize {
+        fn slack(value: &Value) -> usize {
+            match value {
+                Value::Object(fields) => fields
+                    .iter()
+                    .map(|(key, value)| {
+                        if matches!(key.as_str(), "start" | "end") && value.is_u64() {
+                            20usize.saturating_sub(value.to_string().len())
+                        } else {
+                            slack(value)
+                        }
+                    })
+                    .sum(),
+                Value::Array(values) => values.iter().map(slack).sum(),
+                _ => 0,
+            }
+        }
+        let value = serde_json::to_value(value).unwrap();
+        serde_json::to_vec(&value).unwrap().len() + slack(&value)
+    }
+
+    fn fixture(n: usize, start: usize, end: usize) -> Snapshot {
+        let location = Location {
+            path: "test.wi".into(),
+            start,
+            end,
+            display: None,
+        };
+        let span = Span::new(start, end, 1, 1);
+        let function: Function = serde_json::from_value(json!({
+            "identity":null,"id":"f","module":"test","name":"f",
+            "locations":[location],"synthetic":false,"fingerprint":"f",
+            "body_fingerprint":"body","callees":[],"runtime_effects":1,
+            "unknown":false,"unresolved":[]
+        }))
+        .unwrap();
+        let mut semantic = SemanticFacts::default();
+        let symbol = serde_json::from_value(json!({
+            "id":"f","name":"f","kind":"function","location":location,"ty":null
+        }))
+        .unwrap();
+        semantic.symbols = vec![symbol; n];
+        let reference = serde_json::from_value(json!({
+            "target":"f","location":location,"role":"call"
+        }))
+        .unwrap();
+        semantic.references = vec![reference; n];
+        let expression = serde_json::from_value(json!({
+            "function":"f","location":location,"ty":null,"target":null,
+            "operation":"call:f","fingerprint":"expression","flow":0,"node":0,
+            "occurrences":[]
+        }))
+        .unwrap();
+        semantic.expressions = vec![expression; n];
+        let flow = serde_json::from_value(json!({
+            "function":"f","nodes":[{"location":location,"successors":[],"loop_header":false}],
+            "entry":0,"complete":true
+        }))
+        .unwrap();
+        semantic.flows = vec![flow; n];
+        let lock_type: Type = Type::I64;
+        let located = serde_json::from_value(json!({
+            "effect":1,"witness":{"kind":"wait","cause":{
+                "location":location,"operation":"await",
+                "lock":{"mode":"lock read","target":location,"type":lock_type}
+            }},"paths":{"normal":{"may_allocate":"none"},
+                "panic":{"may_allocate":"may"},"scope":"operation","location":location}
+        }))
+        .unwrap();
+        let captured = serde_json::from_value(json!({
+            "effect":1,"witness":{"kind":"wait","cause":{
+                "span":span,"operation":"await",
+                "lock":{"mode":"lock","target":span}
+            }}
+        }))
+        .unwrap();
+        semantic.witnesses.insert(
+            "f".into(),
+            [located, captured]
+                .into_iter()
+                .cycle()
+                .take(n * 2)
+                .collect(),
+        );
+        semantic.effect_calls.insert(
+            "f".into(),
+            vec![
+                semantic::EffectCall {
+                    target: "f".into(),
+                    location: location.clone()
+                };
+                n
+            ],
+        );
+        semantic.unresolved_calls.insert(
+            "f".into(),
+            vec![
+                semantic::UnresolvedCall {
+                    operation: super::super::operation::Operation::IndirectCall,
+                    location: location.clone()
+                };
+                n
+            ],
+        );
+        let mut bridge = crate::rust_bridge_ir::RustBridgeSymbol::new(
+            "foreign".into(),
+            vec![],
+            crate::rust_bridge_ir::Scalar::Void,
+        );
+        bridge.assumption_span = Some(span);
+        semantic.rust_bridges = vec![bridge.clone(); n];
+        semantic.interop.bridges = vec![
+            super::super::interop::Bridge {
+                function: "foreign".into(),
+                identity: None,
+                declaration: vec![location.clone()],
+                declaration_text: String::new(),
+                symbol: bridge,
+            };
+            n
+        ];
+        semantic.interop.crates = vec![
+            super::super::interop::RustCrateIdentity {
+                name: "opaque".into(),
+                version: None,
+                source: super::super::interop::RustCrateSource::Other(json!({
+                    "start":start,"end":end,"nested":[{"start":-1,"end":true},
+                        {"start":{"end":999},"end":[{"start":0},{"end":null}]}],
+                    "unrecognized":"retained"
+                })),
+            };
+            n
+        ];
+        // These live-only fields must not reserve bytes absent from serialization.
+        semantic
+            .rename_scopes
+            .insert("test.wi".into(), vec![(start, end); n]);
+        let mut snapshot = Snapshot {
+            edit_context: None,
+            version: 1,
+            compiler: String::new(),
+            compatibility: String::new(),
+            workspace: String::new(),
+            revision: String::new(),
+            sources: BTreeMap::new(),
+            functions: vec![function; n],
+            semantic,
+        };
+        for function in &mut snapshot.functions {
+            function.body_location = Some(location.clone());
+            function.rename_calls = vec![location.clone()];
+            function.rename_imports = vec![location.clone()];
+        }
+        snapshot
+    }
+
+    #[test]
+    fn typed_snapshot_quota_matches_wire_bound_and_scales() {
+        for (start, end) in [(0, 0), (9, 10), (99, 100), (usize::MAX - 1, usize::MAX)] {
+            let single_slack = snapshot_slack(&fixture(1, start, end));
+            for n in [1, 8, 64] {
+                let snapshot = fixture(n, start, end);
+                assert_eq!(snapshot_slack(&snapshot), single_slack * n);
+                assert_eq!(
+                    bounded_encoded(&snapshot, snapshot_slack(&snapshot)).unwrap(),
+                    legacy_bound(&snapshot)
+                );
+                let projection = Projection {
+                    anchor: None,
+                    key: None,
+                    root: None,
+                    order: 0,
+                    order_path: vec![],
+                    function: snapshot.functions[0].clone(),
+                    semantic: snapshot.semantic,
+                };
+                assert_eq!(
+                    encoded(&projection).unwrap(),
+                    legacy_bound(&(&projection.function, &projection.semantic))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn typed_snapshot_relocation_preserves_all_witness_coordinates() {
+        let snapshot = fixture(1, 2, 3);
+        let mut projection = Projection {
+            anchor: None,
+            key: None,
+            root: None,
+            order: 0,
+            order_path: vec![],
+            function: snapshot.functions[0].clone(),
+            semantic: snapshot.semantic,
+        };
+        let prior_bound = encoded(&projection).unwrap();
+        relocate_projection(
+            &mut projection,
+            &RelocationBatch::new(&[VerificationRelocation {
+                path: "test.wi".into(),
+                old_start: 0,
+                old_end: 10,
+                new_start: 100,
+                new_end: 110,
+            }]),
+        );
+        let fact = &projection.semantic.witnesses["f"][0];
+        let cause = fact.witness.cause.as_ref().unwrap();
+        assert_eq!(cause.location().map(|l| (l.start, l.end)), Some((102, 103)));
+        let target = cause.lock.as_ref().unwrap().target.as_ref().unwrap();
+        let super::super::evidence::SourcePoint::Located(target) = target else {
+            panic!("located lock target");
+        };
+        assert_eq!((target.start, target.end), (102, 103));
+        let path = fact
+            .paths
+            .as_ref()
+            .unwrap()
+            .location
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap();
+        assert_eq!((path.start, path.end), (102, 103));
+        // Captured spans have no path and were never relocated by the wire visitor.
+        let captured = &projection.semantic.witnesses["f"][1];
+        let super::super::evidence::CauseSource::Captured { span } =
+            captured.witness.cause.as_ref().unwrap().source
+        else {
+            panic!("captured span");
+        };
+        assert_eq!((span.start, span.end), (2, 3));
+        assert_eq!(encoded(&projection).unwrap(), prior_bound);
+        assert_eq!(
+            encoded(&projection).unwrap(),
+            legacy_bound(&(&projection.function, &projection.semantic))
+        );
     }
 }

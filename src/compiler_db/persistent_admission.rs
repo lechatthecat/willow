@@ -60,7 +60,8 @@ impl SyntaxQueries {
                         .owners
                         .iter()
                         .map(|(owner, (signature, _))| {
-                            Ok(templates(&signature.decode::<Value>()?).then(|| owner.clone()))
+                            Ok(templates(&signature.decode::<Value>()?)
+                                .then(|| owner.wire_key().to_owned()))
                         })
                         .filter_map(Result::transpose)
                         .collect::<Result<_>>()?,
@@ -72,7 +73,7 @@ impl SyntaxQueries {
                             digest.update(&signature.bytes);
                             digest.update(&body.bytes);
                             (
-                                owner.clone(),
+                                owner.wire_key().to_owned(),
                                 digest.finalize().into(),
                                 signature.bytes.len() + body.bytes.len(),
                             )
