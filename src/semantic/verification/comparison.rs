@@ -431,7 +431,10 @@ pub fn compare(a: &Snapshot, b: &Snapshot, options: &Options) -> Json {
     serde_json::to_value(compare_typed(a, b, options)).expect("contract comparison serializes")
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one comparison session shares solver declarations and revision-specific name environments; keeping obligation queries beside status aggregation makes uncertainty and violation handling auditable"
+)]
 pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Comparison {
     let old: BTreeMap<_, _> = a
         .program

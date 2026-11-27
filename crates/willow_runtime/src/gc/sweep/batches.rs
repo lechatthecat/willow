@@ -702,7 +702,10 @@ impl Cursor {
         }
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one resumable chunk step keeps bulk nursery handling and per-object fallback beside cursor, reclaim-permit and accounting updates, making yield-before-mutation boundaries auditable"
+    )]
     fn chunk_step(
         &mut self,
         owner: &crate::runtime::Runtime,

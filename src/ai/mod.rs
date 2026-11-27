@@ -904,7 +904,10 @@ struct SnapshotBoundary<'a> {
     indirect: Option<&'a HashMap<UnitId, indirect::Inputs>>,
     generics: Option<&'a HashMap<UnitId, generics::Source>>,
 }
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "full and delta snapshots share one ordered assembly pipeline; retained boundary identities must be reconciled before dispatch, generic aggregation, effect propagation and the final digest"
+)]
 fn snapshot_with_boundary(
     frontend: &crate::Frontend,
     entry: &Path,

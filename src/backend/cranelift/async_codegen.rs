@@ -122,7 +122,10 @@ impl UnitCodegenContext<'_> {
     /// Turn the LIR-owned logical frame into the runtime's physical data-slot
     /// layout. The returned identity map is keyed only by `LirLocalId`; the
     /// optional spans on physical slots are diagnostic metadata only.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one physical-frame plan assigns reserved ABI words, shared local slots and send/defer scratch offsets against the same slot vector, keeping offset and GC-mask consistency visible"
+    )]
     fn lir_async_layout(
         &self,
         lir: &LirFunction,
@@ -528,7 +531,10 @@ impl UnitCodegenContext<'_> {
     /// Shared constructor, poll and cancellation lowering. `method` supplies
     /// the class context and static flag; methods always reserve an ABI receiver
     /// argument, but only instance methods store a receiver in the frame.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "constructor, poll and cancellation entry points share one computed frame layout and parameter bindings; their declaration and emission order keeps the task ABI consistent"
+    )]
     fn compile_cooperative_task(
         &mut self,
         name: &str,
@@ -991,7 +997,10 @@ impl UnitCodegenContext<'_> {
 
     /// The poll-fn state machine: split the body at `await sleep(n)` points into
     /// per-state segments; the entry dispatches on the frame state word.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "poll entry, body and resume dispatch share one FunctionBuilder and collected suspension roots; keeping setup and final dispatch together makes SSA dominance and root restoration auditable"
+    )]
     fn compile_coop_main_poll(
         &mut self,
         poll_symbol: &str,
@@ -1842,7 +1851,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     /// `offsets` are the section's frame slots in the order
     /// [`crate::ir::lowered::LirLockSlots::locals`] gives them: handle, token,
     /// phase, protected value.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the acquire/park/re-poll/owned state machine shares frame offsets and join blocks across lock modes; keeping every runtime status edge together makes token ownership and suspension transitions auditable"
+    )]
     pub(super) fn emit_lir_lock_acquire(
         &mut self,
         slots: &crate::ir::lowered::LirLockSlots,

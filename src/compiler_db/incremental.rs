@@ -1628,7 +1628,10 @@ impl QueryProvider for SyntaxProvider<'_> {
     fn contains_body(&self, body: BodyId) -> bool {
         self.bodies.contains_key(&body)
     }
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the QueryNode dispatch keeps each query's dependency reads beside its result and Deferred exits, making cache invalidation dependencies auditable"
+    )]
     fn compute(
         &self,
         table: &TrackedQueryTable,

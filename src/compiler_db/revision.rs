@@ -75,7 +75,10 @@ impl AnalysisRevision {
         self.analyze_policy_update(session, emitter, 128 * 1024 * 1024, true, true)
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one candidate revision owns capture guards, verification and size checks until the final state commit; keeping that transaction visible makes early-return rollback auditable"
+    )]
     fn analyze_policy_update(
         &mut self,
         session: CompilerSession<'_>,

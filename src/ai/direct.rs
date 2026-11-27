@@ -802,7 +802,10 @@ impl DirectSession {
     pub fn resolve(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Value> {
         Ok(serde_json::to_value(self.resolve_typed(selector, filter)?)?)
     }
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "selector resolution keeps location precedence, exact candidates and ranked fallback suggestions in one decision flow so ambiguous locals and renamed symbols use consistent tie-breaking"
+    )]
     pub fn resolve_typed(&mut self, selector: &str, filter: &SelectorFilter) -> Result<Resolution> {
         let mut location_reason = None;
         let located = if let Some((file, byte)) = self.location(selector)? {

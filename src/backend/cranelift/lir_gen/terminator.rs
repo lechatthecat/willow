@@ -5,7 +5,10 @@ use crate::ir::ir_variants;
 use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the select-instruction dispatch keeps probe, fair choice, losing-arm cleanup and commit lowering together so shared wrapper roots and generation ownership remain visible"
+    )]
     fn emit_lir_select_instruction(&mut self, function: &LirFunction, inst: &LirInst) {
         match inst {
             LirInst::SelectInit { operations } => {
@@ -532,7 +535,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         self.builder.ins().jump(blocks[resume.0], &[]);
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one LIR block walk coordinates fault sites, GC cache invalidation, suspension and defer state before its terminator; keeping the dispatch together exposes per-instruction ordering"
+    )]
     pub(super) fn emit_lir_block(
         &mut self,
         layout: LirBlockLayout<'_>,

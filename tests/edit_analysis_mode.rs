@@ -148,7 +148,10 @@ fn verification_disk_borrow_cache_both_workflows_match_clean() {
     ]);
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "both verification workflows share one disk-cache fixture and before/after inventory at each input size, keeping cold/warm equality and filesystem preservation assertions together"
+)]
 fn verification_disk_cache_both_workflows(cases: &[(&str, &str, i32)]) {
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;

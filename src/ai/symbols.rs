@@ -541,7 +541,10 @@ pub(super) fn declarations(
     }
     declarations_of(&program.imports, program.items.iter(), facts, checked);
 }
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the declaration-kind table pairs checked signature collection with source-symbol emission, keeping special handling of constants, constructors and type parameters together"
+)]
 pub(super) fn declarations_of<'a>(
     imports: &[crate::parser::ast::ImportDecl],
     items: impl Iterator<Item = &'a Item> + Clone,
@@ -790,7 +793,10 @@ pub(super) fn select(
     })
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "symbol registration and reference emission share callable, owner and declaration identity indexes; keeping their construction and use together exposes deterministic identity and deduplication rules"
+)]
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
     paths: &HashMap<UnitId, String>,

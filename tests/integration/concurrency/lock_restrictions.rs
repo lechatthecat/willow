@@ -1131,7 +1131,10 @@ fn imported_asynchronous_reference_call_still_rejects_escape() {
 
 /// Cross-unit lock effects: direct, transitive, method/default and eager async.
 #[test]
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the cross-module callable matrix keeps source fixtures and expected lock-effect rejection together under one compilation and witness-checking harness"
+)]
 fn lock_imported_callable_effects() {
     let cases = [
         (

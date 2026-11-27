@@ -355,7 +355,10 @@ impl<'a, 'f> Graph<'a, 'f> {
         }
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one explicit worklist dispatch models statement and expression evaluation order with shared normal, panic and loop continuations, without recursive AST traversal"
+    )]
     fn build(&mut self) {
         while let Some(Work {
             input,

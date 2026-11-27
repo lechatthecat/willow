@@ -264,7 +264,10 @@ impl Source {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one restoration pass reuses source declaration, alias and owner indexes across captured units, keeping template-first precedence and generated-name normalization together"
+)]
 pub(super) fn restore(
     sources: &HashMap<UnitId, Source>,
     captures: &mut HashMap<UnitId, CapturedUnit>,

@@ -168,7 +168,10 @@ pub struct CleanupGraph {
 }
 
 impl CleanupGraph {
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "cleanup graph construction shares scope, registration and region indexes across one worklist; validation remains beside the state transitions whose invariants it checks"
+    )]
     pub fn lower(function: &LirFunction) -> Result<Self, &'static str> {
         let mut graph = Self {
             entries: vec![None; function.blocks.len()],

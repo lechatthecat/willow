@@ -514,7 +514,10 @@ impl UnitCodegenContext<'_> {
         BodyPlanner(self.body_queries.is_some()).program_body_plan(unit)
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "module declaration must bind local aliases before layouts, methods, vtables and descriptors, then publish canonical effect summaries; keeping that order and temporary scope together exposes name-resolution dependencies"
+    )]
     pub(crate) fn declare_module_with_types(
         mut self,
         mod_name: &str,

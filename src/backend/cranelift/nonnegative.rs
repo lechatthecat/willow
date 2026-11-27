@@ -41,7 +41,10 @@ impl Proof {
     }
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the nonnegative proof shares indexed definitions, writes and predecessors across guard validation and copy propagation; keeping rejection rules beside the final worklist makes the conservative proof auditable"
+)]
 pub(super) fn analyze(f: &LirFunction) -> Proof {
     let n = f.locals.len();
     let mut out = Proof {

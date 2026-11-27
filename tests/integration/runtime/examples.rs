@@ -2,9 +2,26 @@ use super::*;
 
 // ── Example files ───────────────────────────────────────────────────────────
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "this function is a static path/expected-output catalog; keeping pairs in one table makes example coverage reviewable without splitting data into helper functions"
+)]
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        (
+            "example/channel_closed_send.wi",
+            "send on closed channel\nsend on closed channel\naccepted\ntrue\n",
+        ),
+        ("example/channel_wait_protocol.wi", "42\ntrue\n"),
+        ("example/concurrency_core.wi", "42\n"),
+        ("example/select_sync_handoff.wi", "42\n"),
+        ("example/semantic_default_effects.wi", "true\ntrue\nfalse\n"),
+        ("example/shareable_captures.wi", "20\n20\n14\n17\n"),
+        ("example/static_task_sharing.wi", "2\n2\n2\n"),
+        (
+            "example/verified_strings.wi",
+            "unknown\n雪🌲\ntrue\nfalse\n7\n3\n0\n",
+        ),
         ("tests/regressions/abi_handshake.wi", "42\n"),
         (
             "tests/regressions/builtin_method_contracts.wi",
@@ -1956,6 +1973,33 @@ fn test_runnable_example_catalog_is_complete() {
     assert_eq!(
         actual_paths, expected_paths,
         "every runnable non-future example entrypoint should have an output assertion"
+    );
+}
+
+#[test]
+fn test_concurrency_and_contract_example_catalog_entries() {
+    let mut remaining: std::collections::HashSet<_> = [
+        "example/channel_closed_send.wi",
+        "example/channel_wait_protocol.wi",
+        "example/concurrency_core.wi",
+        "example/select_sync_handoff.wi",
+        "example/semantic_default_effects.wi",
+        "example/shareable_captures.wi",
+        "example/static_task_sharing.wi",
+        "example/verified_strings.wi",
+    ]
+    .into_iter()
+    .collect();
+    for &(path, expected) in runnable_example_cases() {
+        if remaining.remove(path) {
+            let (out, ok) = compile_file_and_run(path);
+            assert!(ok, "{path} failed to compile or run: {out}");
+            assert_eq!(out, expected, "{path} output mismatch");
+        }
+    }
+    assert!(
+        remaining.is_empty(),
+        "missing catalog entries: {remaining:?}"
     );
 }
 

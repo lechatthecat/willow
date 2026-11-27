@@ -880,7 +880,10 @@ impl Baseline {
         crate::query_stats::verification_phase("baseline_report", started);
         result
     }
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one snapshot projection shares declaration identities, callable ranges and reverse edges across capability propagation, reference attribution and diagnostic ownership"
+    )]
     fn from_snapshot_impl(
         snapshot: &Snapshot,
         diagnostics: Vec<DiagnosticFact>,

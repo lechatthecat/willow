@@ -191,7 +191,6 @@ pub(super) fn finish_with_hooks(
 }
 
 #[cfg(test)]
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish_with_policy(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
@@ -210,7 +209,10 @@ pub(super) fn finish_with_policy(
     )
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one mark-closure protocol keeps drain budgets, source sealing and stopped re-election beside heap-lock and barrier transitions, making every fallback and successful sweep handoff auditable"
+)]
 fn finish_with_policy_in(
     owner: &crate::runtime::Runtime,
     cycle: &Arc<ConcurrentCycle>,

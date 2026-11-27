@@ -208,7 +208,10 @@ async fn main() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the multiline Willow fixture and ordered expected outputs form one async scalar/channel catalog, compiled once under GC stress to check values across suspension"
+)]
 fn async_catalog_50_cases() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"
@@ -472,7 +475,10 @@ async fn part4() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the multiline Willow fixture and ordered expected outputs form one async object catalog, compiled once under GC stress to check references and dispatch across suspension"
+)]
 fn async_object_catalog_50_cases() {
     let (out, ok) = compile_and_run_gc_stress(
         r#"

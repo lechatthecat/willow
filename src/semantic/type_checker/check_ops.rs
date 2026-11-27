@@ -202,7 +202,10 @@ impl TypeChecker {
         value
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the binary-operator rule table keeps operand admissibility, result types and operator-specific recovery diagnostics together for each operator family"
+    )]
     fn finish_binary(&mut self, b: &BinaryExpr, lty: Type, rty: Type) -> Type {
         if Self::contains_error_type(&lty) || Self::contains_error_type(&rty) {
             return Self::error_type();

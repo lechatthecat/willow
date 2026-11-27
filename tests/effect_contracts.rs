@@ -879,7 +879,10 @@ fn no_alloc_generic_typed_storage_helper() {
 }
 
 #[test]
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the enum-representation matrix keeps source inputs and expected allocation effects in one table consumed by the same check/build assertions"
+)]
 fn no_alloc_enum_representations_and_propagation() {
     for (label, declarations, params, result, body, allocates) in [
         (

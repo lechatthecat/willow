@@ -55,7 +55,10 @@ fn parsed(doc: &DocumentMut, original: &str) -> Result<(ProjectManifest, String)
 
 /// Serialize edits from different cache roots too. Resolution holds the existing
 /// bridge/project leases through publication; failed resolution leaves user files intact.
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one dependency-edit transaction holds workspace and bridge leases through candidate resolution and publication; keeping named-update lock selection and rollback boundaries visible protects atomic edits"
+)]
 pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Result<Value> {
     ensure!(
         !options.locked,

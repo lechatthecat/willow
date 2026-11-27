@@ -130,7 +130,10 @@ impl UnitCodegenContext<'_> {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one SSA dispatcher shares exponent classification and the general kernel across IEEE special cases and the integral fast path; keeping block dominance and domain-check ordering visible aids numerical review"
+    )]
     fn define_pow_f64(
         &mut self,
         func_id: FuncId,
@@ -476,7 +479,10 @@ impl UnitCodegenContext<'_> {
 
 // Emit each numerical block once inside the singleton dispatcher. Block
 // parameters replace ABI packing/spilling, preserving every floating operation.
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the compensated log2 kernel keeps range reduction, high/low-word arithmetic and the final merge in numerical evaluation order, with shared SSA values and explicit rounding steps"
+)]
 fn emit_log2_f64(b: &mut FunctionBuilder<'_>, x: Value) -> [Value; 2] {
     let done = b.create_block();
     b.append_block_param(done, types::F64);

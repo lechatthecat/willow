@@ -450,7 +450,10 @@ fn apply_callable_slots(
     semantic::callable_slots::apply_build(&mut programs, Some(dependencies), &stores);
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "template-owner checkers and spooled artifacts share one expansion lifetime; retaining the phase order makes early checker release and source-ordered diagnostics auditable"
+)]
 fn expand_templates(
     mut program: parser::ast::Program,
     graph: &mut module::ModuleGraph,

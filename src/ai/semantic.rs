@@ -286,7 +286,10 @@ impl Captured {
 }
 /// Status of one effect witness: a witness without a source location is
 /// `missing-source`; runtime capabilities are conservative bounds.
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "call, panic, effect and body facts share one boundary-site index and location resolver; their ordered assembly keeps witness provenance and final deduplication together"
+)]
 pub(super) fn finish(
     captures: &HashMap<UnitId, CapturedUnit>,
     paths: &HashMap<UnitId, String>,
