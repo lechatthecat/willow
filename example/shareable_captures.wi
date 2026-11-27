@@ -1,0 +1,37 @@
+// Immutable captures travel with their function value across tasks and channels.
+interface Shared extends Sync {}
+class Operation implements Shared {
+    pub apply: fn(i64) -> i64;
+}
+
+async fn make(offset: i64) -> fn(i64) -> i64 {
+    return |value: i64| value + offset;
+}
+
+async fn invoke(operation: fn(i64) -> i64, value: i64) -> i64 {
+    return operation(value);
+}
+
+async fn receive(channel: Channel<fn(i64) -> i64>) -> i64 {
+    let operation = channel.recv();
+    return operation(10);
+}
+
+async fn main() {
+    let offset = 7;
+    let values = [2, 3, 5].freeze();
+    let operation = new Operation(|value: i64| value + offset + values.len());
+    println(await invoke(operation.apply, 10)); // 20
+
+    let channel = Channel<fn(i64) -> i64>::with_capacity(1);
+    let task = receive(channel);
+    channel.send(operation.apply);
+    println(await task); // 20
+
+    let returned = await make(4);
+    println(await invoke(returned, 10)); // 14
+
+    select { channel.send(|value: i64| value + offset) => {} }
+    let selected = channel.recv();
+    println(await invoke(selected, 10)); // 17
+}

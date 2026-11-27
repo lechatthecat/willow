@@ -2242,7 +2242,17 @@ impl TypeChecker {
         }
         let type_args = type_args
             .iter()
-            .map(|ty| self.normalize_type(ty, span))
+            .map(|ty| {
+                let ty = self.normalize_type(ty, span);
+                // Static constructor arguments are parsed individually, unlike
+                // `Channel<fn(...)>` annotations. Give both routes the same
+                // Send-required callable contract after resolving the owner.
+                if SEND_ONLY_BUILTINS.contains(&class_name) {
+                    ty.with_callable_kind(true)
+                } else {
+                    ty
+                }
+            })
             .collect::<Vec<_>>();
         let call = StaticCall {
             class_name,

@@ -109,7 +109,7 @@ fn only_task_local_function_values_are_kept_from_other_tasks() {
     // A lambda that mutates a capture is task-local wherever it is written.
     rejected(
         "let mut n = 0; let t = in_task(|x: i64| { n = n + x; return n; }, 1);",
-        ErrorCode::E1011,
+        ErrorCode::E2402,
         "task-local",
     );
     rejected(
@@ -119,7 +119,7 @@ fn only_task_local_function_values_are_kept_from_other_tasks() {
     );
     rejected(
         "let mut n = 0; let s = new SharedStage(|x: i64| { n = n + x; return n; });",
-        ErrorCode::E1011,
+        ErrorCode::E2402,
         "task-local",
     );
     // A plain class whose field only ever holds shareable values crosses tasks.

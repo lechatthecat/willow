@@ -147,7 +147,7 @@ impl TypeChecker {
         }
         let (actual, rejected) =
             self.check_lambda_for_callable(l, expected, Some(params), Some(ret));
-        // Answering with the EXPECTED type after the E1011 report keeps the
+        // Answering with the EXPECTED type after the E2402 report keeps the
         // rest of the expression free of a second, derived mismatch.
         if rejected { expected.clone() } else { actual }
     }
@@ -156,7 +156,7 @@ impl TypeChecker {
     /// wanted, with whatever of its parameter and return types the context
     /// already knows. A generic call knows only what earlier arguments bound,
     /// so either part may be absent; `signature` itself is used for the
-    /// callable kind and, unresolved names included, for the E1011 help.
+    /// callable kind and, unresolved names included, for the E2402 help.
     ///
     /// Returns the lambda's type and whether it was rejected as a capturing
     /// lambda where a `fn` is required. A rejected lambda is answered as the
@@ -186,7 +186,7 @@ impl TypeChecker {
         self.push(
             Diagnostic::new(
                 Severity::Error,
-                ErrorCode::E1011,
+                ErrorCode::E2402,
                 "lambda capturing task-local state cannot be shared across tasks".to_string(),
             )
             .with_label(Label::primary(l.span, format!("captures {captured}")))
@@ -211,37 +211,36 @@ impl TypeChecker {
     /// variable scope, so `lookup_var` answers for exactly the names a capture
     /// could name.
     fn collect_lambda_captures(&mut self, l: &LambdaExpr) -> Vec<LambdaCapture> {
-        let mut scan = CaptureScan {
-            checker: self,
-            scopes: crate::semantic::scopes::Scopes::with_frame(
-                l.params.iter().map(|p| (p.name.clone(), ())),
-            ),
-            captures: Vec::new(),
-            capture_indices: HashMap::new(),
-            writes: Vec::new(),
-        };
-        match &l.body {
-            LambdaBody::Expr(e) => scan.walk(AstEvent::Expr(e)),
-            LambdaBody::Block(b) => scan.walk(AstEvent::Block(b)),
+        if !self.local.capture_syntax.contains_key(&l.id) {
+            let mut scan = CaptureScan::new(self);
+            scan.walk(AstEvent::Lambda(l));
+            self.local.capture_syntax.extend(scan.finished);
         }
-        let CaptureScan {
-            mut captures,
-            capture_indices,
-            writes,
-            ..
-        } = scan;
-        for (name, span) in writes {
-            if let Some(&index) = capture_indices.get(&name) {
-                if self
-                    .symbols
-                    .lookup_var(&name)
-                    .is_some_and(|info| info.mutable && !info.is_param)
-                {
-                    captures[index].mutable = true;
-                } else {
-                    self.local.capture_writes.insert(span);
-                    self.push_capture_write(&name, span, captures[index].declaration_span);
-                }
+        let syntax = self
+            .local
+            .capture_syntax
+            .remove(&l.id)
+            .expect("scanned lambda");
+        let mut captures = Vec::with_capacity(syntax.names.len());
+        for (name, written) in syntax.names {
+            let Some(info) = self.symbols.lookup_var(&name).cloned() else {
+                continue;
+            };
+            captures.push(LambdaCapture {
+                mutable: written && info.mutable && !info.is_param,
+                name,
+                ty: info.ty,
+                declaration_span: info.declaration_span,
+            });
+        }
+        // Each write is diagnosed by its own lambda, not again by every
+        // enclosing environment that forwards the same capture.
+        for (name, span) in syntax.writes {
+            if let Some(info) = self.symbols.lookup_var(&name).cloned()
+                && (!info.mutable || info.is_param)
+            {
+                self.local.capture_writes.insert(span);
+                self.push_capture_write(&name, span, info.declaration_span);
             }
         }
         captures
@@ -335,6 +334,7 @@ impl TypeChecker {
                 LambdaBody::Expr(_) => self.body_queries.is_none().then(BodyId::fresh),
             })
             .map(FunctionId::lambda);
+        let capture_bindings = self.local.capture_bindings.clone();
         let result = self.check_lambda_body(
             l,
             lambda_body,
@@ -343,6 +343,7 @@ impl TypeChecker {
             expected_return,
             expected_closure,
         );
+        self.local.capture_bindings = capture_bindings;
         self.record_function_value(callable, l.params.len(), l.span, &result.0);
         result
     }
@@ -356,6 +357,7 @@ impl TypeChecker {
         expected_return: Option<&Type>,
         expected_closure: bool,
     ) -> (Type, Vec<String>) {
+        let capture_errors_start = self.errors.len();
         let previous_body = std::mem::replace(&mut self.local.current_body, lambda_body);
         if let Some(callable) = lambda_callable {
             // A lambda without call sites still owns a graph node; a missing
@@ -380,6 +382,23 @@ impl TypeChecker {
         if let LambdaBody::Expr(expr) = &l.body {
             self.check_transfer_ownership(crate::parser::iter::AstEvent::Expr(expr));
         }
+        let capture_declarations = std::mem::replace(
+            &mut self.local.current_capture_declarations,
+            self.lambda_captures
+                .get(&l.id)
+                .into_iter()
+                .flatten()
+                .map(|capture| capture.declaration_span)
+                .collect(),
+        );
+        self.refine_capture_flow(
+            match &l.body {
+                LambdaBody::Expr(expr) => crate::parser::iter::AstEvent::Expr(expr),
+                LambdaBody::Block(block) => crate::parser::iter::AstEvent::Block(block),
+            },
+            capture_errors_start,
+        );
+        self.local.current_capture_declarations = capture_declarations;
         self.local.lexical_block_depth = saved_lexical;
         self.local.loop_depth = saved_loop;
         self.local.lock_depth = saved_lock;
@@ -605,9 +624,47 @@ impl TypeChecker {
         // serves a task-local slot by subsumption.
         let _ = expected_closure;
         let mut task_local = Vec::new();
+        let mut markers = super::send_sync::MarkerCache::default();
+        self.local.capture_flow.captures.remove(&l.span);
         for capture in &captures {
-            if capture.mutable || !(self.is_send(&capture.ty) && self.is_sync(&capture.ty)) {
+            // A sibling lambda can promote this binding to a shared cell,
+            // even if this lambda only reads it and is checked first.
+            let mutable = capture.mutable
+                || self
+                    .symbols
+                    .lookup_var(&capture.name)
+                    .is_some_and(|v| v.mutable);
+            if matches!(capture.ty, Type::Fn(..) | Type::Closure(..)) {
+                self.local
+                    .capture_flow
+                    .captures
+                    .entry(l.span)
+                    .or_default()
+                    .push((capture.declaration_span, mutable));
+            }
+            if mutable || !self.capture_is_shareable(&capture.ty, &mut markers) {
                 task_local.push(capture.name.clone());
+                self.local.capture_flow.origins.entry(l.span).or_insert_with(|| super::capture_flow::Origin {
+                    binding: (!mutable && matches!(capture.ty, Type::Closure(..))).then_some(capture.declaration_span),
+                    label: std::rc::Rc::new(Label::secondary(capture.declaration_span, if mutable {
+                        format!("captured variable `{}` is mutable and may share a capture cell", capture.name)
+                    } else {
+                        format!("captured variable `{}` has non-Sync or non-Send type", capture.name)
+                    })),
+                });
+                if !self.local.callable_causes.contains_key(&l.span) {
+                    let cause = self.local.capture_bindings.get(&capture.declaration_span)
+                        .and_then(Option::as_ref)
+                        .cloned().unwrap_or_else(|| std::rc::Rc::new(Label::secondary(
+                            capture.declaration_span,
+                            if mutable {
+                                format!("captured variable `{}` is mutable and may share a capture cell", capture.name)
+                            } else {
+                                format!("captured variable `{}` has non-Sync or non-Send type `{}`", capture.name, self.diagnostic_type_name(&capture.ty))
+                            },
+                        )));
+                    self.local.callable_causes.insert(l.span, cause);
+                }
             }
         }
         let fn_ty = if task_local.is_empty() {
@@ -2015,111 +2072,106 @@ pub struct LambdaCapture {
     pub declaration_span: Span,
 }
 
-/// Uses the structural walk's scope and binding events to resolve captures.
-struct CaptureScan<'a> {
-    checker: &'a mut TypeChecker,
-    scopes: crate::semantic::scopes::Scopes<()>,
-    /// The captures found so far, in first-mention order — which is the order
-    /// the closure environment lays its slots out.
-    captures: Vec<LambdaCapture>,
-    capture_indices: HashMap<String, usize>,
-    /// Names the lambda ASSIGNS to that are not bound inside it. Kept apart
-    /// from `captures` because whether a write is legal depends on the
-    /// declaration, which is decided once the whole body has been seen.
+/// Symbolic captures, resolved to types when that lambda is checked. The
+/// insertion order is the environment's first-mention layout order.
+#[derive(Default)]
+pub(super) struct CaptureSyntax {
+    names: indexmap::IndexMap<String, bool>,
+    /// Only this lambda's own writes; descendants propagate the boolean above.
     writes: Vec<(String, Span)>,
 }
 
-impl CaptureScan<'_> {
-    fn bound_inside(&self, name: &str) -> bool {
-        self.scopes.get(name).is_some()
+/// Walk a nested lambda tree once. A use is propagated towards its binding
+/// only until it reaches an already recorded capture. Each read/write fact
+/// crosses each environment edge at most once: O(AST + capture output), with
+/// indexed lexical lookup independent of nesting depth.
+struct CaptureScan<'a> {
+    checker: &'a TypeChecker,
+    scopes: crate::semantic::scopes::Scopes<usize>,
+    active: Vec<(ExprId, CaptureSyntax)>,
+    finished: HashMap<ExprId, CaptureSyntax>,
+}
+
+impl<'a> CaptureScan<'a> {
+    fn new(checker: &'a TypeChecker) -> Self {
+        Self {
+            checker,
+            scopes: crate::semantic::scopes::Scopes::with_frame([]),
+            active: Vec::new(),
+            finished: HashMap::new(),
+        }
     }
 
-    fn note_use(&mut self, name: &str) {
-        // `super.method()` uses the same receiver value, while dispatch remains
-        // statically resolved against the enclosing class's parent.
+    fn note_use(&mut self, name: &str, write: Option<Span>) {
         let name = if name == "super"
-            && !self.bound_inside("super")
+            && self.scopes.get("super").is_none()
             && self.checker.symbols.lookup_var("super").is_none()
         {
             "self"
         } else {
             name
         };
-        if self.bound_inside(name) {
-            return; // bound inside the lambda
-        }
-        if self.capture_indices.contains_key(name) {
-            return; // already recorded; first mention fixes the slot
-        }
-        let Some(info) = self.checker.symbols.lookup_var(name).cloned() else {
-            return; // a free function, a class, a constant — not a capture
+        let owner = match self.scopes.get(name).copied() {
+            Some(depth) => depth,
+            None if self.checker.symbols.lookup_var(name).is_some() => 0,
+            None => return, // a named function, class or constant
         };
-        self.capture_indices
-            .insert(name.to_string(), self.captures.len());
-        self.captures.push(LambdaCapture {
-            mutable: false,
-            name: name.to_string(),
-            ty: info.ty,
-            declaration_span: info.declaration_span,
-        });
-    }
-
-    fn note_write(&mut self, name: &str, span: Span) {
-        if self.bound_inside(name) {
+        if owner == self.active.len() {
             return;
         }
-        if self.checker.symbols.lookup_var(name).is_some() {
-            self.writes.push((name.to_string(), span));
+        for (_, captures) in self.active[owner..].iter_mut().rev() {
+            #[cfg(test)]
+            CAPTURE_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
+            if let Some(written) = captures.names.get_mut(name) {
+                if write.is_none() || *written {
+                    break;
+                }
+                *written = true;
+            } else {
+                captures.names.insert(name.to_owned(), write.is_some());
+            }
+        }
+        if let Some(span) = write {
+            self.active
+                .last_mut()
+                .expect("active lambda")
+                .1
+                .writes
+                .push((name.into(), span));
         }
     }
-}
 
-impl CaptureScan<'_> {
+    fn finish_lambda(&mut self) {
+        let (id, captures) = self.active.pop().expect("active lambda");
+        self.finished.insert(id, captures);
+    }
+
     fn walk(&mut self, root: AstEvent<'_>) {
         for event in AstWalk::new(root) {
+            #[cfg(test)]
+            CAPTURE_SCAN_STEPS.with(|steps| steps.set(steps.get() + 1));
             match event {
-                AstEvent::EnterScope => self.enter_scope(),
-                AstEvent::ExitScope => self.exit_scope(),
-                AstEvent::Bind(name) => self.bind(name),
-                AstEvent::Expr(expr) => self.visit_expr(expr),
-                AstEvent::ExitStmt(stmt) => self.visit_stmt(stmt),
+                AstEvent::Lambda(lambda) => self.active.push((lambda.id, CaptureSyntax::default())),
+                AstEvent::EnterScope => self.scopes.push(),
+                AstEvent::ExitScope => self.scopes.pop(),
+                AstEvent::Bind(name) => self.scopes.insert(name.into(), self.active.len()),
+                AstEvent::Expr(Expr::Var(name, ..)) => self.note_use(name, None),
+                AstEvent::Expr(Expr::Call(call)) => self.note_use(&call.callee, None),
+                AstEvent::ExitStmt(Stmt::Assign(assign)) => {
+                    self.note_use(&assign.name, Some(assign.span))
+                }
+                AstEvent::ExitExpr(Expr::Lambda(_)) => self.finish_lambda(),
                 _ => {}
             }
         }
+        // The root Lambda event has no enclosing Expr exit event.
+        self.finish_lambda();
     }
+}
 
-    fn enter_scope(&mut self) {
-        self.scopes.push();
-    }
-
-    fn exit_scope(&mut self) {
-        self.scopes.pop();
-    }
-
-    fn bind(&mut self, name: &str) {
-        self.scopes.insert(name.to_string(), ());
-    }
-
-    fn visit_stmt(&mut self, stmt: &Stmt) {
-        // Writing an enclosing local captures it too, and an assignment target
-        // is a name on the statement rather than a `Var` the walk can reach.
-        if let Stmt::Assign(assign) = stmt {
-            self.note_use(&assign.name);
-            self.note_write(&assign.name, assign.span);
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &Expr) {
-        match expr {
-            Expr::Var(name, _, _) => self.note_use(name),
-            // Calling a local function VALUE captures it: the callee is a name
-            // on the call node, not a `Var` the walk reaches, exactly as an
-            // assignment target is. A free function's name resolves to no
-            // variable, so `note_use` ignores it.
-            Expr::Call(call) => self.note_use(&call.callee),
-            _ => {}
-        }
-    }
+#[cfg(test)]
+thread_local! {
+    static CAPTURE_SCAN_STEPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -2205,28 +2257,68 @@ mod lambda_capture_tests {
                 for _ in 0..50_000 {
                     expr = Expr::TryPropagate(Box::new(expr), span, ExprId::fresh());
                 }
-                let mut scan = CaptureScan {
-                    checker: &mut checker,
-                    scopes: crate::semantic::scopes::Scopes::with_frame([]),
-                    captures: Vec::new(),
-                    capture_indices: HashMap::new(),
-                    writes: Vec::new(),
+                let lambda = LambdaExpr {
+                    id: ExprId::fresh(),
+                    params: Vec::new(),
+                    return_type: None,
+                    body: LambdaBody::Expr(Box::new(expr)),
+                    span,
                 };
-                scan.walk(AstEvent::Expr(&expr));
-                drop(expr);
+                let mut scan = CaptureScan::new(&checker);
+                scan.walk(AstEvent::Lambda(&lambda));
+                let captured = &scan.finished[&lambda.id];
                 assert_eq!(
-                    scan.captures
-                        .iter()
-                        .map(|capture| capture.name.as_str())
+                    captured
+                        .names
+                        .keys()
+                        .map(String::as_str)
                         .collect::<Vec<_>>(),
                     ["outer"]
                 );
-                assert!(scan.writes.is_empty());
+                assert!(captured.writes.is_empty());
                 assert_eq!(scan.scopes.len(), 1);
             })
             .unwrap()
             .join()
             .unwrap();
+    }
+
+    #[test]
+    fn nested_capture_scan_is_linear_in_syntax_and_environment_slots() {
+        use super::CAPTURE_SCAN_STEPS;
+        for depth in [16, 32, 64, 128] {
+            let source = format!(
+                "fn main() {{ let x = 1; {}{} }}",
+                "let f = || { ".repeat(depth),
+                "return x + x; }; ".repeat(depth),
+            );
+            CAPTURE_SCAN_STEPS.with(|steps| steps.set(0));
+            let (errors, captures) = scan(&source);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(captures.len(), depth);
+            assert!(captures.iter().all(|names| names == &["x"]));
+            let steps = CAPTURE_SCAN_STEPS.with(|steps| steps.get());
+            assert!((depth..=32 * depth).contains(&steps), "{depth}: {steps}");
+            eprintln!(
+                "capture syntax: depth={depth}, slots={}, steps={steps}",
+                captures.len()
+            );
+        }
+    }
+
+    #[test]
+    fn nested_capture_writes_report_each_assignment_once() {
+        let errors = check(
+            "fn main() { let n = 0; let outer = || { let inner = || { n = 1; n = 2; }; inner(); }; outer(); }",
+        );
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .all(|error| error.code == crate::diagnostics::ErrorCode::E1009),
+            "{errors:?}"
+        );
+        assert_ne!(errors[0].primary_span(), errors[1].primary_span());
     }
 
     /// Check `src`, and report both its diagnostics and what each lambda
@@ -2645,7 +2737,7 @@ mod lambda_capture_tests {
                 "import std::collections::Array; async fn run(f: fn() -> i64) -> i64 {{ return f(); }} class C {{ pub v: i64; pub items: Array<i64>; pub fn m(self) {{ let me = self; let t = run(|| {receiver}.v); }} }} fn main() {{}}"
             ));
             assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-            assert_eq!(diagnostics[0].code, crate::diagnostics::ErrorCode::E1011);
+            assert_eq!(diagnostics[0].code, crate::diagnostics::ErrorCode::E2402);
             let rendered = format!("{:?}", diagnostics[0]);
             assert!(
                 rendered.contains(&format!("captures `{receiver}`")),
@@ -2738,7 +2830,7 @@ mod lambda_capture_tests {
         err(
             "async fn apply(g: fn(i64) -> i64, v: i64) -> i64 { return g(v); } \
              fn main() { let mut y = 1; let t = apply(|x: i64| { y = y + x; return y; }, 2); }",
-            "E1011",
+            "E2402",
         );
     }
 

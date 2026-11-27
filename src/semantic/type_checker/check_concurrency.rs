@@ -58,18 +58,17 @@ impl TypeChecker {
                         && v_ty != *elem
                         && !self.recovery_types_compatible(&elem, &v_ty)
                     {
-                        self.push(
-                            Diagnostic::new(
-                                Severity::Error,
-                                ErrorCode::E0201,
-                                format!(
-                                    "select send value type `{}` does not match channel element `{}`",
-                                    self.diagnostic_type_name(&v_ty),
-                                    self.diagnostic_type_name(&elem)
-                                ),
-                            )
-                            .with_label(Label::primary(value.span(), "wrong value type")),
-                        );
+                        let diagnostic = Diagnostic::new(
+                            Severity::Error,
+                            ErrorCode::E0201,
+                            format!(
+                                "select send value type `{}` does not match channel element `{}`",
+                                self.diagnostic_type_name(&v_ty),
+                                self.diagnostic_type_name(&elem)
+                            ),
+                        )
+                        .with_label(Label::primary(value.span(), "wrong value type"));
+                        self.push(self.with_callable_kind_help(diagnostic, &elem, &v_ty));
                     }
                     // A bounded send can suspend while holding the value,
                     // so its type participates in the task's Send check.

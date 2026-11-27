@@ -122,6 +122,8 @@ mod lir_static_property_bodies;
 mod method_receiver_roots;
 #[path = "integration/run_queue_metrics.rs"]
 mod run_queue_metrics;
+#[path = "integration/shareable_captures.rs"]
+mod shareable_captures;
 #[path = "integration/static_dependency_graph.rs"]
 mod static_dependency_graph;
 #[path = "integration/super_method_calls.rs"]

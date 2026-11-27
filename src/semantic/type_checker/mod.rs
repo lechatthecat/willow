@@ -22,6 +22,8 @@ mod check_calls;
 mod check_collections;
 mod check_concurrency;
 use builtin_methods::{ArityText, BuiltinArgument, BuiltinArity, constructor_arity};
+mod callable_capture;
+mod capture_flow;
 mod check_decls;
 mod check_lambda_match;
 mod exhaustiveness;
@@ -2244,6 +2246,7 @@ impl TypeChecker {
     }
 
     fn push(&mut self, d: Diagnostic) {
+        let d = self.with_capture_cause(d);
         if d.severity == Severity::Error {
             self.error_generation += 1;
         }

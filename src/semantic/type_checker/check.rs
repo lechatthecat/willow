@@ -1526,6 +1526,7 @@ impl TypeChecker {
     }
 
     pub(super) fn check_block_scope(&mut self, block: &Block, lexical: bool) {
+        let capture_errors_start = self.errors.len();
         self.local.lexical_block_depth += u32::from(lexical);
         self.symbols.push_scope();
         for stmt in &block.stmts {
@@ -1548,7 +1549,12 @@ impl TypeChecker {
         self.local.lexical_block_depth -= u32::from(lexical);
         if self.local.lexical_block_depth == 0 {
             self.check_transfer_ownership(crate::parser::iter::AstEvent::Block(block));
+            self.refine_capture_flow(
+                crate::parser::iter::AstEvent::Block(block),
+                capture_errors_start,
+            );
         }
+        self.end_capture_scope(block);
     }
 
     /// Type-check `lock <target> as [mut] <binding> { .. }`.
@@ -1804,6 +1810,7 @@ impl TypeChecker {
             Some(ann) => self.check_expr_expecting(&s.init, ann),
             None => self.check_expr(&s.init),
         };
+        self.copy_capture_cause(s.init.span(), s.span);
         if s.name.starts_with("$compound_array_") {
             self.record_element_write(&s.init, reference_start, true);
         }
@@ -1895,6 +1902,7 @@ impl TypeChecker {
                 "previous definition here",
             );
         }
+        self.bind_capture_cause(s.init.span(), s.span, &ty);
         self.define_var(
             s.name.clone(),
             VarInfo {
@@ -2064,6 +2072,8 @@ impl TypeChecker {
                     self.push_immutable_assignment(s, &info);
                 }
                 let got = self.check_expr_expecting(&s.value, &info.ty);
+                self.copy_capture_cause(s.value.span(), s.span);
+                self.bind_capture_cause(s.value.span(), info.declaration_span, &info.ty);
                 if !self.types_compatible(&info.ty, &got) {
                     self.push_value_type_mismatch(&info.ty, &got, s.span, &s.value);
                 }
@@ -2244,10 +2254,16 @@ impl TypeChecker {
         self.local.lexical_block_depth -= 1;
         self.local.loop_depth -= 1;
         self.symbols.pop_scope();
+        self.end_capture_scope(&s.body);
     }
 
     fn check_defer_stmt(&mut self, d: &DeferStmt) {
         self.check_defer_body_shape(d);
+        let capture_entry = matches!(
+            d.body,
+            DeferBody::Block(_) | DeferBody::Expr(Expr::Match(_))
+        )
+        .then(|| self.local.capture_bindings.clone());
         match &d.body {
             // The deferred `await` itself is the reported mistake; checking it
             // would add an unrelated "await outside async" error.
@@ -2258,6 +2274,9 @@ impl TypeChecker {
                 self.check_expr(expr);
             }
             DeferBody::Block(block) => self.check_block(block),
+        }
+        if let Some(entry) = capture_entry {
+            self.local.capture_bindings = entry;
         }
         if let Some((span, operation)) = defer_scheduler_drive_span(&d.body, &self.builtin_calls) {
             self.push(
@@ -2361,6 +2380,7 @@ impl TypeChecker {
         }
 
         for (span, keyword) in defer_control_flow_violations(&d.body) {
+            self.local.capture_flow.invalid_defers.insert(d.body.span());
             self.push_error(
                 ErrorCode::E0905,
                 format!("`{keyword}` is not allowed inside a `defer`"),
@@ -2883,6 +2903,7 @@ impl TypeChecker {
     }
 
     pub(super) fn record_checked_expr(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
+        self.record_callable_join(expr, &ty);
         if self.error_generation != 0 {
             self.record_check_failure(
                 super::body::FailedCheck::Value(expr.id()),
@@ -3307,6 +3328,41 @@ impl TypeChecker {
         }
         // Local variable?
         if let Some(info) = self.symbols.lookup_var(name) {
+            if matches!(info.ty, Type::Fn(..) | Type::Closure(..)) {
+                self.local
+                    .capture_flow
+                    .reads
+                    .insert(*span, info.declaration_span);
+                if matches!(info.ty, Type::Closure(..))
+                    && self
+                        .local
+                        .current_capture_declarations
+                        .contains(&info.declaration_span)
+                {
+                    self.local
+                        .capture_flow
+                        .origins
+                        .entry(info.declaration_span)
+                        .or_insert_with(|| super::capture_flow::Origin {
+                            binding: None,
+                            label: std::rc::Rc::new(Label::secondary(
+                                info.declaration_span,
+                                format!("captured variable `{name}` has task-local function type"),
+                            )),
+                        });
+                }
+            }
+            if let Some(cause) = self
+                .local
+                .capture_bindings
+                .get(&info.declaration_span)
+                .and_then(Option::as_ref)
+                .cloned()
+            {
+                self.local.callable_causes.insert(*span, cause);
+            } else {
+                self.local.callable_causes.remove(span);
+            }
             if let Some((uses, _)) = self.local.inferred_maps.get_mut(&info.declaration_span) {
                 uses.push(expr.id());
                 self.local.pending_map_uses.insert(expr.id());
@@ -3559,6 +3615,10 @@ impl TypeChecker {
                 //
                 // has to load first.
                 Type::Fn(param_types, ret) | Type::Closure(param_types, ret) => {
+                    self.local
+                        .capture_flow
+                        .calls
+                        .insert(c.span, var_info.declaration_span);
                     if param_types.len() != c.args.len() {
                         self.push(
                             Diagnostic::new(
@@ -3882,15 +3942,13 @@ impl TypeChecker {
         checked: bool,
     ) -> Type {
         self.check_ternary_condition(&t.condition, checked);
-        let (then_ty, else_ty) = match expected {
-            Some(ty) => (
-                self.check_argument_expecting(&t.then_expr, ty, checked),
-                self.check_argument_expecting(&t.else_expr, ty, checked),
-            ),
-            None => (
-                self.check_branch_value(&t.then_expr),
-                self.check_branch_value(&t.else_expr),
-            ),
+        let then_ty = match expected {
+            Some(ty) => self.check_argument_expecting(&t.then_expr, ty, checked),
+            None => self.check_branch_value(&t.then_expr),
+        };
+        let else_ty = match expected {
+            Some(ty) => self.check_argument_expecting(&t.else_expr, ty, checked),
+            None => self.check_branch_value(&t.else_expr),
         };
         let unified = if expected.is_some_and(crate::semantic::generic_inference::has_enum_hole) {
             match (&then_ty, &else_ty) {

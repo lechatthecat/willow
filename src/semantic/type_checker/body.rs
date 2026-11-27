@@ -20,6 +20,12 @@ pub(super) type DeclaredTypeParams = indexmap::IndexSet<String, crate::counted_h
 /// keeps this same lexical/inference state until independent lambda inputs exist.
 /// Immutable declarations and unit orchestration are deliberately absent.
 pub(super) struct BodyState {
+    /// One causal witness per expression/binding, shared across alias chains.
+    /// Diagnostic-only: callable kinds remain the authority for sharing.
+    pub(super) callable_causes: HashMap<Span, std::rc::Rc<Label>>,
+    pub(super) capture_bindings: super::callable_capture::CaptureBindings,
+    pub(super) capture_flow: super::capture_flow::Inputs,
+    pub(super) capture_syntax: HashMap<ExprId, super::check_lambda_match::CaptureSyntax>,
     pub(super) failed_checks: HashSet<FailedCheck>,
     /// Nesting depth of enclosing loops; `break`/`continue` outside a loop is
     /// E0904. Reset to 0 inside a lambda body (a loop outside the lambda is
@@ -110,6 +116,10 @@ pub(super) struct BodyState {
 impl Default for BodyState {
     fn default() -> Self {
         Self {
+            callable_causes: HashMap::new(),
+            capture_bindings: Default::default(),
+            capture_flow: Default::default(),
+            capture_syntax: HashMap::new(),
             failed_checks: HashSet::new(),
             loop_depth: 0,
             lock_depth: 0,

@@ -22,8 +22,8 @@
 //!   reassigned after construction (immutable shared fields, see `field_writes`)
 //! - interface: Send iff it `extends Send` or `extends Sync`; Sync iff it
 //!   `extends Sync`
-//! - plain function pointers: Send + Sync (no environment)
-//! - closure values: conservatively neither (captures unknown)
+//! - shareable function values: Send + Sync (immutable Send + Sync captures)
+//! - task-local function values: neither (mutable or unproven captures)
 
 use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use std::collections::HashSet;
@@ -62,6 +62,9 @@ fn is_value_type(ty: &Type) -> bool {
 
 #[willow_continuations::checker]
 impl TypeChecker {
+    pub(super) fn capture_is_shareable(&self, ty: &Type, cache: &mut MarkerCache) -> bool {
+        self.marker_cached(ty, Marker::Send, cache) && self.marker_cached(ty, Marker::Sync, cache)
+    }
     /// True if a value of `ty` may be transferred across worker/task boundaries.
     pub(super) fn is_send(&self, ty: &Type) -> bool {
         self.marker_holds(ty, Marker::Send, &mut MarkerWalk::default())
@@ -545,7 +548,7 @@ impl TypeChecker {
             tests::REASON_VISITS.with(|n| n.set(n.get() + 1));
         }
         // A signature describes calls, not stored captures. Do not clone or walk
-        // arbitrarily large parameter/return types for an environment-free pointer.
+        // arbitrarily large parameter/return types for a proven shareable value.
         if matches!(ty, Type::Fn(_, _)) {
             return true;
         }
@@ -1519,6 +1522,34 @@ mod tests {
             }
             let closure = Type::Closure(signature, Box::new(Type::I64));
             assert!(!c.is_send(&closure) && !c.is_sync(&closure));
+        }
+    }
+
+    #[test]
+    fn capture_marker_cache_visits_shared_type_graph_once() {
+        for depth in [16, 32, 64] {
+            let mut source = String::from("class Node0 { pub value: i64; }\n");
+            for index in 1..=depth {
+                source.push_str(&format!(
+                    "class Node{index} {{ pub left: Node{}; pub right: Node{}; }}\n",
+                    index - 1,
+                    index - 1
+                ));
+            }
+            source.push_str("fn main() {}");
+            let c = checker(&source);
+            for captures in [16, 64, 256] {
+                let mut cache = MarkerCache::default();
+                for _ in 0..captures {
+                    assert!(c.capture_is_shareable(&named(&format!("Node{depth}")), &mut cache));
+                }
+                let visits = cache.0.visits;
+                assert!(
+                    (2 * captures..=4 * depth + 2 * captures + 4).contains(&visits),
+                    "{depth}/{captures}: {visits}"
+                );
+                eprintln!("capture markers: depth={depth}, captures={captures}, visits={visits}");
+            }
         }
     }
 }

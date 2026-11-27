@@ -325,6 +325,7 @@ impl TypeChecker {
     }
 
     fn record_contextual_type(&mut self, expr: &Expr, ty: Type, generation: usize) -> Type {
+        self.record_callable_join(expr, &ty);
         if self.error_generation != 0 {
             self.record_check_failure(
                 super::body::FailedCheck::Value(expr.id()),
@@ -1015,6 +1016,19 @@ impl TypeChecker {
         require_mutable: bool,
         place: ReferencePlaceInfo,
     ) {
+        if matches!(arg.expr, Expr::Var(..)) && matches!(place.ty, Type::Fn(..) | Type::Closure(..))
+        {
+            self.local
+                .capture_flow
+                .reads
+                .insert(arg.expr.span(), place.declaration_span);
+            if require_mutable {
+                self.local
+                    .capture_flow
+                    .reference_writes
+                    .insert(arg.expr.span(), place.declaration_span);
+            }
+        }
         self.reference_arg_modes.insert(
             arg.expr.id(),
             ReferenceArgMode {
