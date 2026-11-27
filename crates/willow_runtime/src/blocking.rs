@@ -1,5 +1,7 @@
-//! Bounded blocking-work pool used to isolate file I/O and conservative foreign
-//! calls from scheduler workers. Stdout uses a separate one-thread, one-slot
+//! Bounded blocking-work pool used to isolate file I/O from scheduler workers.
+//! Synchronous foreign calls instead use the same-thread GC safe region and
+//! task admission guards in `rust_bridge_abi`; this pool does not route them.
+//! Stdout uses a separate one-thread, one-slot
 //! pool so an undrained output pipe cannot starve unrelated file I/O. The
 //! exported blocking gauges describe the general pool only.
 //!
@@ -50,21 +52,6 @@ pub(crate) type BlockingWork = Box<dyn FnOnce() + Send + 'static>;
 pub const DEFAULT_BLOCKING_THREADS: usize = 4;
 /// Default queued-job capacity, per pool thread.
 pub const DEFAULT_BLOCKING_QUEUE_PER_THREAD: usize = 16;
-
-/// Foreign-call classification. Unknown declarations are conservative and use
-/// the blocking pool until explicitly audited as non-blocking.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ForeignCallClass {
-    NonBlocking,
-    Blocking,
-    Unknown,
-}
-
-impl ForeignCallClass {
-    pub fn must_isolate(self) -> bool {
-        !matches!(self, Self::NonBlocking)
-    }
-}
 
 struct PoolState {
     /// Admitted jobs, `len() <= capacity`. Pool threads pop from the front.
@@ -835,13 +822,6 @@ mod tests {
             });
         }
         reset_global_scheduler_for_test();
-    }
-
-    #[test]
-    fn unknown_foreign_calls_are_conservatively_blocking() {
-        assert!(!ForeignCallClass::NonBlocking.must_isolate());
-        assert!(ForeignCallClass::Blocking.must_isolate());
-        assert!(ForeignCallClass::Unknown.must_isolate());
     }
 
     #[test]

@@ -1497,27 +1497,115 @@ const WAIT_FOR_COLLECTION: &str = r#"
         fn willow_gc_collect();
     }
     fn wait_for_collection() {
-        use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
-        let done = Arc::new(AtomicBool::new(false));
-        let finished = done.clone();
-        std::thread::spawn(move || {
+        let (finished, done) = std::sync::mpsc::channel();
+        let collector = std::thread::spawn(move || {
             unsafe {
                 willow_gc_register_mutator();
                 willow_gc_collect();
                 willow_gc_unregister_mutator();
             }
-            finished.store(true, Ordering::SeqCst);
+            finished.send(()).unwrap();
         });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !done.load(Ordering::SeqCst) {
-            if std::time::Instant::now() >= deadline {
-                eprintln!("COLLECTION_STALLED");
-                std::process::abort();
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        if done.recv_timeout(std::time::Duration::from_secs(30)).is_err() {
+            eprintln!("COLLECTION_STALLED");
+            std::process::abort();
         }
+        collector.join().unwrap();
     }
 "#;
+
+#[test]
+fn unknown_and_blocking_foreign_calls_preserve_task_gc_and_native_affinity() {
+    let f = Fixture::new();
+    let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_foreign_region");
+    for file in [
+        "project.toml",
+        "bridge.rs",
+        "src/main.wi",
+        "native/Cargo.toml",
+        "native/src/lib.rs",
+    ] {
+        fs::copy(example.join(file), f.root.join(file)).unwrap();
+    }
+    for workers in ["1", "2"] {
+        let output = f.command_env(&["run", "--offline"], &[("WILLOW_WORKERS", workers)]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "42\nunknown input survives\n42\nblocking input survives\n"
+        );
+    }
+}
+
+#[test]
+fn foreign_admission_effects_and_generated_paths_agree() {
+    use willow_abi::RuntimeEffects;
+    // Unknown and known Blocking bodies have the same unreviewed declaration.
+    // Also cover inactive/revoked claims: neither may select task admission.
+    for class in ["unknown", "blocking", "inactive", "nonblocking", "revoked"] {
+        for ty in [Scalar::I64, Scalar::String] {
+            let mut previous = None;
+            let mut slope = None;
+            for count in [1, 16, 256] {
+                let symbols: Vec<_> = (0..count)
+                    .map(|_| {
+                        let mut symbol =
+                            RustBridgeSymbol::new("call".into(), vec![ty.clone()], ty.clone());
+                        if matches!(class, "inactive" | "nonblocking" | "revoked") {
+                            symbol.declare_nonblocking("0".repeat(64));
+                            symbol.apply_review(class != "inactive");
+                            if class == "revoked" {
+                                symbol.apply_review(false);
+                            }
+                        }
+                        assert_eq!(
+                            symbol.effects & RuntimeEffects::MAY_BLOCK.bits() == 0,
+                            class == "nonblocking"
+                        );
+                        symbol
+                    })
+                    .collect();
+                let source = wrappers(&symbols, Path::new("ffi.rs"), 1);
+                let bounded = class == "nonblocking";
+                assert_eq!(
+                    source
+                        .matches("willow_rust_bridge_enter_nonblocking(1)")
+                        .count(),
+                    if bounded { count } else { 0 }
+                );
+                assert_eq!(
+                    source.matches("willow_rust_bridge_enter(1)").count(),
+                    if bounded { 0 } else { count }
+                );
+                assert_eq!(source.matches("let adapter:").count(), count);
+                // Aggregate support includes one shared handle-release region.
+                assert_eq!(
+                    source.matches("BridgeRegion::enter()").count(),
+                    count + usize::from(ty == Scalar::String)
+                );
+                assert_eq!(source.matches("std::panic::catch_unwind").count(), count);
+                assert!(!source.contains("willow_blocking_"));
+                if let Some((old_count, old_len)) = previous {
+                    let increment = source.len() - old_len;
+                    assert_eq!(increment % (count - old_count), 0);
+                    assert_eq!(
+                        *slope.get_or_insert(increment / (count - old_count)),
+                        increment / (count - old_count)
+                    );
+                }
+                previous = Some((count, source.len()));
+                eprintln!(
+                    "class={class} type={ty:?} declarations={count} guards={count} calls={count} bytes={}",
+                    source.len()
+                );
+            }
+        }
+    }
+}
 
 #[test]
 fn blocking_destructors_leave_collections_running() {
@@ -1763,15 +1851,26 @@ fn nonblocking_many_tasks_gc_and_native_stack() {
     let rust = format!(
         r#"
         {WAIT_FOR_COLLECTION}
+        unsafe extern "C" {{
+            fn willow_sched_current_task() -> u64;
+            fn willow_blocking_completed_jobs() -> i64;
+        }}
         #[inline(never)]
         pub fn work(value:i64)->i64 {{
+            assert_ne!(unsafe {{ willow_sched_current_task() }}, 0);
+            assert_eq!(unsafe {{ willow_blocking_completed_jobs() }}, 0);
             let mut stack = [0u8; 256 * 1024];
             for (i, byte) in stack.iter_mut().enumerate() {{ *byte = i as u8; }}
             std::hint::black_box(&mut stack);
             value + i64::from(stack[42])
         }}
         pub fn collect_during_call(text:&str)->String {{
+            let thread = std::thread::current().id();
+            let task = unsafe {{ willow_sched_current_task() }};
+            assert_ne!(task, 0);
             wait_for_collection();
+            assert_eq!(std::thread::current().id(), thread);
+            assert_eq!(unsafe {{ willow_sched_current_task() }}, task);
             text.to_owned()
         }}
     "#
@@ -1784,7 +1883,7 @@ fn nonblocking_many_tasks_gc_and_native_stack() {
             nonblocking("REVIEW") fn collect_during_call(text:String)->String;
         }
         async fn worker(value:i64)->i64 { return work(value); }
-        async fn heartbeat()->i64 { await sleep(1); return 99; }
+        async fn heartbeat()->i64 { await yield(); return 99; }
         async fn main() {
             let beat = heartbeat();
             let tasks: Array<Task<i64>> = [];
@@ -1898,7 +1997,7 @@ fn nonblocking_foreign_body_allows_other_worker_and_gc_progress() {
             nonblocking("REVIEW") fn hold()->i64;
         }
         async fn held()->i64 { return hold(); }
-        async fn other() { while !started() { await sleep(1); } notify(); }
+        async fn other() { while !started() { await yield(); } notify(); }
         async fn main() { let h = held(); let o = other(); await o; println(await h); }
     "#,
         &rust,

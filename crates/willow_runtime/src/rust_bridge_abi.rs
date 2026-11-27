@@ -1,4 +1,9 @@
-//! Foreign-call admission; only explicitly reviewed bounded calls admit tasks.
+//! Synchronous foreign calls run on their caller's thread in a GC safe region.
+//! Unknown and known-blocking bodies share the conservative admission guard:
+//! compiler effects reject task callers, and `willow_rust_bridge_enter` guards
+//! the ABI too. Only reviewed bounded calls admit tasks, without a pool hop.
+//! Native stack/TLS affinity is preserved. Reverse callbacks into managed
+//! Willow code are unsupported: the idle region cannot access managed state.
 pub(crate) mod aggregate;
 mod asynchronous;
 #[cfg(test)]

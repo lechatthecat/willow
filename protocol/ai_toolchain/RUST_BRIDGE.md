@@ -116,6 +116,30 @@ runtime auto-build, adapter ABI generation, and linking remain owned by their
 existing build paths.
 
 
+## Synchronous foreign execution paths
+
+| Class | Declaration and effects | Execution path |
+| --- | --- | --- |
+| Unknown | An ordinary synchronous declaration, with conservative `MAY_BLOCK` | Direct call on the synchronous caller's thread inside a GC safe region; rejected in Tasks by the compiler and runtime admission guard. |
+| Blocking | A native body known to wait uses the same ordinary declaration and `MAY_BLOCK`; there is no separate `blocking` annotation | The same synchronous guarded GC safe region as Unknown. |
+| NonBlocking | A current reviewed `nonblocking` / `no_block` assertion removes `MAY_BLOCK` | Direct call on the caller's thread, including a Task worker, inside a GC safe region. No blocking-pool submission. |
+
+The compiler's effective bridge facts select the admission guard when generating
+each adapter. There is no runtime classification switch or automatic pool hop.
+The file-I/O blocking pool does not execute synchronous foreign calls. An Unknown
+or Blocking body cannot occupy a Task worker because it is rejected before entry.
+While an admitted synchronous caller waits, its published roots allow GC and
+independently driven Tasks to proceed. Its own continuation waits for the call;
+a synchronous main thread does not itself drive queued Tasks while inside Rust.
+Use an explicit async bridge when a Task needs to await foreign work.
+
+All three paths preserve native thread/TLS and stack identity. Adapters pin
+borrowed managed inputs before entering the region, leave it before converting
+outputs, and leave it on panic as well. Native callbacks confined to native code
+remain on that thread; reverse callbacks into Willow are unsupported and must
+not run inside the region. A NonBlocking assertion covers the complete native
+call, including destructors, and must not conceal a wait.
+
 ## Bounded synchronous calls from tasks
 
 A function can declare `nonblocking("<legacy_review_fingerprint>")` before `fn` inside

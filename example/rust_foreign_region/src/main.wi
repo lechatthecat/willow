@@ -1,0 +1,19 @@
+extern rust {
+    fn remember_thread();
+    fn unknown(text: String) -> String;
+    fn blocking(text: String) -> String;
+}
+
+async fn progress() {
+    gc_minor_collect();
+    gc_collect();
+    println(42);
+}
+
+fn main() {
+    remember_thread();
+    let first = progress();
+    println(unknown("unknown input survives"));
+    let second = progress();
+    println(blocking("blocking input survives"));
+}
