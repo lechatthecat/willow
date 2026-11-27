@@ -19,6 +19,7 @@ pub(super) fn is_collector() -> bool {
 }
 
 impl CollectorGuard<'static> {
+    #[cfg(any(test, feature = "gc-acceptance-faults"))]
     pub(super) fn try_acquire() -> Option<Self> {
         Self::try_acquire_in(crate::runtime::current())
     }
@@ -102,13 +103,6 @@ pub(super) fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
     wait_for_cycle_in(owner, coord, generation);
 }
 
-/// Bound a delayed automatic request without making its allocating caller the
-/// collector. A native trace may Retry until this allocation returns, so only
-/// join initial publication, never marking or whole-cycle completion.
-pub(super) fn start_for_allocation() {
-    start_for_allocation_in(crate::runtime::current())
-}
-
 pub(super) fn start_for_allocation_in(owner: &crate::runtime::Runtime) {
     if IS_COLLECTOR.get() {
         return;
@@ -149,19 +143,13 @@ pub(super) fn start_for_allocation_in(owner: &crate::runtime::Runtime) {
     marking::assist_concurrent_mark_in(owner, 0);
 }
 
-/// Wait for an elected collector without consuming an automatic request.
-/// The same condition-variable protocol joins sweep completion and services
-/// each subsequent stop while this registered waiter remains enrolled.
-pub(super) fn wait_for_current_cycle() {
-    wait_for_current_cycle_in(crate::runtime::current());
-}
-
 pub(super) fn wait_for_current_cycle_in(owner: &crate::runtime::Runtime) {
     let coord = owner.gc.coord.0.lock().unwrap_or_else(|p| p.into_inner());
     let generation = coord.cycle_generation;
     wait_for_cycle_in(owner, coord, generation);
 }
 
+#[cfg(test)]
 /// Revalidate sweep admission under coord -> heap lock order. A sweep may
 /// retire and a later mark may win election after the allocator dropped heap;
 /// never join that later mark on the strength of a stale sweep predicate.
@@ -186,13 +174,6 @@ pub(super) fn wait_for_sweep_budget_in(owner: &crate::runtime::Runtime) -> bool 
     );
     wait_for_cycle_in(owner, coord, generation);
     true
-}
-
-/// Young refills without remaining debt budget join an elected owner instead of
-/// growing the nursery while their pending minor waits behind its sweep. Native collector
-/// callbacks must retain the existing non-waiting/reentrant behavior.
-pub(super) fn wait_for_minor_budget() -> bool {
-    wait_for_minor_budget_in(crate::runtime::current())
 }
 
 pub(super) fn wait_for_minor_budget_in(owner: &crate::runtime::Runtime) -> bool {

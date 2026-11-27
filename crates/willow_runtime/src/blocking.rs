@@ -332,6 +332,7 @@ struct PoolMetrics {
     completed: AtomicU64,
 }
 
+#[cfg(test)]
 /// Run owned native work while parking the current task's native stack. No
 /// managed pointers may be captured by `work`: it can outlive cancellation.
 #[cfg(any(

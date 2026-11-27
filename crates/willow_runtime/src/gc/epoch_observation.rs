@@ -4,28 +4,33 @@ pub(super) trait RegionEvents {
     fn reset_pages(&mut self) {}
     fn page(&mut self) {}
 }
+#[cfg(not(test))]
 impl RegionEvents for NoObservation {}
 pub(super) trait EpochEvents {
     fn read(&self) {}
     fn claim(&self) {}
     fn acquired(&self) {}
 }
+#[cfg(not(test))]
 impl EpochEvents for NoObservation {}
 impl EpochEvents for std::marker::PhantomData<&()> {}
 pub(super) trait ViewEvents: Default {
     fn share(&self) -> Self;
     fn add(&self) {}
 }
+#[cfg(not(test))]
 impl ViewEvents for NoObservation {
     fn share(&self) -> Self {
         *self
     }
 }
 
+#[cfg(not(test))]
 #[derive(Clone, Copy, Default)]
 pub(super) struct NoObservation {
     _private: (),
 }
+#[cfg(not(test))]
 impl NoObservation {
     pub(super) fn borrow(&self) -> std::marker::PhantomData<&()> {
         std::marker::PhantomData

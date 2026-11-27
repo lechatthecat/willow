@@ -264,23 +264,7 @@ fn default_parking() -> &'static Parking {
     &crate::runtime::current().parking
 }
 
-pub(super) fn completion_wake_generation() -> u64 {
-    default_parking().completion.generation()
-}
-pub(super) fn wait_for_completion_event(start: u64) {
-    default_parking()
-        .completion
-        .wait_inner(start, None, std::hint::spin_loop);
-}
-pub(super) fn notify_idle_waiters() {
-    default_parking().notify_idle();
-}
-pub(super) fn notify_local_work(backlog: usize) {
-    default_parking().notify_local(backlog);
-}
-pub(super) fn notify_worker_waiter(worker: usize) {
-    default_parking().notify_worker(worker);
-}
+#[cfg(any(test, feature = "deterministic-test-clock"))]
 pub(super) fn notify_all_idle_waiters() {
     default_parking().notify_all();
 }

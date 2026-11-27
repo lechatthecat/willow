@@ -89,9 +89,6 @@ impl Counters {
 fn default_owner() -> &'static Counters {
     &super::telemetry().footprint
 }
-pub(crate) fn reservation(bytes: u64) {
-    default_owner().reservation(bytes);
-}
 pub(crate) fn reset() {
     default_owner().reset();
 }
@@ -111,10 +108,6 @@ pub(crate) fn window_begin(bytes: u64) -> bool {
 #[cfg(feature = "gc-acceptance-faults")]
 pub(crate) fn window_end() -> u64 {
     default_owner().window_end()
-}
-#[cfg(feature = "gc-acceptance-faults")]
-pub(crate) fn mark_window_complete() {
-    default_owner().mark_window_complete();
 }
 #[cfg(test)]
 mod tests {

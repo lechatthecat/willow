@@ -275,6 +275,7 @@ pub(crate) struct StopMeasurement<'a> {
 }
 
 impl StopMeasurement<'static> {
+    #[cfg(test)]
     pub(crate) fn begin(reason: StopReason) -> Self {
         Self::begin_in(crate::runtime::current(), reason)
     }

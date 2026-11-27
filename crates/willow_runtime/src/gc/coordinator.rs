@@ -149,6 +149,7 @@ pub(super) fn request_tracked() -> Option<Request> {
     request_tracked_in(owner, Owner::Static(owner))
 }
 
+#[cfg(test)]
 /// Request an explicitly owned runtime. Unregistered callers may use this only
 /// without thread-local managed roots; persistent roots belong to the owner's
 /// root registries. Foreign legacy owners are still checked by collector election.

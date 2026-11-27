@@ -218,6 +218,7 @@ impl AsyncRwLock {
         }
     }
 
+    #[cfg(test)]
     fn gc_root(&self) -> Option<*mut u8> {
         if !self.is_ref {
             return None;

@@ -35,10 +35,6 @@
 //! unwinding, allocation and Rust stderr locks are not signal-safe.
 
 #![deny(clippy::undocumented_unsafe_blocks)]
-#![allow(
-    dead_code,
-    reason = "Runtime entry points and helpers are consumed by generated code"
-)]
 // The `extern "C"` ABI exports take raw pointers from Cranelift-generated code
 // and dereference them; they are the unsafe FFI boundary by design, so
 // `not_unsafe_ptr_arg_deref` (which wants `unsafe fn`, incompatible with the

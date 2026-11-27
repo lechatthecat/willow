@@ -341,15 +341,14 @@ pub(crate) fn reached(stage: GcStage) {
 pub(crate) fn reset() {
     default_owner().reset();
 }
+#[cfg(test)]
 pub(crate) fn quiescent() {
     default_owner().quiescent();
 }
 pub fn snapshot() -> CycleMilestones {
     default_owner().snapshot()
 }
-pub(crate) fn try_snapshot() -> Option<CycleMilestones> {
-    default_owner().try_snapshot()
-}
+#[cfg(test)]
 pub(crate) fn record(epoch: u64) -> Option<CycleMilestones> {
     default_owner().record(epoch)
 }

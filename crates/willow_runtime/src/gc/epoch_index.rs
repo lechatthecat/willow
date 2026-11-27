@@ -91,6 +91,7 @@ pub(super) struct RegionIndex {
     view_observation: ViewObservation,
 }
 impl RegionIndex {
+    #[cfg(test)]
     pub(super) fn capture(state: &GcState) -> Self {
         // Reset happened before the stop while the collector held epoch
         // serialization. This stopped publication only captures region views.
@@ -131,6 +132,7 @@ impl RegionIndex {
         }
     }
 
+    #[cfg(test)]
     fn capture_preserving_marks(state: &GcState) -> Self {
         Self::snapshot(state).build(false).0
     }
@@ -365,6 +367,7 @@ mod test_backend;
 use test_backend::EpochData;
 
 impl RegionIndex {
+    #[cfg(not(test))]
     fn from_regions(index: Self) -> Self {
         index
     }
@@ -389,6 +392,7 @@ impl RegionIndex {
         self.locate_region(address)
             .is_none_or(|(view, bit)| view.marks.contains(bit))
     }
+    #[cfg(test)]
     fn metadata(&self, address: usize) -> Option<raw_heap::TraceMetadata> {
         self.locate(address)?;
         HeapObject::from_raw((address - GC_HEADER_SIZE) as *mut GcHeader)
@@ -403,6 +407,7 @@ impl RegionIndex {
             .expect("claimed allocation is nonnull")
             .trace_metadata()
     }
+    #[cfg(not(test))]
     // A drain owns the allocation lifetime; release builds must not reacquire
     // an epoch read lock for each already-claimed object.
     unsafe fn claimed_metadata_unlocked(
@@ -567,9 +572,6 @@ impl EpochIndex {
         // SAFETY: Only the worker that claimed this live epoch entry reads its metadata, before
         // the epoch is retired.
         unsafe { EpochData::claimed_metadata_unlocked(&self.0, address) }
-    }
-    pub(super) fn metadata(&self, address: usize) -> Option<raw_heap::TraceMetadata> {
-        self.0.read().unwrap().metadata(address)
     }
     #[cfg(test)]
     pub(super) fn marked_count(&self) -> usize {

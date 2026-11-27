@@ -1,19 +1,5 @@
 use super::*;
 
-/// Snapshot this thread's live root object pointers (as addresses) from its
-/// thread-local stack. Reads only this thread's TLS, so it is race-free.
-pub(super) fn snapshot_local_roots() -> Vec<usize> {
-    let mut result = Vec::new();
-    crate::generated_context::visit_roots(|slots| {
-        result.extend(slots.iter().filter_map(|&slot| {
-            RootSlot::from_raw(slot)
-                .and_then(RootSlot::load)
-                .map(|payload| payload.as_ptr() as usize)
-        }));
-    });
-    result
-}
-
 std::thread_local! {
     static SATB_BUFFER: std::cell::RefCell<Option<Arc<satb::MutatorBuffer>>> = const { std::cell::RefCell::new(None) };
     /// The registering runtime's epoch cell, or null when this thread is not
@@ -102,7 +88,6 @@ struct QuiescentContext(*const crate::generated_context::Context);
 // SAFETY: only a stopped collector dereferences this, under the coordination
 // lock, while the owner stays in its region. Leaving the region clears it.
 unsafe impl Send for QuiescentContext {}
-
 impl PublishedRoots {
     pub(super) fn current(slots: Vec<usize>) -> Self {
         Self {
@@ -459,39 +444,6 @@ impl Drop for NativeGcScope {
     }
 }
 
-/// The configured bound, or `None` to wait indefinitely.
-///
-/// An acknowledgement that never arrives means a registered thread stopped
-/// without unregistering. The wait then cannot end, and the process produces
-/// no further output at all — the stalled GC regression is a Windows CI job that spent its
-/// whole 90-minute budget inside one such wait. All builds give up after the
-/// bound and name the threads instead; release builds must not silently wait
-/// forever for a vanished mutator.
-/// `WILLOW_GC_HANDSHAKE_TIMEOUT_SECS=0` disables the bound everywhere.
-///
-/// Read once: `std::env::var` allocates for the key on Windows.
-fn handshake_timeout() -> Option<std::time::Duration> {
-    *crate::runtime::current().diagnostics.gc_handshake_timeout
-}
-
-/// Wait on the coordination condvar until `ready` holds.
-///
-/// `outstanding` names the mutators still being waited on. It is consulted
-/// only once the wait has exceeded `handshake_timeout`, which means a
-/// registered mutator can no longer respond. There is no safe recovery from
-/// that: the collector cannot scan a stack whose owner is gone, and dropping
-/// the id from the registry would let a merely slow thread run unscanned. So
-/// report the ids and abort rather than block with no diagnostic.
-pub(super) fn wait_for_mutators<'a>(
-    cv: &GcCondvar,
-    coord: std::sync::MutexGuard<'a, GcCoord>,
-    phase: &str,
-    ready: impl Fn(&GcCoord) -> bool,
-    outstanding: impl Fn(&GcCoord) -> Vec<ThreadId>,
-) -> std::sync::MutexGuard<'a, GcCoord> {
-    wait_for_mutators_with_timeout(handshake_timeout(), cv, coord, phase, ready, outstanding)
-}
-
 fn wait_for_mutators_with_timeout<'a>(
     timeout: Option<std::time::Duration>,
     cv: &GcCondvar,
@@ -812,6 +764,7 @@ impl Drop for RegionReentry {
     }
 }
 
+#[cfg(any(test, feature = "gc-acceptance-faults"))]
 /// Run `collect` with the world stopped: request a safepoint, wait until every
 /// other registered mutator has parked, then run `collect` (which scans all
 /// published roots), then resume the world.

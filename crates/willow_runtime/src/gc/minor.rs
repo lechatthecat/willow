@@ -1786,19 +1786,13 @@ pub(crate) fn minor_collect_pinning_for_test() {
 // Only the major owner may relocate while its epoch exists. Requests coalesce;
 // initial/remark/sweep requests are serviced at a safe owner boundary.
 
-#[cfg(test)]
-pub(super) fn reset_pending() {
-    runtime()
-        .minor_pending
-        .store(false, std::sync::atomic::Ordering::Release);
-}
-
 pub(super) fn requested(owner: &GcRuntime) -> bool {
     owner
         .minor_pending
         .load(std::sync::atomic::Ordering::Acquire)
 }
 
+#[cfg(test)]
 pub(super) fn service_pending() {
     service_pending_in(crate::runtime::current());
 }
@@ -1850,6 +1844,7 @@ fn collect_stopped(
     result
 }
 
+#[cfg(test)]
 pub(super) fn collect_owned() {
     collect_owned_in(crate::runtime::current());
 }

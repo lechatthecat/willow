@@ -285,6 +285,7 @@ impl Observations {
         self.epoch.swap(epoch, Ordering::Relaxed)
     }
 }
+#[cfg(test)]
 fn event(event: u64, kind: u64) -> Event {
     default_owner().event(event, kind)
 }
@@ -326,9 +327,6 @@ impl Drop for MarkerRole {
         ROLE.set(self.0);
     }
 }
-pub(crate) fn register() {
-    register_for_runtime(crate::runtime::current());
-}
 pub(crate) fn register_for_runtime(runtime: &crate::runtime::Runtime) {
     if !runtime.diagnostics.gc_observations() || !REGISTERED.get().is_null() {
         return;
@@ -340,9 +338,6 @@ pub(crate) fn register_for_runtime(runtime: &crate::runtime::Runtime) {
     let State { stats, .. } = &mut *s;
     add(&mut stats.registered, 1, &mut stats.flags);
     s.event(e);
-}
-pub(crate) fn unregister() {
-    unregister_for_runtime(crate::runtime::current());
 }
 pub(crate) fn unregister_for_runtime(runtime: &crate::runtime::Runtime) {
     let owner = &runtime.telemetry.observations;
@@ -356,9 +351,6 @@ pub(crate) fn unregister_for_runtime(runtime: &crate::runtime::Runtime) {
     let State { stats, .. } = &mut *s;
     add(&mut stats.unregistered, 1, &mut stats.flags);
     s.event(e);
-}
-pub(crate) fn progress() {
-    progress_for_runtime(crate::runtime::current());
 }
 
 pub(crate) fn progress_for_runtime(runtime: &crate::runtime::Runtime) {
@@ -431,9 +423,6 @@ impl Drop for StopPhase<'_> {
     fn drop(&mut self) {
         STOP_PHASE.set(self.previous);
     }
-}
-pub(crate) fn graph_work(mark: super::MarkWork) {
-    graph_work_in(crate::runtime::current(), mark);
 }
 
 pub(crate) fn graph_work_in(runtime: &crate::runtime::Runtime, mark: super::MarkWork) {

@@ -210,6 +210,7 @@ pub(crate) unsafe fn resume_parked_roots(token: u64) {
     });
 }
 
+#[cfg(test)]
 /// Release roots only after the corresponding suspended stack was unwound.
 ///
 /// # Safety
@@ -246,16 +247,6 @@ pub unsafe extern "C" fn willow_gc_add_runtime_root(object: *mut u8) {
         return;
     }
     add_address_root_in(runtime(), object, |_| true);
-}
-
-/// Register a task frame the caller still owns exclusively. A registration only
-/// queues the children already stored in its owner, and every later frame store
-/// passes the write barrier, so a frame whose reference slots are all null owes
-/// the next minor nothing. Such frames skip the queue: otherwise each spawn costs
-/// one remembered-owner scan in the serial stop, whether or not the task has
-/// already finished.
-pub(crate) fn add_task_frame_root(frame: *mut u8) {
-    add_task_frame_root_in(crate::runtime::current(), frame);
 }
 
 pub(crate) fn add_task_frame_root_in(owner: &crate::runtime::Runtime, frame: *mut u8) {
@@ -529,18 +520,13 @@ pub(super) fn clear_root_stack_owner_if_empty_in(gc: &GcRuntime) {
     OWNER_EPOCH.set(0);
 }
 
+#[cfg(test)]
 pub(super) fn foreign_root_stack_owner_active() -> bool {
     foreign_root_stack_owner_active_in(runtime())
 }
 
 pub(super) fn foreign_root_stack_owner_active_in(owner: &GcRuntime) -> bool {
     foreign_root_stack_owner_active_locked_in(owner, &owner.coord.0.lock().unwrap())
-}
-
-/// Unregistration also runs under coord, so a collector that decides under the
-/// same lock hold cannot miss a legacy owner that leaves the registry in between.
-pub(super) fn foreign_root_stack_owner_active_locked(coord: &GcCoord) -> bool {
-    foreign_root_stack_owner_active_locked_in(runtime(), coord)
 }
 
 pub(super) fn foreign_root_stack_owner_active_locked_in(
@@ -572,13 +558,6 @@ pub fn runtime_root_count() -> usize {
 pub(crate) fn runtime_root_count_in(owner: &GcRuntime) -> usize {
     let slots = mutator_log::net_root_slots(owner);
     owner.runtime_roots.len() + slots.max(0).unsigned_abs()
-}
-
-/// Values of every runtime-held root: address-registered runtime roots,
-/// registered runtime root slots, and the slots of parked native stacks.
-/// Marking consumers only need values.
-pub(super) fn runtime_roots_snapshot() -> Vec<*mut u8> {
-    runtime_roots_snapshot_in(runtime())
 }
 
 pub(super) fn runtime_roots_snapshot_in(owner: &GcRuntime) -> Vec<*mut u8> {

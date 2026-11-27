@@ -13,7 +13,6 @@ use std::ffi::c_void;
 
 use crate::native_frame::{NativeFrameSpec, NativeTaskFrame};
 
-const CHUNK_RESULT_SLOT: usize = 0;
 const CHUNK_TASK_ID_SLOT: usize = 1;
 const CHUNK_INPUT_SLOT: usize = 2;
 const CHUNK_OUTPUT_SLOT: usize = 3;

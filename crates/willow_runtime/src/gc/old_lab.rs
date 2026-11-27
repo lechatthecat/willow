@@ -59,6 +59,7 @@ impl AllocationPolicy for RuntimeAllocationPolicy {
     }
 }
 
+#[cfg(test)]
 pub(super) fn enabled() -> bool {
     enabled_in(crate::runtime::current())
 }
@@ -302,37 +303,6 @@ pub(super) unsafe fn try_allocate_in(
     .flatten()
 }
 
-/// Retire this thread's buffer, carve a new one, and allocate the object in
-/// it. Returns `None` when no region can supply `span` within the budget.
-/// Callers check [`available`] first.
-///
-/// # Safety
-/// The type, tracing metadata and payload size must satisfy the allocation contract of
-/// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
-/// The allocation span must cover the complete aligned header and payload.
-pub(super) unsafe fn refill_and_allocate(
-    state: &mut GcState,
-    type_id: u32,
-    layout_id: u64,
-    gc_ref_mask: u64,
-    total: usize,
-    span: usize,
-) -> Option<HeapObject> {
-    // SAFETY: The allocation path forwards the validated payload extent, type and tracing
-    // layout; its caller initializes native fields before collection.
-    unsafe {
-        refill_and_allocate_in(
-            crate::runtime::current(),
-            state,
-            type_id,
-            layout_id,
-            gc_ref_mask,
-            total,
-            span,
-        )
-    }
-}
-
 /// # Safety
 /// The type, tracing metadata and payload size must satisfy the allocation contract of
 /// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
@@ -534,12 +504,6 @@ pub(super) fn forget_private_owner(identity: u64) {
     let _ = PRIVATE.try_with(|labs| labs.borrow_mut().remove(&identity));
 }
 
-/// Merge one buffer's allocation counters into the heap totals. Its objects
-/// count as runtime (slow-path) old-region allocations, as before buffering.
-fn sync_record(state: &mut GcState, index: usize) {
-    sync_record_in(runtime(), state, index);
-}
-
 fn sync_record_in(owner: &GcRuntime, state: &mut GcState, index: usize) {
     let record = &mut state.old_labs[index];
     let bytes = record.lab.bytes.load(Ordering::Acquire);
@@ -650,17 +614,6 @@ pub(super) fn retire_all_in(owner: &GcRuntime, state: &mut GcState) {
     prune_in(owner, state);
 }
 
-/// Freeze each active buffer and index one pending entry per admitted chunk.
-/// A rejected entry stays in its original Vec, with a durable indexed-prefix
-/// cursor. Mutator refill/full flush consumes only the remaining suffix.
-pub(super) fn retire_bounded(
-    state: &mut GcState,
-    budget: &mut old_cycle::RemarkBudget,
-    work: &mut crate::gc_telemetry::stops::StopWorkV2,
-) -> bool {
-    retire_bounded_in(runtime(), state, budget, work)
-}
-
 pub(super) fn retire_bounded_in(
     owner: &GcRuntime,
     state: &mut GcState,
@@ -768,6 +721,7 @@ pub(super) fn sync_records_in(owner: &GcRuntime, state: &mut GcState) {
     }
 }
 
+#[cfg(test)]
 /// Retire buffers carved from one region before its sweep visit. The region's
 /// count skips the registry scan for the usual region with no buffer.
 pub(super) fn retire_region(owner: &GcRuntime, state: &mut GcState, region: usize) {
@@ -785,6 +739,7 @@ pub(super) fn retire_region(owner: &GcRuntime, state: &mut GcState, region: usiz
     }
 }
 
+#[cfg(test)]
 /// Drop records of exited threads: only the registry still owns their
 /// buffer. Retiring first indexes their objects and releases the region count.
 fn prune(state: &mut GcState) {

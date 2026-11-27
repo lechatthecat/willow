@@ -69,6 +69,7 @@ impl GcRootHandle {
         }
     }
 
+    #[cfg(test)]
     /// A private root keeps its owning heap alive until the slot is removed.
     /// The registry retains only the slot address, so this does not form a cycle.
     ///

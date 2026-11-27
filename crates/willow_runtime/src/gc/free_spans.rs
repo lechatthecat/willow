@@ -10,10 +10,12 @@ trait SpanObservation {
     fn build(&mut self) {}
 }
 
+#[cfg(not(test))]
 #[derive(Debug, Default)]
 struct NoObservation {
     _private: (),
 }
+#[cfg(not(test))]
 impl SpanObservation for NoObservation {}
 
 #[cfg(not(test))]

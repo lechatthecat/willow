@@ -215,12 +215,14 @@ pub(crate) fn current_epoch() -> u64 {
     default_domain().current_epoch()
 }
 
+#[cfg(test)]
 /// Tag for a frame retired now. Callers retire under their queue's lock, so
 /// each queue stays ordered by tag.
 pub(crate) fn retire_tag() -> u64 {
     default_domain().retire_tag()
 }
 
+#[cfg(test)]
 /// Frames retired with a tag below the returned bound have no unit left that
 /// started before their retirement.
 ///

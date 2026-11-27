@@ -56,6 +56,7 @@ fn string(out: &mut Buffer, value: &str) -> fmt::Result {
     out.write_char('"')
 }
 
+#[cfg(test)]
 fn record(
     out: &mut Buffer,
     kind: &str,

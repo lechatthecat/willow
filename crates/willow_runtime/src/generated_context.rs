@@ -507,6 +507,7 @@ impl ScalarBridge {
         }
     }
 
+    #[cfg(test)]
     /// The mapper must obey the scalar generated C ABI and never unwind.
     #[inline]
     pub(crate) unsafe fn call(&self, entry: unsafe extern "C" fn(i64) -> i64, value: i64) -> i64 {

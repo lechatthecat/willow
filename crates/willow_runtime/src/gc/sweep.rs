@@ -16,6 +16,7 @@ pub(super) fn allocation_budget_exhausted(state: &GcState) -> bool {
             .saturating_sub(state.sweep_allocation_start)
             >= ALLOCATION_RUNWAY
 }
+#[cfg(test)]
 pub(super) fn assist() {
     assist_in(crate::runtime::current());
 }
@@ -42,10 +43,6 @@ pub(super) struct SweepPlan {
     stale_storage: region_cache::StaleStorage,
 }
 
-/// Shared by both major sweep preparations once liveness is final.
-fn begin_sweep(state: &mut GcState) {
-    begin_sweep_in(crate::runtime::current(), state);
-}
 fn begin_sweep_in(owner: &crate::runtime::Runtime, state: &mut GcState) {
     assert!(state.sweeping.is_none());
     #[cfg(feature = "gc-acceptance-faults")]
@@ -57,6 +54,7 @@ fn begin_sweep_in(owner: &crate::runtime::Runtime, state: &mut GcState) {
     state.major_collections = state.major_collections.saturating_add(1);
 }
 
+#[cfg(test)]
 pub(super) fn prepare(state: &mut GcState, marking: Option<Arc<ConcurrentCycle>>) -> SweepPlan {
     prepare_in(crate::runtime::current(), state, marking)
 }
@@ -95,18 +93,6 @@ pub(super) fn prepare_in(
     }
 }
 
-/// Retire allocation buffers and finish any newly appended region suffix under
-/// bounded remark. Existing region flags were published concurrently. Object
-/// reclamation starts in execute(), after the stop gate has been released.
-pub(super) fn prepare_bounded(
-    state: &mut GcState,
-    marking: Arc<ConcurrentCycle>,
-    budget: &mut old_cycle::RemarkBudget,
-    stop_work: &mut crate::gc_telemetry::stops::StopWorkV2,
-) -> Option<SweepPlan> {
-    prepare_bounded_in(crate::runtime::current(), state, marking, budget, stop_work)
-}
-
 pub(super) fn prepare_bounded_in(
     owner: &crate::runtime::Runtime,
     state: &mut GcState,
@@ -131,6 +117,7 @@ pub(super) fn prepare_bounded_in(
     })
 }
 
+#[cfg(test)]
 /// Publish the existing prefix outside global stops, releasing the heap lock
 /// between bounded chunks. Mark coloring remains active: a pre-existing LAB
 /// whose cached sweep flag is clear still allocates black. Final stopped closure
@@ -230,6 +217,7 @@ fn publish_region_prefix_bounded(
     budget.reserve(0, 0, now())
 }
 
+#[cfg(test)]
 /// Publish eligible swept spans only after the next mark epoch has activated.
 /// Each visit is region-local and runs after initial stop release; no heap-wide
 /// index rebuild or sweep work is hidden in the initial pause.
@@ -251,9 +239,11 @@ pub(super) fn release_quarantine_in(owner: &GcRuntime, epoch: u64) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn stopped(work: &mut crate::gc_telemetry::stops::StopWorkV2) -> usize {
     stopped_in(crate::runtime::current(), work)
 }
+#[cfg(test)]
 pub(super) fn stopped_in(
     owner: &crate::runtime::Runtime,
     work: &mut crate::gc_telemetry::stops::StopWorkV2,
@@ -262,6 +252,7 @@ pub(super) fn stopped_in(
     execute(owner, plan, work, false)
 }
 
+#[cfg(test)]
 pub(super) fn concurrent(plan: SweepPlan) -> usize {
     concurrent_in(crate::runtime::current(), plan)
 }
@@ -274,8 +265,10 @@ pub(super) fn concurrent_in(owner: &crate::runtime::Runtime, plan: SweepPlan) ->
     batches::execute_in(owner, plan)
 }
 
+#[cfg(test)]
 type PendingDrop = (DropFn, *mut u8, crate::observation::Value<u32>);
 
+#[cfg(test)]
 fn run_drops(owner: &crate::runtime::Runtime, drops: &mut Vec<PendingDrop>, epoch: u64) {
     for (hook, payload, observed_type) in drops.drain(..) {
         // SAFETY: dead storage is quarantined until finish(), and each hook is
@@ -290,6 +283,7 @@ fn run_drops(owner: &crate::runtime::Runtime, drops: &mut Vec<PendingDrop>, epoc
     }
 }
 
+#[cfg(test)]
 fn execute(
     owner: &crate::runtime::Runtime,
     mut plan: SweepPlan,
@@ -368,11 +362,13 @@ fn execute(
 }
 
 pub(super) trait SweepObservation {
+    #[cfg(test)]
     fn region_visited<'a>(_owner: impl FnOnce() -> &'a Self)
     where
         Self: 'a,
     {
     }
+    #[cfg(test)]
     fn object_visited<'a>(_owner: impl FnOnce() -> &'a Self)
     where
         Self: 'a,
@@ -424,10 +420,6 @@ impl SweepObservation for RuntimeSweepObservation {
     }
 }
 
-fn between_regions(index: usize) {
-    between_regions_observed(|| &runtime().sweep_observation, index);
-}
-
 fn between_regions_in(owner: &GcRuntime, index: usize) {
     between_regions_observed(|| &owner.sweep_observation, index);
 }
@@ -453,6 +445,7 @@ fn release_pin(
     }
 }
 
+#[cfg(test)]
 fn sweep_region(
     owner: &crate::runtime::Runtime,
     state: &mut GcState,
@@ -556,6 +549,7 @@ fn sweep_region(
     freed_bytes
 }
 
+#[cfg(test)]
 fn sweep_chunk(
     owner: &crate::runtime::Runtime,
     state: &mut GcState,
@@ -678,6 +672,7 @@ fn sweep_chunk(
     (freed_bytes, !has_live_objects && owner_state.is_none())
 }
 
+#[cfg(test)]
 fn finish(owner: &crate::runtime::Runtime, state: &mut GcState, dead_chunks: &[bool]) {
     // Release decisions read `allocations`, and remapping invalidates the
     // region indexes of active buffers.
@@ -776,13 +771,6 @@ fn finish(owner: &crate::runtime::Runtime, state: &mut GcState, dead_chunks: &[b
     }
 }
 
-fn note_dead_frame(object: HeapObject, sweep_epoch: u64) {
-    note_dead_frame_in(
-        &crate::runtime::current().frame_lifetime,
-        object,
-        sweep_epoch,
-    );
-}
 fn note_dead_frame_in(
     owner: &crate::frame_lifetime::FrameLifetime,
     object: HeapObject,

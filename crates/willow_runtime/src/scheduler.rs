@@ -984,6 +984,7 @@ impl RunQueues {
         ids
     }
 
+    #[cfg(test)]
     fn clear(&self) {
         while steal_retry(&self.global, &self.retry_observation).is_some() {
             self.global_len.fetch_sub(1, Ordering::AcqRel);
@@ -1148,6 +1149,7 @@ impl ShardedTaskTable {
         self.lock_shard(self.shard_index(id)).insert(id, task);
     }
 
+    #[cfg(test)]
     fn remove(&self, id: RuntimeTaskId) -> Option<RuntimeTask> {
         let removed = self.lock_shard(self.shard_index(id)).remove(&id);
         if removed.is_some() {
@@ -1172,6 +1174,7 @@ impl ShardedTaskTable {
         }
     }
 
+    #[cfg(test)]
     fn drain(&self) -> Vec<RuntimeTask> {
         let mut tasks = Vec::new();
         for index in 0..self.shards.len() {
@@ -1647,6 +1650,7 @@ impl RuntimeScheduler {
             .flatten()
     }
 
+    #[cfg(test)]
     /// True while any task is parked in `BlockedSyscall` — a blocking-pool
     /// job will wake it, so the scheduler must NOT declare idle/stop on the
     /// strength of empty queues alone.
@@ -1932,6 +1936,7 @@ impl RuntimeScheduler {
         set_wake_after_millis_in(&self.tasks, &self.timers, millis);
     }
 
+    #[cfg(test)]
     /// The parked task with the earliest wake-deadline, if any. Backed by a
     /// min-heap so idle scheduling does not scan every parked task.
     fn next_timer_deadline(&self) -> Option<(RuntimeTaskId, Instant)> {
@@ -1940,6 +1945,7 @@ impl RuntimeScheduler {
             .next_deadline(|wake| timer_entry_is_current(tasks, wake))
     }
 
+    #[cfg(test)]
     /// Move every due timer directly from the timer heap to the ready queue.
     ///
     /// TimerQueue keeps popped batches visible to idle detection until every
@@ -2147,10 +2153,6 @@ struct SchedulerComponents {
 }
 
 impl SchedulerComponents {
-    fn new(worker_count: usize) -> Self {
-        Self::with_run_queues(Arc::new(RunQueues::new(worker_count)))
-    }
-
     /// Task ids start at 1 (id 0 is the `willow_sched_current_task()` "no
     /// running task" sentinel).
     fn with_run_queues(run_queues: Arc<RunQueues>) -> Self {
@@ -2281,6 +2283,7 @@ pub(crate) struct SchedulerServices {
 }
 
 impl SchedulerServices {
+    #[cfg(test)]
     pub(crate) fn new(worker_count: usize) -> Self {
         Self::new_in(
             worker_count,
@@ -2524,6 +2527,7 @@ impl Drop for ClaimInFlight<'_> {
     }
 }
 
+#[cfg(test)]
 /// True while any thread holds a popped-but-unclaimed task. Idle detection must
 /// treat this as pending work. A concurrent resolution may conservatively
 /// report work too; a subsequent quiet scan returns false.
@@ -2598,6 +2602,7 @@ fn wake_due_timers_now_in(components: &SchedulerComponents) -> usize {
     }
 }
 
+#[cfg(test)]
 fn wake_global_due_timers(now: Instant) -> usize {
     wake_due_timers_in(global_components(), now)
 }
@@ -3283,6 +3288,7 @@ pub(crate) fn clear_channel_ownership(task_id: u64, token: ChannelOwnershipToken
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 pub(crate) fn take_channel_waits(task_id: u64) -> Vec<ChannelOwnershipToken> {
     global_task_table()
         .with_mut(task_id, RuntimeTask::take_wait_channels)
@@ -4602,6 +4608,7 @@ struct ParallelCompletion {
 }
 
 impl ParallelCompletion {
+    #[cfg(test)]
     fn new(workers: usize) -> Self {
         Self::new_in(workers, Arc::clone(&crate::runtime::current().parking))
     }
@@ -4619,6 +4626,7 @@ impl ParallelCompletion {
         }
     }
 
+    #[cfg(test)]
     fn wait(&self) {
         self.wait_in(crate::runtime::current());
     }

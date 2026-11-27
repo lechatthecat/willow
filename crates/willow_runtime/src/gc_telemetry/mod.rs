@@ -458,6 +458,7 @@ pub(crate) fn with_completed_cpu_for_test<T>(cpu: Option<u64>, run: impl FnOnce(
 }
 
 impl Cycle<'static> {
+    #[cfg(test)]
     /// Called only by the elected collector, before requesting safepoints.
     pub(crate) fn begin(kind: CycleKind) -> Self {
         Self::begin_in(telemetry(), kind)
@@ -634,6 +635,7 @@ impl GcTelemetry {
     }
 }
 
+#[cfg(test)]
 /// Cycle group only: safe while the caller already owns the heap mutex.
 /// Reuses V1's measurement units without recursively sampling the heap.
 pub(crate) fn pacing_cycle_snapshot() -> WillowGcStatsV1 {
@@ -1012,9 +1014,6 @@ fn flush_observations_in(runtime: &crate::runtime::Runtime) {
             sink.writer = None;
         }
     }
-}
-pub(crate) fn emit_cycle(cycle: GcCycleV1) {
-    emit_cycle_in(crate::runtime::current(), cycle);
 }
 pub(crate) fn emit_cycle_in(runtime: &crate::runtime::Runtime, cycle: GcCycleV1) {
     let owner = &runtime.telemetry;

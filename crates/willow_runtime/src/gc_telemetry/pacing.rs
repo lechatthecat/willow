@@ -201,12 +201,6 @@ fn default_pacing() -> &'static Pacing {
 pub fn snapshot() -> Snapshot {
     default_pacing().snapshot()
 }
-pub(crate) fn publish(decision: Decision) {
-    default_pacing().publish(decision);
-}
-pub(crate) fn duty(cpu: Option<u64>, wait: u64) {
-    default_pacing().duty(cpu, wait);
-}
 pub(crate) fn reset() {
     default_pacing().reset();
 }

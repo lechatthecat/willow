@@ -1,11 +1,5 @@
 //! Single-evaluator revision validation. Values remain shared; dependency
 //! metadata belongs to this engine and is never serialized with an artifact.
-// Query-family migration follows the engine phase. Keep the typed dispatcher
-// internal until those families have passed their purity/equality audits.
-#![allow(
-    dead_code,
-    reason = "Typed query dispatcher supports query-family migration"
-)]
 use super::retained::Retained;
 use crate::{module::UnitId, parser::ast::BodyId, semantic::ids::FunctionId};
 use anyhow::{Context, Result};
@@ -228,11 +222,6 @@ struct Memo {
     durability: Durability,
     retained_bytes: usize,
 }
-#[derive(Clone)]
-enum State {
-    Computing { revision: Revision },
-    Ready(Memo),
-}
 
 #[derive(Default)]
 struct Edges {
@@ -344,7 +333,7 @@ pub(crate) struct TrackedQueryTable {
     revision: Revision,
     last_changed: [Revision; 3],
     inputs: im::HashMap<InputNode, Input>,
-    states: RefCell<im::HashMap<QueryNode, State>>,
+    states: RefCell<im::HashMap<QueryNode, Memo>>,
     source_inputs: im::HashSet<PathBuf>,
     input_bytes: usize,
     memo_bytes: Cell<usize>,
@@ -403,17 +392,6 @@ impl TrackedQueryTable {
         self.green.get_mut().clear();
         self.validation_bytes.set(0);
         Ok(())
-    }
-    pub(crate) fn retain_sources(&mut self, paths: &HashSet<PathBuf>) {
-        let removed: Vec<_> = self
-            .source_inputs
-            .iter()
-            .filter(|path| !paths.contains(*path))
-            .cloned()
-            .collect();
-        for path in removed {
-            self.remove_input(&InputNode::Source(path));
-        }
     }
 
     /// Capture each source once before evaluating its queries in a candidate.
@@ -498,6 +476,7 @@ impl TrackedQueryTable {
     pub(crate) fn graph_size(&self) -> (usize, usize) {
         (self.states.borrow().len(), self.dependency_edges.get())
     }
+    #[cfg(test)]
     /// Reclamation is amortized against changed inputs and rebuilt dependencies,
     /// not revisions or validation reads. Persistent candidates share untouched
     /// graph storage. A cold sweep establishes the initial accounting baseline.
@@ -511,6 +490,7 @@ impl TrackedQueryTable {
             self.graph_size()
         }
     }
+    #[cfg(test)]
     /// Explicit full collection, also used at serialization boundaries. Each
     /// actual node/edge visit is recorded; no graph scan determines the trigger.
     pub(crate) fn compact(&mut self, inventory: impl FnMut(&QueryNode) -> bool) -> (usize, usize) {
@@ -537,7 +517,7 @@ impl TrackedQueryTable {
         let mut edges = 0;
         while let Some(node) = pending.pop() {
             node_visits += 1;
-            if let Some(State::Ready(memo)) = states.get(&node) {
+            if let Some(memo) = states.get(&node) {
                 edges += memo.dependencies.len();
                 for dependency in memo.dependencies.iter() {
                     match &dependency.node {
@@ -561,7 +541,7 @@ impl TrackedQueryTable {
         node_visits += states.len();
         node_visits += dead.len();
         for node in dead {
-            if let Some(State::Ready(memo)) = states.remove(&node) {
+            if let Some(memo) = states.remove(&node) {
                 edges += memo.dependencies.len();
                 self.memo_bytes
                     .set(self.memo_bytes.get() - Self::memo_size(&node, &memo));
@@ -615,7 +595,7 @@ impl TrackedQueryTable {
     pub(crate) fn refresh_value(&self, node: &QueryNode, value: QueryValue) -> Result<()> {
         assert_frozen_read();
         let mut states = self.states.borrow_mut();
-        let Some(State::Ready(memo)) = states.get_mut(node) else {
+        let Some(memo) = states.get_mut(node) else {
             anyhow::bail!("refresh of unevaluated query {node:?}");
         };
         anyhow::ensure!(
@@ -639,7 +619,7 @@ impl TrackedQueryTable {
     pub(crate) fn peek(&self, node: &QueryNode) -> Option<QueryValue> {
         assert_frozen_read();
         match self.states.borrow().get(node) {
-            Some(State::Ready(memo)) => memo.result.as_ref().ok().cloned(),
+            Some(memo) => memo.result.as_ref().ok().cloned(),
             _ => None,
         }
     }
@@ -650,7 +630,7 @@ impl TrackedQueryTable {
     #[cfg(test)]
     pub(crate) fn query_dependencies(&self, node: &QueryNode) -> Vec<QueryNode> {
         match self.states.borrow().get(node) {
-            Some(State::Ready(memo)) => memo
+            Some(memo) => memo
                 .dependencies
                 .iter()
                 .filter_map(|edge| match &edge.node {
@@ -669,7 +649,7 @@ impl TrackedQueryTable {
             + self.validation_bytes.get()
             + self.demanded_bytes.get()
             + self.inputs.len() * (std::mem::size_of::<(InputNode, Input)>() + 128) * 2
-            + self.states.borrow().len() * (std::mem::size_of::<(QueryNode, State)>() + 128) * 2
+            + self.states.borrow().len() * (std::mem::size_of::<(QueryNode, Memo)>() + 128) * 2
     }
     #[cfg(test)]
     pub(crate) fn retention_profile(&self) -> std::collections::BTreeMap<String, usize> {
@@ -682,16 +662,14 @@ impl TrackedQueryTable {
                 .to_owned();
             *profile.entry(name).or_default() += input.value.retained_bytes;
         }
-        for (node, state) in self.states.borrow().iter() {
-            if let State::Ready(memo) = state {
-                let name = format!("query:{node:?}")
-                    .split('(')
-                    .next()
-                    .unwrap()
-                    .to_owned();
-                *profile.entry(name).or_default() +=
-                    memo.result.as_ref().map_or(0, |v| v.retained_bytes);
-            }
+        for (node, memo) in self.states.borrow().iter() {
+            let name = format!("query:{node:?}")
+                .split('(')
+                .next()
+                .unwrap()
+                .to_owned();
+            *profile.entry(name).or_default() +=
+                memo.result.as_ref().map_or(0, |v| v.retained_bytes);
         }
         profile
     }
@@ -700,15 +678,12 @@ impl TrackedQueryTable {
             .states
             .borrow()
             .iter()
-            .filter_map(|(node, state)| {
-                let State::Ready(memo) = state else {
-                    return None;
-                };
-                Some(format!(
+            .map(|(node, memo)| {
+                format!(
                     "{node:?}: fingerprint={:?}, dependencies={:?}",
                     memo.result.as_ref().map(|v| v.fingerprint),
                     memo.dependencies
-                ))
+                )
             })
             .collect();
         rows.sort();
@@ -726,6 +701,7 @@ impl TrackedQueryTable {
         })
     }
 
+    #[cfg(test)]
     /// Commit a fully accepted input batch. Validation happens before this API;
     /// rejected refreshes must never mutate the accepted table.
     pub(crate) fn accept(&mut self, values: Vec<(InputNode, QueryValue)>) -> Result<bool> {
@@ -999,10 +975,7 @@ impl TrackedQueryTable {
             return Err(QueryCycle(error).into());
         }
         let previous = match self.states.borrow().get(node) {
-            Some(State::Computing { .. }) => {
-                unreachable!("active evaluations live in the candidate overlay")
-            }
-            Some(State::Ready(memo)) => {
+            Some(memo) => {
                 if let Some(&durability) = self.green.borrow().get(node) {
                     let mut memo = memo.clone();
                     memo.verified_at = self.revision;
@@ -1153,15 +1126,12 @@ impl TrackedQueryTable {
             .iter()
             .map(|edge| match &edge.node {
                 DependencyNode::Input(node) => self.inputs[node].durability,
-                DependencyNode::Query(node) => match &self.states.borrow()[node] {
-                    State::Ready(memo) => self
-                        .green
-                        .borrow()
-                        .get(node)
-                        .copied()
-                        .unwrap_or(memo.durability),
-                    State::Computing { .. } => unreachable!("cycle checked before publication"),
-                },
+                DependencyNode::Query(node) => self
+                    .green
+                    .borrow()
+                    .get(node)
+                    .copied()
+                    .unwrap_or(self.states.borrow()[node].durability),
             })
             .min()
             .unwrap_or(Durability::High);
@@ -1204,9 +1174,7 @@ impl TrackedQueryTable {
             stats.accounting_edges_visited += memo.dependencies.len();
         });
         self.credit(6 + 2 * previous_accounting.map_or(0, |v| v.1) + 2 * memo.dependencies.len());
-        self.states
-            .borrow_mut()
-            .insert(node.clone(), State::Ready(memo.clone()));
+        self.states.borrow_mut().insert(node.clone(), memo.clone());
         if !equal && self.changed_queries.borrow_mut().insert(node.clone()) {
             self.journal_bytes.set(
                 self.journal_bytes.get()
@@ -1283,10 +1251,10 @@ impl Drop for Guard<'_> {
             n.set((depth - 1, if depth == 1 { std::ptr::null() } else { owner }));
         });
         let published = self.table.green.borrow().contains_key(&self.node)
-            || matches!(self.table.states.borrow().get(&self.node),Some(State::Ready(memo)) if memo.verified_at == self.table.revision);
+            || matches!(self.table.states.borrow().get(&self.node),Some(memo) if memo.verified_at == self.table.revision);
         if !published
             && !deferred
-            && let Some(State::Ready(memo)) = self.table.states.borrow_mut().remove(&self.node)
+            && let Some(memo) = self.table.states.borrow_mut().remove(&self.node)
         {
             self.table
                 .memo_bytes
@@ -1390,7 +1358,7 @@ mod tests {
             assert_eq!(next.stats().validation_metadata_entries, size);
             for id in 0..size {
                 let states = next.states.borrow();
-                let Some(State::Ready(memo)) = states.get(&query(id)) else {
+                let Some(memo) = states.get(&query(id)) else {
                     panic!("missing memo")
                 };
                 assert_eq!(memo.verified_at, accepted.revision());
@@ -2060,10 +2028,7 @@ mod tests {
                 .is_err()
             );
             assert!(table.stack.borrow().is_empty());
-            assert!((0..3).all(|n| !matches!(
-                table.states.borrow().get(&query(n)),
-                Some(State::Computing { .. })
-            )));
+            assert!(table.inflight.borrow().is_empty());
             assert_frozen_read();
             assert_eq!(*table.read(&chain, query(0)).unwrap().get::<i64>(), v + 10);
             assert!(table.stack.borrow().is_empty());
@@ -2219,6 +2184,7 @@ struct DiskMemo {
     durability: Durability,
 }
 impl TrackedQueryTable {
+    #[cfg(test)]
     pub(crate) fn disk_snapshot(&self) -> Result<DiskTable> {
         self.disk_snapshot_filtered(|_| true)
     }
@@ -2242,7 +2208,7 @@ impl TrackedQueryTable {
                             | QueryNode::AsyncBorrowReport(_)
                             | QueryNode::ResolvedReferences(_)
                     )
-                    && matches!(state, State::Ready(Memo { result: Ok(_), .. })))
+                    && state.result.is_ok())
                 .then_some(node.clone())
             })
             .collect();
@@ -2253,7 +2219,7 @@ impl TrackedQueryTable {
             if !seen.insert(node.clone()) {
                 continue;
             }
-            let Some(State::Ready(memo)) = states.get(&node) else {
+            let Some(memo) = states.get(&node) else {
                 anyhow::bail!("missing snapshot dependency");
             };
             let value = memo
@@ -2354,7 +2320,7 @@ impl TrackedQueryTable {
             let value = memo.value.decode_query(&memo.node, memo.fingerprint)?;
             let previous = states.insert(
                 memo.node,
-                State::Ready(Memo {
+                Memo {
                     retained_bytes: Self::dependency_bytes(&memo.dependencies)
                         + value.retained_bytes,
                     result: Ok(value),
@@ -2362,7 +2328,7 @@ impl TrackedQueryTable {
                     changed_at: memo.changed_at,
                     dependencies: memo.dependencies.into(),
                     durability: memo.durability,
-                }),
+                },
             );
             anyhow::ensure!(previous.is_none(), "duplicate snapshot memo");
         }
@@ -2370,10 +2336,7 @@ impl TrackedQueryTable {
         let mut incoming: HashMap<QueryNode, usize> =
             states.keys().cloned().map(|node| (node, 0)).collect();
         let mut dependents: HashMap<QueryNode, Vec<QueryNode>> = HashMap::new();
-        for (node, state) in states.iter() {
-            let State::Ready(memo) = state else {
-                unreachable!()
-            };
+        for (node, memo) in states.iter() {
             let mut unique = HashSet::new();
             for dependency in memo.dependencies.iter() {
                 anyhow::ensure!(
@@ -2389,7 +2352,7 @@ impl TrackedQueryTable {
                         (input.changed_at, input.durability)
                     }
                     DependencyNode::Query(query) => {
-                        let Some(State::Ready(target)) = states.get(query) else {
+                        let Some(target) = states.get(query) else {
                             anyhow::bail!("missing snapshot query dependency")
                         };
                         *incoming.get_mut(node).expect("indexed node") += 1;
@@ -2445,21 +2408,12 @@ impl TrackedQueryTable {
         result.memo_bytes.set(
             states
                 .iter()
-                .map(|(node, state)| match state {
-                    State::Ready(memo) => Self::memo_size(node, memo),
-                    State::Computing { .. } => 0,
-                })
+                .map(|(node, memo)| Self::memo_size(node, memo))
                 .sum(),
         );
-        result.dependency_edges.set(
-            states
-                .values()
-                .map(|state| match state {
-                    State::Ready(memo) => memo.dependencies.len(),
-                    State::Computing { .. } => 0,
-                })
-                .sum(),
-        );
+        result
+            .dependency_edges
+            .set(states.values().map(|memo| memo.dependencies.len()).sum());
         result.last_sweep_work =
             states.len() * 3 + result.inputs.len() + result.dependency_edges.get();
         Ok(result)

@@ -72,10 +72,12 @@ trait AllocationObservation {
     fn attempt(&mut self) {}
     fn cleared(&mut self, _bytes: usize) {}
 }
+#[cfg(not(test))]
 #[derive(Default)]
 pub(super) struct NoAllocationObservation {
     _private: (),
 }
+#[cfg(not(test))]
 impl AllocationObservation for NoAllocationObservation {}
 #[cfg(not(test))]
 type RegionAllocationObservation = NoAllocationObservation;
@@ -297,6 +299,7 @@ impl OldRegion {
         address >= self.start() && address < self.end()
     }
 
+    #[cfg(test)]
     /// # Safety
     /// The type, payload extent and tracing mask must agree, including any required bitmap
     /// descriptor or native hooks. Initialize native fields before the object can be traced
@@ -315,6 +318,7 @@ impl OldRegion {
         }
     }
 
+    #[cfg(test)]
     /// # Safety
     /// The type, payload extent and tracing mask must agree, including any required bitmap
     /// descriptor or native hooks. Initialize native fields before the object can be traced
@@ -567,12 +571,6 @@ impl OldRegion {
         ((!interior && payload == address)
             || (interior && address >= payload && address < payload_end))
             .then_some(object)
-    }
-
-    #[cfg(test)]
-    pub(super) fn record_marked_object(&mut self, object: HeapObject) {
-        let offset = object.as_ptr() as usize - self.start();
-        self.mark_bitmap.mark(offset);
     }
 
     #[cfg(test)]

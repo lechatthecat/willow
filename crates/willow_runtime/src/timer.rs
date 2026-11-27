@@ -113,6 +113,7 @@ impl GcTrace for RuntimeSleepFuture {
 // Generated Future<void> values are monotonic millisecond deadlines, not
 // pointers. Zero denotes ready. Copies own no native storage, so aliases,
 // returns, discarded values, panic recovery and cancellation need no cleanup.
+#[cfg(not(feature = "deterministic-test-clock"))]
 static VALUE_EPOCH: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
 
 /// Process-local monotonic nanoseconds, sharing the timer epoch. Saturates

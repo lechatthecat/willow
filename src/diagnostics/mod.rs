@@ -1,8 +1,3 @@
-#![allow(
-    dead_code,
-    reason = "Retain diagnostic construction APIs for compiler consumers"
-)]
-
 pub mod diagnostic;
 pub mod error_code;
 pub mod label;

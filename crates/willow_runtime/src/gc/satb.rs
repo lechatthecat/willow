@@ -416,6 +416,7 @@ impl SatbShards {
         }
     }
 
+    #[cfg(test)]
     /// Run `publish` with this thread's shard buffer when the shards are
     /// unsealed and `valid()` holds under the shard lock; otherwise return
     /// `None` so the caller takes the heap-locked path.

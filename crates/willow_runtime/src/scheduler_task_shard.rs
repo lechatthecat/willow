@@ -86,6 +86,7 @@ impl TaskShard {
         self.first.iter().chain(self.rest.values())
     }
 
+    #[cfg(test)]
     pub(super) fn drain(&mut self) -> impl Iterator<Item = (RuntimeTaskId, RuntimeTask)> {
         self.first
             .take()

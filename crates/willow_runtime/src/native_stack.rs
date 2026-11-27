@@ -351,6 +351,7 @@ fn trampoline(yielder: &Yielder<(), ()>) {
     }
 }
 
+#[cfg(test)]
 /// Yield the active task's native call chain after a tripped quantum check.
 /// Returns false outside task stacks (ordinary synchronous entry code).
 pub(crate) fn suspend() -> bool {

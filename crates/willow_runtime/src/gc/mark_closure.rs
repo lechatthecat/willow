@@ -2,6 +2,7 @@
 //! concurrently, then stopped remark publishes phase Inactive.
 use super::*;
 
+#[cfg(test)]
 pub(super) fn finish(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
@@ -57,6 +58,7 @@ pub(super) fn finish_with_wave_budget(
     )
 }
 
+#[cfg(test)]
 // Separate waiting from policy so contention duration can be tested with
 // deterministic virtual waits, without scheduler-dependent timing assertions.
 pub(super) fn finish_with_wait(
@@ -178,6 +180,7 @@ fn require_stopped_completion(
     None
 }
 
+#[cfg(test)]
 pub(super) fn finish_with_hooks(
     cycle: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
@@ -187,6 +190,7 @@ pub(super) fn finish_with_hooks(
     finish_with_policy(cycle, started, wait, before_recheck, false)
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_lines, reason = "split pending")]
 pub(super) fn finish_with_policy(
     cycle: &Arc<ConcurrentCycle>,
@@ -609,6 +613,7 @@ pub(super) const RECOVERY_BYTES: u64 = 16 * 1024;
 /// Each admitted retry is separated by a resumed 1 ms collector wait.
 pub(super) const MAX_NATIVE_RECOVERY_RETRIES: usize = 128;
 
+#[cfg(test)]
 pub(super) fn finish_stopped(
     marking: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
@@ -632,6 +637,7 @@ pub(super) fn finish_stopped_in(
     finish_recovery_with_wait_in(owner, marking, started, std::thread::sleep)
 }
 
+#[cfg(test)]
 pub(super) fn finish_recovery_with_wait(
     marking: &Arc<ConcurrentCycle>,
     started: std::time::Instant,
@@ -796,6 +802,7 @@ fn finish_recovery_with_wait_in(
     }
 }
 
+#[cfg(test)]
 /// Cancel an unwinding epoch without an unbounded cleanup stop. There is no
 /// reclamation: once publishers/readers leave, header cleanup can run resumed
 /// under the heap lock while collector serialization excludes another cycle.

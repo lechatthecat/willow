@@ -62,6 +62,7 @@ pub(super) struct Pool {
     stop_now: Option<std::time::Instant>,
 }
 
+#[cfg(test)]
 // Sample once per runtime, without initializing its collector or scheduler.
 pub(super) fn configured_count() -> usize {
     *crate::runtime::current().marker_count
@@ -81,6 +82,7 @@ impl Pool {
         Self::new_for_runtime(count, crate::runtime::current())
     }
 
+    #[cfg(test)]
     pub(super) fn new_in(
         count: usize,
         telemetry: &Arc<crate::gc_telemetry::workers::WorkerTelemetry>,

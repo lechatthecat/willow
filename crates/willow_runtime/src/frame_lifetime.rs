@@ -313,9 +313,6 @@ pub fn events() -> Vec<FrameEvent> {
 pub(crate) fn record(kind: FrameEventKind, frame: usize, epoch: u64, bytes: u64) {
     runtime().record_with_sweep(kind, frame, epoch, 0, bytes);
 }
-pub(crate) fn record_sweep(kind: FrameEventKind, frame: usize, sweep_epoch: u64, bytes: u64) {
-    runtime().record_sweep(kind, frame, sweep_epoch, bytes);
-}
 impl FrameLifetime {
     pub(crate) fn record_sweep(
         &self,
@@ -360,12 +357,6 @@ impl FrameLifetime {
         events.push_back(event);
     }
 }
-pub(crate) fn metadata_removed(frame: usize, bytes: usize, terminal: bool, sweep_epoch: u64) {
-    runtime().metadata_removed(frame, bytes, terminal, sweep_epoch);
-}
-pub(crate) fn pending_drop(frame: usize, sweep_epoch: u64) {
-    runtime().pending_drop(frame, sweep_epoch);
-}
 impl FrameLifetime {
     pub(crate) fn metadata_removed(
         &self,
@@ -402,6 +393,7 @@ pub(crate) struct PollLifetime<'a> {
     owner: &'a FrameLifetime,
 }
 impl PollLifetime<'static> {
+    #[cfg(test)]
     pub(crate) fn enter(frame: usize) -> Self {
         Self::enter_in(runtime(), frame)
     }

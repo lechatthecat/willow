@@ -1075,8 +1075,10 @@ fn reclaim(
 trait ReportObservation {
     fn completed(&self, _report: &Report) {}
 }
+#[cfg(not(test))]
 #[derive(Default)]
 struct NoReportObservation;
+#[cfg(not(test))]
 impl ReportObservation for NoReportObservation {}
 #[cfg(not(test))]
 type RuntimeReportObservation = NoReportObservation;
@@ -1092,8 +1094,10 @@ impl ReportObservation for RuntimeReportObservation {
 trait ReleaseObservation {
     fn pause(&self) {}
 }
+#[cfg(not(test))]
 #[derive(Default)]
 struct NoReleaseObservation;
+#[cfg(not(test))]
 impl ReleaseObservation for NoReleaseObservation {}
 #[cfg(not(test))]
 type RuntimeReleaseObservation = NoReleaseObservation;

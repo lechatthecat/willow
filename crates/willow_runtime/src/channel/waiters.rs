@@ -138,6 +138,7 @@ impl WaiterQueue {
         self.single.is_none() && self.head.is_none()
     }
 
+    #[cfg(test)]
     pub(super) fn live(&self) -> Vec<u64> {
         if let Some((task, _)) = self.single {
             return vec![task];

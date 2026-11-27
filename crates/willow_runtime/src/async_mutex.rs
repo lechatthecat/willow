@@ -574,6 +574,7 @@ impl AsyncMutex {
         }
     }
 
+    #[cfg(test)]
     /// The current protected word, for the collector. Reading without ownership
     /// is correct here and only here: the collector needs the *current* root
     /// regardless of who holds the lock, and it never mutates it.

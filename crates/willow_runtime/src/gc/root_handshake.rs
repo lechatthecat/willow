@@ -22,6 +22,7 @@ pub(super) type RuntimeHandshakePolicy = ();
 #[cfg(test)]
 pub(super) type RuntimeHandshakePolicy = tests::Observation;
 
+#[cfg(test)]
 /// Start a concurrent mark epoch, or return `None` when a legacy root owner
 /// outside the registry holds a stack no handshake can publish.
 pub(super) fn begin() -> Option<(u64, Arc<ConcurrentCycle>)> {

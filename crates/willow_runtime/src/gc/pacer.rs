@@ -70,6 +70,7 @@ pub(super) fn scheduler_start(state: &mut super::GcState, budget: u64) {
     publish(state, budget, budget, "scheduler_start");
 }
 
+#[cfg(test)]
 pub(super) fn sample_threshold(state: &mut super::GcState) {
     sample_threshold_in(crate::runtime::current(), state);
 }
@@ -88,10 +89,6 @@ pub(super) fn sample_threshold_in(owner: &crate::runtime::Runtime, state: &mut s
         decision.trigger,
         "allocation_sample",
     );
-}
-
-pub(super) fn allocation_failure(state: &super::GcState) {
-    allocation_failure_in(crate::runtime::current(), state);
 }
 
 pub(super) fn allocation_failure_in(owner: &crate::runtime::Runtime, state: &super::GcState) {

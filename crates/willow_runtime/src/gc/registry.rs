@@ -44,6 +44,7 @@ impl MinorRegistryCache {
     }
 }
 
+#[cfg(test)]
 /// Lock order for writers/capture: minor cache, trace, concurrent hooks, drop.
 /// Read-only legacy lookups need no cache lock. Registration invalidates without copying;
 /// the next capture rebuilds once, avoiding quadratic startup registration.
@@ -287,12 +288,6 @@ fn native_trace_modes_in(gc: &GcRuntime) -> Vec<(u32, TraceMode)> {
         .collect()
 }
 
-// One lookup per encountered type per stopped walk, including absent hooks.
-// This avoids scanning every registered type for a small/empty stopped graph.
-pub(super) fn lookup_trace_contract(type_id: u32) -> Option<(TraceFn, TraceMode)> {
-    lookup_trace_contract_in(runtime(), type_id)
-}
-
 pub(super) fn lookup_trace_contract_in(
     gc: &GcRuntime,
     type_id: u32,
@@ -307,6 +302,7 @@ pub(super) fn lookup_trace_contract_in(
     ))
 }
 
+#[cfg(test)]
 pub(super) fn trace_registry_snapshot() -> (
     IdSet<u32>,
     IdMap<u32, ConcurrentTraceFn>,
@@ -351,6 +347,7 @@ pub(crate) unsafe fn store_gc_reference(slot: *mut *mut u8, value: *mut u8) {
     unsafe { std::sync::atomic::AtomicPtr::from_ptr(slot).store(value, Ordering::Release) }
 }
 
+#[cfg(test)]
 pub(super) fn type_registry() -> &'static Mutex<HashMap<u32, TraceFn>> {
     &runtime().trace_registry
 }
@@ -576,6 +573,7 @@ impl NativeGcRegistration {
     }
 }
 
+#[cfg(test)]
 pub(super) fn drop_registry() -> &'static Mutex<HashMap<u32, DropFn>> {
     &runtime().drop_registry
 }
@@ -633,6 +631,7 @@ pub(super) unsafe fn run_drop_hook(
     });
 }
 
+#[cfg(test)]
 /// Current hook-registry generation. This changes only when existing
 /// registrations are invalidated, never when another type is merely added.
 pub(crate) fn registry_generation() -> u64 {

@@ -8,6 +8,7 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use crate::scheduler::RuntimeWorkerConfig;
 
 pub(crate) struct Runtime {
+    #[cfg(test)]
     pub(crate) scheduler_hooks: crate::observation::SchedulerHooks,
     pub(crate) service_owner: OnceLock<std::sync::Weak<Runtime>>,
     /// Joined first by `Drop for Runtime`, whatever its declaration position.
@@ -46,6 +47,7 @@ pub(crate) struct Runtime {
 }
 
 impl Runtime {
+    #[cfg(test)]
     pub(crate) const fn new(source: fn() -> RuntimeWorkerConfig) -> Self {
         Self::with_gc_initializer(source, crate::gc::GcRuntime::initialize)
     }
@@ -56,6 +58,7 @@ impl Runtime {
     ) -> Self {
         Self {
             service_owner: OnceLock::new(),
+            #[cfg(test)]
             scheduler_hooks: crate::observation::SchedulerHooks::new(),
             frame_reclaim: LazyLock::new(|| {
                 std::sync::Arc::new(crate::frame_reclaim::Domain::new())
@@ -86,6 +89,7 @@ impl Runtime {
         }
     }
 
+    #[cfg(test)]
     /// Shared private owners can safely lend services to background workers.
     pub(crate) fn shared(source: fn() -> RuntimeWorkerConfig) -> std::sync::Arc<Self> {
         let owner = std::sync::Arc::new(Self::new(source));
@@ -153,6 +157,7 @@ pub(crate) fn current() -> &'static Runtime {
     unsafe { &*SELECTED.get() }
 }
 
+#[cfg(test)]
 /// The process-default instance whose storage backs exported ABI data symbols.
 #[inline]
 pub(crate) fn process_default() -> &'static Runtime {
@@ -239,6 +244,7 @@ where
     })
 }
 
+#[cfg(any(test, feature = "gc-acceptance-faults"))]
 /// Bind a thread body to the caller's current runtime. Used where the thread
 /// is spawned through an API other than [`spawn_serving`] (scoped threads).
 pub(crate) fn serving<F, T>(f: F) -> impl FnOnce() -> T
@@ -396,21 +402,25 @@ impl WorkerConfiguration {
         (self.source)()
     }
 
+    #[cfg(test)]
     /// Zero restores the source policy; positive values select that count.
     pub(crate) fn replace_override(&self, workers: usize) -> usize {
         self.worker_override.swap(workers, Ordering::AcqRel)
     }
 
+    #[cfg(test)]
     pub(crate) fn single_worker(&self) -> SingleWorkerLease<'_> {
         self.single_worker_leases.fetch_add(1, Ordering::AcqRel);
         SingleWorkerLease { owner: self }
     }
 }
 
+#[cfg(test)]
 pub struct SingleWorkerLease<'a> {
     owner: &'a WorkerConfiguration,
 }
 
+#[cfg(test)]
 impl Drop for SingleWorkerLease<'_> {
     fn drop(&mut self) {
         let previous = self

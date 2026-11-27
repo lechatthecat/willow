@@ -815,6 +815,7 @@ impl ConcurrentCycle {
         self.drain_recovering_in(owner, || self.drain_items_until_in(owner, limit, deadline))
     }
 
+    #[cfg(test)]
     /// Unwinding retires the queue consumer and publishes MarkBatch before
     /// requesting authoritative stopped tracing. Never continue partial scans.
     pub(super) fn drain_recovering<T: Default>(&self, drain: impl FnOnce() -> T) -> T {
@@ -878,10 +879,6 @@ impl ConcurrentCycle {
             let mut worker = self.queue.register_assist();
             self.drain_worker_until_stride(owner, limit, children, &mut worker, deadline, 1)
         })
-    }
-
-    pub(super) fn drain_background(&self, limit: usize, children: &mut Vec<*mut u8>) -> usize {
-        self.drain_background_in(crate::runtime::current(), limit, children)
     }
 
     pub(super) fn drain_background_in(
@@ -1251,6 +1248,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+#[cfg(test)]
 /// The installed cycle and the generation it was read at; the heap lock is
 /// taken only when the generation moved since this thread last looked.
 pub(super) fn cached_cycle() -> Option<(u64, Arc<ConcurrentCycle>)> {
@@ -1289,11 +1287,6 @@ pub(super) fn cached_cycle_in(owner: &GcRuntime) -> Option<(u64, Arc<ConcurrentC
     let _ = ASSIST_CYCLE
         .try_with(|cached| *cached.borrow_mut() = Some((owner.policy_identity, generation, weak)));
     cycle.map(|cycle| (generation, cycle))
-}
-
-/// Bounded allocation assistance. Only call outside runtime container locks.
-pub(super) fn assist_concurrent_mark(allocated: u64) {
-    assist_concurrent_mark_in(crate::runtime::current(), allocated);
 }
 
 pub(super) fn assist_concurrent_mark_in(owner: &crate::runtime::Runtime, allocated: u64) {

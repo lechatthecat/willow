@@ -342,6 +342,7 @@ pub(crate) fn satb_delete_in(owner: &crate::runtime::Runtime, old: *mut u8) {
     }
 }
 
+#[cfg(test)]
 pub(super) fn flush_satb_current(retire: bool) {
     flush_satb_current_in(crate::runtime::current(), retire);
 }

@@ -603,6 +603,7 @@ unsafe fn channel_send_barrier(raw: *mut c_void, value: WillowChannelValue) {
     };
 }
 
+#[cfg(test)]
 /// Remove a completed/cancelled task from every channel waiter queue. This is
 /// needed for a task cancelled while parked on `select`: no case is chosen, so
 /// generated unregister-all code never runs.

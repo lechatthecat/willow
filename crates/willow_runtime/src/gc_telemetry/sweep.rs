@@ -45,9 +45,6 @@ pub fn snapshot() -> Stats {
 pub(crate) fn reset() {
     default_owner().reset();
 }
-pub(crate) fn completed(objects: u64, bytes: u64, wall_ns: u64, reclaimed_bytes: u64) {
-    default_owner().completed(objects, bytes, wall_ns, reclaimed_bytes);
-}
 
 #[cfg(test)]
 mod tests {

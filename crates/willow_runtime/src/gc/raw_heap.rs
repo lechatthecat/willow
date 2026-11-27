@@ -262,11 +262,6 @@ impl Object {
         inspect(layout, !owned)
     }
 
-    /// This object's layout descriptor, read once.
-    pub(super) fn layout(self) -> willow_abi::GcLayoutDescriptor {
-        self.descriptor()
-    }
-
     /// No state changes on contention. A successful permit pins an interned
     /// descriptor through the liveness bookkeeping and header conversion.
     pub(super) fn try_reclaim_permit(self) -> Option<ReclaimPermit> {

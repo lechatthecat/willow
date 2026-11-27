@@ -27,6 +27,7 @@ pub(crate) struct RuntimeDiagnostics {
     trace_observations: OnceLock<bool>,
     gc_observations: OnceLock<bool>,
 
+    #[cfg(any(test, feature = "gc-notification-prototype"))]
     pub(crate) gc_notify: LazyLock<bool>,
     pub(crate) gc_measure: LazyLock<bool>,
     pub(crate) sched_trace: LazyLock<bool>,
@@ -88,6 +89,7 @@ impl RuntimeDiagnostics {
             trace_milestones: OnceLock::new(),
             trace_observations: OnceLock::new(),
             gc_observations: OnceLock::new(),
+            #[cfg(any(test, feature = "gc-notification-prototype"))]
             gc_notify: LazyLock::new(|| {
                 std::env::var_os("WILLOW_GC_NOTIFY").as_deref() == Some(std::ffi::OsStr::new("1"))
             }),

@@ -590,14 +590,12 @@ impl AllocationHeadroom {
 // Bound the interval between locked allocation-rate/policy samples.
 const POLICY_HEADROOM_CAP: u64 = 1 << 20;
 
+#[cfg(test)]
 fn invalidate_external_headroom() {
     runtime().headroom.invalidate();
 }
 
-pub(super) fn consume_headrooms(bytes: usize) {
-    runtime().headroom.consume(bytes);
-}
-
+#[cfg(test)]
 fn policy_headroom(state: &GcState) -> u64 {
     policy_headroom_in(runtime(), state)
 }
@@ -676,16 +674,6 @@ fn trim_region_cache_to_watermark(owner: &GcRuntime, state: &mut GcState) {
             .region_cache
             .shrink_to(usize::try_from(keep).unwrap_or(usize::MAX));
     }
-}
-
-/// Close the lock-free native path and wait out charges already inside it.
-/// After this, `external_bytes()` holds no transient (rolled-back) bytes and
-/// no new lock-free charge can start until a locked charge republishes the
-/// headroom. SeqCst pairs with the charger's in-flight increment and headroom
-/// load: either the charger sees zero headroom, or this sees it in flight.
-/// O(1) plus a spin over at most a few atomics per in-flight charge.
-fn quiesce_external_charges() {
-    quiesce_external_charges_in(runtime());
 }
 
 fn quiesce_external_charges_in(owner: &GcRuntime) {
@@ -910,6 +898,7 @@ fn region_cache_budget_in(owner: &GcRuntime, state: &GcState) -> usize {
     state.memory_limit_bytes.map_or(usize::MAX, room).min(soft)
 }
 
+#[cfg(test)]
 /// Admit a new old region, reusing retained storage of the same capacity.
 /// The caller accounts the returned region as reserved.
 fn reserve_old_region(state: &mut GcState, kind: RegionKind, capacity: usize) -> Option<OldRegion> {
@@ -942,6 +931,7 @@ fn reserve_old_region_in(
 /// never fits reports exhaustion even while other threads keep producing garbage.
 const BUDGET_COLLECTION_RETRIES: usize = 8;
 
+#[cfg(test)]
 /// Give reclamation an opportunity before treating reservation pressure as
 /// exhaustion. Callers retry while each collection still releases storage:
 /// concurrent allocators may claim it first, so exhaustion is reported after a
@@ -959,10 +949,6 @@ fn collect_for_budget_in(owner: &crate::runtime::Runtime) {
         crate::gc_telemetry::observations::Kind::AllocationStall,
     );
     cycle_wait::collect_for_budget_in(owner);
-}
-
-fn allocation_failure(state: &GcState) -> *mut u8 {
-    allocation_failure_in(runtime(), state)
 }
 
 fn allocation_failure_in(owner: &GcRuntime, state: &GcState) -> *mut u8 {
@@ -1003,6 +989,7 @@ fn major_trigger(state: &GcState) -> usize {
     })
 }
 
+#[cfg(test)]
 fn pacer_inputs(state: &GcState) -> pacer::Inputs {
     pacer_inputs_in(crate::runtime::current(), state)
 }
@@ -1198,7 +1185,6 @@ impl Default for GcState {
 // by `GcRuntime::heap`. Concurrent marking holds an epoch reader and observes
 // initialized headers through atomic start bits; relocation is serialized.
 unsafe impl Send for GcState {}
-
 // Compatibility facade: runtime roots and generated roots share context storage.
 struct RootStackAccess;
 impl RootStackAccess {
@@ -1266,6 +1252,7 @@ pub(crate) struct GcRuntime {
     progress: Mutex<progress::Progress>,
     stop_diagnostics: Mutex<std::collections::VecDeque<old_cycle::StopDiagnostic>>,
     preparation_diagnostic: Mutex<old_cycle::PreparationDiagnostic>,
+    #[cfg(test)]
     storage_allocator: RuntimeStorageAllocator,
     heap: crate::gc_telemetry::observations::GcMutex<GcState>,
     /// Interned runtime-allocation descriptors referenced by this heap's
@@ -1352,6 +1339,7 @@ impl GcRuntime {
             remembered_set: remembered::RememberedSet::with_epoch(card_epoch.clone()),
             ..GcState::default()
         };
+        #[cfg(test)]
         let storage_allocator = heap.storage_allocator.share();
         Self {
             marker_workers: Mutex::new(None),
@@ -1370,6 +1358,7 @@ impl GcRuntime {
             progress: Mutex::new(progress::Progress::default()),
             stop_diagnostics: Mutex::new(std::collections::VecDeque::new()),
             preparation_diagnostic: Mutex::new(old_cycle::PreparationDiagnostic::default()),
+            #[cfg(test)]
             storage_allocator,
             heap: crate::gc_telemetry::observations::GcMutex::new(heap),
             layouts: layouts::Layouts::default(),
@@ -1452,6 +1441,7 @@ impl GcRuntime {
         Self::with_phase(MarkPhase::DefaultAbi)
     }
 
+    #[cfg(test)]
     pub(crate) fn initialize() -> Self {
         Self::default()
     }
@@ -1622,6 +1612,7 @@ unsafe fn initialize_object_at(
     }
 }
 
+#[cfg(test)]
 /// Reservation occupancy can remain high even when few objects are live. A
 /// level-triggered check would repeatedly scan the same rooted region. Keep a
 /// pressure latch across cycles; normal occupancy/pacer triggers and reservation
@@ -1747,6 +1738,7 @@ fn minor_deferral_age(state: &GcState) -> u64 {
     })
 }
 
+#[cfg(test)]
 /// A queued minor may use one fixed nursery budget before joining its owner.
 /// Start the clock at the request, not at the eventual root scan: otherwise
 /// repeated refills during a major sweep would have unbounded, uncharged debt.
@@ -2399,6 +2391,7 @@ fn index_old_region(state: &mut GcState, index: usize) {
     }
 }
 
+#[cfg(test)]
 /// # Safety
 /// The type, tracing metadata and payload size must satisfy the allocation contract of
 /// willow_gc_alloc_layout, including reserved bitmap descriptors and native initialization.
@@ -2524,16 +2517,6 @@ fn allocate_old_region_object_for_move_in(
         count_logical_allocation,
     );
     Some(object)
-}
-
-#[inline]
-fn account_old_region_allocation(
-    state: &mut GcState,
-    size: usize,
-    reused: bool,
-    count_logical_allocation: bool,
-) {
-    account_old_region_allocation_in(runtime(), state, size, reused, count_logical_allocation);
 }
 
 #[inline]
@@ -2915,6 +2898,7 @@ fn append_bitmap_slots(object: HeapObject, slots: &mut Vec<*mut *mut u8>) {
     slots.extend(bitmap_reference_slots(object, object.trace_metadata()));
 }
 
+#[cfg(test)]
 fn object_reference_slots(
     object: HeapObject,
     trace_registry: &HashMap<u32, TraceFn, impl std::hash::BuildHasher>,
@@ -2980,6 +2964,7 @@ pub(crate) fn collect_for_worker_panic_test() {
     collect_internal();
 }
 
+#[cfg(test)]
 fn collect_internal() {
     let _ = try_collect_internal();
 }
@@ -3220,6 +3205,7 @@ fn try_collect_internal_in(owner: &crate::runtime::Runtime) -> CollectionAttempt
     CollectionAttempt::Completed
 }
 
+#[cfg(test)]
 /// Sweep the region-backed old-object index and nursery/pinned regions without
 /// moving survivors. Dead old spans return to their owning region's free list;
 /// completely empty regions are released. Returns total logical bytes freed.
@@ -3227,6 +3213,7 @@ fn sweep() -> usize {
     sweep_with_work(&mut crate::gc_telemetry::stops::StopWorkV2::default())
 }
 
+#[cfg(test)]
 fn sweep_with_work(stop_work: &mut crate::gc_telemetry::stops::StopWorkV2) -> usize {
     sweep::stopped(stop_work)
 }
@@ -3235,6 +3222,7 @@ fn sweep_with_work(stop_work: &mut crate::gc_telemetry::stops::StopWorkV2) -> us
 // Helpers
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
 /// Given a payload pointer, return the GcHeader pointer just before it.
 fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
     GcPayload::from_raw(payload)

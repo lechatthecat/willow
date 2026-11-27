@@ -59,17 +59,23 @@ impl<T: PartialEq> PartialEq<T> for Value<T> {
 /// for synchronous operation counts and aggregate views for background drops.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Event {
+    #[cfg(test)]
     AsyncMutexDropCount,
+    #[cfg(test)]
     AsyncRwlockDropCount,
+    #[cfg(test)]
     ChannelDropCount,
     ChannelRegistrationCount,
     ChannelReserveLocks,
     ChannelWaiterVisits,
     ChannelWakeAttempts,
     ChannelWakeBatches,
+    #[cfg(test)]
     BlockingCellDropCount,
+    #[cfg(test)]
     BlockingRwCellDropCount,
     BlockingCellRegistrationCount,
+    #[cfg(test)]
     NetworkHandleDropCount,
     WordSharedAcquires,
     WordHashCalls,
@@ -211,12 +217,6 @@ mod native_tests {
         pub(crate) fn store(&self, value: usize, _: Ordering) {
             self.set(value);
         }
-        pub(crate) fn fetch_add(&self, value: usize, _: Ordering) -> usize {
-            crate::runtime::current()
-                .gc
-                .native_observation
-                .update(self.0, |old| old.wrapping_add(value))
-        }
     }
 
     #[test]
@@ -246,9 +246,6 @@ mod native_tests {
 pub(crate) struct SchedulerHooks;
 #[cfg(not(test))]
 impl SchedulerHooks {
-    pub(crate) const fn new() -> Self {
-        Self
-    }
     #[inline]
     pub(crate) fn drive<'a>(_: impl FnOnce() -> &'a crate::runtime::Runtime) {}
     #[inline]

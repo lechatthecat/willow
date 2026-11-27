@@ -111,9 +111,6 @@ pub fn enabled() -> bool {
 pub fn snapshot() -> Snapshot {
     default_owner().snapshot()
 }
-pub(crate) fn record(kind: Kind, ns: u64) {
-    record_in(crate::runtime::current(), kind, ns);
-}
 
 pub(crate) fn record_in(owner: &crate::runtime::Runtime, kind: Kind, ns: u64) {
     if owner.diagnostics.gc_profile.one {
@@ -295,14 +292,6 @@ pub(crate) struct WorkerJob<'a> {
     start: Instant,
     cpu: Option<u64>,
 }
-impl WorkerJob<'static> {
-    pub(crate) fn begin(index: usize, idle: u64) -> Option<Self> {
-        if !enabled() {
-            return None;
-        }
-        Some(Self::begin_in(default_owner(), index, idle))
-    }
-}
 impl<'a> WorkerJob<'a> {
     pub(crate) fn begin_in(owner: &'a CollectorProfile, index: usize, idle: u64) -> Self {
         let previous = LOCAL.replace(Some((
@@ -354,9 +343,6 @@ impl Drop for WorkerJob<'_> {
         );
         total.max_queue_depth = total.max_queue_depth.max(w.max_queue_depth);
     }
-}
-pub(crate) fn graph(work: super::MarkWork, duplicates: u64, depth: u64) {
-    graph_for_runtime(crate::runtime::current(), work, duplicates, depth);
 }
 
 pub(crate) fn graph_for_runtime(

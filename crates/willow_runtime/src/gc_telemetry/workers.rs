@@ -124,7 +124,6 @@ pub(crate) enum Failure {
     Spawn,
     JoinTimeout,
     Fallback,
-    DropPanic,
 }
 
 impl WorkerTelemetry {
@@ -135,15 +134,11 @@ impl WorkerTelemetry {
             Failure::Spawn => &mut stats.spawn_failures,
             Failure::JoinTimeout => &mut stats.join_timeouts,
             Failure::Fallback => &mut stats.fallback_cycles,
-            Failure::DropPanic => &mut stats.drop_hook_panics,
         };
         if add(field, 1) {
             stats.flags |= SATURATED;
         }
     }
-}
-pub(crate) fn record_failure(failure: Failure) {
-    default_owner().record_failure(failure);
 }
 
 pub(crate) struct JobMeasurement<'a> {
@@ -153,11 +148,6 @@ pub(crate) struct JobMeasurement<'a> {
     _thread: std::marker::PhantomData<std::rc::Rc<()>>,
     start: Instant,
     cpu: Option<u64>,
-}
-impl JobMeasurement<'static> {
-    pub(crate) fn begin() -> Self {
-        Self::begin_in(super::telemetry())
-    }
 }
 impl<'a> JobMeasurement<'a> {
     pub(crate) fn begin_in(owner: &'a super::Telemetry) -> Self {

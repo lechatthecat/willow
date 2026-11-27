@@ -89,6 +89,7 @@ fn read_tlab_allocations_delta(
     delta
 }
 
+#[cfg(test)]
 pub(super) fn add_tlab_accounting(state: &mut GcState, allocations: u64, bytes: u64) {
     add_tlab_accounting_in(runtime(), state, allocations, bytes);
 }
@@ -104,6 +105,7 @@ fn add_tlab_accounting_in(owner: &GcRuntime, state: &mut GcState, allocations: u
     state.young_allocated_bytes = state.young_allocated_bytes.saturating_add(bytes as usize);
 }
 
+#[cfg(test)]
 /// Publish only the refilling owner's bytes: O(1) expected lookup and one
 /// cursor read. Every refill publishes before replacing its chunk, so missing
 /// bytes are bounded by one active chunk per TLAB, independent of refill count.
@@ -148,10 +150,6 @@ pub(super) fn sync_tlab_accounting_in(owner: &GcRuntime, state: &mut GcState) {
     sync_tlab_counters(owner, state);
     // Index consumers retain the baseline full flush.
     old_lab::flush_all_in(owner, state);
-}
-
-pub(super) fn sync_tlab_accounting_unindexed(state: &mut GcState) {
-    sync_tlab_accounting_unindexed_in(runtime(), state);
 }
 
 pub(super) fn sync_tlab_accounting_unindexed_in(owner: &GcRuntime, state: &mut GcState) {
@@ -227,6 +225,7 @@ pub(super) unsafe fn register_tlab_state_in(gc: &GcRuntime, state: &mut GcState,
     });
 }
 
+#[cfg(test)]
 pub(super) fn retire_tlab_locked(state: &mut GcState, address: usize) {
     retire_tlab_locked_in(
         &crate::runtime::current().telemetry.footprint,
@@ -316,6 +315,7 @@ pub(super) fn index_retired_chunk(chunk: &mut BumpChunk) -> usize {
     chunk.header_offsets.len()
 }
 
+#[cfg(test)]
 /// Seal every active TLAB without indexing its headers. The minor collector
 /// indexes only the chunks it touches; other callers use
 /// `retire_all_tlabs_locked`.
@@ -328,6 +328,7 @@ pub(super) fn retire_all_tlabs_unindexed_in(owner: &crate::runtime::Runtime, sta
     retire_all_tlab_cursors(&owner.telemetry.footprint, state);
 }
 
+#[cfg(test)]
 /// Initial mark captures start maps and must not index old-LAB objects while
 /// retiring nursery cursors. Minor and baseline index consumers keep their flush.
 pub(super) fn retire_all_tlabs_unindexed_for_mark(state: &mut GcState) {
@@ -363,6 +364,7 @@ fn retire_all_tlab_cursors(
     }
 }
 
+#[cfg(test)]
 /// Seal every active TLAB and index every retired chunk that still lacks its
 /// header index. Returns the headers indexed. O(chunks + newly indexed headers).
 pub(super) fn retire_all_tlabs_locked(state: &mut GcState) -> usize {
@@ -372,13 +374,6 @@ pub(super) fn retire_all_tlabs_locked(state: &mut GcState) -> usize {
 fn retire_all_tlabs_locked_in(owner: &crate::runtime::Runtime, state: &mut GcState) -> usize {
     retire_all_tlabs_unindexed_in(owner, state);
     state.tlab_chunks.iter_mut().map(index_retired_chunk).sum()
-}
-
-pub(super) fn retire_tlabs_with_work(
-    state: &mut GcState,
-    work: &mut crate::gc_telemetry::stops::StopWorkV2,
-) {
-    retire_tlabs_with_work_in(crate::runtime::current(), state, work);
 }
 
 pub(super) fn retire_tlabs_with_work_in(

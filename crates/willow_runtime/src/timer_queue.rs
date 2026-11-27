@@ -269,11 +269,13 @@ impl TimerQueue {
         None
     }
 
+    #[cfg(test)]
     /// Entries currently held, including not-yet-pruned stale ones.
     pub(crate) fn len(&self) -> usize {
         self.lock().entries.len()
     }
 
+    #[cfg(test)]
     /// Drop every entry (test reset).
     pub(crate) fn clear(&self) {
         let mut heap = self.lock();

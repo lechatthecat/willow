@@ -122,11 +122,6 @@ pub(crate) struct Span<'a> {
     _interval: super::observations::Span<'a>,
     _exclusive: Option<super::pause::Span<'a>>,
 }
-impl Span<'static> {
-    pub(crate) fn new(phase: Phase) -> Self {
-        Self::for_runtime(crate::runtime::current(), phase)
-    }
-}
 impl<'a> Span<'a> {
     pub(crate) fn for_runtime(runtime: &'a crate::runtime::Runtime, phase: Phase) -> Self {
         Self::start_for_runtime(runtime, phase, true)
@@ -219,11 +214,6 @@ impl Drop for Span<'_> {
     }
 }
 pub(crate) struct WorkerLifetime<'a>(&'a Measurements);
-impl WorkerLifetime<'static> {
-    pub(crate) fn new() -> Self {
-        Self::new_in(default_owner())
-    }
-}
 impl<'a> WorkerLifetime<'a> {
     pub(crate) fn new_in(owner: &'a Measurements) -> Self {
         owner.threads.fetch_add(1, Ordering::AcqRel);
