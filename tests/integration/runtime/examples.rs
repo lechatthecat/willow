@@ -911,6 +911,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/native_stack_overflow.wi", "8\n"),
         ("example/task_stack_overflow.wi", "8\n"),
         ("example/recursion.wi", "3628800\n1024\n6\n"),
+        ("example/enum_recursive_sum.wi", "4950\n100\n"),
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
         (
             "tests/regressions/reference_args_control_flow.wi",

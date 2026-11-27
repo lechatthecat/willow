@@ -1,0 +1,22 @@
+// Release mode reduces this wrapping integer sum to a constant-stack traversal.
+// Checked arithmetic preserves recursive fault frames instead.
+enum Chain { Link(i64, Chain), End }
+
+fn sum(chain: Chain) -> i64 {
+    return match chain {
+        Chain::Link(value, rest) => value + sum(rest),
+        Chain::End => 0,
+    };
+}
+
+fn depth(n: i64) -> i64 {
+    if n == 0 { return 0; }
+    return 1 + depth(n - 1);
+}
+
+fn main() {
+    let mut chain = Chain::End;
+    for i in 0..100 { chain = Chain::Link(i, chain); }
+    println(sum(chain));
+    println(depth(100));
+}

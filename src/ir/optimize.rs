@@ -8,9 +8,11 @@
 use crate::driver::OverflowChecks;
 mod devirtualize;
 mod recursive_inline;
+mod recursive_reduce;
 mod string_concat;
 pub(crate) use devirtualize::devirtualize_function_values;
 pub(crate) use recursive_inline::inline_scalar_recursion;
+pub(crate) use recursive_reduce::reduce_enum_recursion;
 pub(crate) use string_concat::fuse_program;
 
 use std::collections::{HashMap, HashSet};

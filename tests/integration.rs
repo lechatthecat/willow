@@ -251,6 +251,9 @@ mod native_stack_overflow;
 #[path = "integration/lir_constant_folding.rs"]
 mod lir_constant_folding;
 
+#[path = "integration/enum_recursive_sum.rs"]
+mod enum_recursive_sum;
+
 #[path = "integration/type_argument_arity.rs"]
 mod type_argument_arity;
 

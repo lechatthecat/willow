@@ -764,6 +764,7 @@ pub(crate) fn lower_source_program_with(
         .iter_mut()
         .chain(lambdas.iter_mut().map(|lambda| &mut lambda.function))
     {
+        super::optimize::reduce_enum_recursion(function, overflow_checks);
         super::optimize::eliminate_tail_recursion(function);
         super::optimize::inline_scalar_recursion(function, overflow_checks);
         super::optimize::unroll_scalar_loops(function);
