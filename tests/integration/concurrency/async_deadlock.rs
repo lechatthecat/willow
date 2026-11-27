@@ -45,6 +45,44 @@ async fn main() {
     println("UNREACHABLE");
 }
 "#,
+        r#"
+async fn main() {
+    let c = Channel<i64>::with_capacity(1);
+    c.send(1); c.send(2);
+    println("UNREACHABLE");
+}
+"#,
+        r#"
+async fn main() {
+    let c = Channel<i64>::new();
+    c.recv_opt();
+    println("UNREACHABLE");
+}
+"#,
+        r#"
+async fn receiver(c: Channel<i64>) { c.recv(); }
+async fn middle(c: Channel<i64>) { let t = receiver(c); await t; }
+async fn main() {
+    let c = Channel<i64>::new(); let t = middle(c); await t;
+    println("UNREACHABLE");
+}
+"#,
+        r#"
+async fn main() {
+    let a = Channel<i64>::new(); let b = Channel<i64>::new();
+    select { let x = a.recv() => {} let y = b.recv() => {} }
+    println("UNREACHABLE");
+}
+"#,
+        r#"
+async fn receiver(c: Channel<i64>) { c.recv(); }
+async fn main() {
+    let a = Channel<i64>::new(); let b = Channel<i64>::new();
+    let t = receiver(a);
+    select { let x = await t => {} let y = b.recv() => {} }
+    println("UNREACHABLE");
+}
+"#,
     ];
     for (case, source) in cases.iter().enumerate() {
         // Keep exercising the runtime fallback: a returned channel is outside
@@ -68,12 +106,28 @@ async fn main() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             assert!(!output.status.success(), "case={case}, workers={workers}");
             assert!(stderr.contains("deadlock"), "{stderr}");
-            let operation = if case == 0 || case == 4 {
+            let operation = if matches!(case, 0 | 4 | 7 | 9) {
                 "blocked on await"
             } else {
                 "blocked on channel/select"
             };
             assert!(stderr.contains(operation), "case={case}: {stderr}");
+            assert_eq!(output.status.code(), Some(1), "{stderr}");
+            assert!(stderr.contains("witness (registered waits"), "{stderr}");
+            assert!(stderr.contains("-> channel 0x"), "case={case}: {stderr}");
+            if matches!(case, 0 | 4 | 7 | 9) {
+                assert!(stderr.contains("await -> task "), "{stderr}");
+            }
+            if case == 5 {
+                assert!(stderr.contains("SendWait"), "{stderr}");
+            }
+            if case == 7 {
+                assert_eq!(stderr.matches("await -> task ").count(), 2, "{stderr}");
+                assert_eq!(stderr.matches("\n  task ").count(), 3, "{stderr}");
+            }
+            if case == 8 {
+                assert_eq!(stderr.matches("RecvWait -> channel").count(), 2, "{stderr}");
+            }
             assert!(
                 stderr.contains("main") && stderr.contains("task"),
                 "{stderr}"
@@ -295,5 +349,32 @@ async fn main() {
             );
             assert!(!String::from_utf8_lossy(&output.stderr).contains("deadlock"));
         }
+    }
+}
+
+#[test]
+fn async_deadlock_valid_protocol_example() {
+    let project = TestProject::new(
+        "channel_wait_protocol",
+        &[(
+            "main.wi",
+            include_str!("../../../example/channel_wait_protocol.wi"),
+        )],
+    );
+    let compiled = project.compile("main.wi");
+    assert!(
+        compiled.status.success(),
+        "{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    for workers in ["1", "4"] {
+        let output = project.run_with_env_timeout(
+            &[("WILLOW_WORKERS", workers), ("WILLOW_GC_STRESS", "alloc")],
+            std::time::Duration::from_secs(10),
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(!stderr.contains("deadlock"), "{stderr}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "42\ntrue\n");
     }
 }

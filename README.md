@@ -39,6 +39,78 @@ reports some permanent waits in a small straight-line subset. Unsupported code
 can leave the whole program unanalyzed. The absence of E2607 provides **no
 guarantee of progress**. See the [positive and unsupported cases](src/semantic/permanent_wait/tests.rs).
 
+**Runtime guarantee:** an unfinished cooperative `async main` at global
+quiescence fails with a channel/await wait witness and exit status 1. This detects
+an observed whole-program stop, not partial deadlocks while other work or wake
+sources remain. See the [precise scope and exclusions](#runtime-channelawait-deadlock-detection).
+
+## Runtime channel/await deadlock detection
+
+Willow uses **runtime global-quiescence detection** for channel/await deadlocks.
+It does not require a new language subset or a static proof that every accepted
+program terminates. E2607 remains a separate, incomplete compile-time bug finder.
+
+**Guarantee for the covered execution.** When an unfinished `async main` and
+its tasks are suspended on cooperative channel operations, `await`, or `select`,
+and no runnable task, executing poll, in-flight scheduler claim, timer, registered
+I/O waiter or outstanding blocking operation remains, the entry driver reports
+`runtime deadlock` on stderr with a wait witness and terminates with exit status
+1. It cannot treat that global stop as successful completion of main. This
+covers empty receives, full bounded sends, channel cycles and await chains or
+cycles once the whole execution reaches that state. Branches, loops and imported
+helpers do not by themselves exclude a runtime observation.
+
+The witness starts at main and follows registered await targets. It lists task
+IDs, available names and spawn sites, and channel registrations (`RecvWait`,
+`SendWait`, or ownership/handoff roles) with process-local channel identifiers.
+For example, a main awaiting a receiver can produce:
+
+```text
+runtime deadlock: task 1 (main) blocked on await; no runnable task or wake source remains
+witness (registered waits; select entries are alternatives):
+  task 1 (main) blocked on await
+    await -> task 2
+  task 2 (receiver) blocked on channel/select
+    RecvWait -> channel 0x1234
+```
+
+IDs, names, addresses and registration order vary. Channel identifiers are
+opaque identities, not values or pointers to dereference. A channel registration
+does not identify a potential sender; a select's entries are alternatives, not
+edges that must all complete. The witness describes an observed global stop,
+not a minimal cycle proof or a source-level causal trace. To bound diagnostic
+size, it expands at most 64 tasks and prints at most 256 await/channel
+registrations, explicitly marking truncation. Truncation does not change the
+stop decision or exit status. Witness collection runs only after failure has
+been established, using existing metadata with no extra per-operation tracking.
+
+**Correct progressing programs remain accepted.** A queued sender, task
+completion, timer, I/O event or blocking-operation completion keeps the driver
+alive; returning main succeeds without waiting for detached tasks. See the
+runnable [channel protocol](example/channel_wait_protocol.wi), which seeds a
+bounded request before awaiting its relay and drains a closed reply channel.
+
+**These cases have no channel/await deadlock-detection guarantee:**
+
+- A subset of tasks is deadlocked while another task keeps running or yielding,
+  or keeps a timer, I/O registration or blocking operation outstanding. An
+  unrelated wake source also prevents a global-stop diagnosis.
+- An external peer never responds, a blocking syscall never finishes, a native
+  function violates its declared effects, or the program livelocks or starves.
+  Elapsed time alone is never evidence of deadlock.
+- Synchronous `main`, synchronous nested scheduler drives and native blocking
+  paths. Some have their own panic diagnostics, but are not covered by the
+  async-entry witness contract above.
+- Detached blocked tasks after main has returned. Process exit intentionally
+  does not require those tasks to finish.
+
+Neither successful compilation nor a successful execution proves freedom from
+deadlock on other executions. This contract assumes the compiler's cooperative
+lowering and runtime wake-source bookkeeping, and does not certify foreign code.
+Evidence: [entry driver and wake-source checks](crates/willow_runtime/src/scheduler.rs),
+[witness traversal](crates/willow_runtime/src/scheduler_deadlock.rs), and
+[executable deadlock and progress cases](tests/integration/concurrency/async_deadlock.rs).
+
 ## Project status
 
 Willow is a research/engineering project exploring compiler enforcement and

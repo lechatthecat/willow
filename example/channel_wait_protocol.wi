@@ -1,0 +1,15 @@
+// Both peers can make progress: seed the request before awaiting the relay.
+async fn relay(request: Channel<i64>, reply: Channel<i64>) {
+    reply.send(request.recv() + 1);
+    reply.close();
+}
+
+async fn main() {
+    let request = Channel<i64>::with_capacity(1);
+    let reply = Channel<i64>::with_capacity(1);
+    let worker = relay(request, reply);
+    request.send(41);
+    println(reply.recv());
+    await worker;
+    println(reply.recv_opt().is_none());
+}

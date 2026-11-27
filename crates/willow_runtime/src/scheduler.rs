@@ -3916,28 +3916,7 @@ pub extern "C" fn willow_sched_run_until(target: u64) -> i64 {
 #[willow_runtime_macros::ffi_boundary]
 pub extern "C" fn willow_sched_run_main(target: u64) -> i64 {
     let completed = willow_sched_run_until(target);
-    let blocked = global_task_table()
-        .with(target as RuntimeTaskId, |task| {
-            (!task.state.lifecycle().is_terminal()).then(|| {
-                let operation = if task.awaiting_count() > 0 {
-                    "await"
-                } else if !task.wait_channels().is_empty() {
-                    "channel/select"
-                } else if task.lock_wait().is_some() {
-                    "lock"
-                } else {
-                    "parked operation"
-                };
-                format!(
-                    "task {target} ({}) blocked on {operation}; no runnable task or wake source remains",
-                    task.name().unwrap_or("main")
-                )
-            })
-        })
-        .flatten();
-    // Release the task shard before reporting/terminating. No graph walk or
-    // task-frame dereference is needed, even for a large cyclic wait graph.
-    if let Some(message) = blocked {
+    if let Some(message) = deadlock::main_witness(global_task_table(), target) {
         crate::failure::deadlock(format_args!("{message}"));
     }
     completed
@@ -6315,3 +6294,6 @@ pub(crate) fn test_clock_advanced() {
 #[cfg(test)]
 #[path = "scheduler_select_tests.rs"]
 mod select_tests;
+
+#[path = "scheduler_deadlock.rs"]
+mod deadlock;

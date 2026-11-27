@@ -451,6 +451,13 @@ impl RuntimeTask {
             .is_some_and(|wait| wait.awaiting.contains(&awaitee))
     }
 
+    /// Diagnostic traversal only; borrows registrations without consuming them.
+    pub(crate) fn awaiting_ids(&self) -> impl Iterator<Item = RuntimeTaskId> + '_ {
+        self.wait
+            .iter()
+            .flat_map(|wait| wait.awaiting.iter().copied())
+    }
+
     pub fn awaiting_count(&self) -> usize {
         self.wait.as_ref().map_or(0, |wait| wait.awaiting.len())
     }
