@@ -10,11 +10,50 @@ pub enum BuildMode {
 #[derive(Debug, Clone)]
 pub struct TargetOptions {
     pub build_mode: BuildMode,
+    /// Override i64 arithmetic overflow checks; None uses the build-mode default.
+    pub overflow_checks: Option<bool>,
     pub emit_debug_info: bool,
     pub emit_source_map: bool,
     pub strip_symbols: bool,
     pub runtime_lib: Option<PathBuf>,
     pub cargo_target_dir: Option<PathBuf>,
+}
+
+/// Resolved at compile time. Shifts and other integer widths retain their
+/// build-mode policy; only i64 arithmetic accepts the explicit override.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct OverflowChecks {
+    pub(crate) i64_arithmetic: bool,
+    pub(crate) other: bool,
+}
+
+impl From<bool> for OverflowChecks {
+    fn from(enabled: bool) -> Self {
+        Self {
+            i64_arithmetic: enabled,
+            other: enabled,
+        }
+    }
+}
+
+impl OverflowChecks {
+    pub(crate) fn arithmetic(self, layout: crate::parser::ast::IntegerLayout) -> bool {
+        if layout.bits == 64 && layout.signed {
+            self.i64_arithmetic
+        } else {
+            self.other
+        }
+    }
+}
+
+impl TargetOptions {
+    pub(crate) fn resolved_overflow_checks(&self) -> OverflowChecks {
+        let default = self.build_mode == BuildMode::Debug;
+        OverflowChecks {
+            i64_arithmetic: self.overflow_checks.unwrap_or(default),
+            other: default,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -66,6 +105,7 @@ impl CompilerOptions {
         Self {
             target: TargetOptions {
                 build_mode: BuildMode::Debug,
+                overflow_checks: None,
                 emit_debug_info: true,
                 emit_source_map: true,
                 strip_symbols: false,
@@ -83,6 +123,7 @@ impl CompilerOptions {
         Self {
             target: TargetOptions {
                 build_mode: BuildMode::Release,
+                overflow_checks: None,
                 emit_debug_info: false,
                 emit_source_map: false,
                 strip_symbols: false,
@@ -100,6 +141,7 @@ impl CompilerOptions {
         Self {
             target: TargetOptions {
                 build_mode: BuildMode::Release,
+                overflow_checks: None,
                 emit_debug_info: true,
                 emit_source_map: true,
                 strip_symbols: false,
@@ -139,6 +181,28 @@ impl CompilerOptions {
 #[cfg(test)]
 mod compiler_options_tests {
     use super::*;
+
+    #[test]
+    fn overflow_checks_profiles_and_explicit_overrides() {
+        for mut options in [
+            CompilerOptions::debug(),
+            CompilerOptions::release(),
+            CompilerOptions::release_with_debug_info(),
+        ] {
+            for checks in [None, Some(true), Some(false)] {
+                options.target.overflow_checks = checks;
+                let resolved = options.target.resolved_overflow_checks();
+                let debug = options.target.build_mode == BuildMode::Debug;
+                assert_eq!(resolved.i64_arithmetic, checks.unwrap_or(debug));
+                assert_eq!(resolved.other, debug);
+                // Unrelated environment resolution must preserve the explicit policy.
+                let resolved_env = options
+                    .clone()
+                    .with_environment(CompilerEnvironment::default());
+                assert_eq!(resolved_env.target.overflow_checks, checks);
+            }
+        }
+    }
 
     #[test]
     fn debug_and_release_profiles_live_in_target_options() {

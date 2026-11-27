@@ -874,8 +874,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         use crate::ir::lowered::LirRvalue;
         match value {
             LirRvalue::Unary { op, operand, ty } => {
-                let checked = self.overflow_checks()
-                    && crate::ir::lowered::value::is_overflow_checked_unary(op, operand, ty);
+                let checked = value.has_overflow_check_with(self.overflow_checks());
                 let operand = self.emit_lir_operand(function, operand);
                 match op {
                     UnaryOp::Neg if *ty == Type::F64 => self.builder.ins().fneg(operand),
@@ -927,7 +926,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 } else {
                     None
                 };
-                let checked_shift = self.overflow_checks()
+                let checked_shift = self.overflow_checks().other
                     && crate::ir::lowered::value::is_overflow_checked_binary(op, rhs, operand_ty)
                     && matches!(op, BinOp::Shl | BinOp::Shr);
                 let lhs = self.emit_lir_operand(function, lhs);
@@ -1018,8 +1017,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                         self.emit_pow_i64(lhs, rhs, operand_ty.integer_layout().unwrap(), span)
                     }
                 } else if !float
-                    && self.overflow_checks()
                     && matches!(op, BinOp::Add | BinOp::Sub | BinOp::Mul)
+                    && self
+                        .overflow_checks()
+                        .arithmetic(operand_ty.integer_layout().unwrap())
                 {
                     self.emit_checked_int_binop(
                         op,

@@ -9,6 +9,7 @@ use compiler_db::dependencies::ModuleDependencies;
 use module::artifacts::{LiveUnit, UnitArtifacts, UnitKind};
 use std::path::{Path, PathBuf};
 mod options;
+pub(crate) use options::OverflowChecks;
 pub use options::{BuildMode, CodegenOptions, CompilerOptions, TargetOptions};
 mod codegen;
 mod frontend;

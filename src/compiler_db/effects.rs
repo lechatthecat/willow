@@ -1,6 +1,7 @@
 //! One session-local helper/lock/panic fixpoint over typed callable identities.
 //! Imported facts use semantic names; linker spelling belongs to the backend.
 use super::query::QueryTable;
+use crate::driver::OverflowChecks;
 use crate::qualified_name::QualifiedName;
 use crate::{
     module::UnitId,
@@ -20,9 +21,9 @@ use std::{
 };
 
 const PANIC: RuntimeEffects = RuntimeEffects::MAY_PANIC;
-/// Checked arithmetic that this build mode wraps. Every mask that transmits
-/// [`PANIC`] also transmits this bit, so `PANIC | CHECKED_PANIC` of a release
-/// solution equals the overflow-checked solution's `PANIC` exactly.
+/// Checked operations that the resolved policy wraps. Every mask that transmits
+/// [`PANIC`] also transmits this bit, so `PANIC | CHECKED_PANIC` of any
+/// solution equals the fully overflow-checked solution's `PANIC` exactly.
 const CHECKED_PANIC: RuntimeEffects = RuntimeEffects::MAY_CHECKED_PANIC;
 /// Profile-independent panic summary read by checker verdicts.
 pub(crate) const ANY_PANIC: RuntimeEffects = PANIC.union(CHECKED_PANIC);
@@ -295,10 +296,9 @@ pub(crate) struct EffectQueries {
     roots: std::cell::RefCell<HashMap<UnitId, Vec<BodyId>>>,
     names: HashMap<String, UnitId>,
     dependencies: Option<std::rc::Rc<super::dependencies::ModuleDependencies>>,
-    /// Debug builds check `+ - * **` and unary `-` on `i64` for overflow, which makes those
-    /// operators recoverable faults.
-    /// Release builds wrap. Sessions without a mode stay conservative.
-    overflow_checks: bool,
+    /// Resolved arithmetic/shift policy. Sessions without options conservatively
+    /// retain all overflow fault paths.
+    overflow_checks: OverflowChecks,
     /// Function-value facts of the units checked so far in this session, for
     /// E2604 through indirect calls.
     pub(crate) indirect_lock: std::cell::RefCell<IndirectLockSession>,
@@ -333,7 +333,7 @@ impl Default for EffectQueries {
             roots: Default::default(),
             names: HashMap::new(),
             dependencies: None,
-            overflow_checks: true,
+            overflow_checks: true.into(),
             indirect_lock: Default::default(),
         }
     }
@@ -771,7 +771,7 @@ impl EffectQueries {
     pub(crate) fn new(
         modules: &[crate::module::ResolvedModule],
         dependencies: std::rc::Rc<super::dependencies::ModuleDependencies>,
-        overflow_checks: bool,
+        overflow_checks: OverflowChecks,
     ) -> Self {
         let mut result = Self {
             dependencies: Some(dependencies),
@@ -1497,7 +1497,7 @@ struct ColdUnitSolve<'a> {
     origins: Option<(&'a super::ids::BodyIndex, &'a EffectQueries)>,
     index: Option<&'a super::ids::BodyIndex>,
     consumer: Option<UnitId>,
-    overflow_checks: bool,
+    overflow_checks: OverflowChecks,
     plan: EffectPlan,
     problem: EffectProblem<EffectWitness>,
     own: HashSet<FunctionId>,
@@ -1528,7 +1528,7 @@ impl<'a> ColdUnitSolve<'a> {
             origins,
             index,
             consumer,
-            overflow_checks: origins.is_none_or(|(_, queries)| queries.overflow_checks),
+            overflow_checks: origins.map_or(true.into(), |(_, queries)| queries.overflow_checks),
             plan: EffectPlan {
                 ambiguous,
                 ..EffectPlan::default()
@@ -3317,7 +3317,7 @@ fn scan_direct_effects<N: std::fmt::Display>(
     body: &Block,
     types: &HashMap<ExprId, Type<N>>,
     index: Option<&super::ids::BodyIndex>,
-    overflow_checks: bool,
+    overflow_checks: OverflowChecks,
 ) -> Vec<DirectBodyEffects> {
     let mut pending = vec![(id, body_id, body)];
     let mut result = Vec::new();
@@ -3514,12 +3514,12 @@ pub(crate) fn analyze(
 /// worklist keeps this read-only analysis independent of expression depth.
 struct HazardVisitor<'a, N> {
     panics: bool,
-    /// Checked arithmetic that `overflow_checks == false` wraps.
+    /// Overflow fault paths disabled by the resolved policy.
     checked_panics: bool,
     checked_span: Option<crate::diagnostics::Span>,
     panic_span: Option<crate::diagnostics::Span>,
     expr_types: &'a HashMap<ExprId, Type<N>>,
-    overflow_checks: bool,
+    overflow_checks: OverflowChecks,
 }
 
 impl<N> HazardVisitor<'_, N> {
@@ -3529,8 +3529,8 @@ impl<N> HazardVisitor<'_, N> {
     }
     /// Checked arithmetic panics only with overflow checks. Without them it
     /// still feeds the profile-independent [`CHECKED_PANIC`] summary.
-    fn mark_checked(&mut self, span: crate::diagnostics::Span) {
-        if self.overflow_checks {
+    fn mark_checked(&mut self, span: crate::diagnostics::Span, enabled: bool) {
+        if enabled {
             self.mark_direct(span);
         } else {
             self.checked_panics = true;
@@ -3643,7 +3643,16 @@ impl<N> HazardVisitor<'_, N> {
                 if concat || guarded_division || guarded_pow {
                     self.mark_direct(expression.span());
                 } else if checked {
-                    self.mark_checked(expression.span());
+                    self.mark_checked(
+                        expression.span(),
+                        if matches!(expr.op, BinOp::Shl | BinOp::Shr) {
+                            self.overflow_checks.other
+                        } else {
+                            integer.map_or(self.overflow_checks.i64_arithmetic, |layout| {
+                                self.overflow_checks.arithmetic(layout)
+                            })
+                        },
+                    );
                 }
             }
             // Debug builds check integer negation of `i64::MIN`; a negated
@@ -3653,7 +3662,14 @@ impl<N> HazardVisitor<'_, N> {
                     && !matches!(unary.expr, Expr::Integer(..))
                     && !matches!(self.expr_types.get(&unary.id), Some(Type::F64)) =>
             {
-                self.mark_checked(expression.span());
+                let enabled = self
+                    .expr_types
+                    .get(&unary.id)
+                    .and_then(Type::integer_layout)
+                    .map_or(self.overflow_checks.i64_arithmetic, |layout| {
+                        self.overflow_checks.arithmetic(layout)
+                    });
+                self.mark_checked(expression.span(), enabled);
             }
             // Strict await can turn cancellation into a language panic.
             // TaskResult awaits are intentionally not distinguished here:
@@ -4123,7 +4139,7 @@ mod tests {
                     checked_span: None,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
-                    overflow_checks: true,
+                    overflow_checks: true.into(),
                 };
                 hazards.visit_block(&function.body);
                 assert!(hazards.panics);
@@ -4139,6 +4155,49 @@ mod tests {
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         program
+    }
+
+    #[test]
+    fn overflow_override_panic_effects_distinguish_arithmetic_and_shifts() {
+        for (body, arithmetic) in [
+            ("return a + 1;", true),
+            ("return a - 1;", true),
+            ("return a * 2;", true),
+            ("return -a;", true),
+            ("return a ** 3;", true),
+            ("return a << a;", false),
+            ("return a >> 64;", false),
+        ] {
+            let program = program(&format!("fn f(a: i64) -> i64 {{ {body} }}"));
+            let Item::Function(function) = &program.items[0] else {
+                unreachable!()
+            };
+            let mut types = HashMap::new();
+            for event in AstWalk::new(AstEvent::Block(&function.body)) {
+                if let AstEvent::Expr(expression) = event {
+                    types.insert(expression.id(), Type::<String>::I64);
+                }
+            }
+            for i64_arithmetic in [false, true] {
+                for other in [false, true] {
+                    let mut hazards = HazardVisitor {
+                        panics: false,
+                        checked_panics: false,
+                        checked_span: None,
+                        panic_span: None,
+                        expr_types: &types,
+                        overflow_checks: OverflowChecks {
+                            i64_arithmetic,
+                            other,
+                        },
+                    };
+                    hazards.visit_block(&function.body);
+                    let enabled = if arithmetic { i64_arithmetic } else { other };
+                    assert_eq!(hazards.panics, enabled, "{body} {i64_arithmetic} {other}");
+                    assert_eq!(hazards.checked_panics, !enabled);
+                }
+            }
+        }
     }
 
     #[test]
@@ -4177,7 +4236,7 @@ mod tests {
                     checked_span: None,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
-                    overflow_checks,
+                    overflow_checks: overflow_checks.into(),
                 };
                 hazards.visit_block(&function.body);
                 assert_eq!(
@@ -4209,7 +4268,7 @@ mod tests {
                     checked_span: None,
                     panic_span: None,
                     expr_types: &HashMap::<ExprId, Type<TypeId>>::new(),
-                    overflow_checks,
+                    overflow_checks: overflow_checks.into(),
                 };
                 hazards.visit_block(&function.body);
                 assert!(hazards.panics, "{body} overflow_checks={overflow_checks}");
@@ -4238,7 +4297,7 @@ mod tests {
                 checked_span: None,
                 panic_span: None,
                 expr_types: &types,
-                overflow_checks: true,
+                overflow_checks: true.into(),
             };
             hazards.visit_block(&function.body);
             assert_eq!(hazards.panics, panics, "{types:?}");
@@ -4341,7 +4400,7 @@ mod tests {
             &function.body,
             &HashMap::<ExprId, Type>::new(),
             None,
-            true,
+            true.into(),
         );
         assert_eq!(direct.len(), 2);
         assert!(direct[0].lock_span.is_none());
@@ -4365,7 +4424,7 @@ mod tests {
             &old.body,
             &HashMap::<ExprId, Type>::new(),
             None,
-            true,
+            true.into(),
         );
         let mut correspondence = super::super::syntax::Correspondence::default();
         correspondence.reconcile(&before, &mut after).unwrap();
@@ -4415,7 +4474,7 @@ mod tests {
                 &function.body,
                 &types,
                 None,
-                true,
+                true.into(),
             );
             // The first acquisition is the witness; its operand is the whole
             // member chain, not only the field token `target.span()` names.
@@ -4446,7 +4505,7 @@ mod tests {
             &function.body,
             &HashMap::<ExprId, Type>::new(),
             None,
-            true,
+            true.into(),
         );
         let target = direct[0].lock_target.as_ref().unwrap();
         assert!(target.r#type.is_none());
@@ -4480,7 +4539,7 @@ mod tests {
             &old.body,
             &HashMap::<ExprId, Type>::new(),
             None,
-            true,
+            true.into(),
         );
         let mut correspondence = super::super::syntax::Correspondence::default();
         correspondence.reconcile(&before, &mut after).unwrap();
@@ -5505,7 +5564,7 @@ fn quantified_runtime_effect_inventory() {
                 &f.body,
                 &HashMap::<ExprId, Type>::new(),
                 None,
-                true,
+                true.into(),
             ),
             contract_runtime_effects(f),
         );

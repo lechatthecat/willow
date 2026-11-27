@@ -395,10 +395,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     /// Whether `+ - * **` and unary `-` on `i64` are checked for signed
-    /// overflow: debug builds raise a recoverable panic, release builds wrap.
+    /// overflow: enabled checks raise a recoverable panic, disabled checks wrap.
     ///
-    pub(super) fn overflow_checks(&self) -> bool {
-        self.diagnostics.build_mode == BuildMode::Debug
+    pub(super) fn overflow_checks(&self) -> crate::driver::OverflowChecks {
+        self.diagnostics.overflow_checks
     }
 
     /// Signed `+`, `-` or `*` and its overflow flag. Shared by the debug
@@ -446,7 +446,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         (negated, overflowed)
     }
 
-    /// Debug-build `+ - *` on `i64`: raise a recoverable panic on overflow.
+    /// Checked `+ - *` on integers: raise a recoverable panic on overflow.
     pub(super) fn emit_checked_int_binop(
         &mut self,
         op: &BinOp,

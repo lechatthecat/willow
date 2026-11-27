@@ -256,7 +256,7 @@ impl FuncGen<'_, '_> {
         self.builder.block_params(exit_block)[0]
     }
 
-    /// One schedule multiplication. Debug builds guard its overflow flag,
+    /// One schedule multiplication. Enabled checks guard its overflow flag,
     /// masked by `used` when the product may be discarded.
     fn emit_pow_mul(
         &mut self,
@@ -266,7 +266,7 @@ impl FuncGen<'_, '_> {
         layout: IntegerLayout,
         span: Span,
     ) -> Value {
-        if !self.overflow_checks() {
+        if !self.overflow_checks().arithmetic(layout) {
             return self.builder.ins().imul(lhs, rhs);
         }
         let (product, overflowed) =

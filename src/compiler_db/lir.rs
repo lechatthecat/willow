@@ -1,6 +1,7 @@
 //! Body-addressed executable IR. Unit preparation preserves cross-function
 //! optimization; only artifact offsets and symbol bindings remain resident.
 use super::{ids::BodyIndex, lir_artifact::FlatLir, query::QueryTable};
+use crate::driver::OverflowChecks;
 use crate::{
     diagnostics::{Diagnostic, Span},
     ir::{
@@ -55,8 +56,8 @@ pub(crate) struct LirQueries {
     store: Rc<ArtifactStore>,
     units: QueryTable<UnitId, LirUnit>,
     bodies: QueryTable<BodyId, usize>,
-    /// Debug builds check integer overflow.
-    overflow_checks: bool,
+    /// Resolved arithmetic and shift checking policy.
+    overflow_checks: OverflowChecks,
 }
 
 /// Preserve invariant diagnostics at the compiler boundary, including unused
@@ -72,7 +73,7 @@ fn require_complete_facts(diagnostics: &[Diagnostic]) -> Result<()> {
 }
 
 impl LirQueries {
-    pub(crate) fn new(store: Rc<ArtifactStore>, overflow_checks: bool) -> Self {
+    pub(crate) fn new(store: Rc<ArtifactStore>, overflow_checks: OverflowChecks) -> Self {
         Self {
             overflow_checks,
             tracking: Default::default(),
@@ -444,7 +445,7 @@ mod tests {
         let (program, index, mut checker) = check("fn unused() -> i64 { return 1; } fn main() {}");
         checker.expr_types.clear();
         let artifacts = UnitArtifacts::new().unwrap();
-        let queries = LirQueries::new(Rc::clone(&artifacts.store), true);
+        let queries = LirQueries::new(Rc::clone(&artifacts.store), true.into());
         let error = queries
             .lower_unit(
                 UnitId::ENTRY,
@@ -470,7 +471,7 @@ mod tests {
         let expected = lowered::lower_program(&hir);
         let count = expected.functions.len() + expected.lambdas.len();
         let artifacts = UnitArtifacts::new().unwrap();
-        let queries = LirQueries::new(Rc::clone(&artifacts.store), true);
+        let queries = LirQueries::new(Rc::clone(&artifacts.store), true.into());
         let diagnostics = queries
             .lower_unit(UnitId::ENTRY, &program, &index, &tables)
             .unwrap();

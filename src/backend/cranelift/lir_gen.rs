@@ -28,6 +28,7 @@ use super::class_view::ClassTables;
 use super::emit_option_result::ResultSide;
 use super::function_index::FunctionMap;
 use super::{FlatReferenceDebug, ModuleSymbols};
+use crate::driver::OverflowChecks;
 use crate::ir::ir_variants;
 use crate::qualified_name::QualifiedName;
 use crate::semantic::ids::SemanticType as Type;
@@ -231,8 +232,12 @@ fn lir_sync_poll_blocks(f: &LirFunction) -> Vec<bool> {
 /// A bounded scalar early return needs no safepoint. Move the entry poll to
 /// the other branch, including its runtime address/context lookups. Restrict
 /// this to acyclic bodies so loop guards keep their invocation-cached inputs.
-/// Like a division guard, a debug overflow check has a panic path.
-fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool], overflow_checks: bool) -> bool {
+/// Like a division guard, an enabled overflow check has a panic path.
+fn lir_defer_entry_poll(
+    f: &LirFunction,
+    poll: &mut [bool],
+    overflow_checks: OverflowChecks,
+) -> bool {
     use crate::ir::lowered::LirRvalue as V;
     let scalar = |ty: &Type| {
         matches!(
@@ -275,7 +280,7 @@ fn lir_defer_entry_poll(f: &LirFunction, poll: &mut [bool], overflow_checks: boo
         block.instrs.len() <= 8
             && block.instrs.iter().all(|inst| match inst {
                 LirInst::Compute { value, .. } => {
-                    !(overflow_checks && value.has_overflow_check())
+                    !value.has_overflow_check_with(overflow_checks)
                         && match value {
                             V::Use(_) | V::Unary { .. } => true,
                             V::Binary { op, .. } => {
@@ -635,10 +640,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         // A proven inline-only, acyclic leaf cannot consume more stack after
         // its probed prologue. Leave the caller's name in place: a prologue
         // fault occurs before any callee marker could execute in either case.
-        if !super::root_effect::is_safepoint_free_leaf(
-            f,
-            self.diagnostics.build_mode == crate::BuildMode::Debug,
-        ) {
+        if !super::root_effect::is_safepoint_free_leaf(f, self.overflow_checks()) {
             self.emit_stack_helper();
             // For proven runtime-only bodies, every path is dominated by this
             // publication and no body operation changes the helper marker.

@@ -84,7 +84,7 @@ impl CompilerDb {
         dependencies: dependencies::ModuleDependencies,
     ) -> Self {
         let dependencies = std::rc::Rc::new(dependencies);
-        let overflow_checks = inputs.options.target.build_mode == crate::BuildMode::Debug;
+        let overflow_checks = inputs.options.target.resolved_overflow_checks();
         Self {
             source_imports_checked: false,
             prechecks: Default::default(),

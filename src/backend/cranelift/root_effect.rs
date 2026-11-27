@@ -2,6 +2,7 @@
 //!
 //! The live emission-path root count is not a function maximum. Inspect the
 //! complete LIR before binding parameters or emitting the entry snapshot instead.
+use crate::driver::OverflowChecks;
 use crate::ir::ir_variants;
 use crate::ir::lowered::{LirFunction, LirInst, LirOperand, LirRvalue, Terminator};
 use crate::parser::ast::BinOp;
@@ -170,11 +171,14 @@ pub(super) fn may_push_gc_roots(function: &LirFunction) -> bool {
 /// captures read from it. The same instruction set also has
 /// no panic path, so nothing jumps to the panic-return block either.
 ///
-/// Debug builds pass `overflow_checks`: their checked integer arithmetic has
+/// The resolved `overflow_checks` policy determines which integer arithmetic has
 /// a panic path.
 ///
 /// Unknown operations, terminators and parameter modes fail closed.
-pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bool) -> bool {
+pub(super) fn is_safepoint_free_leaf(
+    function: &LirFunction,
+    overflow_checks: OverflowChecks,
+) -> bool {
     if function.is_async || function.params.iter().any(|p| p.by_reference) {
         return false;
     }
@@ -225,7 +229,7 @@ pub(super) fn is_safepoint_free_leaf(function: &LirFunction, overflow_checks: bo
                         ) => false,
                     };
                     operation_is_safe
-                        && !(overflow_checks && value.has_overflow_check())
+                        && !value.has_overflow_check_with(overflow_checks)
                         && value.operands().into_iter().all(LirOperand::is_plain_value)
                 }
                 LirInst::Let { value, ty, .. } => identity(value, ty),
@@ -370,12 +374,15 @@ mod tests {
                     },
                 })
                 .collect();
-            assert!(is_safepoint_free_leaf(&function, true), "blocks={n}");
+            assert!(is_safepoint_free_leaf(&function, true.into()), "blocks={n}");
             function.blocks[n - 1].terminator = Terminator::Jump(BlockId(0));
-            assert!(!is_safepoint_free_leaf(&function, true), "cycle blocks={n}");
+            assert!(
+                !is_safepoint_free_leaf(&function, true.into()),
+                "cycle blocks={n}"
+            );
             function.blocks[n - 1].terminator = Terminator::Jump(BlockId(n));
             assert!(
-                !is_safepoint_free_leaf(&function, true),
+                !is_safepoint_free_leaf(&function, true.into()),
                 "invalid target blocks={n}"
             );
         }
@@ -412,21 +419,21 @@ mod tests {
         };
         for op in [BinOp::Add, BinOp::Sub, BinOp::Mul] {
             let function = leaf(binary(op.clone(), Type::I64));
-            assert!(!is_safepoint_free_leaf(&function, true), "{op:?}");
-            assert!(is_safepoint_free_leaf(&function, false), "{op:?}");
+            assert!(!is_safepoint_free_leaf(&function, true.into()), "{op:?}");
+            assert!(is_safepoint_free_leaf(&function, false.into()), "{op:?}");
         }
         let float = leaf(binary(BinOp::Add, Type::F64));
-        assert!(is_safepoint_free_leaf(&float, true));
+        assert!(is_safepoint_free_leaf(&float, true.into()));
         let compare = leaf(binary(BinOp::Lt, Type::I64));
-        assert!(is_safepoint_free_leaf(&compare, true));
+        assert!(is_safepoint_free_leaf(&compare, true.into()));
         // Negating a constant other than i64::MIN cannot overflow.
         assert!(is_safepoint_free_leaf(
             &leaf(negate(LirOperand::Int(5))),
-            true
+            true.into()
         ));
         assert!(!is_safepoint_free_leaf(
             &leaf(negate(LirOperand::Int(i64::MIN))),
-            true
+            true.into()
         ));
     }
 
@@ -446,9 +453,9 @@ mod tests {
             ty: Type::String,
             source: "p".to_string(),
         }];
-        assert!(is_safepoint_free_leaf(&function, true));
+        assert!(is_safepoint_free_leaf(&function, true.into()));
         function.is_async = true;
-        assert!(!is_safepoint_free_leaf(&function, true));
+        assert!(!is_safepoint_free_leaf(&function, true.into()));
     }
 
     #[test]
@@ -472,14 +479,14 @@ mod tests {
                 })
                 .collect();
             assert!(
-                is_safepoint_free_leaf(&function, true),
+                is_safepoint_free_leaf(&function, true.into()),
                 "shared exit blocks={n}"
             );
             for i in (1..n).step_by(2) {
                 function.blocks[i].terminator = Terminator::Return(None);
             }
             assert!(
-                is_safepoint_free_leaf(&function, true),
+                is_safepoint_free_leaf(&function, true.into()),
                 "many exits blocks={n}"
             );
         }

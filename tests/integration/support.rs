@@ -565,6 +565,16 @@ fn collect_codegen_events(
     release: bool,
     inline_reads: bool,
 ) -> Vec<(String, String)> {
+    collect_codegen_events_with_overflow(source, env, release, inline_reads, None)
+}
+
+pub(super) fn collect_codegen_events_with_overflow(
+    source: &str,
+    env: &[(&str, &str)],
+    release: bool,
+    inline_reads: bool,
+    overflow_checks: Option<bool>,
+) -> Vec<(String, String)> {
     use object::read::{Object, ObjectSection, ObjectSymbol, RelocationTarget};
 
     let id = unique_test_id();
@@ -581,6 +591,9 @@ fn collect_codegen_events(
         .env("WILLOW_KEEP_OBJECT", "1");
     if release {
         command.arg("--release");
+    }
+    if let Some(checks) = overflow_checks {
+        command.arg(format!("--overflow-checks={checks}"));
     }
     for (key, value) in env {
         command.env(key, value);

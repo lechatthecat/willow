@@ -64,6 +64,7 @@ struct CompilerFlags<'a> {
     offline: bool,
     release: bool,
     debug_info: bool,
+    overflow_checks: Option<bool>,
     emit_hir: bool,
     emit_lir: bool,
     runtime_lib: Option<&'a str>,
@@ -81,6 +82,14 @@ impl<'a> CompilerFlags<'a> {
             }
             "--release" => self.release = true,
             "--debug-info" => self.debug_info = true,
+            "--overflow-checks" => {
+                let value = args.next().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "missing value for `--overflow-checks` (expected true or false)"
+                    )
+                })?;
+                self.overflow_checks = Some(Self::parse_overflow_checks(value)?);
+            }
             "--emit-hir" => self.emit_hir = true,
             "--emit-lir" => self.emit_lir = true,
             "--runtime-lib" => {
@@ -90,7 +99,9 @@ impl<'a> CompilerFlags<'a> {
                 self.runtime_lib = Some(path);
             }
             _ => {
-                if let Some(path) = arg.strip_prefix("--runtime-lib=") {
+                if let Some(value) = arg.strip_prefix("--overflow-checks=") {
+                    self.overflow_checks = Some(Self::parse_overflow_checks(value)?);
+                } else if let Some(path) = arg.strip_prefix("--runtime-lib=") {
                     if path.is_empty() {
                         anyhow::bail!("missing value for `--runtime-lib`");
                     }
@@ -101,6 +112,16 @@ impl<'a> CompilerFlags<'a> {
             }
         }
         Ok(true)
+    }
+
+    fn parse_overflow_checks(value: &str) -> Result<bool> {
+        match value {
+            "true" => Ok(true),
+            "false" => Ok(false),
+            _ => anyhow::bail!(
+                "invalid `--overflow-checks` value `{value}` (expected true or false)"
+            ),
+        }
     }
 
     fn finish(self) -> Result<CompilerOptions> {
@@ -120,6 +141,7 @@ impl<'a> CompilerFlags<'a> {
         } else {
             CompilerOptions::debug()
         };
+        options.target.overflow_checks = self.overflow_checks;
         options.target.runtime_lib = self.runtime_lib.map(PathBuf::from);
         options.locked = self.locked;
         options.offline = self.offline;
@@ -678,7 +700,7 @@ fn is_advanced_usage(line: &str) -> bool {
 }
 
 fn detailed_usage() -> &'static str {
-    "Usage:\n  willow version (aliases: --version, -V)\n  willow overview [PATH] [--depth 0|1] [--format human|json|ndjson] [--max-chars N] [--all] [--kind KIND] [--absolute-paths]\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  init preserves existing Git repositories and .gitignore files; outside a repository, run git init in DIR to activate ignore rules. Parent repositories need no nested git init.\n  willow doctor [project-dir] [--format human|json|ndjson]\n  willow rust <check|metadata|tree> [project-dir] [--format human|json|ndjson] [--offline|--locked|--frozen] [--cache-dir DIR]\n  willow rust add NAME@VERSION | NAME --version REQ | NAME --git URL [--rev REV|--tag TAG] | NAME --path DIR [--project-dir DIR] [--format human|json|ndjson]\n  willow rust remove NAME [--project-dir DIR] [--format human|json|ndjson]\n  willow rust update [NAME] [--breaking] [--dry-run] [--project-dir DIR] [--format human|json|ndjson]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow rename SELECTOR NEW_NAME [--dry-run [--diff] [--max-chars N]] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose] [--warnings]\n  rename --dry-run reports files / edits (declarations, references) / collisions / unresolved; add --diff for unified diffs.\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow query rust-bridge [SYMBOL] [--project-dir DIR] [--format json]\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  Semantic --max-chars N is opt-in; counts Unicode characters including the final newline. Whole human entries, JSON fields/array elements are retained; omitted counts describe output items. Caps too small for omission metadata fail on stderr with empty stdout.\n  Semantic commands count checker warnings instead of printing them (JSON diagnostics.warnings; one human stderr note); --warnings prints them. Errors are always printed.\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow tidy [--project-dir DIR] [--format human|json|ndjson] (report only)\n  willow outdated [--project-dir DIR] [--format human|json|ndjson] (requires network)\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--runtime-lib <path>]"
+    "Usage:\n  willow version (aliases: --version, -V)\n  willow overview [PATH] [--depth 0|1] [--format human|json|ndjson] [--max-chars N] [--all] [--kind KIND] [--absolute-paths]\n  willow agent instructions <codex|claude> [--format human|json]\n  willow agent sync [--yes]\n  willow init [DIR] [--name NAME]\n  init preserves existing Git repositories and .gitignore files; outside a repository, run git init in DIR to activate ignore rules. Parent repositories need no nested git init.\n  willow doctor [project-dir] [--format human|json|ndjson]\n  willow rust <check|metadata|tree> [project-dir] [--format human|json|ndjson] [--offline|--locked|--frozen] [--cache-dir DIR]\n  willow rust add NAME@VERSION | NAME --version REQ | NAME --git URL [--rev REV|--tag TAG] | NAME --path DIR [--project-dir DIR] [--format human|json|ndjson]\n  willow rust remove NAME [--project-dir DIR] [--format human|json|ndjson]\n  willow rust update [NAME] [--breaking] [--dry-run] [--project-dir DIR] [--format human|json|ndjson]\n  willow metadata [project-dir] [--format human|json|ndjson]\n  Package commands accept --format human|json|ndjson (default human).\n  willow edit prepare --root DIR --entry main.wi [--project] --requests edits.json [--changes full|diff]\n  willow edit preview --root DIR --transaction ID [--changes full|diff]\n  willow edit <validate|apply|recover> --root DIR --transaction ID\n  willow rename SELECTOR NEW_NAME [--dry-run [--diff] [--max-chars N]] [--source FILE | --project-dir DIR] [--format human|json|ndjson] [--verbose] [--warnings]\n  rename --dry-run reports files / edits (declarations, references) / collisions / unresolved; add --diff for unified diffs.\n  willow impact <source.wi|project-dir> (--file PATH --byte N | --function ID --revision REV) [--direction callers|callees] [--max-nodes N] [--max-depth N]\n  willow query rust-bridge [SYMBOL] [--project-dir DIR] [--format json]\n  willow query <source.wi|project-dir> --requests queries.json\n  willow refs SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow references SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow symbol SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow type SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow effects SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  willow impact SELECTOR [--project-dir DIR | --source FILE] [--format human|json|ndjson] [--kind KIND] [--module MODULE] [--all] [--explain] [--show-id] [--absolute-paths] [--max-chars N] [--warnings]\n  Semantic --max-chars N is opt-in; counts Unicode characters including the final newline. Whole human entries, JSON fields/array elements are retained; omitted counts describe output items. Caps too small for omission metadata fail on stderr with empty stdout.\n  Semantic commands count checker warnings instead of printing them (JSON diagnostics.warnings; one human stderr note); --warnings prints them. Errors are always printed.\n  willow check <source.wi|project-dir> [--format human|ndjson]\n  willow build <source.wi|project-dir> [--format human|ndjson] [--protocol-version 1]\n  willow add [alias] --git URL [--version REQ] [--dry-run] [--project-dir DIR]\n  willow add [alias] --path DIR [--dry-run] [--project-dir DIR]\n  willow add URL [--dry-run] [--project-dir DIR]\n  willow remove alias [--dry-run] [--project-dir DIR]\n  willow update [alias] [--breaking] [--dry-run] [--project-dir DIR]\n  willow tidy [--project-dir DIR] [--format human|json|ndjson] (report only)\n  willow outdated [--project-dir DIR] [--format human|json|ndjson] (requires network)\n  willow deps tree [--project-dir DIR]\n  willow deps why <alias|package-name> [--project-dir DIR]\n  willow package verify [PATH] [--format human|json|ndjson]\n  willow build <source.wi|project-dir> [-o <output>] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--overflow-checks true|false] [--emit-hir] [--emit-lir] [--runtime-lib <path>]\n  willow run [source.wi|project-dir] [--locked|--offline|--frozen] [--debug|--release] [--debug-info] [--overflow-checks true|false] [--runtime-lib <path>] [-- <args>...]\n  willow fetch [project-dir] [--locked|--offline|--frozen] [--format human|json|ndjson]\n  willow debug <source.wi> [--overflow-checks true|false] [--runtime-lib <path>]"
 }
 
 fn stem(path: &str) -> String {
@@ -951,6 +973,56 @@ mod tests {
         };
         assert_eq!(command.source, "main.wi");
         assert_eq!(command.program_args, ["a", "--release"]);
+    }
+
+    #[test]
+    fn overflow_checks_cli_modes_overrides_and_errors() {
+        for command in ["build", "run", "debug"] {
+            for (flags, release, checks) in [
+                (vec![], false, None),
+                (vec!["--overflow-checks=true"], false, Some(true)),
+                (vec!["--overflow-checks", "false"], false, Some(false)),
+                (
+                    vec!["--overflow-checks=true", "--release"],
+                    true,
+                    Some(true),
+                ),
+                (
+                    vec!["--release", "--overflow-checks=false"],
+                    true,
+                    Some(false),
+                ),
+            ] {
+                if command == "debug" && release {
+                    continue;
+                }
+                let mut input = vec![command, "main.wi"];
+                input.extend(flags);
+                let parsed = CliCommand::parse(&mut args(&input).iter()).unwrap();
+                let options = match parsed {
+                    CliCommand::Build(c) => c.options,
+                    CliCommand::Run(c) => c.options,
+                    CliCommand::Debug(c) => c.options,
+                    _ => panic!("unexpected command"),
+                };
+                assert_eq!(options.target.overflow_checks, checks);
+                assert_eq!(
+                    options.target.build_mode == willow_compiler::BuildMode::Release,
+                    release
+                );
+            }
+        }
+        for flags in [
+            vec!["--overflow-checks"],
+            vec!["--overflow-checks="],
+            vec!["--overflow-checks=yes"],
+            vec!["--overflow-checks", "1"],
+        ] {
+            let mut input = vec!["build", "main.wi"];
+            input.extend(flags);
+            let err = CliCommand::parse(&mut args(&input).iter()).err().unwrap();
+            assert!(err.to_string().contains("--overflow-checks"), "{err}");
+        }
     }
 
     #[test]

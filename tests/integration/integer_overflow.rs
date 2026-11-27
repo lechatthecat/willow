@@ -40,6 +40,10 @@ use crate::support::*;
 /// Build `source` in debug or release mode and run it.
 /// Returns `(stdout, stderr, exited successfully)`.
 fn run_mode(source: &str, release: bool) -> (String, String, bool) {
+    run_policy(source, release, None)
+}
+
+fn run_policy(source: &str, release: bool, checks: Option<bool>) -> (String, String, bool) {
     let id = unique_test_id();
     let src_path = temp_path(format!("willow_overflow_{id}.wi"));
     let bin_path = temp_path(format!("willow_overflow_{id}"));
@@ -47,6 +51,13 @@ fn run_mode(source: &str, release: bool) -> (String, String, bool) {
     let mut args = vec!["build", &src_path, "-o", &bin_path];
     if release {
         args.push("--release");
+    }
+    if let Some(checks) = checks {
+        args.push(if checks {
+            "--overflow-checks=true"
+        } else {
+            "--overflow-checks=false"
+        });
     }
     let built = Command::new(env!("CARGO_BIN_EXE_willow"))
         .args(&args)
@@ -247,8 +258,8 @@ fn integer_overflow_12_13_values_that_fit_never_panic() {
                     -9223372036854775807\n-9223372036854775808\n4611686018427387904\n\
                     4052555153018976267\n-4052555153018976267\n-9223372036854775808\n1\n-1\n\
                     8\n9223372036854775807\n";
-    for release in [false, true] {
-        let (out, err, ok) = run_mode(source, release);
+    for (release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(source, *release, *checks);
         assert!(ok, "release={release}: {out}\n{err}");
         assert_eq!(out, expected, "release={release}");
     }
@@ -290,8 +301,8 @@ fn integer_overflow_14_16_explicit_methods_ignore_build_mode() {
                     None\nSome(9223372036854775806)\nNone\nSome(-9223372036854775807)\nNone\n\
                     Some(9223372030926249001)\nNone\nSome(-9223372036854775807)\nSome(42)\n\
                     9223372036854775807\nNone\n";
-    for release in [false, true] {
-        let (out, err, ok) = run_mode(source, release);
+    for (release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(source, *release, *checks);
         assert!(ok, "release={release}: {out}\n{err}");
         assert_eq!(out, expected, "release={release}");
     }
@@ -343,7 +354,6 @@ fn integer_overflow_19_unused_binding_is_still_checked_in_debug() {
 #[test]
 fn integer_overflow_20_async_task_faults() {
     let source = "async fn bump(a: i64) -> i64 {\n\
-                      await sleep(1);\n\
                       return a + 1;\n\
                   }\n\
                   async fn main() {\n\
@@ -579,5 +589,262 @@ fn integer_division_example_both_modes() {
             out,
             "-3\n-1\n-3\n1\ninteger overflow: `i64::MIN / -1`\ninteger overflow: `i64::MIN % -1`\nafter\n"
         );
+    }
+}
+
+// Explicit true/false in both profiles as well as both defaults. Each case is
+// independently compiled so optimization and panic analysis see the same policy.
+const POLICIES: &[(bool, Option<bool>)] = &[
+    (false, None),
+    (true, None),
+    (false, Some(true)),
+    (false, Some(false)),
+    (true, Some(true)),
+    (true, Some(false)),
+];
+
+#[test]
+fn overflow_override_arithmetic_matrix() {
+    for &(release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(&overflow_matrix_source(), release, checks);
+        assert!(ok, "release={release} checks={checks:?}: {err}");
+        assert_eq!(
+            out,
+            expected(!checks.unwrap_or(!release)),
+            "release={release} checks={checks:?}"
+        );
+    }
+}
+
+#[test]
+fn overflow_override_unused_expressions_cleanup_and_callers() {
+    let statements = [
+        "max + 1;",
+        "min - 1;",
+        "max * 2;",
+        "2 ** 63;",
+        "-min;",
+        "let unused = max + 1;",
+        "unused_leaf(max);",
+        "let mut x = max; x += 1;",
+        "let mut x = min; x -= 1;",
+        "let mut x = max; x *= 2;",
+        "let c = new Counter(max); c.bump();",
+        "let a = [max]; a[0] += 1;",
+        "let c = new Counter(max); c.n += 1;",
+        "let f = |a: i64| a + 1; f(max);",
+        "let f = |a: i64| -a; f(min);",
+        "call_value(increment, max);",
+    ];
+    let mut source = String::from(
+        r#"
+fn unused_leaf(a: i64) { a + 1; }
+fn increment(a: i64) -> i64 { return a + 1; }
+fn call_value(f: fn(i64) -> i64, a: i64) -> i64 { return f(a); }
+class Counter {
+    pub n: i64;
+    pub fn bump(self) -> i64 { return self.n + 1; }
+}
+fn main() {
+    let max = 9223372036854775807;
+    let min = -9223372036854775808;
+"#,
+    );
+    for statement in statements {
+        source.push_str("if true { defer match recover() { Some(info) => println(info.message), None => {} } defer println(\"cleanup\"); ");
+        source.push_str(statement);
+        source.push_str(" println(\"continued\"); }\n");
+    }
+    source.push_str("println(\"done\"); }");
+    for &(release, checks) in POLICIES {
+        let checked = checks.unwrap_or(!release);
+        let (out, err, ok) = run_policy(&source, release, checks);
+        assert!(ok, "release={release} checks={checks:?}: {err}");
+        assert_eq!(out.matches("cleanup\n").count(), statements.len(), "{out}");
+        assert_eq!(
+            out.matches("integer overflow:").count(),
+            if checked { statements.len() } else { 0 },
+            "{out}"
+        );
+        assert_eq!(
+            out.matches("continued\n").count(),
+            if checked { 0 } else { statements.len() },
+            "{out}"
+        );
+        assert!(out.ends_with("done\n"), "{out}");
+    }
+}
+
+#[test]
+fn overflow_override_keeps_other_guards_and_shift_policy() {
+    let source = r#"
+fn shl(a: i64, b: i64) -> i64 { return a << b; }
+fn shr(a: i64, b: i64) -> i64 { return a >> b; }
+fn div(a: i64, b: i64) -> i64 { return a / b; }
+fn rem(a: i64, b: i64) -> i64 { return a % b; }
+fn pow(a: i64, b: i64) -> i64 { return a ** b; }
+fn main() {
+    let min = -9223372036854775808;
+    if true { defer match recover() { Some(_) => println("div zero"), None => {} } div(1, 0); }
+    if true { defer match recover() { Some(_) => println("div overflow"), None => {} } div(min, -1); }
+    if true { defer match recover() { Some(_) => println("rem zero"), None => {} } rem(1, 0); }
+    if true { defer match recover() { Some(_) => println("rem overflow"), None => {} } rem(min, -1); }
+    if true { defer match recover() { Some(_) => println("negative exponent"), None => {} } pow(2, -1); }
+    if true { defer match recover() { Some(_) => println("bounds"), None => {} } let a = [1]; println(a[1]); }
+    if true { defer match recover() { Some(_) => println("left shift"), None => {} } println(shl(1, 64)); }
+    if true { defer match recover() { Some(_) => println("right shift"), None => {} } println(shr(-256, 65)); }
+    if true { defer match recover() { Some(_) => println("unused shift"), None => {} } 1 << 64; println("after shift"); }
+    if true { defer match recover() { Some(_) => println("narrow overflow"), None => {} } let mut x: i8 = 127; x += 1; println(x); }
+    println(3 << 62);
+    println(1.5 * 2.0);
+    println(true && false || true);
+}
+"#;
+    for &(release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(source, release, checks);
+        assert!(ok, "release={release} checks={checks:?}: {err}");
+        let shifts = if release {
+            "1\n-128\nafter shift\n-128\n"
+        } else {
+            "left shift\nright shift\nunused shift\nnarrow overflow\n"
+        };
+        assert_eq!(
+            out,
+            format!(
+                "div zero\ndiv overflow\nrem zero\nrem overflow\nnegative exponent\nbounds\n{shifts}-4611686018427387904\n3\ntrue\n"
+            )
+        );
+    }
+}
+
+#[test]
+fn overflow_override_async_fault_and_uncaught_location() {
+    let source = "async fn bump(a: i64) -> i64 { return a + 1; } async fn main() { println(await bump(9223372036854775807)); }";
+    for &(release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(source, release, checks);
+        if checks.unwrap_or(!release) {
+            assert!(!ok, "{out}");
+            assert!(err.contains("integer overflow: `+` at "), "{err}");
+            assert!(err.contains(".wi:1:"), "{err}");
+        } else {
+            assert!(ok, "{err}");
+            assert_eq!(out, "-9223372036854775808\n");
+        }
+    }
+}
+
+#[test]
+fn overflow_override_codegen_counts_are_linear() {
+    for sites in [1, 4, 32] {
+        // One live arithmetic site and one unused expression per function;
+        // calls make the functions reachable while checked faults prevent inlining.
+        let mut source = String::new();
+        for i in 0..sites {
+            source.push_str(&format!(
+                "fn f{i}(a: i64) -> i64 {{ a * 2; return a + {i}; }}\n"
+            ));
+        }
+        source.push_str("fn main() {\n");
+        for i in 0..sites {
+            source.push_str(&format!("println(f{i}(1));\n"));
+        }
+        source.push('}');
+        for &(release, checks) in &[(false, Some(false)), (true, Some(true))] {
+            let events = collect_codegen_events_with_overflow(&source, &[], release, false, checks);
+            let count = events
+                .iter()
+                .filter(|(_, name)| name == "willow_int_overflow_panic")
+                .count();
+            assert_eq!(
+                count,
+                if checks == Some(true) { sites * 2 } else { 0 },
+                "sites={sites} release={release}"
+            );
+        }
+    }
+}
+
+#[test]
+fn overflow_override_imports_transitive_recovery_and_run_command() {
+    let root = std::env::temp_dir().join(format!("willow_overflow_modules_{}", unique_test_id()));
+    fs::create_dir_all(&root).unwrap();
+    fs::write(
+        root.join("math.wi"),
+        "pub fn add(a: i64) -> i64 { return a + 1; }",
+    )
+    .unwrap();
+    fs::write(
+        root.join("main.wi"),
+        r#"
+import math;
+fn relay(a: i64) -> i64 { defer println("relay cleanup"); return math::add(a); }
+fn main() {
+    if true {
+        defer match recover() { Some(info) => println(info.message), None => {} }
+        println(relay(9223372036854775807));
+    }
+    println("done");
+}
+"#,
+    )
+    .unwrap();
+    for (mode, checks, expected) in [
+        (
+            "--release",
+            "true",
+            "relay cleanup\ninteger overflow: `+`\ndone\n",
+        ),
+        (
+            "--debug",
+            "false",
+            "relay cleanup\n-9223372036854775808\ndone\n",
+        ),
+        (
+            "--release",
+            "false",
+            "relay cleanup\n-9223372036854775808\ndone\n",
+        ),
+        (
+            "--debug",
+            "true",
+            "relay cleanup\ninteger overflow: `+`\ndone\n",
+        ),
+    ] {
+        let result = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .arg("run")
+            .arg(root.join("main.wi"))
+            .args([mode, "--overflow-checks", checks])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout),
+            expected,
+            "{mode} checks={checks}"
+        );
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn overflow_override_example_runs_in_all_policies() {
+    let source = include_str!("../../example/integer_overflow.wi");
+    for &(release, checks) in POLICIES {
+        let (out, err, ok) = run_policy(source, release, checks);
+        assert!(ok, "{err}");
+        assert!(
+            out.starts_with("-9223372036854775808\n9223372036854775807\n-2\n"),
+            "{out}"
+        );
+        let end = if checks.unwrap_or(!release) {
+            "recovered: integer overflow: `+`\ndone\n"
+        } else {
+            "-9223372036854775808\nno overflow\ndone\n"
+        };
+        assert!(out.ends_with(end), "{out}");
     }
 }

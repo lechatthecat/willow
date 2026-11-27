@@ -5,6 +5,7 @@
 //! overflowing `+ - * **` or negation is such a fault in debug builds and
 //! wraps in release builds; folding is build-mode
 //! independent, so it leaves both for the backend.
+use crate::driver::OverflowChecks;
 mod devirtualize;
 mod recursive_inline;
 mod string_concat;
@@ -843,11 +844,11 @@ fn inline_scalar_type(ty: &Type) -> bool {
 /// Inline only bounded, single-block scalar leaves. No allocation, calls,
 /// faults, loops, references, or cleanup can cross this transformation.
 /// Keeping the expansion budget small also bounds work between safepoints.
-/// With `overflow_checks` (debug builds), checked integer arithmetic is such a
+/// With arithmetic checks enabled, checked integer arithmetic is such a
 /// fault: its call stack must name the callee.
 pub(crate) fn inline_scalar_leaves(
     functions: &mut [super::lowered::SourceFunction],
-    overflow_checks: bool,
+    overflow_checks: OverflowChecks,
 ) {
     // Whole-program resolution flattened aggregate constructors after the
     // per-function pass. Eliminate those before selecting scalar callees.
@@ -862,7 +863,10 @@ pub(crate) fn inline_scalar_leaves(
         operations: Vec<(LirLocalId, LirRvalue, Type, crate::diagnostics::Span)>,
         result: LirOperand,
     }
-    fn candidate(function: &super::lowered::SourceFunction, overflow_checks: bool) -> Option<Leaf> {
+    fn candidate(
+        function: &super::lowered::SourceFunction,
+        overflow_checks: OverflowChecks,
+    ) -> Option<Leaf> {
         if function.is_async
             || function.blocks.len() != 1
             || !function.captures.is_empty()
@@ -888,7 +892,7 @@ pub(crate) fn inline_scalar_leaves(
         for instruction in &block.instrs {
             match instruction {
                 SourceInst::Compute { local, value, span } => {
-                    if overflow_checks && value.has_overflow_check() {
+                    if value.has_overflow_check_with(overflow_checks) {
                         return None;
                     }
                     match value {
@@ -1306,7 +1310,7 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let (hir, errors) = crate::ir::lower::lower_program(&ast);
         assert!(errors.is_empty(), "{errors:?}");
-        super::super::lowered::lower_source_program_with(&hir, overflow_checks)
+        super::super::lowered::lower_source_program_with(&hir, overflow_checks.into())
     }
 
     fn count_computes(
@@ -1345,6 +1349,36 @@ fn fits() -> i64 { return (9223372036854775806 + 1) * 1 - 0 + (0 - 2) ** 63 - (0
             assert_eq!(count_computes(&program, name, arithmetic), 1, "{name}");
         }
         assert_eq!(count_computes(&program, "fits", arithmetic), 0);
+    }
+
+    #[test]
+    fn overflow_override_inlining_keeps_only_enabled_faults() {
+        use super::super::lowered::LirRvalue;
+        let source = "fn add(a: i64) -> i64 { return a + 1; } fn shift(a: i64) -> i64 { return a << a; } fn main() { println(add(1)); println(shift(2)); }";
+        let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
+        let (ast, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let (hir, errors) = crate::ir::lower::lower_program(&ast);
+        assert!(errors.is_empty(), "{errors:?}");
+        for i64_arithmetic in [false, true] {
+            for other in [false, true] {
+                let policy = crate::driver::OverflowChecks {
+                    i64_arithmetic,
+                    other,
+                };
+                let program = super::super::lowered::lower_source_program_with(&hir, policy);
+                for (callee, enabled) in [("add", i64_arithmetic), ("shift", other)] {
+                    assert_eq!(
+                        count_computes(
+                            &program,
+                            "main",
+                            |value| matches!(value, LirRvalue::DirectCall { callee: c, .. } if c.is_free_named(callee))
+                        ),
+                        usize::from(enabled)
+                    );
+                }
+            }
+        }
     }
 
     #[test]

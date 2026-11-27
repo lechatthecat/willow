@@ -3,6 +3,8 @@
 // A debug build (the default) checks `+`, `-`, `*`, `**` and prefix `-` on
 // `i64` and panics on overflow; `willow build --release` wraps instead. The
 // explicit methods below behave the same way in both builds.
+// Override with --overflow-checks=true (also in release) or
+// --overflow-checks=false (also in debug). See README.md for the full setting and scope.
 
 fn add(a: i64, b: i64) -> i64 {
     return a + b;
@@ -35,7 +37,7 @@ fn main() {
     println(show(min.checked_neg()));
     println(show(7.checked_mul(6)));
 
-    // Plain operators panic on overflow in a debug build. The panic is
+    // Plain operators panic when overflow checks are enabled. The panic is
     // recoverable, like division by zero.
     if true {
         defer match recover() {

@@ -124,6 +124,7 @@ pub(crate) fn configuration(
             json!({
                 "locked": options.locked, "offline": options.offline,
                 "release": options.target.build_mode == crate::BuildMode::Release,
+                "overflow_checks": options.target.overflow_checks,
                 "debug_info": options.target.emit_debug_info,
                 "source_map": options.target.emit_source_map,
                 "strip": options.target.strip_symbols,
@@ -282,6 +283,28 @@ mod tests {
         std::fs::remove_file(root.join("rust-review.toml")).unwrap();
         assert!(!capture().iter().any(|(key, _)| key == &node));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn overflow_override_invalidates_configuration() {
+        let mut inputs =
+            CompilerInputs::native(crate::CompilerOptions::debug(), PathBuf::from("root"));
+        let entry = Path::new("root/main.wi");
+        let mut table = TrackedQueryTable::default();
+        table
+            .replace_inputs(configuration(&inputs, entry, None).unwrap())
+            .unwrap();
+        for checks in [Some(false), Some(true), None] {
+            inputs.options.target.overflow_checks = checks;
+            let after = configuration(&inputs, entry, None).unwrap();
+            let changed: Vec<_> = after
+                .iter()
+                .filter(|entry| !table.matches_inputs(std::slice::from_ref(*entry)))
+                .map(|(node, _)| node.clone())
+                .collect();
+            assert_eq!(changed, [InputNode::Options]);
+            table.replace_inputs(after).unwrap();
+        }
     }
 
     #[test]

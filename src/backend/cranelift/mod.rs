@@ -155,6 +155,7 @@ pub struct BuildCodegenDb {
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
     build_mode: BuildMode,
+    overflow_checks: crate::driver::OverflowChecks,
     /// Source call frames and statement sites for panic stacks: debug builds
     /// and release builds with `--debug-info`.
     call_trace: bool,
@@ -219,6 +220,7 @@ pub struct UnitCodegenContext<'a> {
     body_queries: Option<std::rc::Rc<crate::compiler_db::body::BodyQueries>>,
     layout_queries: std::rc::Rc<crate::compiler_db::layout::LayoutQueries>,
     build_mode: BuildMode,
+    overflow_checks: crate::driver::OverflowChecks,
     /// Source call frames and statement sites for panic stacks: debug builds
     /// and release builds with `--debug-info`.
     call_trace: bool,
@@ -426,6 +428,7 @@ impl Codegen {
                 body_queries: None,
                 layout_queries: layouts,
                 build_mode: opts.target.build_mode,
+                overflow_checks: opts.target.resolved_overflow_checks(),
                 call_trace: opts.target.build_mode == BuildMode::Debug
                     || opts.target.emit_debug_info,
                 enum_infos: TypeMap::with_scope(type_scope.clone()),
@@ -748,7 +751,7 @@ impl UnitCodegenContext<'_> {
                 .lir_queries
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("missing LIR query session"))?;
-            let overflow_checks = self.build_mode == BuildMode::Debug;
+            let overflow_checks = self.overflow_checks;
             if let Some(queries) = &self.body_queries {
                 for (expr, child) in queries.index().child_lambdas(body) {
                     let name = *self.lambda_body_names.get(&child).ok_or_else(|| {
@@ -818,7 +821,7 @@ impl UnitCodegenContext<'_> {
                 (function.name, function)
             })
             .collect();
-        let overflow_checks = self.build_mode == BuildMode::Debug;
+        let overflow_checks = self.overflow_checks;
         for lambda in lir.lambdas {
             if root_effect::is_safepoint_free_leaf(&lambda.function, overflow_checks) {
                 self.leaf_lambdas.insert(lambda.id);
@@ -1577,6 +1580,7 @@ struct FunctionDiagnostics<'a> {
     fault_site_span: Option<crate::diagnostics::Span>,
     /// Build mode for debug checks and instrumentation.
     build_mode: BuildMode,
+    overflow_checks: crate::driver::OverflowChecks,
     /// Publish source call frames and statement sites (see `Codegen`).
     call_trace: bool,
     /// Source file path used in runtime diagnostics.
@@ -1801,6 +1805,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 lir_reference_scopes: Vec::new(),
                 fault_site_span: None,
                 build_mode: unit.build_mode,
+                overflow_checks: unit.overflow_checks,
                 call_trace: unit.call_trace,
                 source_file: &unit.source_file,
                 diagnostic_function: String::new(),

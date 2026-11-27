@@ -147,6 +147,33 @@ cargo build --release
 
 See [installation and toolchain requirements](RELEASE_README.md).
 
+## Integer overflow checks
+
+Willow checks `i64` arithmetic overflow in debug builds (the default) and wraps
+in release builds. Override that choice independently of optimization:
+
+```sh
+willow run example/integer_overflow.wi --release --overflow-checks=true
+willow run example/integer_overflow.wi --debug --overflow-checks=false
+```
+
+`build`, `run`, and `debug` accept `--overflow-checks=true|false` or
+`--overflow-checks true|false`. The last explicit value wins, regardless of flag
+order. The library setting is `options.target.overflow_checks: Option<bool>`;
+`None` uses the profile default, including wrapping for `release_with_debug_info()`.
+
+The setting covers `i64` `+`, `-`, `*`, `**`, unary `-`, and `+=`, `-=`, `*=`
+on locals, fields and array elements, across all compiled Willow modules.
+Enabled checks raise the usual recoverable `integer overflow` panic with source
+location and run `defer`; disabled checks wrap in two's complement. Unused
+expressions still panic when checks are enabled. There is no `**=` operator.
+
+`wrapping_*` and `checked_*` methods retain their explicit behavior. Division,
+remainder, negative integer exponents, and array bounds retain their guards.
+Shift amounts and other integer widths retain their debug/release policies.
+Floating-point arithmetic, native Rust dependencies, and debug information are
+unchanged. See the runnable [example](example/integer_overflow.wi).
+
 ## A taste of Willow
 
 ```willow

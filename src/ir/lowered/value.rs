@@ -455,6 +455,21 @@ pub fn is_overflow_checked_unary(op: &UnaryOp, operand: &LirOperand, ty: &Type) 
 }
 
 impl LirRvalue {
+    /// Whether the resolved policy gives this operation an overflow fault path.
+    pub(crate) fn has_overflow_check_with(&self, checks: crate::driver::OverflowChecks) -> bool {
+        let enabled = match self {
+            Self::Binary {
+                op: BinOp::Shl | BinOp::Shr,
+                ..
+            } => checks.other,
+            Self::Binary { operand_ty: ty, .. } | Self::Unary { ty, .. } => ty
+                .integer_layout()
+                .is_some_and(|layout| checks.arithmetic(layout)),
+            _ => false,
+        };
+        enabled && self.has_overflow_check()
+    }
+
     /// Whether debug overflow checks give this operation a fault path.
     pub fn has_overflow_check(&self) -> bool {
         match self {

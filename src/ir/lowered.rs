@@ -22,6 +22,7 @@
 //! Unsupported lowering is diagnosed; `--emit-lir` renders the final program.
 
 use crate::diagnostics::Span;
+use crate::driver::OverflowChecks;
 use crate::parser::ast::{ExprId, LockMode};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
 use crate::semantic::ids::{FunctionId, SemanticType as Type, TypeId};
@@ -708,15 +709,14 @@ thread_local! {
 /// `Class::method`) of a typed-HIR program to basic blocks, with debug-build
 /// overflow checks (the conservative choice for callers without a mode).
 pub(crate) fn lower_source_program(program: &HirProgram) -> SourceProgram {
-    lower_source_program_with(program, true)
+    lower_source_program_with(program, true.into())
 }
 
-/// `overflow_checks` is set for debug builds, whose checked integer
-/// arithmetic is a fault that leaf/recursive inlining must not move across a
-/// call-stack frame.
+/// The resolved policy determines which integer arithmetic is a fault that
+/// leaf/recursive inlining must not move across a call-stack frame.
 pub(crate) fn lower_source_program_with(
     program: &HirProgram,
-    overflow_checks: bool,
+    overflow_checks: OverflowChecks,
 ) -> SourceProgram {
     let resolution = LoweringDeclarations::new(&program.resolution);
     let mut functions = Vec::with_capacity(program.functions.len());

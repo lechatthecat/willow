@@ -922,9 +922,12 @@ impl UnitCodegenContext<'_> {
                 }
                 _ => super::indirect_leaf::LeafOwner::Function(id),
             };
-            if let Some(leaf) =
-                super::indirect_leaf::Leaf::analyze(function, self.func_ids[name], owner)
-            {
+            if let Some(leaf) = super::indirect_leaf::Leaf::analyze(
+                function,
+                self.func_ids[name],
+                owner,
+                self.overflow_checks,
+            ) {
                 self.indirect_leaves.insert(leaf);
             }
         }
@@ -2049,11 +2052,8 @@ impl UnitCodegenContext<'_> {
         fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // A safepoint-free leaf neither roots its GC parameters nor reaches
         // the panic-return block.
-        let unrooted = !is_main
-            && super::root_effect::is_safepoint_free_leaf(
-                &lir_fn,
-                fg.diagnostics.build_mode == BuildMode::Debug,
-            );
+        let unrooted =
+            !is_main && super::root_effect::is_safepoint_free_leaf(&lir_fn, fg.overflow_checks());
         if !unrooted {
             fg.begin_root_reservation();
         }
@@ -2928,10 +2928,7 @@ impl UnitCodegenContext<'_> {
         fg.locals.address_taken = super::lir_address_taken_locals(&lir_fn);
         // Instance methods bind a rooted `self`, even for scalar bodies, unless
         // the body can never reach a safepoint.
-        let unrooted = super::root_effect::is_safepoint_free_leaf(
-            &lir_fn,
-            fg.diagnostics.build_mode == BuildMode::Debug,
-        );
+        let unrooted = super::root_effect::is_safepoint_free_leaf(&lir_fn, fg.overflow_checks());
         if !unrooted {
             fg.begin_root_reservation();
         }

@@ -48,6 +48,7 @@ impl Leaf {
         function: &LirFunction,
         target: FuncId,
         owner: LeafOwner,
+        overflow_checks: crate::driver::OverflowChecks,
     ) -> Option<Self> {
         let scalar = |ty: &Type| {
             matches!(
@@ -93,6 +94,11 @@ impl Leaf {
         for instruction in &block.instrs {
             match instruction {
                 LirInst::Compute { local, value, .. } => {
+                    // Expansion emits plain scalar operators without a panic
+                    // frame. Keep enabled overflow faults in the original body.
+                    if value.has_overflow_check_with(overflow_checks) {
+                        return None;
+                    }
                     match value {
                         LirRvalue::Use(_) | LirRvalue::Unary { .. } => {}
                         LirRvalue::Binary { op, .. }

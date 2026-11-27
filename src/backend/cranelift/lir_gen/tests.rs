@@ -913,7 +913,7 @@ fn bounded_scalar_return_defers_poll_but_preserves_recursive_path() {
         &["fib"],
     );
     let mut poll = lir_sync_poll_blocks(&f);
-    assert!(lir_defer_entry_poll(&f, &mut poll, false));
+    assert!(lir_defer_entry_poll(&f, &mut poll, false.into()));
     assert!(!poll[0]);
     let mut pending = vec![0];
     let mut visited = HashSet::new();
@@ -946,7 +946,10 @@ fn entry_poll_stays_before_faults_cleanup_and_cycles() {
         let (f, _) = lir_fn_and_tables(source, "f", &["f"]);
         let mut poll = lir_sync_poll_blocks(&f);
         let original = poll.clone();
-        assert!(!lir_defer_entry_poll(&f, &mut poll, false), "{source}");
+        assert!(
+            !lir_defer_entry_poll(&f, &mut poll, false.into()),
+            "{source}"
+        );
         assert_eq!(poll, original);
     }
 }
@@ -960,9 +963,9 @@ fn entry_poll_stays_before_debug_overflow_checks() {
     );
     let mut poll = lir_sync_poll_blocks(&f);
     let original = poll.clone();
-    assert!(!lir_defer_entry_poll(&f, &mut poll, true));
+    assert!(!lir_defer_entry_poll(&f, &mut poll, true.into()));
     assert_eq!(poll, original);
-    assert!(lir_defer_entry_poll(&f, &mut poll, false));
+    assert!(lir_defer_entry_poll(&f, &mut poll, false.into()));
     assert!(!poll[0]);
 }
 

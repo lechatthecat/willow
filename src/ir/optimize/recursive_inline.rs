@@ -1,5 +1,6 @@
 //! Bounded expansion of small, pure self-recursive scalar functions.
 //! Calls still execute in source order; no memoization or reassociation occurs.
+use crate::driver::OverflowChecks;
 use std::collections::{HashMap, HashSet};
 
 use crate::ir::lowered::{
@@ -9,10 +10,13 @@ use crate::ir::lowered::{
 use crate::ir::typed_ast::{HirExpr, HirExprKind};
 use crate::parser::ast::BinOp;
 
-/// With `overflow_checks` (debug builds), checked integer arithmetic is a
+/// With arithmetic checks enabled, checked integer arithmetic is a
 /// fault whose call stack must keep every recursive frame.
 #[allow(clippy::too_many_lines, reason = "split pending")]
-pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_checks: bool) {
+pub(crate) fn inline_scalar_recursion(
+    function: &mut SourceFunction,
+    overflow_checks: OverflowChecks,
+) {
     const MAX_DEPTH: u32 = 3;
     const MAX_INSTRUCTIONS: usize = 256;
     const MAX_BLOCKS: usize = 64;
@@ -56,7 +60,7 @@ pub(crate) fn inline_scalar_recursion(function: &mut SourceFunction, overflow_ch
                     if value.operands().iter().any(|op| !op.is_plain_value()) {
                         return;
                     }
-                    if overflow_checks && value.has_overflow_check() {
+                    if value.has_overflow_check_with(overflow_checks) {
                         return;
                     }
                     match value {
