@@ -302,6 +302,14 @@ The CLI provides `effects`, `impact`, `refs`, `type`, `symbol`, `rename` and
 - <a id="exact-rename-change-a-symbol-preserve-unrelated-names"></a>**Exact rename** edits resolved occurrences and validates the candidate. It covers supported symbols in the loaded project, not strings or external consumers. Preview with `willow rename SELECTOR NEW_NAME --dry-run --diff`; see [rename tests](tests/semantic_rename.rs).
 - <a id="what-an-agent-can-trust"></a>**Effect evidence:** `MAY` has a witness, `UNKNOWN` retains a conservative capability without one, and `NONE` has neither a witness nor uncertainty in the modeled analysis. Missing evidence is not purity. See the [effect-state example](example/effect_states.wi).
 - <a id="compare-scalar-contracts-across-an-edit"></a>**Contract comparisons** do not prove behavioral equivalence. `contract_preserved` does not imply `implementation_verified`; approval requires an independently trusted policy verifier. See [comparison](example/contract_comparison.wi), [repair](example/contract_repair.wi) and [contract comparison tests](tests/contract_comparison_cli.rs).
+  The caller supplies `--protected-base COMMIT`, `--approval-evidence FILE` and
+  `--approval-verifier EXTERNAL_EXECUTABLE`. Choose a trusted verifier outside the
+  editable checkout: its location alone does not authenticate it. The verifier
+  must authenticate the evidence and complete request binding, exit successfully
+  within 10 seconds, and return exactly
+  `{"schema":"willow.contract-approval.v1","approved":true,"binding":<request binding>}`.
+  The `CI` environment variable is neither required nor used as a trust signal.
+
 - <a id="what-needs-language-semantics-and-what-lspmcp-can-provide"></a>**LSP/MCP** can expose semantic results, but the underlying language/analyzer establishes the guarantees. The transport alone does not establish lock safety or proof validity.
 
 ### How this relates to other approaches

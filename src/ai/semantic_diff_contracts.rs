@@ -41,31 +41,15 @@ fn consistent(inputs: &tree::Tree, actual: &comparison::Lock) -> Result<bool> {
         .map(|v| v.unwrap_or(true))
         .map_err(Into::into)
 }
-/// A trusted CI wrapper supplies the verifier executable, never project config.
-/// The verifier independently authenticates the evidence and protected revision.
+/// The caller supplies a trusted verifier executable, never project config.
+/// Trust comes from that verifier authenticating the evidence and protected
+/// revision, not from environment variables or the executable's location alone.
 /// Its exact JSON response must bind the complete request and approve it.
 fn approval(policy: &Policy, root: &Path, binding: &Value) -> Result<bool> {
-    approval_in_context(
-        policy,
-        root,
-        binding,
-        std::env::var("CI").is_ok_and(|v| v == "true"),
-    )
-}
-fn approval_in_context(
-    policy: &Policy,
-    root: &Path,
-    binding: &Value,
-    trusted_ci: bool,
-) -> Result<bool> {
     let (Some(verifier), Some(evidence)) = (&policy.approval_verifier, &policy.approval_evidence)
     else {
         return Ok(false);
     };
-    ensure!(
-        trusted_ci,
-        "approval verification requires trusted CI invocation"
-    );
     let verifier = std::fs::canonicalize(verifier)?;
     ensure!(
         !verifier.starts_with(root),
@@ -76,14 +60,15 @@ fn approval_in_context(
         std::fs::metadata(&evidence)?.len() <= 65536,
         "approval evidence exceeds limit"
     );
-    let mut child = std::process::Command::new(verifier)
-        .arg(&evidence)
-        .arg(serde_json::to_string(binding)?)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-    let output = child.stdout.take().context("approval verifier output")?;
+    let child = shared_child::SharedChild::spawn(
+        std::process::Command::new(verifier)
+            .arg(&evidence)
+            .arg(serde_json::to_string(binding)?)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null()),
+    )?;
+    let output = child.take_stdout().context("approval verifier output")?;
     let (tx, rx) = std::sync::mpsc::sync_channel(1);
     std::thread::spawn(move || {
         use std::io::Read;
@@ -91,18 +76,7 @@ fn approval_in_context(
         let result = output.take(65537).read_to_end(&mut bytes).map(|_| bytes);
         let _ = tx.send(result);
     });
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("approval verifier timed out");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    };
+    let status = wait_for_approval(&child)?;
     ensure!(status.success(), "approval verifier rejected evidence");
     let bytes = rx
         .recv_timeout(std::time::Duration::from_secs(1))
@@ -115,6 +89,31 @@ fn approval_in_context(
     Ok(response
         == json!({"schema":"willow.contract-approval.v1","approved":true,"binding":binding}))
 }
+// SharedChild permits a blocking wait and timeout kill concurrently without PID
+// reuse races. Disable its optional SIGCHLD timeout machinery: a scoped waiter
+// needs no process-wide signal handler and is joined on every return path.
+fn wait_for_approval(child: &shared_child::SharedChild) -> Result<std::process::ExitStatus> {
+    std::thread::scope(|scope| {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let waiter = std::thread::Builder::new().spawn_scoped(scope, move || {
+            let _ = tx.send(child.wait());
+        });
+        if let Err(error) = waiter {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error.into());
+        }
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(status) => Ok(status?),
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                anyhow::bail!("approval verifier timed out");
+            }
+        }
+    })
+}
+
 pub fn verify(options: &Options, policy: &Policy) -> Result<SemanticDiff> {
     let root = std::fs::canonicalize(&options.root)?;
     let before = tree::base_inputs(&root, &options.base, true)?;

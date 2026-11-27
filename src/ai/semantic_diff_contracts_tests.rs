@@ -121,8 +121,7 @@ fn contract_policy_external_verifier_binding_and_fail_closed() {
     set_script(
         "printf '{\"schema\":\"willow.contract-approval.v1\",\"approved\":true,\"binding\":%s}' \"$1\"",
     );
-    assert!(approval_in_context(&policy, &workspace.0, &binding, true).unwrap());
-    assert!(approval_in_context(&policy, &workspace.0, &binding, false).is_err());
+    assert!(approval(&policy, &workspace.0, &binding).unwrap());
     let untrusted = workspace.0.join("untrusted-verifier");
     fs::write(&untrusted, "fixture").unwrap();
     let untrusted_policy = Policy {
@@ -130,18 +129,221 @@ fn contract_policy_external_verifier_binding_and_fail_closed() {
         approval_verifier: Some(untrusted),
         ..Default::default()
     };
-    assert!(approval_in_context(&untrusted_policy, &workspace.0, &binding, true).is_err());
-    let mut replay = binding.clone();
-    replay["target_tree"] = json!("stale");
-    let response = json!({"schema":"willow.contract-approval.v1","approved":true,"binding":replay});
-    set_script(&format!("printf '%s' '{}'", response));
-    assert!(!approval_in_context(&policy, &workspace.0, &binding, true).unwrap());
+    assert!(approval(&untrusted_policy, &workspace.0, &binding).is_err());
+    for field in binding.as_object().unwrap().keys() {
+        let mut replay = binding.clone();
+        replay[field] = json!("stale");
+        let response =
+            json!({"schema":"willow.contract-approval.v1","approved":true,"binding":replay});
+        set_script(&format!("printf '%s' '{}'", response));
+        assert!(
+            !approval(&policy, &workspace.0, &binding).unwrap(),
+            "{field}"
+        );
+    }
+    for response in [
+        json!({"schema":"willow.contract-approval.v1","approved":false,"binding":binding}),
+        json!({"schema":"wrong","approved":true,"binding":binding}),
+        json!({"schema":"willow.contract-approval.v1","approved":true,"binding":binding,"extra":true}),
+    ] {
+        set_script(&format!("printf '%s' '{}'", response));
+        assert!(!approval(&policy, &workspace.0, &binding).unwrap());
+    }
     set_script("exit 1");
-    assert!(approval_in_context(&policy, &workspace.0, &binding, true).is_err());
+    assert!(approval(&policy, &workspace.0, &binding).is_err());
     set_script("printf '{}'");
-    assert!(!approval_in_context(&policy, &workspace.0, &binding, true).unwrap());
+    assert!(!approval(&policy, &workspace.0, &binding).unwrap());
     set_script("printf 'invalid'");
-    assert!(approval_in_context(&policy, &workspace.0, &binding, true).is_err());
+    assert!(approval(&policy, &workspace.0, &binding).is_err());
+}
+
+// Re-execute a single test so changing CI never mutates the parallel test
+// process's environment. Exercise the real approval entry point in each child.
+#[test]
+#[cfg(unix)]
+fn contract_policy_ci_environment_is_not_trust_signal() {
+    for ci in [None, Some("false"), Some("true"), Some("arbitrary")] {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "ai::verify::semantic_diff::contracts::tests::contract_policy_external_verifier_binding_and_fail_closed",
+        ]);
+        command.env_remove("CI");
+        if let Some(value) = ci {
+            command.env("CI", value);
+        }
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "CI={ci:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+}
+
+#[test]
+fn contract_policy_missing_verifier_or_evidence_cannot_approve() {
+    let workspace = tree::Scratch::new().unwrap();
+    for policy in [
+        Policy::default(),
+        Policy {
+            approval_verifier: Some("missing".into()),
+            ..Default::default()
+        },
+        Policy {
+            approval_evidence: Some("missing".into()),
+            ..Default::default()
+        },
+    ] {
+        assert!(!approval(&policy, &workspace.0, &json!({})).unwrap());
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn contract_policy_verifier_input_and_output_limits() {
+    let workspace = tree::Scratch::new().unwrap();
+    let external = tree::Scratch::new().unwrap();
+    let evidence = external.0.join("verifier.sh");
+    let policy = Policy {
+        approval_verifier: Some("/bin/sh".into()),
+        approval_evidence: Some(evidence.clone()),
+        ..Default::default()
+    };
+    let response =
+        json!({"schema":"willow.contract-approval.v1","approved":true,"binding":{}}).to_string();
+    // Exactly the limit remains valid; one byte over must fail closed. Output
+    // padding also exceeds pipe capacity, exercising concurrent bounded reads.
+    for length in [65536, 65537] {
+        let script = format!(
+            "printf '%s' '{response}'; printf '%{}s' ''\n",
+            length - response.len()
+        );
+        fs::write(&evidence, script).unwrap();
+        let result = approval(&policy, &workspace.0, &json!({}));
+        if length == 65536 {
+            assert!(result.unwrap());
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "approval verifier output exceeds limit"
+            );
+        }
+        let mut script = format!("printf '%s' '{response}'\n#");
+        script.extend(std::iter::repeat_n('x', length - script.len()));
+        fs::write(&evidence, script).unwrap();
+        let result = approval(&policy, &workspace.0, &json!({}));
+        if length == 65536 {
+            assert!(result.unwrap());
+        } else {
+            assert_eq!(
+                result.unwrap_err().to_string(),
+                "approval evidence exceeds limit"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn contract_policy_growing_bindings_invoke_verifier_once() {
+    let workspace = tree::Scratch::new().unwrap();
+    let external = tree::Scratch::new().unwrap();
+    let evidence = external.0.join("verifier.sh");
+    fs::write(
+        &evidence,
+        r#"printf x >> "$0.count"
+printf '{"schema":"willow.contract-approval.v1","approved":true,"binding":%s}' "$1"
+"#,
+    )
+    .unwrap();
+    let policy = Policy {
+        approval_verifier: Some("/bin/sh".into()),
+        approval_evidence: Some(evidence),
+        ..Default::default()
+    };
+    for (index, size) in [1, 32, 256].into_iter().enumerate() {
+        let binding = json!({"changes": vec!["change"; size]});
+        assert!(approval(&policy, &workspace.0, &binding).unwrap());
+        assert_eq!(
+            fs::read(external.0.join("verifier.sh.count"))
+                .unwrap()
+                .len(),
+            index + 1
+        );
+        println!("binding_items={size} verifier_invocations=1");
+    }
+}
+
+#[test]
+fn contract_policy_wait_child() {
+    match std::env::var("WILLOW_APPROVAL_WAIT_TEST").as_deref() {
+        Ok("success") => (),
+        Ok("reject") => std::process::exit(7),
+        Ok("block") => {
+            // Parent keeps the pipe open without writing. No timing assumption:
+            // the verifier wait must kill this process at its real deadline.
+            use std::io::Read;
+            std::io::stdin().read_exact(&mut [0]).unwrap();
+            panic!("blocked verifier unexpectedly received input");
+        }
+        _ => (),
+    }
+}
+
+#[test]
+fn contract_policy_blocking_wait_exit_and_ten_second_timeout() {
+    for mode in ["success", "reject", "block"] {
+        let child = shared_child::SharedChild::spawn(
+            Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "ai::verify::semantic_diff::contracts::tests::contract_policy_wait_child",
+                ])
+                .env("WILLOW_APPROVAL_WAIT_TEST", mode)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null()),
+        )
+        .unwrap();
+        let started = std::time::Instant::now();
+        let result = wait_for_approval(&child);
+        match mode {
+            "success" => assert!(result.unwrap().success()),
+            "reject" => assert_eq!(result.unwrap().code(), Some(7)),
+            _ => {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    "approval verifier timed out"
+                );
+                assert!(started.elapsed() >= std::time::Duration::from_secs(10));
+                assert!(
+                    !child
+                        .try_wait()
+                        .unwrap()
+                        .expect("verifier must be reaped")
+                        .success()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn contract_policy_closed_stdout_still_obeys_verifier_timeout() {
+    let workspace = tree::Scratch::new().unwrap();
+    let external = tree::Scratch::new().unwrap();
+    let evidence = external.0.join("verifier.sh");
+    // The timer is the behavior under test. exec keeps the timeout target and
+    // sleeper the same process; closing stdout must not count as process exit.
+    fs::write(&evidence, "exec 1>&-; exec sleep 60\n").unwrap();
+    let policy = Policy {
+        approval_verifier: Some("/bin/sh".into()),
+        approval_evidence: Some(evidence),
+        ..Default::default()
+    };
+    let started = std::time::Instant::now();
+    let error = approval(&policy, &workspace.0, &json!({})).unwrap_err();
+    assert_eq!(error.to_string(), "approval verifier timed out");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(10));
 }
 
 #[test]
