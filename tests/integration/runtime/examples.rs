@@ -76,6 +76,10 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/owned_class_task_loans.wi", "11\n13\n23\n14\n"),
         ("example/owned_task_loans.wi", "11\n13\n23\n1\n"),
         ("example/ownership_transfer.wi", "42\n7\n"),
+        ("example/shared_object_safety.wi", "3\n8\n11\n"),
+        ("example/lock_coupling.wi", "6\n6\n"),
+        ("example/semantic_dispatch_effects.wi", "1\n2\ndone\n"),
+        ("example/semantic_type_parameters.wi", "5\nba\n7\nT\n"),
         ("tests/regressions/parallel_allocation_scaling.wi", "true\n"),
         (
             "tests/regressions/permanent_wait_escapes.wi",
@@ -1596,6 +1600,16 @@ fn runnable_project_example_cases() -> &'static [ProjectExampleCase] {
 // use their existing path dependencies without pretending to test crates.io.
 fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
+        (
+            "example/rust_blocking_pool",
+            "example/rust_blocking_pool/src/main.wi",
+            "42\n42\n",
+        ),
+        (
+            "example/rust_foreign_region",
+            "example/rust_foreign_region/src/main.wi",
+            "42\nunknown input survives\n42\nblocking input survives\n",
+        ),
         (
             "example/rust_interop_queries",
             "example/rust_interop_queries/src/main.wi",

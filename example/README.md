@@ -43,6 +43,14 @@ its bases) lets `self` escape, for example by calling an overridable method,
 because that method may read the subclass fields. See
 `constructor_self_use.wi`.
 
+## Sharing mutable objects
+
+For safe shared mutation, see [shared_object_safety.wi](shared_object_safety.wi):
+share a mutex, transfer a channel payload, or await an exclusive local loan.
+If a program receives E2402/E2408, follow the
+[ownership migration guidance](../README.md#e2402-async-calls-capture-only-shareable-or-exclusively-lent-values).
+The boundary-witness diagnostics do not change which programs are accepted.
+
 ## Synchronous helpers in tasks
 
 A task can call an ordinary synchronous helper, including loops and recursion,

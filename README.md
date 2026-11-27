@@ -229,6 +229,41 @@ indirect calls use conservative candidates. See [loan examples](example/owned_ta
 [ownership transfer](example/ownership_transfer.wi), [capture tests](tests/integration/concurrency/capture_checking.rs)
 and [static sharing checks](src/semantic/type_checker/static_sharing.rs).
 
+**Shared mutable objects.** The compiler uses structural capabilities and
+exclusive ownership checks, rather than a runtime race detector. Calling an
+`async fn` creates a task (there is no `spawn` keyword). A mutable object cannot
+be shared with another task through arguments, captured closures, channels, or
+containing fields while retaining unprotected access. This includes reads that
+could overlap a write. Diagnostics identify the unsupported boundary or alias
+use; conflicting loans and reuse after transfer also point to the earlier
+ownership boundary. A witness describes a conservative source-level conflict,
+not a schedule observed at runtime.
+
+Share `Mutex<T>` for mutable state, appropriate `RwLock<T>` or atomic values,
+or structurally immutable/frozen data. Sending a non-`Sync` object through a
+channel transfers ownership: neither the sender nor any connected alias may
+keep using it. Receiving yields an owned value. A fresh local object can instead
+be lent to one task; its aliases become usable after the task's unconditional
+`await` in the block that lent it. Independent task-local mutation is allowed.
+Protected references must stay inside their lexical lock. See the runnable
+[shared-object example](example/shared_object_safety.wi).
+
+To migrate rejected code, move construction inside each task, wrap the object
+once and share its mutex, send an owned value and stop using sender aliases, or
+send a frozen snapshot. For sequential work, await the exclusive loan before
+reusing any alias. An opaque factory needs a checked `@sending` return contract
+to establish freshness. Branches, loops, unknown callees and escaping aliases
+are analyzed conservatively, so some race-free programs need these changes.
+Task-local callable values do not gain sharing permission merely because the
+scheduler is configured with one worker.
+
+These checks cover the compiler's modeled Willow heap and task boundaries;
+they do not verify handwritten Rust adapters, native threads, raw native aliases,
+or foreign implementations of the ABI. Native code must uphold its declarations
+and the runtime's ownership and synchronization contracts. The compiler, GC and
+runtime remain part of the trusted implementation. No claim of detecting every
+race in arbitrary native or interoperating code is made.
+
 <a id="sending-after-channel-close"></a>
 
 **Closed channels.** Sending after close raises a recoverable panic; accepted

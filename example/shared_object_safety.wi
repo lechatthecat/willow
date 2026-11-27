@@ -1,0 +1,39 @@
+// Share the lock; transfer channel payloads; lend local objects until await.
+class Counter {
+    pub value: i64;
+    pub fn add(self, amount: i64) { self.value += amount; }
+}
+
+async fn add(shared: Mutex<Counter>, amount: i64) {
+    lock shared as counter { counter.add(amount); }
+}
+
+async fn receive(channel: Channel<Counter>) -> i64 {
+    let counter = channel.recv();
+    counter.add(1);
+    return counter.value;
+}
+
+async fn lend(counter: Counter) { counter.add(1); }
+
+async fn main() {
+    let shared = Mutex::new(new Counter(0));
+    let first = add(shared, 1);
+    let second = add(shared, 2);
+    await first;
+    await second;
+    lock shared as counter { println(counter.value); }
+
+    let channel: Channel<Counter> = Channel::new();
+    let receiver = receive(channel);
+    let outgoing = new Counter(7);
+    channel.send(outgoing);
+    // outgoing belongs to the receiver now; use its returned scalar result.
+    println(await receiver);
+
+    let local = new Counter(10);
+    let alias = local;
+    await lend(local);
+    // All local aliases become available again after the exclusive loan ends.
+    println(alias.value);
+}

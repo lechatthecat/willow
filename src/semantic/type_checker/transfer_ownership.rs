@@ -62,6 +62,10 @@ struct OwnershipState {
     /// unconditional in the same block instance ends a loan started there.
     regions: Vec<(usize, usize)>,
     loan_errors: Vec<(Span, &'static str)>,
+    /// One source location per boundary and one causal edge per reported use.
+    /// Index once; never search all loans/transfers while formatting an error.
+    boundary_spans: HashMap<(usize, usize), Span>,
+    witnesses: HashMap<Span, Span>,
     /// This body is a `@sending fn`: each returned value must be fresh.
     sending_return: bool,
     sending_returns: Vec<(usize, Span)>,
@@ -424,6 +428,19 @@ impl TypeChecker {
         let mut diagnostics = Vec::new();
         let mut lock_escapes = LockEscapes::default();
         let mut moved = HashMap::new();
+        for index in 0..state.graph.transfers.len() {
+            let (id, tick, _, span) = state.graph.transfers[index];
+            let root = state.graph.root(id);
+            state.boundary_spans.entry((root, tick)).or_insert(span);
+        }
+        for loan in &state.loans {
+            let root = state.graph.root(loan.value);
+            // Distinct payloads can cross in the same call at the same tick.
+            state
+                .boundary_spans
+                .entry((root, loan.start))
+                .or_insert(loan.span);
+        }
         for (id, tick, loop_id, span) in std::mem::take(&mut state.graph.transfers) {
             let root = state.graph.root(id);
             if self.local.current_async_context && state.graph.loan_borrowed[root] {
@@ -438,7 +455,10 @@ impl TypeChecker {
                 Some("cannot transfer a non-Sync value whose alias may have escaped")
             } else if state.graph.origins[root] != loop_id {
                 Some("cannot transfer an outer non-Sync value in a repeated loop")
-            } else if moved.contains_key(&root) {
+            } else if let Some(tick) = moved.get(&root) {
+                state
+                    .witnesses
+                    .insert(span, state.boundary_spans[&(root, *tick)]);
                 Some("non-Sync value is transferred more than once")
             } else {
                 None
@@ -461,6 +481,10 @@ impl TypeChecker {
                     && *start < tick
                     && tick < *end
                 {
+                    state
+                        .witnesses
+                        .entry(span)
+                        .or_insert(state.boundary_spans[&(root, *start)]);
                     state.loan_errors.push((
                         span,
                         if *elsewhere {
@@ -471,7 +495,11 @@ impl TypeChecker {
                     ));
                 }
             }
-            if moved.get(&root).is_some_and(|moved| tick > *moved) {
+            if let Some(moved) = moved.get(&root).filter(|moved| tick > **moved) {
+                state
+                    .witnesses
+                    .entry(span)
+                    .or_insert(state.boundary_spans[&(root, *moved)]);
                 if intervals.contains_key(&root) {
                     state.loan_errors.push((
                         span,
@@ -536,13 +564,13 @@ impl TypeChecker {
                 let diagnostic = self
                     .task_loan_failure(ty, span, reason)
                     .with_help(loan_help(reason));
-                self.push(diagnostic);
+                self.push(with_boundary_witness(diagnostic, &state.witnesses));
                 continue;
             }
-            self.push(Diagnostic::new(Severity::Error, ErrorCode::E2402, reason)
+            self.push(with_boundary_witness(Diagnostic::new(Severity::Error, ErrorCode::E2402, reason)
                 .with_label(Label::primary(span, "exclusive task access cannot be established"))
                 .with_note("this value is not `Sync`; even immediately awaited calls require proof of exclusive access")
-                .with_help(loan_help(reason)));
+                .with_help(loan_help(reason)), &state.witnesses));
         }
         #[cfg(test)]
         {
@@ -591,7 +619,7 @@ impl TypeChecker {
                 diagnostic = diagnostic
                     .with_note(format!("{dependent} later {uses} not reported separately"));
             }
-            self.push(diagnostic);
+            self.push(with_boundary_witness(diagnostic, &state.witnesses));
         }
     }
 
@@ -1087,7 +1115,11 @@ fn loan_intervals(
         if ranges.last().map(|r| (r.0, r.1)) == Some((start, end)) {
             continue;
         }
-        if ranges.last().is_some_and(|(_, end, _)| start < *end) {
+        if let Some((previous, _, _)) = ranges.last().filter(|(_, end, _)| start < *end) {
+            state
+                .witnesses
+                .entry(span)
+                .or_insert(state.boundary_spans[&(value, *previous)]);
             state
                 .loan_errors
                 .push((span, "non-Sync value already has an outstanding task loan"));
@@ -1095,6 +1127,23 @@ fn loan_intervals(
         ranges.push((start, end, elsewhere));
     }
     intervals
+}
+
+fn with_boundary_witness(
+    mut diagnostic: Diagnostic,
+    witnesses: &HashMap<Span, Span>,
+) -> Diagnostic {
+    if let Some(primary) = diagnostic.primary_span()
+        && let Some(origin) = witnesses.get(&primary)
+        && origin.file_id == primary.file_id
+        && *origin != primary
+    {
+        diagnostic = diagnostic.with_label(Label::secondary(
+            *origin,
+            "earlier ownership boundary for this value or a connected alias",
+        ));
+    }
+    diagnostic
 }
 
 /// Repair advice for a rejected task loan, specific to its reason.

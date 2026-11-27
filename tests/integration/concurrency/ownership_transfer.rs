@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn shared_access_example_runs() {
+    let (out, ok) = compile_and_run(include_str!("../../../example/shared_object_safety.wi"));
+    assert!(ok, "{out}");
+    assert_eq!(out, "3\n8\n11\n");
+}
+
+#[test]
+fn shared_access_cli_reports_causal_boundary() {
+    for (body, code) in [
+        (
+            "let c = new Cell(0); let t = change(c); c.set(2); await t;",
+            "E2402",
+        ),
+        (
+            "let ch: Channel<Cell> = Channel::new(); let c = new Cell(0); ch.send(c); c.set(2);",
+            "E2408",
+        ),
+        (
+            "let h = new Holder(new Cell(0)); let t = nested(h); h.cell.set(2); await t;",
+            "E2402",
+        ),
+    ] {
+        let source = format!(
+            "class Cell {{ pub n: i64; pub fn set(self, n: i64) {{ self.n = n; }} }}
+            class Holder {{ pub cell: Cell; }}
+            async fn change(c: Cell) {{ c.set(1); }}
+            async fn nested(h: Holder) {{ h.cell.set(1); }}
+            async fn main() {{ {body} }}"
+        );
+        let (ok, diagnostic) = compile_with_data_race_check(&source);
+        assert!(!ok && diagnostic.contains(code), "{diagnostic}");
+        assert!(
+            diagnostic.contains("earlier ownership boundary"),
+            "{diagnostic}"
+        );
+    }
+}
+
+#[test]
 fn ownership_transfer_rejects_original_alias_routes() {
     for body in [
         "let b = new Box(0); let m = Mutex::new(b); b.set(1);",
