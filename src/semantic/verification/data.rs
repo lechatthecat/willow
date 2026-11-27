@@ -46,6 +46,7 @@ pub(super) fn sort(ty: &Type) -> VerificationResult<String> {
         | Type::U8
         | Type::I64 => Ok("Int".into()),
         Type::Bool => Ok("Bool".into()),
+        Type::String => Ok("String".into()),
         Type::Named(_) => Ok(format!("D{}", type_key(ty))),
         _ if frozen_element(ty).is_some() => Ok(format!("D{}", type_key(ty))),
         _ => Err(Unsupported.error("mutable or unsupported verification type")),
@@ -58,6 +59,11 @@ pub(super) fn domain(ty: &Type, value: &str) -> String {
             "(or (and (<= 0 {value}) (<= {value} 55295)) (and (<= 57344 {value}) (<= {value} 1114111)))"
         ),
         Type::Bool => "true".into(),
+        // Literals map one byte to one SMT character. Symbolic strings use a
+        // larger alphabet: a conservative superset for equality and length.
+        // Restricting that alphabet is unnecessary for sound proofs here and
+        // can exhaust the solver budget on otherwise simple loop invariants.
+        Type::String => format!("(<= (str.len {value}) 9223372036854775807)"),
         _ => format!("(valid_{} {value})", type_key(ty)),
     }
 }
@@ -73,6 +79,7 @@ pub(super) fn default_value(ty: &Type) -> String {
         | Type::U8
         | Type::I64 => "0".into(),
         Type::Bool => "false".into(),
+        Type::String => "\"\"".into(),
         _ => format!("default_{}", type_key(ty)),
     }
 }
@@ -132,6 +139,7 @@ impl DataTypes<'_> {
                 | Type::U8
                 | Type::I64
                 | Type::Bool
+                | Type::String
         ) {
             return Ok(());
         }
@@ -287,6 +295,7 @@ impl DataTypes<'_> {
                 | Type::U8
                 | Type::I64
                 | Type::Bool
+                | Type::String
         ) || self.constructors.contains_key(ty)
         {
             Ok(())

@@ -18,6 +18,18 @@ impl Value {
         }
     }
 }
+/// Escape every UTF-8 byte, including quotes, backslashes and NUL. Encoding
+/// literals as byte strings makes str.len agree with Willow's byte length.
+fn byte_string(value: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(value.len().saturating_mul(6).saturating_add(2));
+    out.push('"');
+    for byte in value.bytes() {
+        write!(out, "\\u{{{byte:02x}}}").expect("write to String");
+    }
+    out.push('"');
+    out
+}
 pub(super) fn integer(n: impl Into<i128>) -> String {
     let n = n.into();
     if n < 0 {
@@ -231,6 +243,7 @@ impl<'a> Encoder<'a> {
                             | Type::U8
                             | Type::I64
                             | Type::Bool
+                            | Type::String
                     )
             }
             BinOp::And | BinOp::Or => l.boolean && r.boolean,
@@ -285,6 +298,7 @@ impl<'a> Encoder<'a> {
                 ty: Type::Char,
             }),
             Expr::Bool(b, ..) => Ok(Value::literal(b.to_string(), true)),
+            Expr::String(s, ..) => self.typed_node(byte_string(s), &Type::String),
             Expr::Var(n, ..) => {
                 if let Some(v) = state.env.get(n) {
                     return Ok(v.clone());
@@ -347,28 +361,27 @@ impl<'a> Encoder<'a> {
             }
             Expr::MethodCall(c) if c.args.is_empty() => {
                 use crate::semantic::intrinsics::{Intrinsic, MethodName};
-                // A declared length has the historical receiver diagnostic, but
-                // only a checked frozen-array intrinsic can emit its SMT selector.
-                let frozen = match self.data.calls {
-                    Some(calls) => match calls.get(&c.id) {
-                        Some(Intrinsic::FrozenArrayLen) => true,
-                        Some(
-                            Intrinsic::StringLen | Intrinsic::MapLen | Intrinsic::FrozenMapLen,
-                        ) => false,
-                        None if c.method.kind() == MethodName::Len => false,
-                        _ => return Err(Unsupported.error("unsupported expression in i64/bool V1")),
-                    },
-                    None if c.method.kind() == MethodName::Len => true,
-                    None => return Err(Unsupported.error("unsupported expression in i64/bool V1")),
-                };
+                // Check resolved intrinsic identity before encoding a length.
+                // Unchecked comparison/test ASTs additionally check the receiver type.
+                let intrinsic = self.data.calls.map(|calls| calls.get(&c.id).copied());
                 let object = self.expr(&c.object, state, gate)?;
-                if !frozen || frozen_element(&object.ty).is_none() {
-                    return Err(Unsupported.error("len requires immutable FrozenArray"));
+                if c.method.kind() == MethodName::Len {
+                    if object.ty == Type::String
+                        && intrinsic.is_none_or(|i| i == Some(Intrinsic::StringLen))
+                    {
+                        return self.node(format!("(str.len {})", object.text), false);
+                    }
+                    if frozen_element(&object.ty).is_some()
+                        && intrinsic.is_none_or(|i| i == Some(Intrinsic::FrozenArrayLen))
+                    {
+                        return self.node(
+                            format!("(len_{} {})", type_key(&object.ty), object.text),
+                            false,
+                        );
+                    }
+                    return Err(Unsupported.error("len requires immutable FrozenArray or String"));
                 }
-                self.node(
-                    format!("(len_{} {})", type_key(&object.ty), object.text),
-                    false,
-                )
+                Err(Unsupported.error("unsupported verification method"))
             }
             Expr::Match(m) => self.match_expr(m, state, gate, expected),
             Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => {

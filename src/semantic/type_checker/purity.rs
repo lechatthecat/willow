@@ -659,7 +659,8 @@ impl TypeChecker {
             | Type::Char
             | Type::U8
             | Type::I64
-            | Type::Bool => true,
+            | Type::Bool
+            | Type::String => true,
             Type::Generic(name, args) if Builtin::from_name(name) == Some(Builtin::FrozenArray) => {
                 args.len() == 1 && self.verification_immutable_type_at(&args[0], cache, depth + 1)
             }
@@ -937,9 +938,11 @@ impl TypeChecker {
                 }
             }
             for target in &sites.targets {
-                // The frozen container length cannot change, even when its
-                // elements are outside the immutable proof-data subset.
-                if *target == crate::semantic::intrinsics::Intrinsic::FrozenArrayLen.function_id() {
+                // String and frozen-container lengths cannot change, even when
+                // array elements are outside the immutable proof-data subset.
+                if *target == crate::semantic::intrinsics::Intrinsic::FrozenArrayLen.function_id()
+                    || *target == crate::semantic::intrinsics::Intrinsic::StringLen.function_id()
+                {
                     continue;
                 }
                 let target_local = self.effect_index.local_target(*target);

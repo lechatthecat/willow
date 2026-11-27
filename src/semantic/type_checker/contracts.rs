@@ -56,6 +56,7 @@ impl TypeChecker {
                     let allowed = match expr {
                         Expr::Integer(..)
                         | Expr::Char(..)
+                        | Expr::String(..)
                         | Expr::Float(..)
                         | Expr::Bool(..)
                         | Expr::Binary(_)
@@ -70,10 +71,13 @@ impl TypeChecker {
                             .iter()
                             .all(|arm| matches!(arm.body, MatchBody::Expr(_))),
                         Expr::MethodCall(c) => {
-                            self.builtin_calls.get(&c.id) == Some(&Intrinsic::FrozenArrayLen)
-                                && self.expr_types.get(&c.object.id()).is_some_and(|ty| {
-                                    self.verification_immutable_type(ty, immutable)
-                                })
+                            matches!(
+                                self.builtin_calls.get(&c.id),
+                                Some(Intrinsic::FrozenArrayLen | Intrinsic::StringLen)
+                            ) && self
+                                .expr_types
+                                .get(&c.object.id())
+                                .is_some_and(|ty| self.verification_immutable_type(ty, immutable))
                         }
                         Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => true,
                         Expr::Var(name, ..) => {

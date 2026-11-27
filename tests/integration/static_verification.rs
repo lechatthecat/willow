@@ -332,3 +332,68 @@ fn main(){let a=[1,2,3].freeze();let b=[9].freeze();println(boundaries());printl
         assert_eq!(output, "0\n3\n3\n2\n");
     }
 }
+
+#[test]
+fn verified_string_example_and_runtime_counterexample_both_modes() {
+    let source = include_str!("../../example/verified_strings.wi");
+    for (output, ok) in [compile_and_run(source), compile_and_run_release(source)] {
+        assert!(ok, "{output}");
+        assert_eq!(output, "unknown\n雪🌲\ntrue\nfalse\n7\n3\n0\n");
+    }
+    // Replay a concrete solver candidate at the runtime contract boundary.
+    let wrong = r#"@pure fn f(s:String)->String requires s=="x" ensures result=="y" {return s;} fn main(){println(f("x"));}"#;
+    for release in [false, true] {
+        let id = unique_test_id();
+        let path = temp_path(format!("string_counterexample_{id}.wi"));
+        let binary = temp_path(format!("string_counterexample_{id}"));
+        fs::write(&path, wrong).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_willow"));
+        command.args(["build", &path, "-o", &binary]);
+        if release {
+            command.arg("--release");
+        }
+        let build = command.output().unwrap();
+        assert!(
+            build.status.success(),
+            "{}",
+            String::from_utf8_lossy(&build.stderr)
+        );
+        let run = Command::new(&binary).output().unwrap();
+        assert!(!run.status.success());
+        assert!(
+            String::from_utf8_lossy(&run.stderr).contains("contract"),
+            "{}",
+            String::from_utf8_lossy(&run.stderr)
+        );
+        fs::remove_file(path).unwrap();
+        remove_output_artifacts(&binary);
+    }
+}
+
+#[test]
+fn verified_string_cli_rejects_counterexamples_and_unknown() {
+    for (source, reason) in [
+        (
+            r#"@pure @verified fn f(s:String)->String requires s=="x" ensures result=="y" {return s;}"#,
+            "COUNTEREXAMPLE",
+        ),
+        (
+            r#"@pure @verified fn f(s:String)->bool {return s.contains("x");}"#,
+            "UNKNOWN",
+        ),
+        (
+            r#"@pure @verified fn f(s:String,t:String)->bool {return s<t;}"#,
+            "UNKNOWN",
+        ),
+        (
+            r#"import std::collections::Array; @pure @verified fn f(a:Array<String>)->String {return a[0];}"#,
+            "UNKNOWN",
+        ),
+        (
+            r#"@pure @verified fn f(s:String)->String {return s+"!";}"#,
+            "UNKNOWN",
+        ),
+    ] {
+        assert_compile_error_contains(&format!("{source} fn main(){{}}"), &[reason]);
+    }
+}

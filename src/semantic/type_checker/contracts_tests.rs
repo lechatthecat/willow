@@ -26,7 +26,7 @@ fn contracts_reference_and_type_restrictions() {
             "fn f() requires false && (1 + true > 0) {}",
         ),
         ("allocation", "fn f() requires [1] == [1] {}"),
-        ("string reference", "fn f(s:String) requires s == s {}"),
+        ("string reference", "fn f(s:&String) requires s == s {}"),
     ] {
         let errors = check_source(&format!("{source} fn main() {{}}"));
         assert!(
@@ -151,4 +151,12 @@ fn contracts_match_statement_arms_rejected() {
             assert!(errors.is_empty(), "{source}: {errors:?}");
         }
     }
+}
+
+#[test]
+fn contracts_immutable_string_values_are_allowed() {
+    let errors = check_source(
+        r#"fn f(s:String)->String requires s.len()>0 ensures result==s {return s;} fn main() {}"#,
+    );
+    assert!(errors.is_empty(), "{errors:?}");
 }

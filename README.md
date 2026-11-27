@@ -161,11 +161,13 @@ and [contract tests](tests/effect_contracts.rs).
 <a id="verified-prove-a-contract-with-z3"></a>
 
 **`@pure @verified`** proves supported value contracts under their preconditions
-using Z3. The subset includes i64/bool, read-only frozen arrays and closed immutable
-data; unsupported constructs and unsuccessful proofs fail closed. This trusts
-the compiler and solver and does not verify the whole program. Install Z3 4.15.4
+using Z3. The subset includes integer scalars, bool/char, String equality and byte
+lengths, read-only frozen arrays and closed immutable data. String lengths count UTF-8 bytes, including embedded NUL; concatenation
+and other String methods remain unsupported. Unsupported constructs and unsuccessful
+proofs fail closed. This trusts the compiler and solver and does not verify the
+whole program. Install Z3 4.15.4
 and keep `z3` on PATH, or set `WILLOW_Z3`. See the [proof example](example/static_verification.wi),
-[immutable data](example/verified_data.wi), [loops](example/verified_loops.wi) and
+[strings](example/verified_strings.wi), [immutable data](example/verified_data.wi), [loops](example/verified_loops.wi) and
 [solver-backed no-panic](example/proven_no_panic.wi).
 
 <a id="pure-and-run-time-contracts"></a>

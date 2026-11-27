@@ -233,7 +233,8 @@ fn verified_length_preserves_user_receiver_diagnostic() {
             .errors
             .iter()
             .any(|error| error.code == ErrorCode::E2631
-                && error.message == "@verified `f`: UNKNOWN: len requires immutable FrozenArray")
+                && error.message
+                    == "@verified `f`: UNKNOWN: len requires immutable FrozenArray or String")
     );
 }
 
@@ -250,7 +251,7 @@ fn checked_length_encoding_uses_receiver_identity() {
         (
             "class C {pub x:i64; pub fn len(self)->i64 {return self.x;}} @pure @verified fn f(c:C)->i64 {return c.len();}",
             None,
-            Some("len requires immutable FrozenArray"),
+            Some("len requires immutable FrozenArray or String"),
         ),
         (
             "@pure @verified fn f(a:FrozenArray<i64>)->i64 ensures result>=0 {return a.len();}",

@@ -138,3 +138,38 @@ fn inferred_loop_annotations_add_no_runtime_instructions() {
         );
     }
 }
+
+#[test]
+fn verified_string_annotation_adds_no_runtime_instructions() {
+    let source = "@pure fn f(s:String)->i64 ensures result==s.len() {return s.len();} fn main(){}";
+    let mut counts = Vec::new();
+    for text in [
+        source.to_owned(),
+        source.replace("@pure", "@pure @verified"),
+    ] {
+        let lir = lowered(&text);
+        let f = lir
+            .functions
+            .iter()
+            .find(|f| f.name.is_free_named("f"))
+            .unwrap();
+        let instructions: usize = f.blocks.iter().map(|b| b.instrs.len()).sum();
+        let checks = f
+            .blocks
+            .iter()
+            .flat_map(|b| &b.instrs)
+            .filter(|i| {
+                matches!(i,
+            LirInst::Compute { value: LirRvalue::BuiltinCall { callee, .. }, .. }
+            if callee.is_free_named("$contract_check"))
+            })
+            .count();
+        assert_eq!(checks, 1);
+        counts.push((f.blocks.len(), instructions, f.locals.len()));
+    }
+    assert_eq!(counts[0], counts[1]);
+    eprintln!(
+        "String plain/verified blocks,instructions,locals={:?}",
+        counts[0]
+    );
+}

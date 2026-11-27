@@ -179,8 +179,8 @@ fn report(f: &FunctionDecl, options: &Options) -> Report {
         location: f.span,
         status: Status::Unknown,
         model: "checked-i64",
-        verified_scope: "checked scalars, immutable data, bounded quantifiers and annotated loops",
-        analyzer_version: "4",
+        verified_scope: "checked scalars, byte strings, immutable data, bounded quantifiers and annotated loops",
+        analyzer_version: "5",
         solver_version: solver::VERSION,
         solver_timeout_ms: options.timeout_ms,
         approval_status: "UNVERIFIED",
@@ -761,3 +761,6 @@ mod data_tests;
 
 #[cfg(test)]
 mod inferred_loop_tests;
+
+#[cfg(test)]
+mod string_tests;
