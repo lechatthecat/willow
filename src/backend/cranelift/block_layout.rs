@@ -281,6 +281,87 @@ mod tests {
         (modules, entry)
     }
 
+    fn helper_publication_symbols(function: &Function) -> Vec<cranelift_codegen::ir::GlobalValue> {
+        use cranelift_codegen::ir::{InstructionData, ValueDef};
+        let mut symbols = Vec::new();
+        for block in function.layout.blocks() {
+            for inst in function.layout.block_insts(block) {
+                let InstructionData::Store { offset, args, .. } = function.dfg.insts[inst] else {
+                    continue;
+                };
+                if i32::from(offset) != willow_abi::generated_context::HELPER_OFFSET {
+                    continue;
+                }
+                let ValueDef::Result(address, _) = function.dfg.value_def(args[1]) else {
+                    continue;
+                };
+                if function.dfg.insts[address].opcode() != Opcode::GetPinnedReg {
+                    continue;
+                }
+                let ValueDef::Result(value, _) = function.dfg.value_def(args[0]) else {
+                    panic!("helper descriptor must be a static symbol");
+                };
+                let InstructionData::UnaryGlobalValue {
+                    opcode: Opcode::SymbolValue,
+                    global_value,
+                } = function.dfg.insts[value]
+                else {
+                    panic!("helper descriptor must be a static symbol");
+                };
+                symbols.push(global_value);
+            }
+        }
+        symbols
+    }
+
+    #[test]
+    fn cold_helper_publications_share_one_symbol_per_function() {
+        use std::collections::HashSet;
+        for sites in [1, 8, 32] {
+            // Recursion prevents the runtime-only helper proof. Each array
+            // access has cold fault/publication paths, but none needs a
+            // distinct address for the enclosing function's descriptor.
+            let source = format!(
+                "import std::collections::Array;
+                fn fib(n: i64) -> i64 {{
+                    if n < 2 {{ return n; }} return fib(n - 1) + fib(n - 2);
+                }}
+                fn main() {{ let xs: Array<i64> = []; xs.push(1);
+                    let mut total = fib(4); let mut i = 0; {} println(total); }}",
+                "i = 0; while i < xs.len() { total = total + xs[i]; i = i + 1; }".repeat(sites)
+            );
+            let functions = compiled_functions(&source);
+            let mut publications = 0;
+            for function in &functions {
+                let symbols = helper_publication_symbols(function);
+                publications += symbols.len();
+                let unique: HashSet<_> = symbols.into_iter().collect();
+                assert!(unique.len() <= 1, "{sites} sites: {unique:?}");
+            }
+            assert!(publications > sites, "cold publications were not exercised");
+        }
+    }
+
+    #[test]
+    fn scalar_array_growth_publishes_helper_only_at_entry() {
+        for sites in [1, 8, 32] {
+            let source = format!(
+                "import std::collections::Array;
+                fn main() {{ let xs: Array<i64> = []; {}
+                    let mut i = 0;
+                    while i < xs.len() {{ xs[i] = xs[i] + 1; i = i + 1; }}
+                    println(xs[0]); }}",
+                "xs.push(1);".repeat(sites)
+            );
+            let functions = compiled_functions(&source);
+            let publications: usize = functions
+                .iter()
+                .map(|function| helper_publication_symbols(function).len())
+                .sum();
+            assert_eq!(publications, 1, "{sites} source Array.push sites");
+        }
+    }
+
     /// Every indirect call site of a function shares one panic-depth
     /// snapshot slot, so the frame does not grow with the number of sites.
     #[test]

@@ -59,7 +59,11 @@ pub(super) fn preserves_stack_helper(function: &LirFunction) -> bool {
                         receiver_ty,
                         ..
                     } => {
-                        matches!(intrinsic, Intrinsic::ArrayLen)
+                        // Source Array.push expands to scalar storage resize
+                        // and a store. Its inline path and runtime growth/fault
+                        // fallback cannot invoke Willow code or replace the
+                        // enclosing helper marker, just like ArrayAlloc.
+                        matches!(intrinsic, Intrinsic::ArrayLen | Intrinsic::ArrayResize)
                             && matches!(receiver_ty, Type::Array(element) if immediate(element))
                     }
                     ir_variants!(
@@ -309,6 +313,52 @@ fn is_acyclic(function: &LirFunction) -> bool {
 mod tests {
     use super::*;
     use crate::ir::lowered::{BlockId, LirBlock};
+
+    #[test]
+    fn stack_helper_proof_accepts_only_scalar_array_resize() {
+        use crate::diagnostics::Span;
+        use crate::ir::lowered::LirLocalId;
+        use crate::semantic::intrinsics::Intrinsic;
+
+        for (element, expected) in [
+            (Type::I8, true),
+            (Type::I16, true),
+            (Type::I32, true),
+            (Type::I64, true),
+            (Type::U8, true),
+            (Type::U16, true),
+            (Type::U32, true),
+            (Type::U64, true),
+            (Type::Char, true),
+            (Type::F64, true),
+            (Type::Bool, true),
+            (Type::String, false),
+            (Type::Array(Box::new(Type::I64)), false),
+        ] {
+            let mut function = LirFunction::empty_artifact_region();
+            function.blocks = vec![LirBlock {
+                id: BlockId(0),
+                instrs: vec![LirInst::Compute {
+                    local: LirLocalId(1),
+                    value: LirRvalue::IntrinsicCall {
+                        intrinsic: Intrinsic::ArrayResize,
+                        method: "__abi_resize".into(),
+                        receiver: LirOperand::Local(LirLocalId(0)),
+                        receiver_ty: Type::Array(Box::new(element.clone())),
+                        args: vec![LirOperand::Int(32)],
+                        arg_types: vec![Type::I64],
+                        result: Type::Void,
+                    },
+                    span: Span::dummy(),
+                }],
+                recovery: Vec::new(),
+                terminator: Terminator::Return(None),
+            }];
+            assert_eq!(preserves_stack_helper(&function), expected, "{element:?}");
+            function.is_async = true;
+            assert!(!preserves_stack_helper(&function));
+        }
+    }
 
     #[test]
     fn stack_helper_proof_rejects_generated_calls_and_unknown_effects() {

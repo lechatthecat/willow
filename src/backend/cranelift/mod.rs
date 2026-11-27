@@ -1588,7 +1588,10 @@ struct FunctionDiagnostics<'a> {
     /// Source-level owner of diagnostic locations (including class qualification).
     diagnostic_function: String,
     diagnostic_async: bool,
-    overflow_helper_literal: Option<DataId>,
+    /// One function-local symbol identity for the immutable helper descriptor.
+    /// Re-declaring the same data at each cold call would keep distinct address
+    /// values live across hot loops and force their poll gates to spill.
+    overflow_helper_literal: Option<cranelift_codegen::ir::GlobalValue>,
     /// A proven runtime-only body has published its marker at entry; no body
     /// operation can replace it, so subsequent runtime calls need no store.
     stack_helper_established: bool,

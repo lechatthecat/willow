@@ -1277,8 +1277,8 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         if !self.diagnostics.diagnostic_async && !self.diagnostics.diagnostic_function.is_empty() {
             // Publish one immutable {bytes, length} descriptor atomically. The
             // context follows the native task across worker migration.
-            let data = if let Some(data) = self.diagnostics.overflow_helper_literal {
-                data
+            let global = if let Some(global) = self.diagnostics.overflow_helper_literal {
+                global
             } else {
                 let bytes = self.string_literals[&self.diagnostics.diagnostic_function].bytes;
                 let data = self.module.declare_anonymous_data(false, false).unwrap();
@@ -1292,10 +1292,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 let reference = self.module.declare_data_in_data(bytes, &mut desc);
                 desc.write_data_addr(0, reference, 0);
                 self.module.define_data(data, &desc).unwrap();
-                self.diagnostics.overflow_helper_literal = Some(data);
-                data
+                let global = self.module.declare_data_in_func(data, self.builder.func);
+                self.diagnostics.overflow_helper_literal = Some(global);
+                global
             };
-            let global = self.module.declare_data_in_func(data, self.builder.func);
             let ptr_ty = reference_type(self.module.target_config());
             let pointer = self.builder.ins().symbol_value(ptr_ty, global);
             let context = self.builder.ins().get_pinned_reg(ptr_ty);
