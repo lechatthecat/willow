@@ -98,16 +98,16 @@ pub struct WillowGcStatsV2 {
     pub workers: super::workers::MarkWorkerStatsV2,
 }
 
-/// Keep pause totals compact at one cache line.
+/// Whole-stop totals; cache isolation belongs to the contended runtime state,
+/// not to unrelated telemetry storage.
 #[derive(Clone, Copy, Default)]
 pub(crate) struct PauseTotals {
     pub(crate) count: u64,
     pub(crate) total_ns: u64,
     pub(crate) max_ns: u64,
-    _line_fill: [u64; 5],
 }
 
-const _: () = assert!(std::mem::size_of::<PauseTotals>() == 64);
+const _: () = assert!(std::mem::size_of::<PauseTotals>() == 3 * std::mem::size_of::<u64>());
 
 impl PauseTotals {
     fn record(&mut self, ns: u64) {

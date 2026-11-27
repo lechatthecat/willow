@@ -253,3 +253,47 @@ impl TerminalTarget<'_> {
         true
     }
 }
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    #[test]
+    fn retirement_shard_cache_lines_do_not_depend_on_owner_phase() {
+        // Terminal queues used to sit beside the global scheduler mutex:
+        // unrelated static growth could put its lock word and queue metadata
+        // on the same line. The heap shards must retain their own alignment,
+        // regardless of where their owner is placed.
+        #[repr(C, align(128))]
+        struct Shifted<const PREFIX: usize> {
+            prefix: [u8; PREFIX],
+            owner: TerminalRetirements,
+        }
+
+        fn check<const PREFIX: usize>() {
+            let shifted = Box::new(Shifted {
+                prefix: [0; PREFIX],
+                owner: TerminalRetirements::new(Arc::new(crate::frame_reclaim::Domain::new())),
+            });
+            let owner = &shifted.owner;
+            assert_eq!(std::ptr::from_ref(owner) as usize % 64, PREFIX);
+            let stride = std::mem::size_of::<PaddedShard>();
+            assert_eq!(stride % 128, 0);
+            let base = owner.shards.as_ptr() as usize;
+            for (index, shard) in owner.shards.iter().enumerate() {
+                let address = std::ptr::from_ref(shard) as usize;
+                assert_eq!(address % 128, 0);
+                assert_eq!(address, base + index * stride);
+                let guard = TerminalRetirements::lock(shard);
+                let data = std::ptr::from_ref(&*guard) as usize;
+                assert!(data >= address);
+                assert!(data + std::mem::size_of::<RetirementShard>() <= address + stride);
+            }
+        }
+
+        check::<0>();
+        check::<16>();
+        check::<32>();
+        check::<48>();
+    }
+}
