@@ -2712,10 +2712,16 @@ mod tests {
             std::env::temp_dir().join(format!("willow-boundary-provenance-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("main.wi");
-        for n in [16, 64, 256] {
-            let mut source = String::from(
-                "interface W { fn weight(self) -> i64; }\nclass C implements W { pub fn weight(self) -> i64 { return 1; } }\n",
-            );
+        for (resolved, n) in [false, true]
+            .into_iter()
+            .flat_map(|resolved| [16, 64, 256].map(|n| (resolved, n)))
+        {
+            let mut source = String::from("interface W { fn weight(self) -> i64; }\n");
+            if resolved {
+                source.push_str(
+                    "class C implements W { pub fn weight(self) -> i64 { return 1; } }\n",
+                );
+            }
             let mut origins = Vec::new();
             for i in 0..n {
                 source.push_str(&format!("fn caller{i}(w: W) -> i64 {{ return w."));
@@ -2751,8 +2757,8 @@ mod tests {
                 .filter(|w| w.witness.kind == WitnessKind::ExternalBoundary)
                 .count();
             assert_eq!(
-                seeds, n,
-                "transitive summaries must not duplicate local seeds"
+                seeds, 0,
+                "unit-local external summaries must not become workspace seeds"
             );
             let analysis = super::super::effect_states::Analysis::new(&snapshot);
             let by_name: HashMap<_, _> = snapshot
@@ -2769,7 +2775,13 @@ mod tests {
                 ] {
                     let output = analysis.output(by_name[name.as_str()]);
                     let reasons = output[5]["unknown_reasons"].as_array().unwrap();
+                    if resolved {
+                        assert_eq!(output[5]["state"], "none", "{name}: {output}");
+                        assert!(reasons.is_empty(), "{name}: {output}");
+                        continue;
+                    }
                     assert_eq!(reasons.len(), 1, "{name}: {output}");
+                    assert_eq!(reasons[0]["callee"], "weight", "{name}: {output}");
                     assert_eq!(
                         reasons[0]["location"]["start"], expected,
                         "{name}: {output}"
@@ -2781,11 +2793,69 @@ mod tests {
                     );
                 }
             }
-            // Exactly one boundary reason traverses each wrapper and chain edge.
-            assert_eq!(analysis.edge_visits, 2 * n);
+            // One unresolved reason per effect traverses each wrapper/chain
+            // edge. A closed pure union propagates no evidence at all.
+            assert_eq!(analysis.edge_visits, if resolved { 0 } else { 14 * n });
             println!(
-                "boundary callers={n} seeds={seeds} propagated_edge_visits={}",
+                "boundary resolved={resolved} callers={n} seeds={seeds} propagated_edge_visits={}",
                 analysis.edge_visits
+            );
+        }
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn dispatch_effects_workspace_union_scales_with_sites_and_implementations() {
+        let directory =
+            std::env::temp_dir().join(format!("willow-workspace-union-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for n in [8, 32, 128] {
+            let api = format!(
+                "module api; pub interface Worker {{ fn work(self) -> i64; }} pub fn invoke(w: Worker) -> i64 {{ {} return 0; }}",
+                "w.work();".repeat(n)
+            );
+            std::fs::write(directory.join("api.wi"), api).unwrap();
+            let mut source = String::from("import api;\n");
+            for i in 0..n {
+                source.push_str(&format!("class C{i} implements api::Worker {{ pub fn work(self) -> i64 {{ return 0; }} }}\n"));
+            }
+            source.push_str("fn main() {}\n");
+            std::fs::write(&path, source).unwrap();
+            let snapshot = crate::CompilerSession::new(
+                path.to_str().unwrap(),
+                "",
+                &crate::CompilerOptions::debug(),
+                None,
+            )
+            .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+            .unwrap();
+            let function = snapshot
+                .functions
+                .iter()
+                .find(|f| f.name == "invoke")
+                .unwrap()
+                .id
+                .clone();
+            let edges: usize = snapshot.functions.iter().map(|f| f.callees.len()).sum();
+            let sites: usize = snapshot.semantic.effect_calls.values().map(Vec::len).sum();
+            let revision = snapshot.revision.clone();
+            let mut session = QuerySession::new(snapshot).unwrap();
+            let value = session.query(QueryRequest::Effects { revision, function });
+            assert!(
+                value["result"]["effects"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e["state"] == "none"),
+                "{value}"
+            );
+            assert_eq!(edges, n + 1);
+            assert_eq!(sites, n);
+            assert_eq!(session.effect_edge_visits, n + 1);
+            println!(
+                "workspace dispatch n={n} edges={edges} sites={sites} visits={}",
+                session.effect_edge_visits
             );
         }
         std::fs::remove_dir_all(directory).unwrap();

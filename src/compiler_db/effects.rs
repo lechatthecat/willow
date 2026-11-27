@@ -1018,6 +1018,24 @@ impl EffectQueries {
         Some(frozen)
     }
 
+    /// Local seeds before unit-level dispatch propagation. Workspace queries
+    /// resolve their own implementation sets and must not seed a caller with
+    /// effects from another generic instantiation or an unresolved unit boundary.
+    pub(crate) fn effect_seed(
+        &self,
+        unit: UnitId,
+        id: FunctionId,
+    ) -> Option<EffectSummary<EffectWitness>> {
+        Some(
+            self.solutions
+                .borrow()
+                .get(&unit)?
+                .equation(id)?
+                .seed
+                .clone(),
+        )
+    }
+
     fn source_effects(
         &self,
         consumer: UnitId,

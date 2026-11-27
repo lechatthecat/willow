@@ -52,8 +52,7 @@ impl Captured {
     /// every instantiation their class or its ancestors declare
     /// (`implements I<A>, I<B>`).
     pub(super) fn targets(&mut self, symbols: &SymbolTable, graph: &CallGraph) {
-        // One ancestor walk per (class, interface), shared by its methods.
-        let mut walked = HashMap::new();
+        let mut implemented = ImplementationKeys::default();
         for (&id, sites) in graph.iter() {
             let Some(owner) = id.owner() else {
                 continue;
@@ -82,12 +81,9 @@ impl Captured {
                 continue;
             };
             for &target in &sites.targets {
-                let keys = target.owner().and_then(|class| {
-                    walked
-                        .entry((class.clone(), owner.clone()))
-                        .or_insert_with(|| implemented_keys(symbols, class.as_ref(), interface))
-                        .clone()
-                });
+                let keys = target
+                    .owner_type()
+                    .and_then(|class| implemented.get(symbols, class, interface.declaration_span));
                 self.targets.push((id, target, keys));
             }
         }
@@ -99,42 +95,95 @@ fn generic_interface(
     symbols: &SymbolTable,
     method: FunctionId,
 ) -> Option<&crate::semantic::symbols::InterfaceInfo> {
-    let interface = symbols.lookup_interface(method.owner()?.as_ref())?;
+    let interface = symbols.lookup_interface(&method.owner_type()?.to_string())?;
     (!interface.type_params.is_empty()
         && method.synthetic_kind() != crate::qualified_name::SyntheticKind::InterfaceDefault)
         .then_some(interface)
 }
 
-/// Keys of every instantiation of `interface` that `class` or an ancestor
-/// implements (a class may implement several, e.g. `I<A>, I<B>`). `None`
-/// (implements every key) when the chain or any instantiation is unresolved.
-fn implemented_keys(
-    symbols: &SymbolTable,
-    class: &str,
-    interface: &crate::semantic::symbols::InterfaceInfo,
-) -> Option<Vec<String>> {
-    let mut keys = Vec::new();
-    let mut seen = HashSet::new();
-    let mut current = Some(class.to_owned());
-    while let Some(name) = current {
-        if !seen.insert(name.clone()) {
-            break;
+/// Inherited interface instances, indexed once per class across all methods
+/// and interfaces. Persistent maps/sets share unchanged ancestors; a chain of
+/// new instantiations does not copy every preceding prefix. None is an unknown
+/// instantiation (inside the map) or unavailable/cyclic ancestry (in the cache).
+type ClassInstances = im::HashMap<Span, Option<im::OrdSet<String>>>;
+#[derive(Default)]
+struct ImplementationKeys {
+    classes: HashMap<TypeId, Option<ClassInstances>>,
+}
+#[cfg(test)]
+thread_local! {
+    static KEY_ANCESTOR_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+impl ImplementationKeys {
+    fn get(
+        &mut self,
+        symbols: &SymbolTable,
+        class: TypeId,
+        interface: Span,
+    ) -> Option<Vec<String>> {
+        if !self.classes.contains_key(&class) {
+            self.index(symbols, class);
         }
-        let class = symbols.lookup_class(&name)?;
-        for ty in &class.implements {
-            let (Type::Named(name) | Type::Generic(name, _)) = ty else {
-                continue;
-            };
-            if symbols
-                .lookup_interface(name)
-                .is_some_and(|i| i.declaration_span == interface.declaration_span)
-            {
-                keys.push(symbols.interface_instance_key(ty)?);
-            }
-        }
-        current = class.base_class.clone();
+        self.classes
+            .get(&class)?
+            .as_ref()?
+            .get(&interface)?
+            .as_ref()
+            .map(|keys| keys.iter().cloned().collect())
     }
-    (!keys.is_empty()).then_some(keys)
+
+    fn index(&mut self, symbols: &SymbolTable, class: TypeId) {
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = Some(class);
+        let mut instances = Some(ClassInstances::new());
+        while let Some(id) = current {
+            if let Some(cached) = self.classes.get(&id) {
+                instances = cached.clone();
+                break;
+            }
+            if !seen.insert(id) {
+                instances = None;
+                break;
+            }
+            #[cfg(test)]
+            KEY_ANCESTOR_VISITS.with(|n| n.set(n.get() + 1));
+            let Some(info) = symbols.lookup_class(&id.to_string()) else {
+                self.classes.insert(id, None);
+                instances = None;
+                break;
+            };
+            pending.push((id, info));
+            current = info.base_class.as_deref().map(TypeId::from_source_name);
+        }
+        for (id, info) in pending.into_iter().rev() {
+            if let Some(instances) = &mut instances {
+                for ty in &info.implements {
+                    let (Type::Named(name) | Type::Generic(name, _)) = ty else {
+                        continue;
+                    };
+                    let Some(declaration) = symbols.lookup_interface(name) else {
+                        continue;
+                    };
+                    if declaration.type_params.is_empty() {
+                        continue;
+                    }
+                    let keys = instances
+                        .entry(declaration.declaration_span)
+                        .or_insert_with(|| Some(im::OrdSet::new()));
+                    match symbols.interface_instance_key(ty) {
+                        Some(key) => {
+                            if let Some(keys) = keys {
+                                keys.insert(key);
+                            }
+                        }
+                        None => *keys = None,
+                    }
+                }
+            }
+            self.classes.insert(id, instances.clone());
+        }
+    }
 }
 
 type Key = (UnitId, FunctionId);
@@ -378,6 +427,70 @@ mod tests {
             unknown: false,
             unresolved: vec![],
         }
+    }
+
+    #[test]
+    fn dispatch_effects_generic_ancestry_is_indexed_once_per_class() {
+        let directory = std::env::temp_dir().join(format!(
+            "willow-interface-key-scaling-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("main.wi");
+        for shape in ["chain", "fanout", "interfaces"] {
+            for n in [8, 32, 128] {
+                let interfaces = if shape == "interfaces" { n } else { 1 };
+                let mut source = String::new();
+                for i in 0..interfaces {
+                    source.push_str(&format!("interface I{i}<T> {{ fn work(self) -> i64; }}\n"));
+                }
+                let contracts = (0..interfaces)
+                    .map(|i| format!("I{i}<i64>"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                source.push_str(&format!("open class Root implements {contracts} {{ pub open fn work(self) -> i64 {{ return 0; }} }}\n"));
+                for i in 0..n {
+                    let base = if shape == "chain" && i != 0 {
+                        format!("C{}", i - 1)
+                    } else {
+                        "Root".into()
+                    };
+                    source.push_str(&format!("open class C{i} extends {base} {{ pub open override fn work(self) -> i64 {{ return 0; }} }}\n"));
+                }
+                source.push_str("fn invoke(w: I0<i64>) -> i64 { return w.work(); } fn main() {}\n");
+                std::fs::write(&path, source).unwrap();
+                KEY_ANCESTOR_VISITS.with(|n| n.set(0));
+                let snapshot = crate::CompilerSession::new(
+                    path.to_str().unwrap(),
+                    "",
+                    &crate::CompilerOptions::debug(),
+                    None,
+                )
+                .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+                .unwrap();
+                let visits = KEY_ANCESTOR_VISITS.with(std::cell::Cell::get);
+                assert_eq!(visits, n + 1, "{shape} n={n}");
+                let function = snapshot
+                    .functions
+                    .iter()
+                    .position(|f| f.name == "invoke")
+                    .unwrap();
+                let states = super::super::effect_states::Analysis::new(&snapshot).output(function);
+                assert!(
+                    states
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .all(|e| e["state"] == "none"),
+                    "{states}"
+                );
+                println!(
+                    "interface keys shape={shape} classes={} interfaces={interfaces} ancestry_visits={visits}",
+                    n + 1
+                );
+            }
+        }
+        std::fs::remove_dir_all(directory).unwrap();
     }
 
     /// Bodyless/builtin implementations are folded into the interface node's

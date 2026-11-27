@@ -1,0 +1,20 @@
+// Inspect: willow effects semantic_dispatch_effects::start --source example/semantic_dispatch_effects.wi --explain
+// All Idle implementations are pure; Worker includes one suspending body.
+// Expected output: 1, 2, done (one per line).
+interface Idle { fn value(self) -> i64; }
+class One implements Idle { pub fn value(self) -> i64 { return 1; } }
+class Two implements Idle { pub fn value(self) -> i64 { return 2; } }
+fn value(idle: Idle) -> i64 { return idle.value(); }
+
+interface Worker extends Sync { fn work(self) -> Task<void>; }
+class Immediate implements Worker { pub async fn work(self) {} }
+class Waiting implements Worker { pub async fn work(self) { await sleep(0); } }
+fn start(worker: Worker) -> Task<void> { return worker.work(); }
+
+async fn main() {
+    println(value(new One()));
+    println(value(new Two()));
+    await start(new Immediate());
+    await start(new Waiting());
+    println("done");
+}

@@ -6645,9 +6645,9 @@ fn open_self_call_effects_use_closed_dispatch_family() {
         for name in ["Base::count", "through_interface", "through_base", "relay"] {
             let value = f.json(&["effects", &format!("main::{name}")], 0);
             for effect in value["result"]["effects"].as_array().unwrap() {
-                // Panic capability is separately conservative for interface
-                // contracts; the five scheduler/allocation effects are pure.
-                if effect["effect"] != 32 {
+                // Arithmetic in count may panic; the interface implementation
+                // family itself is pure, including its panic effect.
+                if effect["effect"] != 32 || name == "through_interface" {
                     assert_eq!(effect["state"], "none", "{name}: {value}");
                     assert_eq!(effect["unknown_reasons"], serde_json::json!([]), "{value}");
                 }
@@ -6691,7 +6691,7 @@ fn open_self_call_effects_preserve_effectful_overrides() {
 #[test]
 fn interface_boundary_reasons_keep_reachable_caller_provenance() {
     let f = Fixture::new();
-    let source = "interface W { fn weight(self) -> i64; }\nclass C implements W { pub fn weight(self) -> i64 { return 1; } }\nfn first(w: W) -> i64 { return w.weight(); }\nfn second(w: W) -> i64 { return w.weight(); }\nfn wrap_first(w: W) -> i64 { return first(w); }\nfn wrap_second(w: W) -> i64 { return second(w); }\nfn outer(w: W) -> i64 { return wrap_second(w); }\nfn main() {}\n";
+    let source = "interface W { fn weight(self) -> i64; }\nfn first(w: W) -> i64 { return w.weight(); }\nfn second(w: W) -> i64 { return w.weight(); }\nfn wrap_first(w: W) -> i64 { return first(w); }\nfn wrap_second(w: W) -> i64 { return second(w); }\nfn outer(w: W) -> i64 { return wrap_second(w); }\nfn main() {}\n";
     fs::write(f.0.join("src/main.wi"), source).unwrap();
     let first = source.find("w.weight()").unwrap() + 2;
     let second = source.rfind("w.weight()").unwrap() + 2;
@@ -6702,7 +6702,7 @@ fn interface_boundary_reasons_keep_reachable_caller_provenance() {
         ("wrap_second", second),
         ("outer", second),
     ] {
-        let value = f.json(&["effects", &format!("main::{name}")], 0);
+        let value = f.json(&["effects", &format!("main::{name}")], 1);
         let reasons: Vec<_> = value["result"]["effects"]
             .as_array()
             .unwrap()
@@ -7327,5 +7327,258 @@ fn type_parameter_project_selectors_and_positions_share_identity() {
         );
         let renamed = f.json(&["rename", selector, "Element"], 0);
         assert_eq!(renamed["result"]["validation"], "passed");
+    }
+}
+
+#[test]
+fn dispatch_effects_imported_union_removes_unit_external_bounds() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/contract.wi"), "module contract; pub interface Worker extends Sync { fn work(self) -> Task<void>; }\npub fn invoke(w: Worker) -> Task<void> { return w.work(); }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import contract; class Pure implements contract::Worker { pub async fn work(self) {} } class Other implements contract::Worker { pub async fn work(self) {} } fn main() {}\n").unwrap();
+    let value = f.json(&["effects", "contract::invoke", "--explain"], 0);
+    assert!(
+        value["result"]["effects"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["state"] == "none"),
+        "{value}"
+    );
+}
+
+#[test]
+fn dispatch_effects_unresolved_names_and_positions() {
+    let f = Fixture::new();
+    let source = "interface Worker { fn work(self); }\nfn invoke(w: Worker) { w.work(); }\nfn relay(w: Worker) { invoke(w); }\nfn main() {}\n";
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for name in ["invoke", "relay"] {
+        for explain in [false, true] {
+            let selector = format!("main::{name}");
+            let mut args = vec!["effects", &selector];
+            if explain {
+                args.push("--explain");
+            }
+            let value = f.json(&args, 1);
+            for effect in value["result"]["effects"].as_array().unwrap() {
+                let reason = effect["unknown_reasons"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|r| r["code"] == "unresolved-callee")
+                    .unwrap();
+                assert_eq!(reason["callee"], "work", "{value}");
+                assert_eq!(reason["location"]["path"], "src/main.wi");
+                assert_eq!(reason["location"]["line"], 2);
+                assert_eq!(reason["location"]["column"], 26);
+            }
+            let output = f.run(&args);
+            let text = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                text.contains("Unknown: unresolved-callee `work` at src/main.wi:2:26"),
+                "{text}"
+            );
+        }
+    }
+}
+
+fn closed_dispatch_fixture(
+    kind: &str,
+    imported: bool,
+    suspends: bool,
+) -> (Fixture, String, String) {
+    let f = Fixture::new();
+    let prefix = if imported { "api::" } else { "" };
+    let body = if suspends { "await sleep(0);" } else { "" };
+    let (contract, receiver, implementations) = match kind {
+        "interface" => (
+            "pub interface Worker { fn work(self) -> Task<void>; }",
+            "Worker",
+            format!(
+                "class Pure implements {prefix}Worker {{ pub async fn work(self) {{}} }}\nclass Other implements {prefix}Worker {{ pub async fn work(self) {{ {body} }} }}"
+            ),
+        ),
+        "generic" => (
+            "pub interface Worker<T> { fn work(self) -> Task<void>; }",
+            "Worker<i64>",
+            format!(
+                "class Pure implements {prefix}Worker<i64> {{ pub async fn work(self) {{}} }}\nclass Other implements {prefix}Worker<i64> {{ pub async fn work(self) {{ {body} }} }}\nclass Noise implements {prefix}Worker<bool> {{ pub async fn work(self) {{ await sleep(0); }} }}"
+            ),
+        ),
+        "open" => (
+            "pub open class Worker { pub open fn work(self) -> Task<void> { return done(); } }",
+            "Worker",
+            format!(
+                "class Pure extends {prefix}Worker {{}}\nclass Other extends {prefix}Worker {{ pub override async fn work(self) {{ {body} }} }}"
+            ),
+        ),
+        "inherited" => (
+            "pub interface Worker { fn work(self) -> Task<void>; }",
+            "Worker",
+            format!(
+                "open class Parent {{ pub async fn work(self) {{ {body} }} }}\nclass Other extends Parent implements {prefix}Worker {{}}\nclass Pure implements {prefix}Worker {{ pub async fn work(self) {{}} }}"
+            ),
+        ),
+        "default" => (
+            "pub interface Worker { fn work(self) -> Task<void> { return done(); } }",
+            "Worker",
+            format!(
+                "class Pure implements {prefix}Worker {{}}\nclass Other implements {prefix}Worker {{ pub async fn work(self) {{ {body} }} }}"
+            ),
+        ),
+        _ => unreachable!(),
+    };
+    let api = format!(
+        "{contract}\nasync fn done() {{}}\npub fn invoke(w: {receiver}) -> Task<void> {{ return w.work(); }}\npub fn relay(w: {receiver}) -> Task<void> {{ return invoke(w); }}\n"
+    );
+    let selector = if imported {
+        fs::write(f.0.join("src/api.wi"), format!("module api;\n{api}")).unwrap();
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!("import api;\n{implementations}\nfn main() {{}}\n"),
+        )
+        .unwrap();
+        "api::invoke"
+    } else {
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!("{api}{implementations}\nfn main() {{}}\n"),
+        )
+        .unwrap();
+        "main::invoke"
+    };
+    let implementation = if kind == "inherited" {
+        "main::Parent::work"
+    } else {
+        "main::Other::work"
+    };
+    (f, selector.into(), implementation.into())
+}
+
+#[test]
+fn dispatch_effects_closed_unions_twenty_perspectives() {
+    for kind in ["interface", "generic", "open", "inherited", "default"] {
+        for imported in [false, true] {
+            for suspends in [false, true] {
+                let (f, selector, implementation) =
+                    closed_dispatch_fixture(kind, imported, suspends);
+                let value = f.json(&["effects", &selector, "--explain"], 0);
+                let effects = value["result"]["effects"].as_array().unwrap();
+                assert!(
+                    effects
+                        .iter()
+                        .all(|e| e["unknown_reasons"] == serde_json::json!([])),
+                    "{kind}/{imported}/{suspends}: {value}"
+                );
+                let implementation = f.json(&["effects", &implementation], 0);
+                let id = &implementation["result"]["selected"]["id"];
+                // The other reachable bodies are pure: the union is exactly
+                // this implementation, across every effect, not just waiting.
+                for effect in effects {
+                    let expected = implementation["result"]["effects"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["effect"] == effect["effect"])
+                        .unwrap();
+                    assert_eq!(
+                        effect["state"], expected["state"],
+                        "{kind}/{imported}/{suspends}: {value}"
+                    );
+                    if !suspends {
+                        assert_eq!(effect["state"], "none", "{value}");
+                    }
+                }
+                let suspension = effects.iter().find(|e| e["effect"] == 4).unwrap();
+                assert_eq!(
+                    suspension["state"],
+                    if suspends { "may" } else { "none" },
+                    "{value}"
+                );
+                if suspends {
+                    assert_eq!(&suspension["witness"]["function"], id, "{value}");
+                    let evidence = value["result"]["effect_evidence"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["effect"] == 4 && &e["via_function"] == id)
+                        .unwrap();
+                    assert_eq!(
+                        evidence["call_chain"],
+                        serde_json::json!([value["result"]["selected"]["id"], id]),
+                        "{value}"
+                    );
+                    let location = &evidence["task_relationship"]["location"];
+                    let path = location["path"].as_str().unwrap();
+                    let source = fs::read_to_string(f.0.join(path)).unwrap();
+                    let start = location["start"].as_u64().unwrap() as usize;
+                    let end = location["end"].as_u64().unwrap() as usize;
+                    assert_eq!(&source[start..end], "work", "{value}");
+                    assert!(location["line"].is_number() && location["column"].is_number());
+                }
+                let impact = f.json(&["impact", &selector], 0);
+                let node = impact["result"]["impact"]["nodes"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|n| n["selector"] == selector)
+                    .unwrap();
+                assert_eq!(node["effects"], value["result"]["effects"], "{impact}");
+            }
+        }
+    }
+}
+
+#[test]
+fn dispatch_effects_keep_local_panics_and_unresolved_calls() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/api.wi"), "module api; pub interface Worker { fn work(self) -> i64; } pub fn invoke(w: Worker, n: i64) -> i64 { w.work(); return 10 / n; } pub fn relay(w: Worker, n: i64) -> i64 { return invoke(w, n); }\n").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import api; class Pure implements api::Worker { pub fn work(self) -> i64 { return 0; } } fn mixed(w: api::Worker, f: fn() -> i64) -> i64 { w.work(); return f(); } fn main() {}\n").unwrap();
+    for selector in ["api::invoke", "api::relay"] {
+        let value = f.json(&["effects", selector], 0);
+        for effect in value["result"]["effects"].as_array().unwrap() {
+            assert_eq!(
+                effect["state"],
+                if effect["effect"] == 32 {
+                    "may"
+                } else {
+                    "none"
+                },
+                "{value}"
+            );
+            assert_eq!(effect["unknown_reasons"], serde_json::json!([]));
+        }
+    }
+    let value = f.json(&["effects", "main::mixed"], 1);
+    for effect in value["result"]["effects"].as_array().unwrap() {
+        assert_eq!(effect["state"], "unknown", "{value}");
+        let reason = effect["unknown_reasons"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["code"] == "unresolved-callee")
+            .unwrap();
+        assert_eq!(reason["callee"], "f", "{value}");
+        assert_eq!(reason["location"]["path"], "src/main.wi");
+        assert!(reason["location"]["line"].is_number() && reason["location"]["column"].is_number());
+    }
+}
+
+#[test]
+fn dispatch_effects_generic_imports_keep_distinct_interface_keys() {
+    let f = Fixture::new();
+    for (module, ty) in [("api", "i64"), ("alternate", "bool")] {
+        fs::write(f.0.join(format!("src/{module}.wi")), format!("module {module}; pub interface Worker<T> {{ fn work(self) -> Task<void>; }} pub fn invoke(w: Worker<{ty}>) -> Task<void> {{ return w.work(); }}\n")).unwrap();
+    }
+    fs::write(f.0.join("src/main.wi"), "import api; import alternate; class Both implements api::Worker<i64>, alternate::Worker<bool> { pub async fn work(self) {} } class Wrong implements alternate::Worker<i64> { pub async fn work(self) { await sleep(0); } } class Other implements api::Worker<bool> { pub async fn work(self) { await sleep(0); } } fn main() {}\n").unwrap();
+    for selector in ["api::invoke", "alternate::invoke"] {
+        let value = f.json(&["effects", selector], 0);
+        assert!(
+            value["result"]["effects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|e| e["state"] == "none"),
+            "{value}"
+        );
     }
 }

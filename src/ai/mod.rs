@@ -221,6 +221,11 @@ pub(crate) fn capture(
     facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
     symbols: &crate::semantic::symbols::SymbolTable,
     index: Option<&crate::compiler_db::ids::BodyIndex>,
+    local_effects: &impl Fn(
+        FunctionId,
+    ) -> Option<
+        crate::semantic::effects::EffectSummary<crate::compiler_db::effects::EffectWitness>,
+    >,
 ) -> CapturedUnit {
     let CaptureInputs {
         indirect,
@@ -262,8 +267,9 @@ pub(crate) fn capture(
         if is_async {
             result.semantic.async_functions.insert(id);
         }
-        capture_compiler_effects(&mut result, facts, id);
-        let compiler_bits = facts.get(&id).map_or_else(
+        let local = local_effects(id);
+        capture_compiler_effects(&mut result, facts, id, local.as_ref());
+        let compiler_bits = local.as_ref().or_else(|| facts.get(&id)).map_or_else(
             || {
                 if matches!(body, AstEvent::Expr(_)) {
                     RuntimeEffects::ALL.bits()
@@ -460,12 +466,16 @@ fn capture_compiler_effects(
     result: &mut CapturedUnit,
     facts: &crate::semantic::effects::EffectFacts<crate::compiler_db::effects::EffectWitness>,
     id: FunctionId,
+    local: Option<
+        &crate::semantic::effects::EffectSummary<crate::compiler_db::effects::EffectWitness>,
+    >,
 ) {
     if let Some(summary) = facts.get(&id) {
         result.semantic.compiler_effects.insert(
             id,
             summary.effects().intersection(RuntimeEffects::ALL).bits(),
         );
+        let summary = local.unwrap_or(summary);
         use crate::compiler_db::effects::EffectWitness;
         use evidence::{
             CapabilityOperation as Op, Cause, CauseSource, EffectFact, LockRecord, SourcePoint,

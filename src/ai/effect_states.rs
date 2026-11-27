@@ -48,6 +48,8 @@ pub enum EvidenceKind {
 #[derive(Debug, Clone, Serialize)]
 pub struct UnknownReason {
     pub code: UnknownReasonCode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub callee: Option<String>,
     pub location: Option<Location>,
 }
 #[derive(Debug, Clone, Serialize)]
@@ -160,7 +162,7 @@ impl Analysis {
             }
             if let Some(sites) = snapshot.semantic.unresolved_calls.get(&f.id) {
                 for site in sites {
-                    result.reason(
+                    result.named_reason(
                         i,
                         RuntimeEffects::ALL.bits(),
                         if matches!(site.operation, super::operation::Operation::IndirectCall) {
@@ -169,18 +171,33 @@ impl Analysis {
                             1
                         },
                         Some(&site.location),
+                        Some(&site.operation),
                     );
                 }
             }
             if !f.unresolved.is_empty() || (f.synthetic && f.unknown && index.callees[i].is_empty())
             {
-                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
+                result.named_reason(
+                    i,
+                    RuntimeEffects::ALL.bits(),
+                    1,
+                    f.locations.first(),
+                    Some(f.unresolved.first().unwrap_or(&f.name)),
+                );
             }
-            if f.callees
+            if let Some(callee) = f
+                .callees
                 .iter()
-                .any(|id| !index.by_id.contains_key(id.as_str()))
+                .find(|id| !index.by_id.contains_key(id.as_str()))
             {
-                result.reason(i, RuntimeEffects::ALL.bits(), 1, f.locations.first());
+                let location = snapshot
+                    .semantic
+                    .effect_calls
+                    .get(&f.id)
+                    .and_then(|sites| sites.iter().find(|site| &site.target == callee))
+                    .map(|site| &site.location)
+                    .or_else(|| f.locations.first());
+                result.named_reason(i, RuntimeEffects::ALL.bits(), 1, location, Some(callee));
             }
             let ranges = super::semantic::local_ranges(&f.locations);
             if let Some(facts) = snapshot.semantic.witnesses.get(&f.id) {
@@ -270,7 +287,7 @@ impl Analysis {
         for (i, f) in snapshot.functions.iter().enumerate() {
             for bit in 0..COUNT {
                 if f.unknown && result.facts[i][bit].reasons.iter().all(Option::is_none) {
-                    result.reason(i, 1 << bit, 1, None);
+                    result.named_reason(i, 1 << bit, 1, f.locations.first(), Some(&f.name));
                     missing.push_back((i, bit, 2));
                 }
                 if f.runtime_effects & (1 << bit) != 0
@@ -316,6 +333,16 @@ impl Analysis {
         }
     }
     fn reason(&mut self, function: usize, bits: u8, reason: usize, location: Option<&Location>) {
+        self.named_reason(function, bits, reason, location, None);
+    }
+    fn named_reason(
+        &mut self,
+        function: usize,
+        bits: u8,
+        reason: usize,
+        location: Option<&Location>,
+        callee: Option<&dyn std::fmt::Display>,
+    ) {
         if !(0..COUNT).any(|bit| {
             bits & (1 << bit) != 0 && self.facts[function][bit].reasons[reason].is_none()
         }) {
@@ -324,6 +351,7 @@ impl Analysis {
         let id = self.reasons.len();
         self.reasons.push(UnknownReason {
             code: REASONS[reason],
+            callee: callee.map(ToString::to_string),
             location: location.cloned(),
         });
         for bit in 0..COUNT {
@@ -404,6 +432,7 @@ impl Analysis {
                 witness: None,
                 unknown_reasons: vec![UnknownReason {
                     code: UnknownReasonCode::MissingBody,
+                    callee: None,
                     location: None,
                 }],
             })
@@ -560,6 +589,7 @@ mod tests {
                 assert_eq!(effect["state"], "unknown");
                 assert_eq!(effect["unknown_reasons"][0]["location"]["start"], 3);
                 assert_eq!(effect["unknown_reasons"][0]["location"]["end"], 7);
+                assert_eq!(effect["unknown_reasons"][0]["callee"], "callee");
             }
         }
     }
@@ -569,6 +599,32 @@ mod tests {
         witness(&mut s, 0, 1, "runtime-capability", "indirect-call");
         assert_eq!(output(&s, 0)[0]["state"], "unknown");
         assert!(reason(&output(&s, 0), "indirect-call"));
+    }
+
+    #[test]
+    fn unresolved_edge_names_target_and_uses_its_call_site() {
+        let mut s = fixture(2);
+        link(&mut s, 1, 0);
+        s.functions[0].callees.push("absent::method".into());
+        s.semantic.effect_calls.insert(
+            "f0".into(),
+            vec![semantic::EffectCall {
+                target: "absent::method".into(),
+                location: Location {
+                    display: None,
+                    path: "test.wi".into(),
+                    start: 3,
+                    end: 7,
+                },
+            }],
+        );
+        for i in [0, 1] {
+            let value = output(&s, i);
+            for effect in value.as_array().unwrap() {
+                assert_eq!(effect["unknown_reasons"][0]["callee"], "absent::method");
+                assert_eq!(effect["unknown_reasons"][0]["location"]["start"], 3);
+            }
+        }
     }
     #[test]
     fn external_boundary_is_unknown() {
@@ -784,6 +840,41 @@ mod tests {
                     n * COUNT * (REASONS.len() + 1)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn named_unresolved_evidence_is_shared_across_deep_callers() {
+        for n in [16, 64, 256, 1024] {
+            let mut s = fixture(n);
+            for i in 1..n {
+                link(&mut s, i - 1, i);
+            }
+            s.semantic.unresolved_calls.insert(
+                format!("f{}", n - 1),
+                (0..n)
+                    .map(|i| semantic::UnresolvedCall {
+                        operation: "receiver.work".into(),
+                        location: Location {
+                            display: None,
+                            path: "test.wi".into(),
+                            start: i,
+                            end: i + 1,
+                        },
+                    })
+                    .collect(),
+            );
+            let analysis = Analysis::new(&s);
+            assert_eq!(analysis.reasons.len(), 1);
+            assert_eq!(analysis.edge_visits, COUNT * (n - 1));
+            assert_eq!(
+                analysis.output(0)[0]["unknown_reasons"][0]["callee"],
+                "receiver.work"
+            );
+            println!(
+                "named reasons n={n} stored=1 visits={}",
+                analysis.edge_visits
+            );
         }
     }
 }

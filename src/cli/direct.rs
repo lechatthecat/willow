@@ -798,7 +798,14 @@ fn effect_state_lines(
                 UnknownReasonCode::MissingWitness => "missing-witness",
                 UnknownReasonCode::MissingSource => "missing-source",
             };
-            lines.push(format!("  Unknown: {code}"));
+            let mut detail = format!("  Unknown: {code}");
+            if let Some(callee) = &reason.callee {
+                detail.push_str(&format!(" `{callee}`"));
+            }
+            if let Some(site) = &reason.location {
+                detail.push_str(&format!(" at {}", location(Some(site))));
+            }
+            lines.push(detail);
         }
     }
 }

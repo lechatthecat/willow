@@ -805,13 +805,30 @@ pub(crate) fn capture_incremental(
         bodies,
         queries,
     } = origin;
+    let local_effects = |id| queries.effect_seed(unit, id);
     let plan = PLAN.with(|slot| slot.borrow().clone());
     let Some(plan) = plan else {
-        return capture(program, graph, inputs, facts, symbols, index);
+        return capture(
+            program,
+            graph,
+            inputs,
+            facts,
+            symbols,
+            index,
+            &local_effects,
+        );
     };
     let Some(bodies) = bodies else {
         plan.borrow_mut().request_retry(SnapshotRetry::FullCapture);
-        return capture(program, graph, inputs, facts, symbols, index);
+        return capture(
+            program,
+            graph,
+            inputs,
+            facts,
+            symbols,
+            index,
+            &local_effects,
+        );
     };
     let selection = select_capture(
         &mut plan.borrow_mut(),
@@ -843,6 +860,7 @@ pub(crate) fn capture_incremental(
                 facts,
                 symbols,
                 index,
+                &local_effects,
             );
             let mut owners = HashSet::new();
             let plan = plan.borrow();
@@ -866,7 +884,15 @@ pub(crate) fn capture_incremental(
         }
         Err(retry) => {
             plan.borrow_mut().request_retry(retry);
-            capture(program, graph, inputs, facts, symbols, index)
+            capture(
+                program,
+                graph,
+                inputs,
+                facts,
+                symbols,
+                index,
+                &local_effects,
+            )
         }
     }
 }
