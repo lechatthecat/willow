@@ -7287,3 +7287,45 @@ fn io_contract_effect_queries_report_external_access() {
     );
     assert!(!String::from_utf8_lossy(&output.stdout).contains("\"state\":\"none\""));
 }
+
+#[test]
+fn type_parameter_project_selectors_and_positions_share_identity() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import util; fn main() { println(util::fold(1)); }",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/util.wi"),
+        "pub fn fold<T>(value: T) -> T { return value; }\npub class TopK<T> { pub value: T; }\n",
+    )
+    .unwrap();
+    for (selector, count) in [("util::fold::T", 2), ("util::TopK::T", 1)] {
+        let result = f.json(&["refs", selector, "--kind", "type-parameter"], 0);
+        assert_eq!(result["result"]["total"], count);
+        assert_eq!(result["result"]["selected"]["identity"]["module"], "util");
+        let id = &result["result"]["selected"]["id"];
+        for loc in std::iter::once(&result["result"]["selected"]["location"]).chain(
+            result["result"]["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| &r["location"]),
+        ) {
+            let at = format!("src/util.wi:{}:{}", loc["line"], loc["column"]);
+            let symbol = f.json(&["symbol", &at], 0);
+            assert_eq!(&symbol["result"]["selected"]["id"], id);
+            assert_eq!(symbol["result"]["selected"]["selector"], selector);
+        }
+        let human = f.run(&["symbol", selector]);
+        assert!(human.status.success());
+        assert!(
+            String::from_utf8(human.stdout)
+                .unwrap()
+                .contains("type-parameter")
+        );
+        let renamed = f.json(&["rename", selector, "Element"], 0);
+        assert_eq!(renamed["result"]["validation"], "passed");
+    }
+}

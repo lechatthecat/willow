@@ -1595,6 +1595,7 @@ impl<'a> StructuredIndex<'a> {
                         | SymbolKind::Variant
                         | SymbolKind::Binding
                         | SymbolKind::Parameter
+                        | SymbolKind::TypeParameter
                 )
         });
         let local_ids: std::collections::HashSet<_> = snapshot
@@ -1604,13 +1605,19 @@ impl<'a> StructuredIndex<'a> {
             .filter(|s| matches!(s.kind, SymbolKind::Binding | SymbolKind::Parameter))
             .map(|s| s.id.as_str())
             .collect();
-        if requested_renames.iter().any(|id| local_ids.contains(id)) {
+        if snapshot.semantic.symbols.iter().any(|symbol| {
+            requested_renames.contains(symbol.id.as_str())
+                && matches!(
+                    symbol.kind,
+                    SymbolKind::Binding | SymbolKind::Parameter | SymbolKind::TypeParameter
+                )
+        }) {
             let mut destinations = std::collections::HashSet::new();
             for operation in operations {
                 if let Operation::Rename { name, .. } = operation {
                     ensure!(
                         destinations.insert(name),
-                        "batch rename with local bindings requires distinct destination names to prevent capture"
+                        "batch rename with lexical bindings requires distinct destination names to prevent capture"
                     );
                 }
             }

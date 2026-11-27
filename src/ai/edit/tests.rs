@@ -226,40 +226,45 @@ impl DiagnosticEmitter for Collect {
     }
 }
 #[test]
-fn batch_local_rename_rejects_new_destination_capture() {
-    let f = Fixture::new();
-    let source = "fn main() { let a = 1; let b = 2; println(a + b); }";
-    fs::write(f.0.join("main.wi"), source).unwrap();
-    let w = f.workspace();
-    let mut emitter = crate::diagnostics::HumanEmitter;
-    let snapshot = w
-        .analyze(&f.0.join("main.wi"), false, &mut emitter)
-        .unwrap();
-    let operations = snapshot
-        .semantic
-        .symbols
-        .iter()
-        .filter(|s| s.kind == SymbolKind::Binding)
-        .map(|s| Operation::Rename {
-            function: s.id.clone(),
-            name: "fresh".into(),
-        })
-        .collect::<Vec<_>>();
-    assert_eq!(operations.len(), 2);
-    let error = w
-        .prepare(
-            &f.0.join("main.wi"),
-            false,
-            Request {
-                revision: snapshot.revision.clone(),
-                operations,
-            },
-            ChangeFormat::Full,
-            &mut emitter,
-        )
-        .unwrap_err();
-    assert!(format!("{error:#}").contains("distinct destination names"));
-    assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+fn batch_local_and_type_parameter_rename_rejects_new_destination_capture() {
+    for source in [
+        "fn main() { let a = 1; let b = 2; println(a + b); }",
+        "fn generic<T, A>(x: T, y: A) {} fn main() {}",
+        "class Pair<T, A> { pub x: T; pub y: A; } fn main() {}",
+    ] {
+        let f = Fixture::new();
+        fs::write(f.0.join("main.wi"), source).unwrap();
+        let w = f.workspace();
+        let mut emitter = crate::diagnostics::HumanEmitter;
+        let snapshot = w
+            .analyze(&f.0.join("main.wi"), false, &mut emitter)
+            .unwrap();
+        let operations = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .filter(|s| matches!(s.kind, SymbolKind::Binding | SymbolKind::TypeParameter))
+            .map(|s| Operation::Rename {
+                function: s.id.clone(),
+                name: "fresh".into(),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(operations.len(), 2);
+        let error = w
+            .prepare(
+                &f.0.join("main.wi"),
+                false,
+                Request {
+                    revision: snapshot.revision.clone(),
+                    operations,
+                },
+                ChangeFormat::Full,
+                &mut emitter,
+            )
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("distinct destination names"));
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+    }
 }
 
 #[test]

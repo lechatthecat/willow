@@ -316,6 +316,7 @@ pub(super) struct Index<'a> {
     renamed: HashSet<&'a str>,
     unknown: HashMap<String, (String, Span)>,
     source_tokens: HashMap<Point<'a>, (&'a str, &'a Span)>,
+    type_names: HashSet<(&'a str, &'a str)>,
     local_ranges: HashMap<&'a str, Location>,
     named_tokens: HashMap<&'a str, Vec<(&'a str, &'a Span)>>,
     #[cfg(test)]
@@ -343,6 +344,7 @@ impl<'a> Index<'a> {
             unknown: HashMap::new(),
             source_tokens: HashMap::new(),
             local_ranges: HashMap::new(),
+            type_names: HashSet::new(),
             named_tokens: HashMap::new(),
             #[cfg(test)]
             indexed: 0,
@@ -390,6 +392,30 @@ impl<'a> Index<'a> {
         let mut by_start = vec![Vec::new(); scope_count];
         for symbol in &snapshot.semantic.symbols {
             result.symbols.insert(&symbol.id, symbol);
+            if let Some(l) = &symbol.location {
+                if let Some(span) = symbol.details.type_parameter_scope {
+                    result.local_ranges.insert(
+                        &symbol.id,
+                        Location {
+                            path: l.path.clone(),
+                            start: span.start,
+                            end: span.end,
+                            display: None,
+                        },
+                    );
+                }
+                if matches!(
+                    symbol.kind,
+                    SymbolKind::Class
+                        | SymbolKind::Interface
+                        | SymbolKind::Enum
+                        | SymbolKind::Import
+                ) {
+                    result
+                        .type_names
+                        .insert((&l.path, QualifiedName::new(&symbol.name).last_segment()));
+                }
+            }
             for &(start, end) in result.scopes.get(&symbol.id).into_iter().flatten() {
                 by_start[start].push((
                     QualifiedName::new(&symbol.name).last_segment(),
@@ -500,6 +526,7 @@ impl<'a> Index<'a> {
                     | SymbolKind::Variant
                     | SymbolKind::Binding
                     | SymbolKind::Parameter
+                    | SymbolKind::TypeParameter
             )
         })
     }
@@ -519,12 +546,28 @@ impl<'a> Index<'a> {
             !self.renamed.contains(id),
             "duplicate rename of dispatch family"
         );
-        let local = matches!(selected.kind, SymbolKind::Binding | SymbolKind::Parameter);
+        let type_parameter = selected.kind == SymbolKind::TypeParameter;
+        let local = matches!(
+            selected.kind,
+            SymbolKind::Binding | SymbolKind::Parameter | SymbolKind::TypeParameter
+        );
+        if type_parameter {
+            let location = selected
+                .location
+                .as_ref()
+                .context("type parameter has no source location")?;
+            ensure!(
+                !self.type_names.contains(&(location.path.as_str(), name))
+                    && crate::semantic::builtin_types::BuiltinTypeId::from_name(name).is_none()
+                    && !matches!(name, "String" | "void"),
+                "rename destination conflicts with a type or import in scope"
+            );
+        }
         if local {
             let range = self
                 .local_ranges
                 .get(id)
-                .context("local binding has no editable function scope")?;
+                .context("declaration has no editable lexical scope")?;
             // Conservative capture prevention: any existing destination spelling
             // in the enclosing function (including nested closures) is rejected.
             // Indexed range lookup avoids a token scan for each local rename.
@@ -545,7 +588,11 @@ impl<'a> Index<'a> {
                         .to_str()
                         .context("non UTF-8 path")?;
                     return Err(reject(
-                        "rename destination already occurs in the enclosing function; renaming could capture or shadow another binding",
+                        if type_parameter {
+                            "rename destination already occurs in the type parameter owner; renaming could capture a type or another type parameter"
+                        } else {
+                            "rename destination already occurs in the enclosing function; renaming could capture or shadow another binding"
+                        },
                         relative,
                         span,
                     ));
@@ -762,7 +809,7 @@ mod tests {
 
     #[test]
     fn unrelated_destination_queries_do_not_multiply_full_scans() {
-        for kind in ["field", "binding"] {
+        for kind in ["field", "binding", "type-parameter"] {
             for n in [16usize, 64, 256, 1024] {
                 let root = std::env::temp_dir().join("willow-collision-index");
                 let path = root.join("main.wi").to_str().unwrap().to_owned();
@@ -785,7 +832,10 @@ mod tests {
                         id,
                         identity: None,
                         source_name: None,
-                        details: Default::default(),
+                        details: symbols::DeclarationDetails {
+                            type_parameter_scope: (kind == "type-parameter").then_some(t.span),
+                            ..Default::default()
+                        },
                         name: name.clone(),
                         kind: kind.into(),
                         ty: None,

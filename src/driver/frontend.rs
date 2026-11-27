@@ -1167,7 +1167,9 @@ pub(super) fn expand_prechecked_unit(
         metadata.class_templates = checker.generics.class_template_spans();
         metadata.logical_types = checker.generics.logical_types.raw().clone();
         metadata.nominal_aliases = std::mem::take(&mut checker.generics.nominal_aliases);
-        metadata.symbols = std::mem::take(&mut checker.generics.source_symbols);
+        metadata
+            .symbols
+            .extend(std::mem::take(&mut checker.generics.source_symbols));
         metadata.index_symbols();
         sources.insert(unit, metadata);
     }

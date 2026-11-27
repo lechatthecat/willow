@@ -116,3 +116,90 @@ mod tests {
         }
     }
 }
+
+/// Top-level generic binders have disjoint lexical extents. Index owners once,
+/// then resolve each explicit type head without rescanning declarations/bodies.
+pub(crate) struct TypeParameterScopes<'a> {
+    owners: Vec<(Span, std::collections::HashSet<&'a str>)>,
+    #[cfg(test)]
+    probes: std::cell::Cell<usize>,
+}
+impl<'a> TypeParameterScopes<'a> {
+    pub fn new(program: &'a crate::parser::ast::Program) -> Self {
+        use crate::parser::ast::Item;
+        let mut owners: Vec<_> = program
+            .items
+            .iter()
+            .filter_map(|item| {
+                let (span, params) = match item {
+                    Item::Function(f) => (f.span, &f.type_params),
+                    Item::Class(c) => (c.span, &c.type_params),
+                    Item::Enum(e) => (e.span, &e.type_params),
+                    Item::Interface(i) => (i.span, &i.type_params),
+                };
+                (!params.is_empty()).then(|| (span, params.iter().map(String::as_str).collect()))
+            })
+            .collect();
+        owners.sort_by_key(|(span, _)| (span.file_id.0, span.start));
+        Self {
+            owners,
+            #[cfg(test)]
+            probes: std::cell::Cell::new(0),
+        }
+    }
+    pub fn owner(&self, usage: &crate::parser::ast::TypeUse) -> Option<Span> {
+        let p = self.owners.partition_point(|(span, _)| {
+            #[cfg(test)]
+            self.probes.set(self.probes.get() + 1);
+            (span.file_id.0, span.start) <= (usage.span.file_id.0, usage.span.start)
+        });
+        let (owner, params) = self.owners.get(p.checked_sub(1)?)?;
+        (owner.contains(usage.span) && params.contains(usage.name.as_str())).then_some(*owner)
+    }
+}
+
+#[cfg(test)]
+mod type_parameter_tests {
+    use super::*;
+
+    #[test]
+    fn type_parameter_owner_index_scales_with_owners_parameters_and_uses() {
+        for owners in [16usize, 64, 256] {
+            for parameters in [1, 8] {
+                for uses in [4, 32] {
+                    let params = (0..parameters)
+                        .map(|p| format!("T{p}"))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let args = (0..uses)
+                        .map(|u| format!("x{u}: T{}", u % parameters))
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let source = (0..owners)
+                        .map(|i| format!("fn generic{i}<{params}>({args}) {{}}\n"))
+                        .collect::<String>();
+                    let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+                    let (program, errors) = crate::parser::Parser::new(tokens).parse();
+                    assert!(errors.is_empty(), "{errors:?}");
+                    let index = TypeParameterScopes::new(&program);
+                    assert_eq!(index.owners.len(), owners);
+                    assert_eq!(
+                        index.owners.iter().map(|(_, p)| p.len()).sum::<usize>(),
+                        owners * parameters
+                    );
+                    assert_eq!(program.type_uses.len(), owners * uses);
+                    for usage in &program.type_uses {
+                        assert!(index.owner(usage).unwrap().contains(usage.span));
+                    }
+                    let bound = owners * uses * (owners.ilog2() as usize + 2);
+                    assert!(index.probes.get() <= bound);
+                    println!(
+                        "owners={owners} parameters={parameters} uses_per_owner={uses} references={} probes={} bound={bound}",
+                        owners * uses,
+                        index.probes.get()
+                    );
+                }
+            }
+        }
+    }
+}

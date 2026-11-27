@@ -1272,3 +1272,158 @@ fn rename_to_contextual_open_for_all_target_kinds() {
         assert_eq!(after, source.replace("old", "open"));
     }
 }
+
+#[test]
+fn type_parameter_selectors_positions_refs_and_atomic_rename() {
+    let source = include_str!("../example/semantic_type_parameters.wi");
+    for (owner, parameter, count) in [
+        ("fold", "T", 3),
+        ("fold", "A", 4),
+        ("TopK", "T", 4),
+        ("unused", "T", 2),
+    ] {
+        let f = Fixture::new(source);
+        let selector = format!("main::{owner}::{parameter}");
+        let refs = f.run(&["refs", &selector, "--all", "--kind", "type-parameter"], 0);
+        assert_eq!(refs["result"]["total"], count, "{refs}");
+        let selected = &refs["result"]["selected"];
+        assert_eq!(selected["kind"], "type-parameter");
+        let positions = std::iter::once(&selected["location"]).chain(
+            refs["result"]["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| &r["location"]),
+        );
+        for location in positions {
+            let position = format!("main.wi:{}:{}", location["line"], location["column"]);
+            let at = f.run(&["symbol", &position], 0);
+            assert_eq!(at["result"]["selected"]["id"], selected["id"], "{at}");
+            assert_eq!(at["result"]["selected"]["selector"], selector);
+        }
+        let preview = f.run(&["rename", &selector, "Element", "--dry-run", "--diff"], 0);
+        assert_eq!(preview["result"]["declarations_updated"], 1);
+        assert_eq!(preview["result"]["references_updated"], count);
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        let applied = f.run(&["rename", &selector, "Element"], 0);
+        assert_eq!(applied["result"]["validation"], "passed");
+        assert_eq!(applied["result"]["edits"], count + 1);
+        let new_selector = format!("main::{owner}::Element");
+        assert_eq!(f.run(&["refs", &new_selector], 0)["result"]["total"], count);
+        let changed = fs::read_to_string(f.0.join("main.wi")).unwrap();
+        assert!(changed.contains("TopK<String>(\"T\")"));
+        assert!(changed.contains("// willow symbol semantic_type_parameters::fold::T"));
+        for other in ["fold", "TopK", "unused"] {
+            if other != owner {
+                f.run(&["symbol", &format!("main::{other}::T")], 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn type_parameter_rename_rejects_capture_without_changing_files() {
+    let source = "import helper::Remote as Alias;\nclass Local {}\ninterface Contract {}\nenum Choice { One }\nfn fold<T, A>(value: T, acc: A) -> T { let item: Alias = new Alias(); return value; }\nclass TopK<T, A> { pub value: T; }\nfn main() {}\n";
+    for selector in ["main::fold::T", "main::TopK::T"] {
+        for name in [
+            "A", "Local", "Contract", "Choice", "Alias", "Array", "String", "void", "i64", "if",
+            "T",
+        ] {
+            let f = Fixture::new(source);
+            f.write("helper.wi", "pub class Remote {}");
+            let rejected = f.run(&["rename", selector, name, "--dry-run"], 1);
+            assert_eq!(rejected["status"], "error", "{rejected}");
+            assert!(
+                rejected["message"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("conflict")
+                        || s.contains("capture")
+                        || s.contains("keyword")
+                        || s.contains("no effect")),
+                "{rejected}"
+            );
+            assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+            assert!(!f.0.join(".willow-edits/active").exists());
+        }
+    }
+}
+
+#[test]
+fn type_parameter_cross_module_unicode_and_unused_binders() {
+    let f = Fixture::new("import util; fn main() { println(util::identity(1)); }");
+    let source = "/* 型 */ pub fn identity<T>(value: T) -> T { return value; }\npub class Empty<T> {}\npub fn unused<T>() {}\n";
+    f.write("util.wi", source);
+    for (owner, count) in [("identity", 2), ("Empty", 0), ("unused", 0)] {
+        let selector = format!("util::{owner}::T");
+        let refs = f.run(&["refs", &selector], 0);
+        assert_eq!(refs["result"]["total"], count, "{refs}");
+        let location = &refs["result"]["selected"]["location"];
+        let position = format!("util.wi:{}:{}", location["line"], location["column"]);
+        let result = f.run(&["rename", &position, "Element"], 0);
+        assert_eq!(result["result"]["edits"], count + 1);
+        f.run(&["symbol", &format!("util::{owner}::Element")], 0);
+    }
+    assert_eq!(
+        fs::read_to_string(f.0.join("main.wi")).unwrap(),
+        "import util; fn main() { println(util::identity(1)); }"
+    );
+}
+
+#[test]
+fn type_parameter_enum_interface_and_scope_isolation() {
+    let source = "enum Maybe<T> { Some(T), None }\ninterface Reader<T> { fn get(self) -> T; }\nfn f<T>(x: T) -> T { return x; }\nfn g<Element>(x: Element) -> Element { return x; }\nfn main() {}\n";
+    let f = Fixture::new(source);
+    for owner in ["Maybe", "Reader", "f"] {
+        let result = f.run(&["rename", &format!("main::{owner}::T"), "Element"], 0);
+        assert_eq!(result["result"]["validation"], "passed");
+    }
+    f.run(&["refs", "main::g::Element"], 0);
+}
+
+#[test]
+fn type_parameter_rename_work_scales_with_source_uses() {
+    for n in [8, 32, 128] {
+        let args = (0..n)
+            .map(|i| format!("x{i}: T"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let source = format!("fn f<T>({args}) {{}} fn main() {{}}");
+        let f = Fixture::new(&source);
+        let preview = f.run(
+            &["rename", "main::f::T", "Element", "--dry-run", "--diff"],
+            0,
+        );
+        assert_eq!(preview["result"]["edits"], n + 1, "{preview}");
+        assert_eq!(
+            preview["result"]["work"]["references_visited"], n,
+            "{preview}"
+        );
+        assert_eq!(preview["result"]["declarations_updated"], 1);
+        println!(
+            "type_parameter uses={n} patches={} reference_visits={n}",
+            n + 1
+        );
+    }
+}
+
+#[test]
+fn type_parameter_constraints_interfaces_and_explicit_arguments() {
+    let source = "interface Reader<R> { fn read(self) -> R; }\nclass Child<T> implements Reader<T> { pub value: T; pub fn read(self) -> T { return self.value; } pub fn get(self) -> T where T: i64 | f64 { let value: T = self.value; return identity<T>(value); } }\nfn identity<T>(value: T) -> T { return value; }\nfn main() { println(new Child<i64>(7).get()); }\n";
+    let f = Fixture::new(source);
+    let refs = f.run(&["refs", "main::Child::T"], 0);
+    assert_eq!(refs["result"]["total"], 7, "{refs}");
+    for reference in refs["result"]["references"].as_array().unwrap() {
+        let l = &reference["location"];
+        let position = format!("main.wi:{}:{}", l["line"], l["column"]);
+        assert_eq!(
+            f.run(&["symbol", &position], 0)["result"]["selected"]["id"],
+            refs["result"]["selected"]["id"]
+        );
+    }
+    let result = f.run(&["rename", "main::Child::T", "Element"], 0);
+    assert_eq!(result["result"]["edits"], 8);
+    let changed = fs::read_to_string(f.0.join("main.wi")).unwrap();
+    assert!(changed.contains("where Element: i64 | f64"));
+    assert!(changed.contains("identity<Element>(value)"));
+    assert!(changed.contains("fn identity<T>"));
+}

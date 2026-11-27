@@ -237,12 +237,25 @@ impl Source {
                 _ => {}
             }
         }
+        let mut symbols = Facts::default();
+        let parameters = crate::semantic::analysis_symbols::TypeParameterScopes::new(program);
+        for usage in &program.type_uses {
+            if let Some(owner) = parameters.owner(usage) {
+                symbols.reference(
+                    usage.span,
+                    &usage.name,
+                    Declaration::new(&usage.name, "type-parameter", owner, None),
+                    "type",
+                    false,
+                );
+            }
+        }
         Self {
             class_templates: HashMap::new(),
             imports: program.imports.clone(),
             logical_types: HashMap::new(),
             nominal_aliases: HashMap::new(),
-            symbols: Facts::default(),
+            symbols,
             written,
             owners: symbols::owners_of(items.iter().copied()),
             details: symbols::details_of(items.iter().copied(), &Default::default()),
@@ -279,6 +292,19 @@ pub(super) fn restore(
         .values()
         .flat_map(|s| &s.declarations)
         .map(|d| ((d.span, d.kind.as_str(), source_spelling(&d.name)), d))
+        .collect();
+    // Imported function aliases retain the declaration span even when the
+    // checker records the local import spelling instead of the source name.
+    let function_declarations: HashMap<_, _> = declarations
+        .values()
+        .filter(|d| SymbolKind::from(d.kind.as_str()) == SymbolKind::Function)
+        .map(|d| (d.span, *d))
+        .collect();
+    let parameters: HashMap<_, _> = sources
+        .values()
+        .flat_map(|s| &s.symbols.references)
+        .filter(|r| SymbolKind::from(r.target.kind.as_str()) == SymbolKind::TypeParameter)
+        .map(|r| (r.span, &r.target))
         .collect();
     let written: HashMap<_, _> = sources.values().flat_map(|s| &s.written).collect();
     let class_declarations: HashMap<_, _> = sources
@@ -356,11 +382,16 @@ pub(super) fn restore(
                     .cloned()
             })
             .map_names(|name| {
-                QualifiedName::from_segments(
-                    QualifiedName::new(&name)
-                        .segments()
-                        .map(crate::semantic::ids::source_name),
-                )
+                QualifiedName::from_segments(QualifiedName::new(&name).segments().map(|segment| {
+                    use crate::qualified_name::SyntheticKind;
+                    match crate::semantic::ids::synthetic_name_kind(segment) {
+                        SyntheticKind::LocalNamespace
+                        | SyntheticKind::PackageNamespace
+                        | SyntheticKind::StdNamespace
+                        | SyntheticKind::ForeignReceiver => segment.to_owned(),
+                        _ => crate::semantic::ids::source_name(segment),
+                    }
+                }))
             })
         };
         let restore = |d: &mut Declaration| {
@@ -369,10 +400,16 @@ pub(super) fn restore(
             {
                 *d = source.clone();
             }
-            if let Some(source) =
-                declarations.get(&(d.span, d.kind.as_str(), source_spelling(&d.name)))
+            if let Some(source) = declarations
+                .get(&(d.span, d.kind.as_str(), source_spelling(&d.name)))
+                .copied()
+                .or_else(|| {
+                    (SymbolKind::from(d.kind.as_str()) == SymbolKind::Function)
+                        .then(|| function_declarations.get(&d.span).copied())
+                        .flatten()
+                })
             {
-                *d = (*source).clone();
+                *d = source.clone();
             }
             d.name = source_spelling(&d.name);
             if let Some(ty) = &mut d.ty {
@@ -396,6 +433,14 @@ pub(super) fn restore(
                     .is_some_and(|source| !QualifiedName::new(&source).is_qualified()))
         });
         for r in &mut capture.symbols.references {
+            // Instances retain source annotation spans but resolve their types
+            // after substitution. Source binders own those tokens in queries.
+            if r.role == "type"
+                && let Some(parameter) = parameters.get(&r.span)
+            {
+                r.target = (*parameter).clone();
+                r.ty = None;
+            }
             let kind = SymbolKind::from(r.target.kind.as_str());
             let generic_callable = matches!(kind, SymbolKind::Function | SymbolKind::Method)
                 && declarations.contains_key(&(

@@ -549,10 +549,11 @@ impl DirectSession {
                     | SymbolKind::Method
                     | SymbolKind::Binding
                     | SymbolKind::Parameter
+                    | SymbolKind::TypeParameter
             )
         {
             let message = format!(
-                "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields, enum variants and local bindings; this symbol kind is not supported. No files changed",
+                "unsupported rename target `{selector}` ({}): rename supports source functions, methods, fields, enum variants, local bindings and type parameters; this symbol kind is not supported. No files changed",
                 symbol.kind
             );
             if let Some(location) = &selected.location
@@ -760,7 +761,7 @@ impl DirectSession {
             None => "end of file".to_owned(),
         };
         let mut reason = format!(
-            "No symbol at this position: found {found}. Place the cursor on an identifier."
+            "No symbol at this position: found {found}. No semantic declaration or reference is recorded here."
         );
         let nearest = self
             .snapshot()
@@ -1825,6 +1826,49 @@ impl DirectSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn type_parameter_position_miss_never_mislabels_identifiers() {
+        let text = "T fn (  // 型\n";
+        let mut snapshot = Snapshot {
+            edit_context: None,
+            version: 1,
+            compiler: storage::compiler_stamp(),
+            compatibility: String::new(),
+            workspace: "/virtual".into(),
+            revision: String::new(),
+            sources: BTreeMap::new(),
+            semantic: Default::default(),
+            functions: vec![],
+        };
+        snapshot.revision = snapshot.digest().unwrap();
+        let mut session = DirectSession::new(snapshot).unwrap();
+        session
+            .sources
+            .insert("/virtual/main.wi".into(), SourceIndex::new(text.into()));
+        for (byte, found) in [
+            (0, "token `T`"),
+            (2, "token `fn`"),
+            (5, "token `(`"),
+            (6, "whitespace"),
+            (8, "a comment"),
+            (11, "a comment"),
+            (14, "end of line"),
+        ] {
+            let reason = session
+                .missing_symbol_reason("/virtual/main.wi", byte)
+                .unwrap();
+            assert!(reason.contains(found), "{reason}");
+            assert!(
+                reason.contains("No semantic declaration or reference"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("Place the cursor on an identifier"),
+                "{reason}"
+            );
+        }
+    }
+
     #[test]
     fn bundled_source_locations_use_embedded_bytes_and_verify_hash() {
         let path = "<std>/collections.wi";

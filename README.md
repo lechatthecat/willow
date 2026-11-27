@@ -334,6 +334,18 @@ The CLI provides `effects`, `impact`, `refs`, `type`, `symbol`, `rename` and
 
 - <a id="what-needs-language-semantics-and-what-lspmcp-can-provide"></a>**LSP/MCP** can expose semantic results, but the underlying language/analyzer establishes the guarantees. The transport alone does not establish lock safety or proof validity.
 
+### Type parameter queries and rename
+
+A type parameter uses the selector `module::owner::parameter`, for example
+`util::fold::T` for `fn fold<T>` or `util::TopK::T` for `class TopK<T>`.
+`symbol` accepts that selector or `file:line:column` on its declaration or a use.
+`refs` lists type uses inside that owner, including uninstantiated generic bodies.
+`rename` changes the declaration and those uses together; `--dry-run --diff`
+previews the edits. Other owners' parameters with the same spelling are unchanged.
+Rename rejects other parameters, visible type/import names and existing destination
+spellings inside the owner to prevent capture. See the runnable
+[type parameter example](example/semantic_type_parameters.wi).
+
 ### How this relates to other approaches
 
 Willow explores selected concurrency rules and compiler-readable evidence, using

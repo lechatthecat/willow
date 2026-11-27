@@ -1,0 +1,24 @@
+// Select type parameters with module::owner::parameter, or a source position.
+// willow symbol semantic_type_parameters::fold::T --source example/semantic_type_parameters.wi
+// willow refs semantic_type_parameters::TopK::T --source example/semantic_type_parameters.wi
+// willow rename semantic_type_parameters::fold::T Element --source example/semantic_type_parameters.wi --dry-run --diff
+import std::collections::Array;
+fn fold<T, A>(value: T, acc: A, f: fn(A, T) -> A) -> A {
+    let values: Array<T> = [value];
+    return f(acc, values[0]);
+}
+class TopK<T> {
+    pub value: T;
+    pub init(self, value: T) { self.value = value; }
+    pub fn get(self) -> T {
+        let result: T = self.value;
+        return result;
+    }
+}
+fn unused<T>(value: T) -> T { return value; }
+fn main() {
+    println(fold(3, 2, |acc: i64, value: i64| acc + value));
+    println(fold("a", "b", |acc: String, value: String| acc + value));
+    println(new TopK<i64>(7).get());
+    println(new TopK<String>("T").get());
+}

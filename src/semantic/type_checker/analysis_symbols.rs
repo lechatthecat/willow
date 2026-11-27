@@ -14,28 +14,7 @@ impl TypeChecker {
         if !self.capture_call_sites && program.imports.is_empty() {
             return;
         }
-        let mut owners: Vec<_> = program
-            .items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Enum(e) => Some((
-                    e.span,
-                    e.type_params
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>(),
-                )),
-                Item::Interface(i) => Some((
-                    i.span,
-                    i.type_params
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<HashSet<_>>(),
-                )),
-                _ => None,
-            })
-            .collect();
-        owners.sort_by_key(|(span, _)| (span.file_id.0, span.start));
+        let owners = crate::semantic::analysis_symbols::TypeParameterScopes::new(program);
         for import in &program.imports {
             if !self.capture_call_sites {
                 break;
@@ -65,21 +44,14 @@ impl TypeChecker {
             }
         }
         for usage in &program.type_uses {
-            let p = owners.partition_point(|(span, _)| {
-                (span.file_id.0, span.start) <= (usage.span.file_id.0, usage.span.start)
-            });
-            if let Some((owner, params)) = p.checked_sub(1).map(|i| &owners[i])
-                && owner.file_id == usage.span.file_id
-                && usage.span.end <= owner.end
-                && params.contains(usage.name.as_str())
-            {
+            if let Some(owner) = owners.owner(usage) {
                 if !self.capture_call_sites {
                     continue;
                 }
                 self.analysis_symbols.reference(
                     usage.span,
                     &usage.name,
-                    Declaration::new(&usage.name, "type-parameter", *owner, None),
+                    Declaration::new(&usage.name, "type-parameter", owner, None),
                     "type",
                     false,
                 );

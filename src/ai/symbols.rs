@@ -203,6 +203,8 @@ impl<'de> Deserialize<'de> for Symbol {
 /// It does not alter persisted symbol facts or selector identities.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DeclarationDetails {
+    /// Live lexical extent for type-parameter rename; never serialized.
+    pub type_parameter_scope: Option<Span>,
     pub effect_contracts: Vec<String>,
     pub public_api: bool,
     pub is_public: bool,
@@ -677,12 +679,18 @@ pub(super) fn declarations_of<'a>(
                         )
                     }),
                 );
+                for p in &f.type_params {
+                    declare(p, "type-parameter", f.span, None);
+                }
                 for p in &f.params {
                     declare(&p.name, "parameter", p.span, Some(p.ty.clone()));
                 }
             }
             Item::Class(c) => {
                 declare(&c.name, "class", c.span, Some(Type::Named(c.name.clone())));
+                for p in &c.type_params {
+                    declare(p, "type-parameter", c.span, None);
+                }
                 for f in &c.fields {
                     declare(
                         &f.name,
@@ -968,7 +976,12 @@ pub(super) fn finish(
             },
             // Type-parameter declarations share their container span. Do not
             // clone the whole generic parameter list onto each parameter.
-            details: if matches!(
+            details: if kind == SymbolKind::TypeParameter {
+                DeclarationDetails {
+                    type_parameter_scope: Some(d.span),
+                    ..Default::default()
+                }
+            } else if matches!(
                 kind,
                 SymbolKind::Function
                     | SymbolKind::Method

@@ -848,7 +848,12 @@ impl Parser {
         };
         let constraint = if matches!(self.peek_kind(), TokenKind::Ident(n) if n == "where") {
             self.advance();
+            let parameter_span = self.current_span();
             let parameter = self.expect_ident()?;
+            self.type_uses.push(TypeUse {
+                name: parameter.clone(),
+                span: parameter_span,
+            });
             self.expect(TokenKind::Colon)?;
             let mut alternatives = vec![self.parse_type()?];
             while self.eat(TokenKind::Pipe) {
