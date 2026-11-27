@@ -4,6 +4,11 @@ use super::*;
 use crate::ir::ir_variants;
 use crate::ir::lowered::LirRvalue;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static PATTERN_SCOPE_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Conservative "can evaluating this run a collection?" test, used to decide
 /// whether a live GC temporary has to be rooted across a sub-expression. Only
 /// the forms known to be allocation-free answer `false`; everything else —
@@ -82,7 +87,6 @@ pub(super) fn lir_cleanup_graph_is_valid(f: &LirFunction) -> bool {
 /// This is what the compile error prints, which is the difference between
 /// "something in this function is unsupported" and a construct, a type and a
 /// line to go and fix.
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(in crate::backend::cranelift) fn lir_rejection_reason(
     f: &LirFunction,
     ctx: &LirTypeCtx<'_>,
@@ -151,12 +155,7 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
             ));
         }
     }
-    // Names the walker can resolve, mapped to the type they are BOUND with (not
-    // the initialiser's type — see `LirInst::Let::ty`). Any other `Var` is
-    // something the HIR spells like a variable but codegen must special-case —
-    // a bare enum variant, a function used as a value — so an unresolved
-    // form fails validation.
-    let mut names: HashMap<&str, Cow<'_, Type>> = HashMap::new();
+    // Lowered locals must have unique physical names and valid owner storage.
     let mut physical_names = HashSet::new();
     for local in &f.locals {
         if !physical_names.insert(local.name.as_str()) {
@@ -165,17 +164,102 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
                 local.name
             ));
         }
-        if local.is_gc_owner() {
-            if !local.synthetic || local.parameter || local.ty != Type::Void {
-                return Some(
-                    "opaque GC owners must be synthetic storage without a language type".into(),
-                );
-            }
-        } else {
-            names.insert(local.name.as_str(), Cow::Borrowed(&local.ty));
+        if local.is_gc_owner() && (!local.synthetic || local.parameter || local.ty != Type::Void) {
+            return Some(
+                "opaque GC owners must be synthetic storage without a language type".into(),
+            );
         }
     }
 
+    if let Some(reason) = array_capture_rejection_reason(f, ctx) {
+        return Some(reason);
+    }
+
+    // A synchronous function's defer scopes live on the emitter's own Rust-side
+    // stack, so the walker can only compile one whose open scopes are the same
+    // whichever way control reached a block AND are what the emitter is holding
+    // when it gets there.
+    if !lir_cleanup_graph_is_valid(f) {
+        return Some("its defer scope crosses LIR blocks".to_string());
+    }
+
+    // User binding types remain the primary diagnostic even after their
+    // initializers have been split into preceding Compute instructions.
+    for block in &f.blocks {
+        for instruction in &block.instrs {
+            if let LirInst::Let { name, ty, .. } = instruction
+                && !ctx.supported_type(ty)
+            {
+                return Some(format!(
+                    "`let {name}` binds type `{}`, outside the walker's subset",
+                    type_name(ty)
+                ));
+            }
+        }
+    }
+    for block in &f.blocks {
+        for inst in &block.instrs {
+            // Keep recursive defer validation in this frame: extracting the
+            // instruction checks must not add a Rust frame per nested defer.
+            if let LirInst::Defer { body, .. } = inst {
+                if lir_rejection_reason(&body.function, ctx).is_some() {
+                    return Some("it registers an unsupported `defer` body".to_string());
+                }
+                continue;
+            }
+            if let Some(reason) = instruction_rejection_reason(f, ctx, inst) {
+                return Some(reason);
+            }
+        }
+        match &block.terminator {
+            Terminator::Branch { cond, .. } => {
+                if cond.ty(&f.locals) != Some(Type::Bool) || !cond.is_plain_value() {
+                    return Some("a branch has an invalid boolean operand".into());
+                }
+            }
+            Terminator::Return(Some(value)) => {
+                if value.ty(&f.locals) == Some(Type::Void) {
+                    return Some("the `return` yields a `void` value, which has no slot in the function's signature".into());
+                }
+                if !value
+                    .ty(&f.locals)
+                    .is_some_and(|ty| ty != Type::Void && ctx.storable(&f.return_type, &ty))
+                    || !value.is_plain_value()
+                {
+                    return Some("a return has an incompatible operand or signature".into());
+                }
+            }
+            Terminator::Suspend { .. } if !f.is_async => {
+                return Some("a synchronous function contains a suspension edge".to_string());
+            }
+            // A `lock` critical section. The protected value
+            // is loaded into a frame slot on acquisition and committed back on
+            // release, so the walker has to be able to represent it. The lock
+            // HANDLE needs no check of its own: the lowerer hoisted it into a
+            // `let`, which the instruction loop above already vetted.
+            Terminator::Suspend {
+                operation: SuspendOp::LockAcquire { slots, span },
+                ..
+            } => {
+                let value_ty = &slots.value_ty;
+                if !ctx.supported_type(value_ty) {
+                    return Some(format!(
+                        "the `lock` at line {} protects type `{}`, outside the walker's subset",
+                        span.line,
+                        type_name(value_ty)
+                    ));
+                }
+            }
+            Terminator::Jump(_)
+            | Terminator::Suspend { .. }
+            | Terminator::Return(None)
+            | Terminator::CleanupReturn => {}
+        }
+    }
+    None
+}
+
+fn array_capture_rejection_reason(f: &LirFunction, ctx: &LirTypeCtx<'_>) -> Option<String> {
     // Opaque owners carry no language type. Recover their checked capture
     // provenance so malformed LIR cannot reinterpret a buffer or replace its
     // bounds-checked index with another local.
@@ -235,347 +319,291 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
         }
     }
 
-    // A synchronous function's defer scopes live on the emitter's own Rust-side
-    // stack, so the walker can only compile one whose open scopes are the same
-    // whichever way control reached a block AND are what the emitter is holding
-    // when it gets there.
-    if !lir_cleanup_graph_is_valid(f) {
-        return Some("its defer scope crosses LIR blocks".to_string());
-    }
+    None
+}
 
-    // User binding types remain the primary diagnostic even after their
-    // initializers have been split into preceding Compute instructions.
-    for block in &f.blocks {
-        for instruction in &block.instrs {
-            if let LirInst::Let { name, ty, .. } = instruction
-                && !ctx.supported_type(ty)
+fn computation_rejection_reason(
+    f: &LirFunction,
+    ctx: &LirTypeCtx<'_>,
+    local: crate::ir::lowered::LirLocalId,
+    value: &LirRvalue,
+    span: &Span,
+) -> Option<String> {
+    if let crate::ir::lowered::LirRvalue::DirectCall {
+        callee,
+        args,
+        params,
+        result,
+    } = value
+    {
+        if !(ctx.known_fn_id)(callee) {
+            return Some(format!(
+                "the call to `{callee}` at line {} has no declared function",
+                span.line
+            ));
+        }
+        if let Some(ty) = std::iter::once(result)
+            .chain(params)
+            .find(|ty| !ctx.supported_type(ty))
+        {
+            return Some(format!(
+                "the call to `{callee}` at line {} has type `{}`, outside the supported LIR types",
+                span.line,
+                type_name(ty)
+            ));
+        }
+        if !flat_argument_modes_match(
+            args,
+            ctx.func_param_modes
+                .get_id(callee)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        ) {
+            return Some(format!(
+                "the call to `{callee}` has incompatible reference modes"
+            ));
+        }
+        if ctx.fn_types.get_id(callee).is_some_and(|signature| {
+            !matches!(signature,
+        Type::Fn(declared, output) if declared.len() == params.len()
+            && declared.iter().zip(params).all(|(declared, actual)| ctx.same_repr(declared, actual))
+            && ctx.same_repr(output, result))
+        }) {
+            return Some(format!(
+                "the call to `{callee}` at line {} has an incompatible signature",
+                span.line
+            ));
+        }
+    }
+    match value {
+        crate::ir::lowered::LirRvalue::FunctionRef { function, ty }
+            if !ctx
+                .fn_value_of(function)
+                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
+        {
+            return Some(format!(
+                "the function value `{function}` at line {} has an incompatible signature",
+                span.line
+            ));
+        }
+        crate::ir::lowered::LirRvalue::Closure { id, ty, .. }
+            if !(ctx.lambda_symbol)(*id)
+                .and_then(|symbol| ctx.fn_value_of(&symbol))
+                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
+        {
+            return Some(format!(
+                "a lambda at line {} has an unsupported environment or signature",
+                span.line
+            ));
+        }
+        ir_variants!(
+            LirRvalue;
+            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
+            Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+            RebindResultError, IntoError, PrepareMethod, MethodCall,
+            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+            IndirectCall, Unary, Binary, StringConcat
+        ) => {}
+    }
+    if let crate::ir::lowered::LirRvalue::IntrinsicCall {
+        intrinsic,
+        receiver_ty,
+        arg_types,
+        result,
+        method,
+        ..
+    } = value
+        && !flat_intrinsic_supported(*intrinsic, receiver_ty, arg_types, result, ctx)
+    {
+        return Some(format!(
+            "the `{method}` method at line {} uses an unsupported type",
+            span.line
+        ));
+    }
+    if !flat_rvalue_supported(value, &f.locals, ctx) || !value.is_well_typed(&f.locals, local) {
+        use crate::ir::lowered::LirRvalue as V;
+        let operation = match value {
+            V::PrepareMethod {
+                receiver_ty,
+                method,
+                ..
+            }
+            | V::MethodCall {
+                receiver_ty,
+                method,
+                ..
+            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
+            V::EnumMethod {
+                receiver_ty,
+                method,
+                ..
+            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
+            V::StaticField { class, field, .. } | V::StaticStore { class, field, .. } => {
+                format!("the static property `{class}::{field}`")
+            }
+            V::ObjectAlloc { class } | V::ConstructorCall { class, .. } => {
+                format!("`new {class}`")
+            }
+            V::FieldLoad {
+                object_ty, field, ..
+            }
+            | V::FieldStore {
+                object_ty, field, ..
+            } => format!("the field `{field}` on a `{}`", type_name(object_ty)),
+            V::StaticCall { class, method, .. } => {
+                format!("the call to `{class}::{method}`")
+            }
+            V::StartTask { callee, .. } => {
+                format!("the task constructor `{callee}`")
+            }
+            ir_variants!(
+                V;
+                BeginReferenceCall, Use, AwaitFuture, SelectIdleWait, Coerce,
+                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, EnumAlloc,
+                EnumPayloadStore, Range, BuiltinCall, FormatScalar, Panic,
+                Recover, ReferenceDebug, RebindResultError, IntoError,
+                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall,
+                DirectCall, IndirectCall, Unary, Binary, StringConcat
+            ) => "a flat computation".into(),
+        };
+        return Some(format!(
+            "{operation} at line {} has incompatible operands, metadata or destination",
+            span.line
+        ));
+    }
+    None
+}
+
+fn instruction_rejection_reason(
+    f: &LirFunction,
+    ctx: &LirTypeCtx<'_>,
+    inst: &LirInst,
+) -> Option<String> {
+    match inst {
+        LirInst::Compute { local, value, span } => {
+            return computation_rejection_reason(f, ctx, *local, value, span);
+        }
+        LirInst::Let {
+            local,
+            name,
+            ty,
+            value,
+            ..
+        } => {
+            if !f
+                .locals
+                .get(local.0 as usize)
+                .is_some_and(|slot| slot.name == *name && slot.ty == *ty && !slot.is_gc_owner())
+                || !value
+                    .ty(&f.locals)
+                    .is_some_and(|source| ctx.storable(ty, &source))
+                || !value.is_plain_value()
             {
                 return Some(format!(
-                    "`let {name}` binds type `{}`, outside the walker's subset",
-                    type_name(ty)
+                    "`let {name}` has incompatible LIR storage or operand"
                 ));
             }
         }
-    }
-    for block in &f.blocks {
-        for inst in &block.instrs {
-            match inst {
-                LirInst::Compute { local, value, span } => {
-                    if let crate::ir::lowered::LirRvalue::DirectCall {
-                        callee,
-                        args,
-                        params,
-                        result,
-                    } = value
-                    {
-                        if !(ctx.known_fn_id)(callee) {
-                            return Some(format!(
-                                "the call to `{callee}` at line {} has no declared function",
-                                span.line
-                            ));
-                        }
-                        if let Some(ty) = std::iter::once(result)
-                            .chain(params)
-                            .find(|ty| !ctx.supported_type(ty))
-                        {
-                            return Some(format!(
-                                "the call to `{callee}` at line {} has type `{}`, outside the supported LIR types",
-                                span.line,
-                                type_name(ty)
-                            ));
-                        }
-                        if !flat_argument_modes_match(
-                            args,
-                            ctx.func_param_modes
-                                .get_id(callee)
-                                .map(Vec::as_slice)
-                                .unwrap_or(&[]),
-                        ) {
-                            return Some(format!(
-                                "the call to `{callee}` has incompatible reference modes"
-                            ));
-                        }
-                        if ctx.fn_types.get_id(callee).is_some_and(|signature| !matches!(signature,
-                            Type::Fn(declared, output) if declared.len() == params.len()
-                                && declared.iter().zip(params).all(|(declared, actual)| ctx.same_repr(declared, actual))
-                                && ctx.same_repr(output, result)))
-                             {
-                            return Some(format!("the call to `{callee}` at line {} has an incompatible signature", span.line));
-                        }
-                    }
-                    match value {
-                        crate::ir::lowered::LirRvalue::FunctionRef { function, ty }
-                            if !ctx
-                                .fn_value_of(function)
-                                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
-                        {
-                            return Some(format!(
-                                "the function value `{function}` at line {} has an incompatible signature",
-                                span.line
-                            ));
-                        }
-                        crate::ir::lowered::LirRvalue::Closure { id, ty, .. }
-                            if !(ctx.lambda_symbol)(*id)
-                                .and_then(|symbol| ctx.fn_value_of(&symbol))
-                                .is_some_and(|known| ctx.same_callable(&known, ty)) =>
-                        {
-                            return Some(format!(
-                                "a lambda at line {} has an unsupported environment or signature",
-                                span.line
-                            ));
-                        }
-                        ir_variants!(
-                            LirRvalue;
-                            BeginReferenceCall, Use, AwaitFuture, StartTask, SelectIdleWait,
-                            Coerce, ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
-                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
-                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
-                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
-                            RebindResultError, IntoError, PrepareMethod, MethodCall,
-                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
-                            IndirectCall, Unary, Binary, StringConcat
-                        ) => {}
-                    }
-                    if let crate::ir::lowered::LirRvalue::IntrinsicCall {
-                        intrinsic,
-                        receiver_ty,
-                        arg_types,
-                        result,
-                        method,
-                        ..
-                    } = value
-                        && !flat_intrinsic_supported(
-                            *intrinsic,
-                            receiver_ty,
-                            arg_types,
-                            result,
-                            ctx,
-                        )
-                    {
-                        return Some(format!(
-                            "the `{method}` method at line {} uses an unsupported type",
-                            span.line
-                        ));
-                    }
-                    if !flat_rvalue_supported(value, &f.locals, ctx)
-                        || !value.is_well_typed(&f.locals, *local)
-                    {
-                        use crate::ir::lowered::LirRvalue as V;
-                        let operation = match value {
-                            V::PrepareMethod {
-                                receiver_ty,
-                                method,
-                                ..
-                            }
-                            | V::MethodCall {
-                                receiver_ty,
-                                method,
-                                ..
-                            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
-                            V::EnumMethod {
-                                receiver_ty,
-                                method,
-                                ..
-                            } => format!("the method `{method}` on a `{}`", type_name(receiver_ty)),
-                            V::StaticField { class, field, .. }
-                            | V::StaticStore { class, field, .. } => {
-                                format!("the static property `{class}::{field}`")
-                            }
-                            V::ObjectAlloc { class } | V::ConstructorCall { class, .. } => {
-                                format!("`new {class}`")
-                            }
-                            V::FieldLoad {
-                                object_ty, field, ..
-                            }
-                            | V::FieldStore {
-                                object_ty, field, ..
-                            } => format!("the field `{field}` on a `{}`", type_name(object_ty)),
-                            V::StaticCall { class, method, .. } => {
-                                format!("the call to `{class}::{method}`")
-                            }
-                            V::StartTask { callee, .. } => {
-                                format!("the task constructor `{callee}`")
-                            }
-                            ir_variants!(
-                                V;
-                                BeginReferenceCall, Use, AwaitFuture, SelectIdleWait, Coerce,
-                                ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, EnumAlloc,
-                                EnumPayloadStore, Range, BuiltinCall, FormatScalar, Panic,
-                                Recover, ReferenceDebug, RebindResultError, IntoError,
-                                StringLiteral, FunctionRef, Closure, Print, IntrinsicCall,
-                                DirectCall, IndirectCall, Unary, Binary, StringConcat
-                            ) => "a flat computation".into(),
-                        };
-                        return Some(format!(
-                            "{operation} at line {} has incompatible operands, metadata or destination",
-                            span.line
-                        ));
-                    }
-                }
-                LirInst::Let {
-                    local,
-                    name,
-                    ty,
-                    value,
-                    ..
-                } => {
-                    if !f.locals.get(local.0 as usize).is_some_and(|slot| {
-                        slot.name == *name && slot.ty == *ty && !slot.is_gc_owner()
-                    }) || !value
+        LirInst::Assign { local, name, value } => {
+            if !f.locals.get(local.0 as usize).is_some_and(|slot| {
+                slot.name == *name
+                    && !slot.is_gc_owner()
+                    && value
                         .ty(&f.locals)
-                        .is_some_and(|source| ctx.storable(ty, &source))
-                        || !value.is_plain_value()
-                    {
-                        return Some(format!(
-                            "`let {name}` has incompatible LIR storage or operand"
-                        ));
-                    }
-                }
-                LirInst::Assign { local, name, value } => {
-                    if !f.locals.get(local.0 as usize).is_some_and(|slot| {
-                        slot.name == *name
-                            && !slot.is_gc_owner()
-                            && value
-                                .ty(&f.locals)
-                                .is_some_and(|source| ctx.storable(&slot.ty, &source))
-                    }) || !value.is_plain_value()
-                    {
-                        return Some(format!(
-                            "`{name} = ...` has incompatible LIR storage or operand"
-                        ));
-                    }
-                }
-                LirInst::Unsupported { span, reason } => {
-                    return Some(format!("{reason} at line {}", span.line));
-                }
-                // Listed rather than caught by `_` so a new instruction has to
-                // be given an explicit validation decision here.
-                LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
-                LirInst::FlushDefers { .. } => {}
-                // Names locals this walker has already decided on, and stores
-                // a constant into the slots it gave them.
-                LirInst::ClearScopeRoots { .. } => {}
-                // Every release has a matching acquisition in the same
-                // function, and the decision is made there — on the terminator
-                // that carries the type this reads back.
-                LirInst::ReleaseLock { .. } => {}
-                LirInst::Defer { body, .. } => {
-                    let supported = lir_rejection_reason(&body.function, ctx).is_none();
-                    if !supported {
-                        return Some("it registers an unsupported `defer` body".to_string());
-                    }
-                }
-                // A `match` lowering split into blocks.
-                // The pattern is vetted here rather than through
-                // `supported_expr`, because the arm bodies are already ordinary
-                // LIR statements and their binding names are already in `names`
-                // as locals of this function.
-                LirInst::MatchTest {
-                    scrutinee,
-                    pattern,
-                    span,
-                    ..
-                }
-                | LirInst::MatchBind {
-                    scrutinee,
-                    pattern,
-                    span,
-                    ..
-                } => {
-                    let Some(scrutinee_local) = f
+                        .is_some_and(|source| ctx.storable(&slot.ty, &source))
+            }) || !value.is_plain_value()
+            {
+                return Some(format!(
+                    "`{name} = ...` has incompatible LIR storage or operand"
+                ));
+            }
+        }
+        LirInst::Unsupported { span, reason } => {
+            return Some(format!("{reason} at line {}", span.line));
+        }
+        // Listed rather than caught by `_` so a new instruction has to
+        // be given an explicit validation decision here.
+        LirInst::EnterDeferScope { .. } | LirInst::LeaveDeferScope { .. } => {}
+        LirInst::FlushDefers { .. } => {}
+        // Names locals this walker has already decided on, and stores
+        // a constant into the slots it gave them.
+        LirInst::ClearScopeRoots { .. } => {}
+        // Every release has a matching acquisition in the same
+        // function, and the decision is made there — on the terminator
+        // that carries the type this reads back.
+        LirInst::ReleaseLock { .. } => {}
+        LirInst::Defer { .. } => unreachable!("defer bodies are validated by the caller"),
+        // A `match` lowering split into blocks.
+        // The pattern is vetted here rather than through
+        // `supported_expr`, because the arm bodies are already ordinary
+        // LIR statements and their binding names are already in `names`
+        // as locals of this function.
+        LirInst::MatchTest {
+            scrutinee,
+            pattern,
+            span,
+            ..
+        }
+        | LirInst::MatchBind {
+            scrutinee,
+            pattern,
+            span,
+            ..
+        } => {
+            let Some(scrutinee_local) = f
+                .locals
+                .get(scrutinee.0 as usize)
+                .filter(|local| !local.is_gc_owner())
+            else {
+                return Some("a match references an invalid scrutinee local".into());
+            };
+            let scrutinee_ty = &scrutinee_local.ty;
+            match inst {
+                LirInst::MatchTest { result, .. }
+                    if !f
                         .locals
-                        .get(scrutinee.0 as usize)
-                        .filter(|local| !local.is_gc_owner())
-                    else {
-                        return Some("a match references an invalid scrutinee local".into());
-                    };
-                    let scrutinee_ty = &scrutinee_local.ty;
-                    match inst {
-                        LirInst::MatchTest { result, .. }
-                            if !f.locals.get(result.0 as usize).is_some_and(|local| {
-                                !local.is_gc_owner() && local.ty == Type::Bool
-                            }) =>
-                        {
-                            return Some("a match test has an invalid boolean destination".into());
-                        }
-                        LirInst::MatchBind { bindings, .. }
-                            if bindings.iter().any(|id| {
-                                f.locals
-                                    .get(id.0 as usize)
-                                    .is_none_or(|local| local.is_gc_owner())
-                            }) =>
-                        {
-                            return Some("a match binding references an invalid local".into());
-                        }
-                        ir_variants!(
-                            LirInst;
-                            Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
-                            ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
-                            SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
-                            Unsupported
-                        ) => {}
-                    }
-                    let mut arm_names = names.clone();
-                    if !supported_lir_pattern(pattern, scrutinee_ty, ctx, &mut arm_names) {
-                        return Some(format!(
-                            "the `match` arm at line {} tests a `{}` with a pattern outside the \
-                             walker's subset",
-                            span.line,
-                            type_name(scrutinee_ty)
-                        ));
-                    }
-                }
-                LirInst::SelectInit { .. }
-                | LirInst::SelectProbe { .. }
-                | LirInst::SelectPick { .. }
-                | LirInst::SelectUnregister { .. }
-                | LirInst::SelectCommit { .. } => {}
-            }
-        }
-        match &block.terminator {
-            Terminator::Branch { cond, .. } => {
-                if cond.ty(&f.locals) != Some(Type::Bool) || !cond.is_plain_value() {
-                    return Some("a branch has an invalid boolean operand".into());
-                }
-            }
-            Terminator::Return(Some(value)) => {
-                if value.ty(&f.locals) == Some(Type::Void) {
-                    return Some("the `return` yields a `void` value, which has no slot in the function's signature".into());
-                }
-                if !value
-                    .ty(&f.locals)
-                    .is_some_and(|ty| ty != Type::Void && ctx.storable(&f.return_type, &ty))
-                    || !value.is_plain_value()
+                        .get(result.0 as usize)
+                        .is_some_and(|local| !local.is_gc_owner() && local.ty == Type::Bool) =>
                 {
-                    return Some("a return has an incompatible operand or signature".into());
+                    return Some("a match test has an invalid boolean destination".into());
                 }
-            }
-            Terminator::Suspend { .. } if !f.is_async => {
-                return Some("a synchronous function contains a suspension edge".to_string());
-            }
-            // A `lock` critical section. The protected value
-            // is loaded into a frame slot on acquisition and committed back on
-            // release, so the walker has to be able to represent it. The lock
-            // HANDLE needs no check of its own: the lowerer hoisted it into a
-            // `let`, which the instruction loop above already vetted.
-            Terminator::Suspend {
-                operation: SuspendOp::LockAcquire { slots, span },
-                ..
-            } => {
-                let value_ty = &slots.value_ty;
-                if !ctx.supported_type(value_ty) {
-                    return Some(format!(
-                        "the `lock` at line {} protects type `{}`, outside the walker's subset",
-                        span.line,
-                        type_name(value_ty)
-                    ));
+                LirInst::MatchBind { bindings, .. }
+                    if bindings.iter().any(|id| {
+                        f.locals
+                            .get(id.0 as usize)
+                            .is_none_or(|local| local.is_gc_owner())
+                    }) =>
+                {
+                    return Some("a match binding references an invalid local".into());
                 }
+                ir_variants!(
+                    LirInst;
+                    Compute, Let, Assign, EnterDeferScope, LeaveDeferScope, FlushDefers,
+                    ClearScopeRoots, Defer, SelectInit, SelectProbe, SelectPick,
+                    SelectUnregister, SelectCommit, ReleaseLock, MatchTest, MatchBind,
+                    Unsupported
+                ) => {}
             }
-            Terminator::Jump(_)
-            | Terminator::Suspend { .. }
-            | Terminator::Return(None)
-            | Terminator::CleanupReturn => {}
+            let mut arm_names = HashMap::new();
+            #[cfg(test)]
+            PATTERN_SCOPE_ENTRIES.with(|count| count.set(count.get() + arm_names.len()));
+            if !supported_lir_pattern(pattern, scrutinee_ty, ctx, &mut arm_names) {
+                return Some(format!(
+                    "the `match` arm at line {} tests a `{}` with a pattern outside the \
+                 walker's subset",
+                    span.line,
+                    type_name(scrutinee_ty)
+                ));
+            }
         }
+        LirInst::SelectInit { .. }
+        | LirInst::SelectProbe { .. }
+        | LirInst::SelectPick { .. }
+        | LirInst::SelectUnregister { .. }
+        | LirInst::SelectCommit { .. } => {}
     }
     None
 }

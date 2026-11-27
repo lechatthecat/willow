@@ -788,7 +788,6 @@ pub(crate) struct CaptureOrigin<'a> {
     pub queries: &'a EffectQueries,
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn capture_incremental(
     origin: CaptureOrigin<'_>,
     program: &Program,
@@ -811,373 +810,15 @@ pub(crate) fn capture_incremental(
         plan.borrow_mut().request_retry(SnapshotRetry::FullCapture);
         return capture(program, graph, inputs, facts, symbols, index);
     };
-    let selection = (|| -> Result<_, SnapshotRetry> {
-        let mut plan = plan.borrow_mut();
-
-        let known = plan
-            .previous
-            .units
-            .get(&unit)
-            .ok_or(SnapshotRetry::FullCapture)?;
-        if !known.unique_roots {
-            return Err(SnapshotRetry::ColdCompilation);
-        }
-        if known.imports != imports(program) {
-            return Err(SnapshotRetry::FullCapture);
-        }
-        let source_changes = bodies
-            .effect_source_changes(unit)
-            .ok_or(SnapshotRetry::FullCapture)?;
-        if (known.items != program.items.len() || bodies.declarations_changed(unit))
-            && source_changes
-                .iter()
-                .any(|(owner, _)| owner.function_name().is_none())
-        {
-            return Err(SnapshotRetry::FullCapture);
-        }
-        plan.unit_items.insert(unit, program.items.len());
-        let mut changed: HashSet<_> = bodies
-            .changed_bodies_in(unit)
-            .into_iter()
-            .map(|body| bodies.index().root_body(body))
-            .collect();
-        let mut source_only_spans = HashSet::new();
-        for (owner, exists) in source_changes {
-            plan.owner_checks += 1;
-            let name = owner.function_name().ok_or(SnapshotRetry::FullCapture)?;
-            let key = (unit, FunctionId::free(name));
-            if exists {
-                if let Some(group) = plan.source_keys.get(&key) {
-                    changed.extend(group.iter().copied());
-                } else if let Some(span) = bodies.source_owner_span(unit, &owner) {
-                    plan.changed.insert(key);
-                    source_only_spans.insert(span);
-                } else {
-                    return Err(SnapshotRetry::FullCapture);
-                }
-            } else {
-                plan.removed.insert(key);
-            }
-        }
-        for owner in bodies.source_body_changes(unit) {
-            let Some(name) = owner.function_name() else {
-                continue;
-            };
-            let key = (unit, FunctionId::free(name));
-            if !plan.source_keys.contains_key(&key)
-                && let Some(span) = bodies.source_owner_span(unit, &owner)
-            {
-                plan.owner_checks += 1;
-                plan.changed.insert(key);
-                source_only_spans.insert(span);
-            }
-        }
-        let mut selected = Program {
-            instantiation_types: vec![],
-            type_uses: vec![],
-            module: program.module.clone(),
-            imports: vec![],
-            items: vec![],
-        };
-        let mut selected_graph = CallGraph::default();
-        let mut selected_types = HashMap::new();
-        let mut selected_calls = HashMap::new();
-        let mut selected_patterns = HashMap::new();
-        let mut constructor_items = HashMap::<usize, usize>::new();
-        let mut selected_symbols = crate::semantic::analysis_symbols::Facts::default();
-        let mut selected_indirect = crate::semantic::indirect_lock::IndirectInputs::default();
-        // A retired instance can leave a source template with no checked body.
-        // Select current source coordinates, including edits before the owner.
-        for body in queries.removed_roots(unit) {
-            if let Some(root) = plan.previous.roots.get(&body)
-                && matches!(root.kind, RootKind::Function)
-                && let Some(span) = bodies.source_owner_span(
-                    unit,
-                    &SourceOwner::function(&generics::source_spelling(&root.key.1.name())),
-                )
-            {
-                source_only_spans.insert(span);
-            }
-        }
-        if let Some(&start) = plan.annotation_starts.get(&unit) {
-            let annotations = &inputs.symbols.references[start..];
-            for span in source_only_spans {
-                let first = annotations.partition_point(|r| r.span.start < span.start);
-                let end = annotations.partition_point(|r| r.span.start < span.end);
-                selected_symbols.references.extend(
-                    annotations[first..end]
-                        .iter()
-                        .filter(|r| r.span.end <= span.end)
-                        .cloned(),
-                );
-            }
-        }
-
-        // A dependent body's compiler evidence can change without a typed
-        // body change (for example an imported callee's panic boundary).
-        // Reproject affected owners through the same witness precedence as
-        // cold capture, reusing their retained typed bodies and symbol facts.
-        for function in queries.affected_functions(unit) {
-            if let Some(body) = plan.current_keys.get(&(unit, function)) {
-                changed.insert(*body);
-            }
-        }
-        // A source template is one public projection even when several checked
-        // instances contribute to it. Reconstruct that affected projection from
-        // its complete current contribution group on additions and removals.
-        let generic_groups: HashSet<_> = changed
-            .iter()
-            .chain(queries.removed_roots(unit).iter())
-            .filter_map(|body| {
-                plan.current_roots
-                    .get(body)
-                    .or_else(|| plan.previous.roots.get(body))
-            })
-            .filter(|root| matches!(root.kind, RootKind::Function))
-            .map(|root| {
-                (
-                    unit,
-                    FunctionId::free(generics::source_spelling(&root.key.1.name())),
-                )
-            })
-            .collect();
-        let related_instances: Vec<_> = generic_groups
-            .iter()
-            .filter_map(|key| plan.source_keys.get(key))
-            .flat_map(|group| group.iter().copied())
-            .collect();
-        changed.extend(related_instances);
-        let related: Vec<_> = changed
-            .iter()
-            .filter_map(|body| plan.current_roots.get(body))
-            .filter_map(|root| plan.constructor_groups.get(&root.key))
-            .flat_map(|group| group.iter().copied())
-            .collect();
-        changed.extend(related);
-        let mut changed: Vec<_> = changed.into_iter().collect();
-        changed.sort_by_key(|body| {
-            plan.current_roots.get(body).map(|root| {
-                (
-                    root.item,
-                    match root.kind {
-                        RootKind::Function => (0, 0),
-                        RootKind::Method(member) => (1, member),
-                        RootKind::Constructor(member) => (2, member),
-                        RootKind::Default(member) => (1, member),
-                    },
-                )
-            })
-        });
-        for body in changed {
-            plan.owner_checks += 1;
-            let owner_unit = plan
-                .current_roots
-                .get(&body)
-                .map(|root| root.key.0)
-                .or_else(|| bodies.index().owner(body).map(|(unit, _)| unit));
-            if owner_unit != Some(unit) {
-                continue;
-            }
-            let root = plan
-                .current_roots
-                .get(&body)
-                .ok_or(SnapshotRetry::FullCapture)?
-                .clone();
-            let (block, span, item) = match (program.items.get(root.item), root.kind) {
-                (Some(Item::Function(function)), RootKind::Function) => {
-                    if !function.type_params.is_empty() || function.rust_bridge.is_some() {
-                        return Err(SnapshotRetry::FullCapture);
-                    }
-                    (
-                        &function.body,
-                        function.span,
-                        Item::Function(function.clone()),
-                    )
-                }
-                (Some(Item::Class(class)), RootKind::Method(member)) => {
-                    if !class.type_params.is_empty() {
-                        return Err(SnapshotRetry::FullCapture);
-                    }
-                    let method = class
-                        .methods
-                        .get(member)
-                        .ok_or(SnapshotRetry::FullCapture)?;
-                    let selected_class = ClassDecl {
-                        abi_storage: class.abi_storage.clone(),
-                        type_params: vec![],
-                        name: class.name.clone(),
-                        modifiers: class.modifiers,
-                        base_class: class.base_class.clone(),
-                        implements: class.implements.clone(),
-                        source_implements_len: class.source_implements_len,
-                        fields: vec![],
-                        methods: vec![method.clone()],
-                        constructors: vec![],
-                        span: class.span,
-                    };
-                    (&method.body, method.span, Item::Class(selected_class))
-                }
-                (Some(Item::Class(class)), RootKind::Constructor(member)) => {
-                    if !class.type_params.is_empty() {
-                        return Err(SnapshotRetry::FullCapture);
-                    }
-                    let constructor = class
-                        .constructors
-                        .get(member)
-                        .ok_or(SnapshotRetry::FullCapture)?;
-                    let selected_class = ClassDecl {
-                        abi_storage: class.abi_storage.clone(),
-                        type_params: vec![],
-                        name: class.name.clone(),
-                        modifiers: class.modifiers,
-                        base_class: class.base_class.clone(),
-                        implements: class.implements.clone(),
-                        source_implements_len: class.source_implements_len,
-                        fields: vec![],
-                        methods: vec![],
-                        constructors: vec![constructor.clone()],
-                        span: class.span,
-                    };
-                    (
-                        &constructor.body,
-                        constructor.span,
-                        Item::Class(selected_class),
-                    )
-                }
-                (Some(Item::Interface(interface)), RootKind::Default(member)) => {
-                    if !interface.type_params.is_empty() {
-                        return Err(SnapshotRetry::FullCapture);
-                    }
-                    let method = interface
-                        .methods
-                        .get(member)
-                        .ok_or(SnapshotRetry::FullCapture)?;
-                    let block = method
-                        .default_body
-                        .as_ref()
-                        .ok_or(SnapshotRetry::FullCapture)?;
-                    let selected_interface = crate::parser::ast::InterfaceDecl {
-                        default_import_uses: vec![],
-                        name: interface.name.clone(),
-                        public: interface.public,
-                        type_params: vec![],
-                        extends: interface.extends.clone(),
-                        methods: vec![method.clone()],
-                        instance_of: interface.instance_of.clone(),
-                        template_checked: false,
-                        span: interface.span,
-                    };
-                    (block, method.span, Item::Interface(selected_interface))
-                }
-                _ => return Err(SnapshotRetry::FullCapture),
-            };
-            if block.id != body {
-                return Err(SnapshotRetry::FullCapture);
-            }
-            if let Some(sites) = graph.get(&root.key.1) {
-                selected_graph.merge(root.key.1, sites.clone());
-            }
-            let mut nested = vec![body];
-            while let Some(parent) = nested.pop() {
-                for (_, child) in bodies.index().child_lambdas(parent) {
-                    if let Some(sites) = graph.get(&FunctionId::lambda(child)) {
-                        selected_graph.merge(FunctionId::lambda(child), sites.clone());
-                    }
-                    let typed = bodies.read(child).map_err(|_| SnapshotRetry::FullCapture)?;
-                    selected_symbols.extend(typed.analysis_symbols());
-                    typed.snapshot_tables(
-                        &mut selected_types,
-                        &mut selected_calls,
-                        &mut selected_patterns,
-                    );
-                    selected_indirect.extend(
-                        bodies
-                            .indirect_inputs(child)
-                            .map_err(|_| SnapshotRetry::FullCapture)?,
-                    );
-                    nested.push(child);
-                }
-            }
-            let copied = matches!((&item,root.kind),(Item::Class(class),RootKind::Method(_)) if class.methods.iter().any(|method|method.is_interface_default));
-            match bodies.indirect_inputs(body) {
-                Ok(inputs) => selected_indirect.extend(inputs),
-                Err(_) if copied => {}
-                Err(_) => return Err(SnapshotRetry::FullCapture),
-            }
-            match bodies.read(body) {
-                Ok(typed) => {
-                    selected_symbols.extend(typed.analysis_symbols());
-                    if !copied {
-                        typed.snapshot_tables(
-                            &mut selected_types,
-                            &mut selected_calls,
-                            &mut selected_patterns,
-                        );
-                    }
-                }
-                Err(_) if copied => {}
-                Err(_) => return Err(SnapshotRetry::FullCapture),
-            }
-            // Copied defaults may use checked metadata owned by their source.
-            for event in AstWalk::new(AstEvent::Block(block)) {
-                if let AstEvent::Expr(expression) = event {
-                    let id = expression.id();
-                    if let Some(value) = inputs.types.get(&id) {
-                        selected_types.insert(id, value.clone());
-                    }
-                    if let Some(value) = inputs.calls.get(&id) {
-                        selected_calls.insert(id, *value);
-                    }
-                }
-            }
-            if let Some(&start) = plan.annotation_starts.get(&unit) {
-                let annotations = &inputs.symbols.references[start..];
-                let first = annotations.partition_point(|r| r.span.start < span.start);
-                let end = annotations.partition_point(|r| r.span.start < span.end);
-                selected_symbols.references.extend(
-                    annotations[first..end]
-                        .iter()
-                        .filter(|r| r.span.end <= span.end)
-                        .cloned(),
-                );
-            }
-            if matches!(root.kind, RootKind::Constructor(_)) {
-                if let Some(&index) = constructor_items.get(&root.item) {
-                    if let (Item::Class(existing), Item::Class(next)) =
-                        (&mut selected.items[index], item)
-                    {
-                        existing.constructors.extend(next.constructors);
-                    }
-                } else {
-                    constructor_items.insert(root.item, selected.items.len());
-                    selected.items.push(item);
-                }
-            } else {
-                selected.items.push(item);
-            }
-            plan.projected_bodies.insert(body);
-            plan.changed.insert(root.key);
-        }
-        if let Some(known) = plan.previous.units.get(&unit) {
-            selected.imports = selected_symbols
-                .used_imports
-                .iter()
-                .filter_map(|name| known.import_names.get(name).cloned())
-                .collect();
-            selected.imports.sort_by_key(|import| import.span.start);
-        }
-        Ok((
-            selected,
-            selected_graph,
-            selected_symbols,
-            selected_indirect,
-            selected_types,
-            selected_calls,
-            selected_patterns,
-        ))
-    })();
+    let selection = select_capture(
+        &mut plan.borrow_mut(),
+        (unit, bodies, queries),
+        program,
+        graph,
+        &inputs,
+    );
     match selection {
-        Ok((
+        Ok(CaptureSelection {
             selected,
             selected_graph,
             selected_symbols,
@@ -1185,7 +826,7 @@ pub(crate) fn capture_incremental(
             selected_types,
             selected_calls,
             selected_patterns,
-        )) => {
+        }) => {
             let mut captured = capture(
                 &selected,
                 &selected_graph,
@@ -1223,6 +864,459 @@ pub(crate) fn capture_incremental(
         Err(retry) => {
             plan.borrow_mut().request_retry(retry);
             capture(program, graph, inputs, facts, symbols, index)
+        }
+    }
+}
+
+struct CaptureSelection {
+    selected: Program,
+    selected_graph: CallGraph,
+    selected_symbols: crate::semantic::analysis_symbols::Facts,
+    selected_indirect: crate::semantic::indirect_lock::IndirectInputs,
+    selected_types: HashMap<ExprId, Type>,
+    selected_calls: HashMap<ExprId, Option<FunctionId>>,
+    selected_patterns: HashMap<PatternId, Pattern>,
+}
+
+fn changed_capture_roots(
+    plan: &mut Plan,
+    unit: UnitId,
+    bodies: &BodyQueries,
+    program: &Program,
+) -> Result<(HashSet<BodyId>, HashSet<Span>), SnapshotRetry> {
+    let known = plan
+        .previous
+        .units
+        .get(&unit)
+        .ok_or(SnapshotRetry::FullCapture)?;
+    if !known.unique_roots {
+        return Err(SnapshotRetry::ColdCompilation);
+    }
+    if known.imports != imports(program) {
+        return Err(SnapshotRetry::FullCapture);
+    }
+    let source_changes = bodies
+        .effect_source_changes(unit)
+        .ok_or(SnapshotRetry::FullCapture)?;
+    if (known.items != program.items.len() || bodies.declarations_changed(unit))
+        && source_changes
+            .iter()
+            .any(|(owner, _)| owner.function_name().is_none())
+    {
+        return Err(SnapshotRetry::FullCapture);
+    }
+    plan.unit_items.insert(unit, program.items.len());
+    let mut changed: HashSet<_> = bodies
+        .changed_bodies_in(unit)
+        .into_iter()
+        .map(|body| bodies.index().root_body(body))
+        .collect();
+    let mut source_only_spans = HashSet::new();
+    for (owner, exists) in source_changes {
+        plan.owner_checks += 1;
+        let name = owner.function_name().ok_or(SnapshotRetry::FullCapture)?;
+        let key = (unit, FunctionId::free(name));
+        if exists {
+            if let Some(group) = plan.source_keys.get(&key) {
+                changed.extend(group.iter().copied());
+            } else if let Some(span) = bodies.source_owner_span(unit, &owner) {
+                plan.changed.insert(key);
+                source_only_spans.insert(span);
+            } else {
+                return Err(SnapshotRetry::FullCapture);
+            }
+        } else {
+            plan.removed.insert(key);
+        }
+    }
+    for owner in bodies.source_body_changes(unit) {
+        let Some(name) = owner.function_name() else {
+            continue;
+        };
+        let key = (unit, FunctionId::free(name));
+        if !plan.source_keys.contains_key(&key)
+            && let Some(span) = bodies.source_owner_span(unit, &owner)
+        {
+            plan.owner_checks += 1;
+            plan.changed.insert(key);
+            source_only_spans.insert(span);
+        }
+    }
+    Ok((changed, source_only_spans))
+}
+
+fn capture_root_item<'a>(
+    program: &'a Program,
+    root: &Root,
+) -> Result<(&'a Block, Span, Item), SnapshotRetry> {
+    Ok(match (program.items.get(root.item), root.kind) {
+        (Some(Item::Function(function)), RootKind::Function) => {
+            if !function.type_params.is_empty() || function.rust_bridge.is_some() {
+                return Err(SnapshotRetry::FullCapture);
+            }
+            (
+                &function.body,
+                function.span,
+                Item::Function(function.clone()),
+            )
+        }
+        (Some(Item::Class(class)), RootKind::Method(member)) => {
+            if !class.type_params.is_empty() {
+                return Err(SnapshotRetry::FullCapture);
+            }
+            let method = class
+                .methods
+                .get(member)
+                .ok_or(SnapshotRetry::FullCapture)?;
+            let selected_class = ClassDecl {
+                abi_storage: class.abi_storage.clone(),
+                type_params: vec![],
+                name: class.name.clone(),
+                modifiers: class.modifiers,
+                base_class: class.base_class.clone(),
+                implements: class.implements.clone(),
+                source_implements_len: class.source_implements_len,
+                fields: vec![],
+                methods: vec![method.clone()],
+                constructors: vec![],
+                span: class.span,
+            };
+            (&method.body, method.span, Item::Class(selected_class))
+        }
+        (Some(Item::Class(class)), RootKind::Constructor(member)) => {
+            if !class.type_params.is_empty() {
+                return Err(SnapshotRetry::FullCapture);
+            }
+            let constructor = class
+                .constructors
+                .get(member)
+                .ok_or(SnapshotRetry::FullCapture)?;
+            let selected_class = ClassDecl {
+                abi_storage: class.abi_storage.clone(),
+                type_params: vec![],
+                name: class.name.clone(),
+                modifiers: class.modifiers,
+                base_class: class.base_class.clone(),
+                implements: class.implements.clone(),
+                source_implements_len: class.source_implements_len,
+                fields: vec![],
+                methods: vec![],
+                constructors: vec![constructor.clone()],
+                span: class.span,
+            };
+            (
+                &constructor.body,
+                constructor.span,
+                Item::Class(selected_class),
+            )
+        }
+        (Some(Item::Interface(interface)), RootKind::Default(member)) => {
+            if !interface.type_params.is_empty() {
+                return Err(SnapshotRetry::FullCapture);
+            }
+            let method = interface
+                .methods
+                .get(member)
+                .ok_or(SnapshotRetry::FullCapture)?;
+            let block = method
+                .default_body
+                .as_ref()
+                .ok_or(SnapshotRetry::FullCapture)?;
+            let selected_interface = crate::parser::ast::InterfaceDecl {
+                default_import_uses: vec![],
+                name: interface.name.clone(),
+                public: interface.public,
+                type_params: vec![],
+                extends: interface.extends.clone(),
+                methods: vec![method.clone()],
+                instance_of: interface.instance_of.clone(),
+                template_checked: false,
+                span: interface.span,
+            };
+            (block, method.span, Item::Interface(selected_interface))
+        }
+        _ => return Err(SnapshotRetry::FullCapture),
+    })
+}
+
+fn select_capture(
+    plan: &mut Plan,
+    (unit, bodies, queries): (UnitId, &BodyQueries, &EffectQueries),
+    program: &Program,
+    graph: &CallGraph,
+    inputs: &CaptureInputs<'_>,
+) -> Result<CaptureSelection, SnapshotRetry> {
+    let (mut changed, mut source_only_spans) = changed_capture_roots(plan, unit, bodies, program)?;
+    let mut selected = Program {
+        instantiation_types: vec![],
+        type_uses: vec![],
+        module: program.module.clone(),
+        imports: vec![],
+        items: vec![],
+    };
+    let mut selected_graph = CallGraph::default();
+    let mut selected_types = HashMap::new();
+    let mut selected_calls = HashMap::new();
+    let mut selected_patterns = HashMap::new();
+    let mut constructor_items = HashMap::<usize, usize>::new();
+    let mut selected_symbols = crate::semantic::analysis_symbols::Facts::default();
+    let mut selected_indirect = crate::semantic::indirect_lock::IndirectInputs::default();
+    // A retired instance can leave a source template with no checked body.
+    // Select current source coordinates, including edits before the owner.
+    for body in queries.removed_roots(unit) {
+        if let Some(root) = plan.previous.roots.get(&body)
+            && matches!(root.kind, RootKind::Function)
+            && let Some(span) = bodies.source_owner_span(
+                unit,
+                &SourceOwner::function(&generics::source_spelling(&root.key.1.name())),
+            )
+        {
+            source_only_spans.insert(span);
+        }
+    }
+    if let Some(&start) = plan.annotation_starts.get(&unit) {
+        let annotations = &inputs.symbols.references[start..];
+        for span in source_only_spans {
+            let first = annotations.partition_point(|r| r.span.start < span.start);
+            let end = annotations.partition_point(|r| r.span.start < span.end);
+            selected_symbols.references.extend(
+                annotations[first..end]
+                    .iter()
+                    .filter(|r| r.span.end <= span.end)
+                    .cloned(),
+            );
+        }
+    }
+
+    // A dependent body's compiler evidence can change without a typed
+    // body change (for example an imported callee's panic boundary).
+    // Reproject affected owners through the same witness precedence as
+    // cold capture, reusing their retained typed bodies and symbol facts.
+    for function in queries.affected_functions(unit) {
+        if let Some(body) = plan.current_keys.get(&(unit, function)) {
+            changed.insert(*body);
+        }
+    }
+    let changed = expand_capture_groups(plan, unit, queries, changed);
+    for body in changed {
+        plan.owner_checks += 1;
+        let owner_unit = plan
+            .current_roots
+            .get(&body)
+            .map(|root| root.key.0)
+            .or_else(|| bodies.index().owner(body).map(|(unit, _)| unit));
+        if owner_unit != Some(unit) {
+            continue;
+        }
+        let root = plan
+            .current_roots
+            .get(&body)
+            .ok_or(SnapshotRetry::FullCapture)?
+            .clone();
+        let (block, span, item) = capture_root_item(program, &root)?;
+        if block.id != body {
+            return Err(SnapshotRetry::FullCapture);
+        }
+        if let Some(sites) = graph.get(&root.key.1) {
+            selected_graph.merge(root.key.1, sites.clone());
+        }
+        let mut nested = vec![body];
+        while let Some(parent) = nested.pop() {
+            for (_, child) in bodies.index().child_lambdas(parent) {
+                if let Some(sites) = graph.get(&FunctionId::lambda(child)) {
+                    selected_graph.merge(FunctionId::lambda(child), sites.clone());
+                }
+                let typed = bodies.read(child).map_err(|_| SnapshotRetry::FullCapture)?;
+                selected_symbols.extend(typed.analysis_symbols());
+                typed.snapshot_tables(
+                    &mut selected_types,
+                    &mut selected_calls,
+                    &mut selected_patterns,
+                );
+                selected_indirect.extend(
+                    bodies
+                        .indirect_inputs(child)
+                        .map_err(|_| SnapshotRetry::FullCapture)?,
+                );
+                nested.push(child);
+            }
+        }
+        let copied = matches!((&item,root.kind),(Item::Class(class),RootKind::Method(_)) if class.methods.iter().any(|method|method.is_interface_default));
+        match bodies.indirect_inputs(body) {
+            Ok(inputs) => selected_indirect.extend(inputs),
+            Err(_) if copied => {}
+            Err(_) => return Err(SnapshotRetry::FullCapture),
+        }
+        match bodies.read(body) {
+            Ok(typed) => {
+                selected_symbols.extend(typed.analysis_symbols());
+                if !copied {
+                    typed.snapshot_tables(
+                        &mut selected_types,
+                        &mut selected_calls,
+                        &mut selected_patterns,
+                    );
+                }
+            }
+            Err(_) if copied => {}
+            Err(_) => return Err(SnapshotRetry::FullCapture),
+        }
+        // Copied defaults may use checked metadata owned by their source.
+        for event in AstWalk::new(AstEvent::Block(block)) {
+            if let AstEvent::Expr(expression) = event {
+                let id = expression.id();
+                if let Some(value) = inputs.types.get(&id) {
+                    selected_types.insert(id, value.clone());
+                }
+                if let Some(value) = inputs.calls.get(&id) {
+                    selected_calls.insert(id, *value);
+                }
+            }
+        }
+        if let Some(&start) = plan.annotation_starts.get(&unit) {
+            let annotations = &inputs.symbols.references[start..];
+            let first = annotations.partition_point(|r| r.span.start < span.start);
+            let end = annotations.partition_point(|r| r.span.start < span.end);
+            selected_symbols.references.extend(
+                annotations[first..end]
+                    .iter()
+                    .filter(|r| r.span.end <= span.end)
+                    .cloned(),
+            );
+        }
+        if matches!(root.kind, RootKind::Constructor(_)) {
+            if let Some(&index) = constructor_items.get(&root.item) {
+                if let (Item::Class(existing), Item::Class(next)) =
+                    (&mut selected.items[index], item)
+                {
+                    existing.constructors.extend(next.constructors);
+                }
+            } else {
+                constructor_items.insert(root.item, selected.items.len());
+                selected.items.push(item);
+            }
+        } else {
+            selected.items.push(item);
+        }
+        plan.projected_bodies.insert(body);
+        plan.changed.insert(root.key);
+    }
+    if let Some(known) = plan.previous.units.get(&unit) {
+        selected.imports = selected_symbols
+            .used_imports
+            .iter()
+            .filter_map(|name| known.import_names.get(name).cloned())
+            .collect();
+        selected.imports.sort_by_key(|import| import.span.start);
+    }
+    Ok(CaptureSelection {
+        selected,
+        selected_graph,
+        selected_symbols,
+        selected_indirect,
+        selected_types,
+        selected_calls,
+        selected_patterns,
+    })
+}
+
+fn expand_capture_groups(
+    plan: &Plan,
+    unit: UnitId,
+    queries: &EffectQueries,
+    mut changed: HashSet<BodyId>,
+) -> Vec<BodyId> {
+    // A source template is one public projection even when several checked
+    // instances contribute to it. Reconstruct that affected projection from
+    // its complete current contribution group on additions and removals.
+    let generic_groups: HashSet<_> = changed
+        .iter()
+        .chain(queries.removed_roots(unit).iter())
+        .filter_map(|body| {
+            plan.current_roots
+                .get(body)
+                .or_else(|| plan.previous.roots.get(body))
+        })
+        .filter(|root| matches!(root.kind, RootKind::Function))
+        .map(|root| {
+            (
+                unit,
+                FunctionId::free(generics::source_spelling(&root.key.1.name())),
+            )
+        })
+        .collect();
+    let related_instances: Vec<_> = generic_groups
+        .iter()
+        .filter_map(|key| plan.source_keys.get(key))
+        .flat_map(|group| group.iter().copied())
+        .collect();
+    changed.extend(related_instances);
+    let related: Vec<_> = constructor_capture_siblings(
+        changed
+            .iter()
+            .filter_map(|body| plan.current_roots.get(body)),
+        &plan.constructor_groups,
+    )
+    .collect();
+    changed.extend(related);
+    let mut changed: Vec<_> = changed.into_iter().collect();
+    changed.sort_by_key(|body| {
+        plan.current_roots.get(body).map(|root| {
+            (
+                root.item,
+                match root.kind {
+                    RootKind::Function => (0, 0),
+                    RootKind::Method(member) => (1, member),
+                    RootKind::Constructor(member) => (2, member),
+                    RootKind::Default(member) => (1, member),
+                },
+            )
+        })
+    });
+    changed
+}
+
+/// A class's changed constructors share one projection. Visit that group's
+/// members once even when every overload changed in the same revision.
+fn constructor_capture_siblings<'a>(
+    roots: impl Iterator<Item = &'a Root>,
+    groups: &'a HashMap<Key, HashSet<BodyId>>,
+) -> impl Iterator<Item = BodyId> + 'a {
+    let keys: HashSet<_> = roots.map(|root| root.key).collect();
+    keys.into_iter()
+        .filter_map(move |key| groups.get(&key))
+        .flat_map(|group| group.iter().copied())
+}
+
+#[cfg(test)]
+mod capture_selection_tests {
+    use super::*;
+
+    #[test]
+    fn constructor_capture_visits_each_sibling_once() {
+        for count in [16, 64, 256] {
+            let key = (UnitId::ENTRY, FunctionId::free("constructor_group"));
+            let members: HashSet<_> = (0..count).map(|_| BodyId::fresh()).collect();
+            let groups = HashMap::from([(key, members.clone())]);
+            let roots: Vec<_> = (0..count)
+                .map(|member| Root {
+                    item: 0,
+                    kind: RootKind::Constructor(member),
+                    span: Span::dummy(),
+                    key,
+                })
+                .collect();
+            let visited: Vec<_> = constructor_capture_siblings(roots.iter(), &groups).collect();
+            assert_eq!(visited.len(), count);
+            assert_eq!(visited.into_iter().collect::<HashSet<_>>(), members);
+            assert_eq!(
+                constructor_capture_siblings(roots[..1].iter(), &groups).count(),
+                count
+            );
+            assert_eq!(
+                constructor_capture_siblings(roots[..0].iter(), &groups).count(),
+                0
+            );
         }
     }
 }

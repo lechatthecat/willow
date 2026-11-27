@@ -298,3 +298,26 @@ fn generic_new_inference_scales_linearly() {
         assert_eq!(*instances, i0, "instances grow with repeats: {per_size:?}");
     }
 }
+
+#[test]
+fn nested_inferred_constructors_keep_constant_executor_nesting() {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let mut baseline = None;
+            for depth in [1, 64, 512] {
+                // Every constructor instantiates Box<i64>; only expression
+                // depth grows, without an increasing type or instance graph.
+                let expression = format!("{}7{}", "new Box(".repeat(depth), ").v".repeat(depth));
+                crate::compiler_stack::take_max_run_nesting();
+                let (_, errors) = check(&format!("let value: i64 = {expression};"));
+                assert!(errors.is_empty(), "{errors:?}");
+                let nesting = crate::compiler_stack::take_max_run_nesting();
+                eprintln!("inferred constructors: depth={depth}, executor nesting={nesting}");
+                assert_eq!(nesting, *baseline.get_or_insert(nesting));
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}

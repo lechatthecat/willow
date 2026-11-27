@@ -3222,7 +3222,7 @@ fn sweep_with_work(stop_work: &mut crate::gc_telemetry::stops::StopWorkV2) -> us
 // Helpers
 // ---------------------------------------------------------------------------
 
-#[cfg(test)]
+#[cfg(any(test, not(debug_assertions)))]
 /// Given a payload pointer, return the GcHeader pointer just before it.
 fn payload_to_header(payload: *mut u8) -> *mut GcHeader {
     GcPayload::from_raw(payload)

@@ -180,7 +180,6 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     }
 
     // Keep explicit emission operands aligned with the LIR/runtime ABI.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn emit_flat_intrinsic_inner(
         &mut self,
         intrinsic: Intrinsic,
@@ -192,117 +191,42 @@ impl<'a, 'b> FuncGen<'a, 'b> {
     ) -> cranelift_codegen::ir::Value {
         use Intrinsic::*;
         match intrinsic {
-            IntegerConvert | IntegerWrappingConvert | IntegerCheckedConvert => {
-                let target = if intrinsic == IntegerCheckedConvert {
-                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap()
-                } else {
-                    result
-                };
-                self.emit_scalar_conversion(
-                    receiver,
-                    receiver_ty,
-                    target,
-                    intrinsic == IntegerCheckedConvert,
-                )
+            IntegerConvert
+            | IntegerWrappingConvert
+            | IntegerCheckedConvert
+            | ScalarToString
+            | ScalarParse
+            | I64ToString
+            | StringToString
+            | TaskResult
+            | I64WrappingAdd
+            | I64WrappingSub
+            | I64WrappingMul
+            | I64WrappingNeg
+            | I64CheckedAdd
+            | I64CheckedSub
+            | I64CheckedMul
+            | I64CheckedNeg
+            | StringConcatArray
+            | StringLen
+            | StringByteAt
+            | StringSubstring
+            | StringSplit
+            | StringFind
+            | StringRepeat
+            | StringReplace
+            | StringTrimStart
+            | StringTrimEnd
+            | StringToLower
+            | StringToUpper
+            | StringTrim
+            | StringContains
+            | StringStartsWith
+            | StringEndsWith
+            | F64ToString
+            | BoolToString => {
+                self.emit_scalar_intrinsic(intrinsic, receiver, receiver_ty, args, result)
             }
-            ScalarToString => self.emit_scalar_string(receiver, receiver_ty),
-            ScalarParse => {
-                let target =
-                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap();
-                self.emit_scalar_parse(receiver, target)
-            }
-            I64ToString => {
-                let receiver = self.widen_integer(receiver, receiver_ty);
-                self.emit_value_runtime_call(rt::willow_i64_to_string, &[receiver])
-            }
-            StringToString | TaskResult => receiver,
-            // Explicit overflow behavior ignores the build mode.
-            I64WrappingAdd => self.builder.ins().iadd(receiver, args[0]),
-            I64WrappingSub => self.builder.ins().isub(receiver, args[0]),
-            I64WrappingMul => self.builder.ins().imul(receiver, args[0]),
-            I64WrappingNeg => self.builder.ins().ineg(receiver),
-            I64CheckedAdd | I64CheckedSub | I64CheckedMul | I64CheckedNeg => {
-                let (value, overflowed) = match intrinsic {
-                    I64CheckedAdd => self.emit_overflowing_binop(
-                        &BinOp::Add,
-                        receiver,
-                        args[0],
-                        receiver_ty.integer_layout().unwrap(),
-                    ),
-                    I64CheckedSub => self.emit_overflowing_binop(
-                        &BinOp::Sub,
-                        receiver,
-                        args[0],
-                        receiver_ty.integer_layout().unwrap(),
-                    ),
-                    I64CheckedMul => self.emit_overflowing_binop(
-                        &BinOp::Mul,
-                        receiver,
-                        args[0],
-                        receiver_ty.integer_layout().unwrap(),
-                    ),
-                    _ => self.emit_overflowing_neg(receiver, receiver_ty.integer_layout().unwrap()),
-                };
-                // `Option<i64>` is a scalar pair: tag 0 `Some`, 1 `None` with
-                // a zero payload, as `emit_alloc_option_none` builds it.
-                let value = self.widen_integer(value, receiver_ty);
-                let tag = self.builder.ins().uextend(types::I64, overflowed);
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let payload = self.builder.ins().select(overflowed, zero, value);
-                self.emit_pair(tag, payload)
-            }
-            StringConcatArray => {
-                self.emit_value_runtime_call(rt::willow_string_concat_array, &[receiver])
-            }
-            StringLen => self.emit_string_length(receiver),
-            StringByteAt => {
-                self.emit_value_runtime_call(rt::willow_string_byte_at, &[receiver, args[0]])
-            }
-            StringSubstring => self.emit_value_runtime_call(
-                rt::willow_string_substring,
-                &[receiver, args[0], args[1]],
-            ),
-            StringSplit => {
-                self.emit_value_runtime_call(rt::willow_string_split, &[receiver, args[0]])
-            }
-            StringFind => {
-                // The runtime answers a byte offset or `-1`; the language sees
-                // the inline `Option<i64>` pair (tag 0 `Some`, 1 `None` with a
-                // zero payload), so absence costs a compare and two selects.
-                let offset =
-                    self.emit_value_runtime_call(rt::willow_string_find, &[receiver, args[0]]);
-                let zero = self.builder.ins().iconst(types::I64, 0);
-                let absent = self.builder.ins().icmp(IntCC::SignedLessThan, offset, zero);
-                let tag = self.builder.ins().uextend(types::I64, absent);
-                let payload = self.builder.ins().select(absent, zero, offset);
-                self.emit_pair(tag, payload)
-            }
-            StringRepeat => {
-                self.emit_value_runtime_call(rt::willow_string_repeat, &[receiver, args[0]])
-            }
-            StringReplace => self
-                .emit_value_runtime_call(rt::willow_string_replace, &[receiver, args[0], args[1]]),
-            StringTrimStart => {
-                self.emit_value_runtime_call(rt::willow_string_trim_start, &[receiver])
-            }
-            StringTrimEnd => self.emit_value_runtime_call(rt::willow_string_trim_end, &[receiver]),
-            StringToLower => self.emit_value_runtime_call(rt::willow_string_to_lower, &[receiver]),
-            StringToUpper => self.emit_value_runtime_call(rt::willow_string_to_upper, &[receiver]),
-            StringTrim => self.emit_value_runtime_call(rt::willow_string_trim, &[receiver]),
-            StringContains | StringStartsWith | StringEndsWith => {
-                let symbol = if intrinsic == StringContains {
-                    rt::willow_string_contains
-                } else if intrinsic == StringEndsWith {
-                    rt::willow_string_ends_with
-                } else {
-                    rt::willow_string_starts_with
-                };
-                let value = self.emit_value_runtime_call(symbol, &[receiver, args[0]]);
-                self.builder.ins().ireduce(types::I8, value)
-            }
-
-            F64ToString => self.emit_value_runtime_call(rt::willow_f64_to_string, &[receiver]),
-            BoolToString => self.emit_value_runtime_call(rt::willow_bool_to_string, &[receiver]),
             TaskCancel => {
                 let id = self.builder.ins().load(
                     types::I64,
@@ -437,6 +361,23 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                 };
                 self.emit_value_runtime_call(runtime, &[receiver])
             }
+            MapLen | FrozenMapLen | MapToString | MapFreeze | MapKeys | MapValues | MapEntries
+            | MapContains | FrozenMapContains | MapGet | FrozenMapGet | MapRemove | MapInsert => {
+                self.emit_map_intrinsic(intrinsic, (receiver, receiver_ty), args, arg_types, roots)
+            }
+        }
+    }
+
+    fn emit_map_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        (receiver, receiver_ty): (cranelift_codegen::ir::Value, &Type),
+        args: &[cranelift_codegen::ir::Value],
+        arg_types: &[Type],
+        roots: &OperandRoots,
+    ) -> cranelift_codegen::ir::Value {
+        use Intrinsic::*;
+        match intrinsic {
             MapLen | FrozenMapLen => self.emit_value_runtime_call(rt::willow_map_len, &[receiver]),
             MapToString => self.emit_value_runtime_call(rt::willow_map_to_string, &[receiver]),
             MapFreeze => self.emit_value_runtime_call(rt::willow_map_copy, &[receiver]),
@@ -511,6 +452,132 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     _ => unreachable!(),
                 }
             }
+            _ => unreachable!("map intrinsic dispatch"),
+        }
+    }
+
+    fn emit_scalar_intrinsic(
+        &mut self,
+        intrinsic: Intrinsic,
+        receiver: cranelift_codegen::ir::Value,
+        receiver_ty: &Type,
+        args: &[cranelift_codegen::ir::Value],
+        result: &Type,
+    ) -> cranelift_codegen::ir::Value {
+        use Intrinsic::*;
+        match intrinsic {
+            IntegerConvert | IntegerWrappingConvert | IntegerCheckedConvert => {
+                let target = if intrinsic == IntegerCheckedConvert {
+                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap()
+                } else {
+                    result
+                };
+                self.emit_scalar_conversion(
+                    receiver,
+                    receiver_ty,
+                    target,
+                    intrinsic == IntegerCheckedConvert,
+                )
+            }
+            ScalarToString => self.emit_scalar_string(receiver, receiver_ty),
+            ScalarParse => {
+                let target =
+                    builtin_types::unary_arg(result, builtin_types::BuiltinTypeId::Option).unwrap();
+                self.emit_scalar_parse(receiver, target)
+            }
+            I64ToString => {
+                let receiver = self.widen_integer(receiver, receiver_ty);
+                self.emit_value_runtime_call(rt::willow_i64_to_string, &[receiver])
+            }
+            StringToString | TaskResult => receiver,
+            // Explicit overflow behavior ignores the build mode.
+            I64WrappingAdd => self.builder.ins().iadd(receiver, args[0]),
+            I64WrappingSub => self.builder.ins().isub(receiver, args[0]),
+            I64WrappingMul => self.builder.ins().imul(receiver, args[0]),
+            I64WrappingNeg => self.builder.ins().ineg(receiver),
+            I64CheckedAdd | I64CheckedSub | I64CheckedMul | I64CheckedNeg => {
+                let (value, overflowed) = match intrinsic {
+                    I64CheckedAdd => self.emit_overflowing_binop(
+                        &BinOp::Add,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    I64CheckedSub => self.emit_overflowing_binop(
+                        &BinOp::Sub,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    I64CheckedMul => self.emit_overflowing_binop(
+                        &BinOp::Mul,
+                        receiver,
+                        args[0],
+                        receiver_ty.integer_layout().unwrap(),
+                    ),
+                    _ => self.emit_overflowing_neg(receiver, receiver_ty.integer_layout().unwrap()),
+                };
+                // `Option<i64>` is a scalar pair: tag 0 `Some`, 1 `None` with
+                // a zero payload, as `emit_alloc_option_none` builds it.
+                let value = self.widen_integer(value, receiver_ty);
+                let tag = self.builder.ins().uextend(types::I64, overflowed);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let payload = self.builder.ins().select(overflowed, zero, value);
+                self.emit_pair(tag, payload)
+            }
+            StringConcatArray => {
+                self.emit_value_runtime_call(rt::willow_string_concat_array, &[receiver])
+            }
+            StringLen => self.emit_string_length(receiver),
+            StringByteAt => {
+                self.emit_value_runtime_call(rt::willow_string_byte_at, &[receiver, args[0]])
+            }
+            StringSubstring => self.emit_value_runtime_call(
+                rt::willow_string_substring,
+                &[receiver, args[0], args[1]],
+            ),
+            StringSplit => {
+                self.emit_value_runtime_call(rt::willow_string_split, &[receiver, args[0]])
+            }
+            StringFind => {
+                // The runtime answers a byte offset or `-1`; the language sees
+                // the inline `Option<i64>` pair (tag 0 `Some`, 1 `None` with a
+                // zero payload), so absence costs a compare and two selects.
+                let offset =
+                    self.emit_value_runtime_call(rt::willow_string_find, &[receiver, args[0]]);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                let absent = self.builder.ins().icmp(IntCC::SignedLessThan, offset, zero);
+                let tag = self.builder.ins().uextend(types::I64, absent);
+                let payload = self.builder.ins().select(absent, zero, offset);
+                self.emit_pair(tag, payload)
+            }
+            StringRepeat => {
+                self.emit_value_runtime_call(rt::willow_string_repeat, &[receiver, args[0]])
+            }
+            StringReplace => self
+                .emit_value_runtime_call(rt::willow_string_replace, &[receiver, args[0], args[1]]),
+            StringTrimStart => {
+                self.emit_value_runtime_call(rt::willow_string_trim_start, &[receiver])
+            }
+            StringTrimEnd => self.emit_value_runtime_call(rt::willow_string_trim_end, &[receiver]),
+            StringToLower => self.emit_value_runtime_call(rt::willow_string_to_lower, &[receiver]),
+            StringToUpper => self.emit_value_runtime_call(rt::willow_string_to_upper, &[receiver]),
+            StringTrim => self.emit_value_runtime_call(rt::willow_string_trim, &[receiver]),
+            StringContains | StringStartsWith | StringEndsWith => {
+                let symbol = if intrinsic == StringContains {
+                    rt::willow_string_contains
+                } else if intrinsic == StringEndsWith {
+                    rt::willow_string_ends_with
+                } else {
+                    rt::willow_string_starts_with
+                };
+                let value = self.emit_value_runtime_call(symbol, &[receiver, args[0]]);
+                self.builder.ins().ireduce(types::I8, value)
+            }
+
+            F64ToString => self.emit_value_runtime_call(rt::willow_f64_to_string, &[receiver]),
+            BoolToString => self.emit_value_runtime_call(rt::willow_bool_to_string, &[receiver]),
+            _ => unreachable!("scalar intrinsic dispatch"),
         }
     }
 

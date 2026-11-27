@@ -728,6 +728,56 @@ fn flat_array_references_reject_forged_capture_metadata() {
 }
 
 #[test]
+fn flat_pattern_validation_does_not_copy_unrelated_locals() {
+    use crate::ir::lowered::{LirLocalId, LirPattern};
+    let (program, tables) = checked_lowering("fn f(x: i64) -> i64 { return x; }", &["f"]);
+    let original = &program.functions[0];
+    let parameter = original
+        .locals
+        .iter()
+        .find(|local| local.parameter)
+        .unwrap();
+    for count in [16, 64, 256] {
+        let mut function = original.clone();
+        for index in 0..count {
+            let mut local = parameter.clone();
+            local.id = LirLocalId(function.locals.len() as u32);
+            local.name = format!("unrelated_{index}");
+            local.parameter = false;
+            function.locals.push(local);
+            function.blocks[0].instrs.push(LirInst::MatchBind {
+                scrutinee: parameter.id,
+                pattern: LirPattern::Binding {
+                    name: "x".into(),
+                    ty: Type::I64,
+                },
+                bindings: vec![parameter.id],
+                span: Span::dummy(),
+            });
+        }
+        validation::PATTERN_SCOPE_ENTRIES.with(|entries| entries.set(0));
+        let reason = tables.with_ctx(|ctx| lir_rejection_reason(&function, ctx));
+        assert_eq!(reason, None);
+        assert_eq!(
+            validation::PATTERN_SCOPE_ENTRIES.with(|entries| entries.get()),
+            0
+        );
+        // An empty binding scratch still enforces representation checks.
+        if let LirInst::MatchBind { pattern, .. } = function.blocks[0].instrs.last_mut().unwrap() {
+            *pattern = LirPattern::Binding {
+                name: "x".into(),
+                ty: Type::Bool,
+            };
+        }
+        assert!(
+            tables
+                .with_ctx(|ctx| lir_rejection_reason(&function, ctx))
+                .is_some()
+        );
+    }
+}
+
+#[test]
 fn flat_rvalues_reject_unknown_layouts_and_invalid_coercions() {
     use crate::ir::lowered::{LirOperand as O, LirRvalue as V};
     let (_, tables) = checked_lowering(

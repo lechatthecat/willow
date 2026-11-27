@@ -17,7 +17,6 @@ impl Parser {
         Ok(())
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     pub(super) fn parse_rust_bridge(&mut self) -> Result<Vec<Item>, Diagnostic> {
         self.advance();
         if self.expect_ident()? != "rust" {
@@ -37,72 +36,7 @@ impl Parser {
         while !self.check(TokenKind::RBrace) && !self.at_eof() {
             let span = self.current_span();
             if self.check(TokenKind::Class) {
-                let record = self.parse_class(Modifiers::PUBLIC)?;
-                self.validate_rust_record_identifier(&record.name, "record")?;
-                if !record.type_params.is_empty()
-                    || record.base_class.is_some()
-                    || !record.implements.is_empty()
-                    || !record.methods.is_empty()
-                    || !record.constructors.is_empty()
-                    || record
-                        .fields
-                        .iter()
-                        .any(|f| !f.public() || f.is_static() || f.initializer.is_some())
-                {
-                    return Err(self.err(
-                        ErrorCode::E0102,
-                        "rust_bridge_signature_mismatch: records require public value fields only",
-                    ));
-                }
-                if self.rust_opaque_names.contains(&record.name)
-                    || self.rust_records.contains_key(&record.name)
-                    || matches!(
-                        record.name.as_str(),
-                        "String"
-                            | "i8"
-                            | "i16"
-                            | "i32"
-                            | "u16"
-                            | "u32"
-                            | "u64"
-                            | "char"
-                            | "u8"
-                            | "i64"
-                            | "f64"
-                            | "bool"
-                            | "void"
-                    )
-                    || crate::semantic::builtin_types::BuiltinTypeId::from_name(&record.name)
-                        .is_some()
-                {
-                    return Err(self.err(
-                        ErrorCode::E0102,
-                        "rust_bridge_signature_mismatch: duplicate or reserved record name",
-                    ));
-                }
-                let mut fields = Vec::new();
-                let mut names = std::collections::HashSet::new();
-                for field in &record.fields {
-                    self.validate_rust_record_identifier(&field.name, "record field")?;
-                    let ty = Scalar::from_type_with_records(&field.ty, &self.rust_opaque_names, &self.rust_records)
-                        .filter(|ty| *ty != Scalar::Void)
-                        .ok_or_else(|| self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported record field (declare nested records first)"))?;
-                    if !names.insert(&field.name) {
-                        return Err(self.err(
-                            ErrorCode::E0102,
-                            "rust_bridge_signature_mismatch: duplicate record field",
-                        ));
-                    }
-                    fields.push((field.name.clone(), ty));
-                }
-                self.rust_records.insert(
-                    record.name.clone(),
-                    crate::rust_bridge_ir::Record {
-                        name: record.name.clone(),
-                        fields,
-                    },
-                );
-                items.push(Item::Class(record));
+                items.push(self.parse_rust_record()?);
                 continue;
             }
             let effect_contracts = self.parse_effect_contracts()?;
@@ -243,92 +177,184 @@ impl Parser {
                 }));
                 continue;
             }
-            let modifiers = self.parse_async_modifier(Modifiers::PUBLIC);
-            let is_async = modifiers.contains(Modifiers::ASYNC);
-            if is_async && nonblocking.is_some() {
-                return Err(self.err(
-                    ErrorCode::E0102,
-                    "async Rust bridge cannot declare nonblocking",
-                ));
-            }
-            self.expect(TokenKind::Fn)?;
-            let name = self.expect_ident()?;
-            if name == "main" {
-                return Err(self.err(ErrorCode::E0102, "Rust bridge cannot declare main"));
-            }
-            let name = namespace
-                .as_ref()
-                .map_or(name.clone(), |ns| format!("{ns}::{name}"));
-            self.expect(TokenKind::LParen)?;
-            let mut params = Vec::new();
-            let mut inputs = Vec::new();
-            while !self.check(TokenKind::RParen) && !self.at_eof() {
-                let param = self.parse_param()?;
-                self.reject_sending(&[], std::slice::from_ref(&param), "extern declarations")?;
-                let ty = Scalar::from_type_with_records(
-                    &param.ty,
-                    &self.rust_opaque_names,
-                    &self.rust_records,
-                )
-                .filter(|ty| *ty != Scalar::Void);
-                if ty.is_none() || !matches!(param.mode, ParamMode::Value) {
-                    return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported value parameter (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)"));
-                }
-                inputs.push(ty.unwrap());
-                params.push(param);
-                if !self.eat(TokenKind::Comma) {
-                    break;
-                }
-            }
-            self.expect(TokenKind::RParen)?;
-            let return_type = if self.eat(TokenKind::Arrow) {
-                self.parse_type()?
-            } else {
-                Type::Void
-            };
-            let output = Scalar::from_type_with_records(&return_type, &self.rust_opaque_names, &self.rust_records).ok_or_else(|| {
-                self.err(
-                    ErrorCode::E0102,
-                    "rust_bridge_signature_mismatch: unsupported return type (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)",
-                )
-            })?;
-            self.expect(TokenKind::Semicolon)?;
-            let span = span.to(self.previous_span());
-            let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
-            symbol.is_async = is_async;
-            symbol.no_io = !effect_contracts.is_empty();
-
-            if is_async {
-                symbol.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
-                symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
-            }
-            symbol.resolve_records(&self.rust_records);
-            if let Some(fingerprint) = nonblocking {
-                symbol.declare_nonblocking(fingerprint);
-            }
-            symbol.assumption_span = symbol.has_assumptions().then_some(span);
-            items.push(Item::Function(FunctionDecl {
-                requires: Vec::new(),
-                ensures: Vec::new(),
-                effect_contracts,
-                return_type_span: None,
-                type_params: Vec::new(),
-                rust_bridge: Some(Box::new(symbol)),
-                name,
-                modifiers,
-                params,
-                return_type,
-                body: Block {
-                    id: BodyId::fresh(),
-                    stmts: vec![],
-                    span,
-                },
+            items.push(self.parse_rust_callable(
+                namespace.as_deref(),
                 span,
-                constant: None,
-            }));
+                effect_contracts,
+                nonblocking,
+            )?);
         }
         self.expect(TokenKind::RBrace)?;
         Ok(items)
+    }
+
+    fn parse_rust_record(&mut self) -> Result<Item, Diagnostic> {
+        let record = self.parse_class(Modifiers::PUBLIC)?;
+        self.validate_rust_record_identifier(&record.name, "record")?;
+        if !record.type_params.is_empty()
+            || record.base_class.is_some()
+            || !record.implements.is_empty()
+            || !record.methods.is_empty()
+            || !record.constructors.is_empty()
+            || record
+                .fields
+                .iter()
+                .any(|f| !f.public() || f.is_static() || f.initializer.is_some())
+        {
+            return Err(self.err(
+                ErrorCode::E0102,
+                "rust_bridge_signature_mismatch: records require public value fields only",
+            ));
+        }
+        if self.rust_opaque_names.contains(&record.name)
+            || self.rust_records.contains_key(&record.name)
+            || matches!(
+                record.name.as_str(),
+                "String"
+                    | "i8"
+                    | "i16"
+                    | "i32"
+                    | "u16"
+                    | "u32"
+                    | "u64"
+                    | "char"
+                    | "u8"
+                    | "i64"
+                    | "f64"
+                    | "bool"
+                    | "void"
+            )
+            || crate::semantic::builtin_types::BuiltinTypeId::from_name(&record.name).is_some()
+        {
+            return Err(self.err(
+                ErrorCode::E0102,
+                "rust_bridge_signature_mismatch: duplicate or reserved record name",
+            ));
+        }
+        let mut fields = Vec::new();
+        let mut names = std::collections::HashSet::new();
+        for field in &record.fields {
+            self.validate_rust_record_identifier(&field.name, "record field")?;
+            let ty = Scalar::from_type_with_records(
+                &field.ty,
+                &self.rust_opaque_names,
+                &self.rust_records,
+            )
+            .filter(|ty| *ty != Scalar::Void)
+            .ok_or_else(|| {
+                self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported record field (declare nested records first)")
+            })?;
+            if !names.insert(&field.name) {
+                return Err(self.err(
+                    ErrorCode::E0102,
+                    "rust_bridge_signature_mismatch: duplicate record field",
+                ));
+            }
+            fields.push((field.name.clone(), ty));
+        }
+        self.rust_records.insert(
+            record.name.clone(),
+            crate::rust_bridge_ir::Record {
+                name: record.name.clone(),
+                fields,
+            },
+        );
+        Ok(Item::Class(record))
+    }
+
+    fn parse_rust_callable(
+        &mut self,
+        namespace: Option<&str>,
+        span: crate::diagnostics::Span,
+        effect_contracts: Vec<EffectContract>,
+        nonblocking: Option<String>,
+    ) -> Result<Item, Diagnostic> {
+        let modifiers = self.parse_async_modifier(Modifiers::PUBLIC);
+        let is_async = modifiers.contains(Modifiers::ASYNC);
+        if is_async && nonblocking.is_some() {
+            return Err(self.err(
+                ErrorCode::E0102,
+                "async Rust bridge cannot declare nonblocking",
+            ));
+        }
+        self.expect(TokenKind::Fn)?;
+        let name = self.expect_ident()?;
+        if name == "main" {
+            return Err(self.err(ErrorCode::E0102, "Rust bridge cannot declare main"));
+        }
+        let name = namespace.map_or(name.clone(), |ns| format!("{ns}::{name}"));
+        self.expect(TokenKind::LParen)?;
+        let mut params = Vec::new();
+        let mut inputs = Vec::new();
+        while !self.check(TokenKind::RParen) && !self.at_eof() {
+            let param = self.parse_param()?;
+            self.reject_sending(&[], std::slice::from_ref(&param), "extern declarations")?;
+            let ty = Scalar::from_type_with_records(
+                &param.ty,
+                &self.rust_opaque_names,
+                &self.rust_records,
+            )
+            .filter(|ty| *ty != Scalar::Void);
+            if ty.is_none() || !matches!(param.mode, ParamMode::Value) {
+                return Err(self.err(ErrorCode::E0102, "rust_bridge_signature_mismatch: unsupported value parameter (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)"));
+            }
+            inputs.push(ty.unwrap());
+            params.push(param);
+            if !self.eat(TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        let return_type = if self.eat(TokenKind::Arrow) {
+            self.parse_type()?
+        } else {
+            Type::Void
+        };
+        let output = Scalar::from_type_with_records(
+            &return_type,
+            &self.rust_opaque_names,
+            &self.rust_records,
+        )
+        .ok_or_else(|| {
+            self.err(
+                ErrorCode::E0102,
+                "rust_bridge_signature_mismatch: unsupported return type (expected scalar, String, scalar/String Array, declared record, opaque, Option or Result)",
+            )
+        })?;
+        self.expect(TokenKind::Semicolon)?;
+        let span = span.to(self.previous_span());
+        let mut symbol = RustBridgeSymbol::new(name.clone(), inputs, output);
+        symbol.is_async = is_async;
+        symbol.no_io = !effect_contracts.is_empty();
+
+        if is_async {
+            symbol.effects &= !willow_abi::RuntimeEffects::MAY_BLOCK.bits();
+            symbol.effects |= willow_abi::RuntimeEffects::MAY_SUSPEND.bits();
+        }
+        symbol.resolve_records(&self.rust_records);
+        if let Some(fingerprint) = nonblocking {
+            symbol.declare_nonblocking(fingerprint);
+        }
+        symbol.assumption_span = symbol.has_assumptions().then_some(span);
+        Ok(Item::Function(FunctionDecl {
+            requires: Vec::new(),
+            ensures: Vec::new(),
+            effect_contracts,
+            return_type_span: None,
+            type_params: Vec::new(),
+            rust_bridge: Some(Box::new(symbol)),
+            name,
+            modifiers,
+            params,
+            return_type,
+            body: Block {
+                id: BodyId::fresh(),
+                stmts: vec![],
+                span,
+            },
+            span,
+            constant: None,
+        }))
     }
 }
 

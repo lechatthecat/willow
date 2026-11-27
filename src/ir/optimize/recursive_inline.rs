@@ -12,140 +12,11 @@ use crate::parser::ast::BinOp;
 
 /// With arithmetic checks enabled, checked integer arithmetic is a
 /// fault whose call stack must keep every recursive frame.
-#[allow(clippy::too_many_lines, reason = "split pending")]
 pub(crate) fn inline_scalar_recursion(
     function: &mut SourceFunction,
     overflow_checks: OverflowChecks,
 ) {
-    const MAX_DEPTH: u32 = 3;
-    const MAX_INSTRUCTIONS: usize = 256;
-    const MAX_BLOCKS: usize = 64;
-    if function.is_async
-        || !function.captures.is_empty()
-        || !super::inline_scalar_type(&function.return_type)
-        || function.params.iter().any(|p| p.by_reference)
-        || function.locals.len() > 32
-        || function
-            .locals
-            .iter()
-            .any(|l| l.is_gc_owner() || !super::inline_scalar_type(&l.ty))
-        || function.blocks.is_empty()
-        || function.blocks.len() > 6
-    {
-        return;
-    }
-    let leaf = |e: &HirExpr| {
-        super::inline_scalar_type(&e.ty)
-            && matches!(
-                e.kind,
-                HirExprKind::Var(_)
-                    | HirExprKind::Int(_)
-                    | HirExprKind::Float(_)
-                    | HirExprKind::Bool(_)
-            )
-    };
-    let mut calls = 0usize;
-    let mut instructions = 0;
-    let mut returns = 0;
-    let mut edges = vec![Vec::new(); function.blocks.len()];
-    let mut incoming = vec![0usize; function.blocks.len()];
-    for block in &function.blocks {
-        if !block.recovery.is_empty() {
-            return;
-        }
-        for inst in &block.instrs {
-            instructions += 1;
-            match inst {
-                SourceInst::Compute { value, .. } => {
-                    if value.operands().iter().any(|op| !op.is_plain_value()) {
-                        return;
-                    }
-                    if value.has_overflow_check_with(overflow_checks) {
-                        return;
-                    }
-                    match value {
-                        LirRvalue::Use(_) | LirRvalue::Unary { .. } => {}
-                        LirRvalue::Binary { op, .. }
-                            if !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
-                        LirRvalue::DirectCall { callee, args, .. }
-                            if *callee == function.name && args.len() == function.params.len() =>
-                        {
-                            calls += 1
-                        }
-                        ir_variants!(
-                            LirRvalue;
-                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
-                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
-                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
-                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
-                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
-                            RebindResultError, IntoError, PrepareMethod, MethodCall,
-                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
-                            IndirectCall, Binary, StringConcat
-                        ) => return,
-                    }
-                }
-                SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
-                ir_variants!(
-                    SourceInst;
-                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
-                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
-                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
-                    MatchTest, MatchBind, Expr
-                ) => return,
-            }
-        }
-        match &block.terminator {
-            SourceTerminator::Jump(target) => edges[block.id.0].push(target.0),
-            SourceTerminator::Branch {
-                cond,
-                then_block,
-                else_block,
-            } if leaf(cond) => {
-                edges[block.id.0].extend([then_block.0, else_block.0]);
-            }
-            SourceTerminator::Return(Some(value)) if leaf(value) => returns += 1,
-            SourceTerminator::Branch { .. }
-            | SourceTerminator::Suspend { .. }
-            | SourceTerminator::Return(_)
-            | SourceTerminator::CleanupReturn => return,
-        }
-        for &target in &edges[block.id.0] {
-            incoming[target] += 1;
-        }
-    }
-    if !(1..=2).contains(&calls) || instructions > 16 {
-        return;
-    }
-    // Acyclic intraprocedural CFG only. Remaining recursive calls provide the
-    // safepoints; at most four source invocation levels are combined per expansion.
-    let mut ready: Vec<_> = incoming
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &n)| (n == 0).then_some(i))
-        .collect();
-    let mut visited = 0;
-    while let Some(block) = ready.pop() {
-        visited += 1;
-        for &target in &edges[block] {
-            incoming[target] -= 1;
-            if incoming[target] == 0 {
-                ready.push(target);
-            }
-        }
-    }
-    if visited != function.blocks.len() {
-        return;
-    }
-    let depth = (1..=MAX_DEPTH)
-        .take_while(|&depth| {
-            let copies: usize = (1..=depth).map(|level| calls.pow(level)).sum();
-            instructions + copies * (instructions + function.params.len() + returns)
-                <= MAX_INSTRUCTIONS
-                && function.blocks.len() + copies * (function.blocks.len() + 1) <= MAX_BLOCKS
-        })
-        .last()
-        .unwrap_or(0);
+    let depth = scalar_recursion_depth(function, overflow_checks);
     if depth == 0 {
         return;
     }
@@ -324,4 +195,136 @@ pub(crate) fn inline_scalar_recursion(
             }
         }
     }
+}
+
+fn scalar_recursion_depth(function: &SourceFunction, overflow_checks: OverflowChecks) -> u32 {
+    const MAX_DEPTH: u32 = 3;
+    const MAX_INSTRUCTIONS: usize = 256;
+    const MAX_BLOCKS: usize = 64;
+    if function.is_async
+        || !function.captures.is_empty()
+        || !super::inline_scalar_type(&function.return_type)
+        || function.params.iter().any(|p| p.by_reference)
+        || function.locals.len() > 32
+        || function
+            .locals
+            .iter()
+            .any(|l| l.is_gc_owner() || !super::inline_scalar_type(&l.ty))
+        || function.blocks.is_empty()
+        || function.blocks.len() > 6
+    {
+        return 0;
+    }
+    let leaf = |e: &HirExpr| {
+        super::inline_scalar_type(&e.ty)
+            && matches!(
+                e.kind,
+                HirExprKind::Var(_)
+                    | HirExprKind::Int(_)
+                    | HirExprKind::Float(_)
+                    | HirExprKind::Bool(_)
+            )
+    };
+    let mut calls = 0usize;
+    let mut instructions = 0;
+    let mut returns = 0;
+    let mut edges = vec![Vec::new(); function.blocks.len()];
+    let mut incoming = vec![0usize; function.blocks.len()];
+    for block in &function.blocks {
+        if !block.recovery.is_empty() {
+            return 0;
+        }
+        for inst in &block.instrs {
+            instructions += 1;
+            match inst {
+                SourceInst::Compute { value, .. } => {
+                    if value.operands().iter().any(|op| !op.is_plain_value()) {
+                        return 0;
+                    }
+                    if value.has_overflow_check_with(overflow_checks) {
+                        return 0;
+                    }
+                    match value {
+                        LirRvalue::Use(_) | LirRvalue::Unary { .. } => {}
+                        LirRvalue::Binary { op, .. }
+                            if !matches!(op, BinOp::Div | BinOp::Rem | BinOp::Pow) => {}
+                        LirRvalue::DirectCall { callee, args, .. }
+                            if *callee == function.name && args.len() == function.params.len() =>
+                        {
+                            calls += 1
+                        }
+                        ir_variants!(
+                            LirRvalue;
+                            BeginReferenceCall, AwaitFuture, StartTask, SelectIdleWait, Coerce,
+                            ArrayAlloc, CaptureArrayOwner, ArrayStore, Index, ObjectAlloc,
+                            FieldLoad, FieldStore, StaticField, StaticStore, StaticCall,
+                            EnumAlloc, EnumPayloadStore, ConstructorCall, Range, EnumMethod,
+                            BuiltinCall, FormatScalar, Panic, Recover, ReferenceDebug,
+                            RebindResultError, IntoError, PrepareMethod, MethodCall,
+                            StringLiteral, FunctionRef, Closure, Print, IntrinsicCall, DirectCall,
+                            IndirectCall, Binary, StringConcat
+                        ) => return 0,
+                    }
+                }
+                SourceInst::ClearScopeRoots { .. } => {} // all locals proved scalar
+                ir_variants!(
+                    SourceInst;
+                    EnterDeferScope, LeaveDeferScope, FlushDefers, Defer, Let, Assign,
+                    FieldAssign, IndexAssign, StaticFieldAssign, SuperInit, SelectInit,
+                    SelectProbe, SelectPick, SelectUnregister, SelectCommit, ReleaseLock,
+                    MatchTest, MatchBind, Expr
+                ) => return 0,
+            }
+        }
+        match &block.terminator {
+            SourceTerminator::Jump(target) => edges[block.id.0].push(target.0),
+            SourceTerminator::Branch {
+                cond,
+                then_block,
+                else_block,
+            } if leaf(cond) => {
+                edges[block.id.0].extend([then_block.0, else_block.0]);
+            }
+            SourceTerminator::Return(Some(value)) if leaf(value) => returns += 1,
+            SourceTerminator::Branch { .. }
+            | SourceTerminator::Suspend { .. }
+            | SourceTerminator::Return(_)
+            | SourceTerminator::CleanupReturn => return 0,
+        }
+        for &target in &edges[block.id.0] {
+            incoming[target] += 1;
+        }
+    }
+    if !(1..=2).contains(&calls) || instructions > 16 {
+        return 0;
+    }
+    // Acyclic intraprocedural CFG only. Remaining recursive calls provide the
+    // safepoints; at most four source invocation levels are combined per expansion.
+    let mut ready: Vec<_> = incoming
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &n)| (n == 0).then_some(i))
+        .collect();
+    let mut visited = 0;
+    while let Some(block) = ready.pop() {
+        visited += 1;
+        for &target in &edges[block] {
+            incoming[target] -= 1;
+            if incoming[target] == 0 {
+                ready.push(target);
+            }
+        }
+    }
+    if visited != function.blocks.len() {
+        return 0;
+    }
+    (1..=MAX_DEPTH)
+        .take_while(|&depth| {
+            let copies: usize = (1..=depth).map(|level| calls.pow(level)).sum();
+            instructions + copies * (instructions + function.params.len() + returns)
+                <= MAX_INSTRUCTIONS
+                && function.blocks.len() + copies * (function.blocks.len() + 1) <= MAX_BLOCKS
+        })
+        .last()
+        .unwrap_or(0)
 }

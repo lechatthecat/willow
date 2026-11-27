@@ -130,6 +130,34 @@ fn pipes_outside_patterns_are_unaffected() {
 }
 
 #[test]
+fn nested_or_pattern_recovery_keeps_constant_executor_nesting() {
+    std::thread::Builder::new()
+        .stack_size(1024 * 1024)
+        .spawn(|| {
+            let mut baseline = None;
+            for depth in [1, 16, 48] {
+                let pattern = format!("{}0{}", "Some(1 | ".repeat(depth), ")".repeat(depth));
+                let source =
+                    format!("fn f(x: i64) {{ match x {{ {pattern} => {{}}, _ => {{}} }} }}");
+                crate::compiler_stack::take_max_run_nesting();
+                let found = errors(&source);
+                assert_eq!(found.len(), depth, "{found:?}");
+                assert!(
+                    found
+                        .iter()
+                        .all(|error| error.message.starts_with("or-patterns are not supported"))
+                );
+                let nesting = crate::compiler_stack::take_max_run_nesting();
+                eprintln!("or-pattern recovery: depth={depth}, executor nesting={nesting}");
+                assert_eq!(nesting, *baseline.get_or_insert(nesting));
+            }
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+#[test]
 fn many_alternatives_report_one_error() {
     for size in [2usize, 64, 1024] {
         let alternatives = (0..size).map(|i| i.to_string()).collect::<Vec<_>>();

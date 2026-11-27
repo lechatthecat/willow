@@ -7,8 +7,9 @@ use super::*;
 /// and bind whatever it destructures. On success the pattern's
 /// bindings are added to `names`, which is why this takes the map by `&mut`:
 /// the arm body is checked against the extended scope, exactly as the emitter
-/// will run it. On failure `names` may have been partly extended, so callers
-/// pass a throwaway clone rather than their own map.
+/// will run it. On failure `names` may have been partly extended. The pattern
+/// never reads existing names, so validation can use an empty scratch map
+/// instead of copying unrelated function locals for every arm.
 ///
 /// `ClassDowncast` tests the boxed object's runtime `type_id`, so it is
 /// admitted only for a class the walker has a `type_id` and a layout for

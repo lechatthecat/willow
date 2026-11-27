@@ -363,6 +363,7 @@ impl<'a> MinorCollector<'a> {
             let object = HeapObject::from_payload(payload);
             if object.allocated() && object.generation() == GC_GENERATION_OLD {
                 self.worklist.push((object, true));
+                #[cfg(debug_assertions)]
                 return;
             }
         }
@@ -1038,7 +1039,10 @@ impl<'a> MinorCollector<'a> {
         mark_roots
     }
 
-    #[allow(clippy::too_many_lines, reason = "split pending")]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one stopped collection owns source headers through pinning, evacuation, transport remapping and sweep; keeping these phases together exposes reclamation order and telemetry guard lifetimes without extra survivor walks"
+    )]
     fn run(
         mut self,
         roots: MinorRoots,

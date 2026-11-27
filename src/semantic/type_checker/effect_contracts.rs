@@ -2,7 +2,13 @@
 use super::*;
 use crate::compiler_db::effects::EffectWitness;
 use crate::semantic::call_graph::CallGraph;
-use crate::semantic::effects::{EffectFacts, RuntimeEffects};
+use crate::semantic::effects::{EffectFacts, EffectProblem, RuntimeEffects};
+const CONTRACT_EFFECTS: RuntimeEffects = RuntimeEffects::MAY_BLOCK
+    .union(RuntimeEffects::MAY_SUSPEND)
+    .union(RuntimeEffects::MAY_IO)
+    .union(RuntimeEffects::MAY_PANIC)
+    .union(RuntimeEffects::MAY_CHECKED_PANIC)
+    .union(RuntimeEffects::MAY_ALLOCATE);
 use std::collections::VecDeque;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -587,7 +593,6 @@ impl TypeChecker {
     /// an unknown callback must fail a declaration proof even outside a lock.
     /// Arity hub nodes reuse the existing address-taken analysis without a
     /// call-sites × candidate-values expansion.
-    #[allow(clippy::too_many_lines, reason = "split pending")]
     fn solve_contracts(
         &self,
         program: &Program,
@@ -595,13 +600,6 @@ impl TypeChecker {
         facts: &EffectFacts<EffectWitness>,
         roots: impl Iterator<Item = FunctionId>,
     ) -> (CallGraph, EffectFacts<EffectWitness>) {
-        const CONTRACT_EFFECTS: RuntimeEffects = RuntimeEffects::MAY_BLOCK
-            .union(RuntimeEffects::MAY_SUSPEND)
-            .union(RuntimeEffects::MAY_IO)
-            .union(RuntimeEffects::MAY_PANIC)
-            .union(RuntimeEffects::MAY_CHECKED_PANIC)
-            .union(RuntimeEffects::MAY_ALLOCATE);
-        use crate::compiler_db::effects::LOCK_EFFECT_WAIT;
         use crate::semantic::{call_graph::CallSites, effects::EffectProblem};
         let mut graph = graph.clone();
         let allocations = self.contract_allocations(program, &mut graph);
@@ -678,12 +676,6 @@ impl TypeChecker {
                 .filter_map(|(&id, _)| (id.is_lambda()).then_some(id)),
         );
         let mut normalized = CallGraph::default();
-        let mut abi_effects = HashMap::new();
-        let builtin_aliases = self
-            .imported_std_modules
-            .iter()
-            .map(|(alias, module)| (alias.clone(), module.module.clone()))
-            .collect();
         for (&id, sites) in graph.iter() {
             let mut sites = sites.clone();
             if sites.has_unknown
@@ -734,6 +726,41 @@ impl TypeChecker {
                         .sum::<usize>(),
             )
         });
+        let (mut problem, abi_effects) =
+            self.seed_contract_bodies(program, &graph, facts, nodes, problem);
+        problem = self.seed_contract_calls(&normalized, &abi_effects, problem);
+        for (owner, span) in allocations {
+            problem = problem.seed(
+                owner,
+                RuntimeEffects::MAY_ALLOCATE,
+                Some(EffectWitness::Allocation {
+                    owner,
+                    source: (span.file_id.0, span.start, span.end),
+                }),
+            );
+        }
+        let facts = problem.solve_reachable(&normalized);
+        (normalized, facts)
+    }
+
+    fn seed_contract_bodies(
+        &self,
+        program: &Program,
+        graph: &CallGraph,
+        facts: &EffectFacts<EffectWitness>,
+        nodes: HashSet<FunctionId>,
+        mut problem: EffectProblem<EffectWitness>,
+    ) -> (
+        EffectProblem<EffectWitness>,
+        HashMap<FunctionId, RuntimeEffects>,
+    ) {
+        use crate::compiler_db::effects::LOCK_EFFECT_WAIT;
+        let mut abi_effects = HashMap::new();
+        let builtin_aliases = self
+            .imported_std_modules
+            .iter()
+            .map(|(alias, module)| (alias.clone(), module.module.clone()))
+            .collect();
         let foreign: HashMap<_, _> = program
             .items
             .iter()
@@ -848,6 +875,15 @@ impl TypeChecker {
                 );
             }
         }
+        (problem, abi_effects)
+    }
+
+    fn seed_contract_calls(
+        &self,
+        normalized: &CallGraph,
+        abi_effects: &HashMap<FunctionId, RuntimeEffects>,
+        mut problem: EffectProblem<EffectWitness>,
+    ) -> EffectProblem<EffectWitness> {
         // ABI effects are proved at each actual source call, not at a shared
         // synthetic leaf whose representative span might belong to another caller.
         for (&caller, sites) in normalized.iter() {
@@ -927,18 +963,7 @@ impl TypeChecker {
                 }
             }
         }
-        for (owner, span) in allocations {
-            problem = problem.seed(
-                owner,
-                RuntimeEffects::MAY_ALLOCATE,
-                Some(EffectWitness::Allocation {
-                    owner,
-                    source: (span.file_id.0, span.start, span.end),
-                }),
-            );
-        }
-        let facts = problem.solve_reachable(&normalized);
-        (normalized, facts)
+        problem
     }
 
     /// Propagate each declaration contract kind once per (type, method).

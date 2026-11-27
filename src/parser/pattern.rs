@@ -208,6 +208,7 @@ impl Parser {
     }
 }
 
+#[willow_continuations::parser]
 impl Parser {
     /// Willow has no or-patterns. After `first`, consume every `| pattern`
     /// alternative, report them once, and keep `first` so parsing continues.

@@ -311,7 +311,6 @@ pub fn verify_cached(
     )
     .with_artifacts(options, |_| {})
 }
-#[allow(clippy::too_many_lines, reason = "split pending")]
 fn verify_with_data(
     program: &Program,
     options: &Options,
@@ -407,6 +406,13 @@ fn verify_with_data(
     {
         engine = Err(error);
     }
+    let proof = ProofContext {
+        functions: &functions,
+        names: &names,
+        data,
+        options,
+        edges: &edges,
+    };
     for id in order {
         let f = functions[id];
         let verified = has(f, EffectContractKind::Verified);
@@ -418,143 +424,6 @@ fn verify_with_data(
             .iter()
             .map(|i| functions[*i].name.clone())
             .collect();
-        let mut verify_function = || -> VerificationResult<()> {
-            let summary = encode(id, &functions, &names, data)?;
-            r.vc_nodes = summary.nodes;
-            r.dependency_digests = edges[id]
-                .iter()
-                .map(|i| semantic_digests[*i].clone())
-                .collect();
-            semantic_digests[id] =
-                digest(&(summary.definitions.clone() + &r.dependency_digests.join("\n")));
-            if summary.dependencies != edges[id] {
-                return Err(FailureKind::Infrastructure.error("unresolved call dependency"));
-            }
-            let s = engine.as_mut().map_err(|e| e.clone())?;
-            s.exchange(&summary.definitions)?;
-            if !verified {
-                return Ok(());
-            }
-            #[cfg(test)]
-            PROOF_RUNS.with(|n| n.set(n.get() + 1));
-            let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
-            r.inferred_loop_annotations = summary.inferred_loop_annotations;
-            let cached = cache.get(&cache_key);
-            let cache_hit = cached.is_some();
-            let mut args = Vec::new();
-            let mut domain = vec!["true".to_string()];
-            for (i, p) in f.params.iter().enumerate() {
-                let name = format!("a{id}_{i}");
-                let ty = sort(&p.ty)?;
-                s.exchange(&format!("(declare-const {name} {ty})\n"))?;
-                domain.push(data::domain(&p.ty, &name));
-                r.input_symbols.insert(name.clone(), p.name.clone());
-                args.push(name);
-            }
-            let mut model_symbols = args.clone();
-            model_symbols.extend(summary.loop_symbols.keys().cloned());
-            r.input_symbols.extend(summary.loop_symbols.clone());
-            let domain = format!("(and {})", domain.join(" "));
-            let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
-            if let Some(obligations) = cached {
-                // Probe the live solver before reuse: missing, poisoned or exhausted
-                // sessions cannot be turned into a successful old result.
-                if s.query("false", &[])?.0 != Answer::Unsat {
-                    cache.remove(&cache_key);
-                    return Err(
-                        FailureKind::Infrastructure.error("solver unavailable for cached proof")
-                    );
-                }
-                r.obligations = obligations;
-            } else {
-                for (kind, formula, want) in [
-                    (
-                        "requires safety",
-                        format!("(and {domain} (not {}))", call("pre_safe")),
-                        Answer::Unsat,
-                    ),
-                    (
-                        "requires satisfiability",
-                        format!("(and {domain} {})", call("pre")),
-                        Answer::Sat,
-                    ),
-                    (
-                        "body safety and termination",
-                        format!(
-                            "(and {domain} {} {} (not {}))",
-                            call("pre"),
-                            call("assume"),
-                            call("safe")
-                        ),
-                        Answer::Unsat,
-                    ),
-                    (
-                        "ensures safety",
-                        format!(
-                            "(and {domain} {} {} (not {}))",
-                            call("pre"),
-                            call("assume"),
-                            call("post_safe")
-                        ),
-                        Answer::Unsat,
-                    ),
-                    (
-                        "ensures truth",
-                        format!(
-                            "(and {domain} {} {} (not {}))",
-                            call("pre"),
-                            call("assume"),
-                            call("post")
-                        ),
-                        Answer::Unsat,
-                    ),
-                ] {
-                    let (answer, model) = s.query(
-                        &formula,
-                        if want == Answer::Unsat {
-                            &model_symbols
-                        } else {
-                            &[]
-                        },
-                    )?;
-                    r.obligations.push(Obligation {
-                        kind: kind.into(),
-                        solver_result: answer.as_str().into(),
-                        expected_solver_result: want.as_str().into(),
-                        counterexample_candidate: if answer != want { model } else { None },
-                    });
-                    if answer != want {
-                        return Err(match answer {
-                            Answer::Unknown => FailureKind::Infrastructure
-                                .error("solver returned UNKNOWN (timeout or incomplete theory)"),
-                            Answer::Unsat => {
-                                FailureKind::VacuousPrecondition.error(format!("failed {kind}"))
-                            }
-                            Answer::Sat => {
-                                FailureKind::Counterexample.error(format!("failed {kind}"))
-                            }
-                        });
-                    }
-                }
-            }
-            // Only proved dependencies get an abstract return function. The
-            // encoder instantiates their contracts at individual call sites.
-            let sorts = f
-                .params
-                .iter()
-                .map(|p| sort(&p.ty))
-                .collect::<Result<Vec<_>, _>>()?
-                .join(" ");
-            s.exchange(&format!(
-                "(declare-fun f{id}_contract ({sorts}) {})\n",
-                sort(&f.return_type)?
-            ))?;
-            r.status = Status::Proven;
-            if !cache_hit {
-                cache.insert(cache_key, r.obligations.clone());
-            }
-            Ok(())
-        };
         let result = if prior_error {
             Err(FailureKind::Unsupported
                 .error("type or purity checking failed")
@@ -583,7 +452,16 @@ fn verify_with_data(
         }) {
             Err(failure)
         } else {
-            verify_function().map_err(FunctionFailure::Direct)
+            proof
+                .verify_function(
+                    id,
+                    verified,
+                    &mut r,
+                    &mut engine,
+                    cache,
+                    &mut semantic_digests,
+                )
+                .map_err(FunctionFailure::Direct)
         };
         match result {
             Ok(()) => states[id] = FunctionState::Valid,
@@ -631,6 +509,169 @@ fn verify_with_data(
         reports,
         smt,
         artifact_error: None,
+    }
+}
+
+/// Shared immutable inputs for each proof in the topological schedule.
+struct ProofContext<'a> {
+    functions: &'a [&'a FunctionDecl],
+    names: &'a HashMap<&'a str, usize>,
+    data: &'a DataTypes<'a>,
+    options: &'a Options,
+    edges: &'a [BTreeSet<usize>],
+}
+
+impl ProofContext<'_> {
+    fn verify_function(
+        &self,
+        id: usize,
+        verified: bool,
+        r: &mut Report,
+        engine: &mut VerificationResult<solver::Solver>,
+        cache: &mut ProofCache,
+        semantic_digests: &mut [String],
+    ) -> VerificationResult<()> {
+        let Self {
+            functions,
+            names,
+            data,
+            options,
+            edges,
+        } = *self;
+        let f = functions[id];
+        let summary = encode(id, functions, names, data)?;
+        r.vc_nodes = summary.nodes;
+        r.dependency_digests = edges[id]
+            .iter()
+            .map(|i| semantic_digests[*i].clone())
+            .collect();
+        semantic_digests[id] =
+            digest(&(summary.definitions.clone() + &r.dependency_digests.join("\n")));
+        if summary.dependencies != edges[id] {
+            return Err(FailureKind::Infrastructure.error("unresolved call dependency"));
+        }
+        let s = engine.as_mut().map_err(|e| e.clone())?;
+        s.exchange(&summary.definitions)?;
+        if !verified {
+            return Ok(());
+        }
+        #[cfg(test)]
+        PROOF_RUNS.with(|n| n.set(n.get() + 1));
+        let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
+        r.inferred_loop_annotations = summary.inferred_loop_annotations;
+        let cached = cache.get(&cache_key);
+        let cache_hit = cached.is_some();
+        let mut args = Vec::new();
+        let mut domain = vec!["true".to_string()];
+        for (i, p) in f.params.iter().enumerate() {
+            let name = format!("a{id}_{i}");
+            let ty = sort(&p.ty)?;
+            s.exchange(&format!("(declare-const {name} {ty})\n"))?;
+            domain.push(data::domain(&p.ty, &name));
+            r.input_symbols.insert(name.clone(), p.name.clone());
+            args.push(name);
+        }
+        let mut model_symbols = args.clone();
+        model_symbols.extend(summary.loop_symbols.keys().cloned());
+        r.input_symbols.extend(summary.loop_symbols.clone());
+        let domain = format!("(and {})", domain.join(" "));
+        let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
+        if let Some(obligations) = cached {
+            // Probe the live solver before reuse: missing, poisoned or exhausted
+            // sessions cannot be turned into a successful old result.
+            if s.query("false", &[])?.0 != Answer::Unsat {
+                cache.remove(&cache_key);
+                return Err(
+                    FailureKind::Infrastructure.error("solver unavailable for cached proof")
+                );
+            }
+            r.obligations = obligations;
+        } else {
+            for (kind, formula, want) in [
+                (
+                    "requires safety",
+                    format!("(and {domain} (not {}))", call("pre_safe")),
+                    Answer::Unsat,
+                ),
+                (
+                    "requires satisfiability",
+                    format!("(and {domain} {})", call("pre")),
+                    Answer::Sat,
+                ),
+                (
+                    "body safety and termination",
+                    format!(
+                        "(and {domain} {} {} (not {}))",
+                        call("pre"),
+                        call("assume"),
+                        call("safe")
+                    ),
+                    Answer::Unsat,
+                ),
+                (
+                    "ensures safety",
+                    format!(
+                        "(and {domain} {} {} (not {}))",
+                        call("pre"),
+                        call("assume"),
+                        call("post_safe")
+                    ),
+                    Answer::Unsat,
+                ),
+                (
+                    "ensures truth",
+                    format!(
+                        "(and {domain} {} {} (not {}))",
+                        call("pre"),
+                        call("assume"),
+                        call("post")
+                    ),
+                    Answer::Unsat,
+                ),
+            ] {
+                let (answer, model) = s.query(
+                    &formula,
+                    if want == Answer::Unsat {
+                        &model_symbols
+                    } else {
+                        &[]
+                    },
+                )?;
+                r.obligations.push(Obligation {
+                    kind: kind.into(),
+                    solver_result: answer.as_str().into(),
+                    expected_solver_result: want.as_str().into(),
+                    counterexample_candidate: if answer != want { model } else { None },
+                });
+                if answer != want {
+                    return Err(match answer {
+                        Answer::Unknown => FailureKind::Infrastructure
+                            .error("solver returned UNKNOWN (timeout or incomplete theory)"),
+                        Answer::Unsat => {
+                            FailureKind::VacuousPrecondition.error(format!("failed {kind}"))
+                        }
+                        Answer::Sat => FailureKind::Counterexample.error(format!("failed {kind}")),
+                    });
+                }
+            }
+        }
+        // Only proved dependencies get an abstract return function. The
+        // encoder instantiates their contracts at individual call sites.
+        let sorts = f
+            .params
+            .iter()
+            .map(|p| sort(&p.ty))
+            .collect::<Result<Vec<_>, _>>()?
+            .join(" ");
+        s.exchange(&format!(
+            "(declare-fun f{id}_contract ({sorts}) {})\n",
+            sort(&f.return_type)?
+        ))?;
+        r.status = Status::Proven;
+        if !cache_hit {
+            cache.insert(cache_key, r.obligations.clone());
+        }
+        Ok(())
     }
 }
 

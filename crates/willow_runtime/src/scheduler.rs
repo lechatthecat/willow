@@ -5428,7 +5428,6 @@ fn parallel_run_is_idle_in(
         .any(|source| work_source_is_live_in(owner, components, state, *source))
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
 fn scheduler_run_loop(
     target: Option<RuntimeTaskId>,
     worker: usize,
@@ -5446,7 +5445,10 @@ fn scheduler_run_loop(
     )
 }
 
-#[allow(clippy::too_many_lines, reason = "split pending")]
+#[allow(
+    clippy::too_many_lines,
+    reason = "one scheduler turn keeps claim guards, GC safepoints, frame retirement and park-generation checks in lexical order; splitting its early exits obscures guard lifetimes on the hot poll path"
+)]
 fn scheduler_run_loop_in(
     owner: &crate::runtime::Runtime,
     target: Option<RuntimeTaskId>,
