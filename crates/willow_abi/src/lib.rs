@@ -42,6 +42,8 @@ pub mod native;
 pub mod plugin;
 pub mod runtime_type_ids;
 pub mod schema;
+#[doc = include_str!("../TUNING.md")]
+pub mod settings;
 pub use schema::RUNTIME_ABI;
 // Keep the existing descriptor-type import path available to ABI consumers.
 pub use runtime_type_ids::GC_BITMAP_TYPE_ID;

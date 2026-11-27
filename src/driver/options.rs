@@ -1,5 +1,7 @@
 use std::path::PathBuf;
-use willow_abi::workers::{default_worker_count, parse_worker_count};
+use willow_abi::workers::default_worker_count;
+#[cfg(test)]
+use willow_abi::workers::parse_worker_count;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BuildMode {
@@ -91,8 +93,7 @@ impl CompilerEnvironment {
     fn read() -> Self {
         Self {
             workers: Some(
-                parse_worker_count(std::env::var("WILLOW_WORKERS").ok().as_deref())
-                    .unwrap_or_else(default_worker_count),
+                willow_abi::settings::worker_count().unwrap_or_else(default_worker_count),
             ),
             runtime_lib: std::env::var_os("WILLOW_RUNTIME_LIB").map(PathBuf::from),
             cargo_target_dir: std::env::var_os("CARGO_TARGET_DIR").map(PathBuf::from),

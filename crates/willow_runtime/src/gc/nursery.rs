@@ -49,13 +49,7 @@ pub(super) struct Policy {
 impl Policy {
     pub(super) fn from_env() -> Self {
         Self {
-            fixed: std::env::var("WILLOW_GC_NURSERY_BYTES").ok().map(|value| {
-                value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|bytes| *bytes > 0)
-                    .expect("WILLOW_GC_NURSERY_BYTES must be a positive byte count")
-            }),
+            fixed: willow_abi::settings::nursery_bytes(),
         }
     }
 

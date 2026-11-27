@@ -17,7 +17,9 @@ use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use willow_abi::workers::{default_worker_count, parse_worker_count};
+use willow_abi::workers::default_worker_count;
+#[cfg(test)]
+use willow_abi::workers::parse_worker_count;
 
 use crate::lock_wait::{LockId, LockWaitLink, RegistrationToken};
 use crate::task::{
@@ -112,6 +114,7 @@ pub struct RuntimeWorkerConfig {
 }
 
 impl RuntimeWorkerConfig {
+    #[cfg(test)]
     fn from_env_value(value: Option<&str>, default_workers: usize) -> Self {
         let requested_workers = parse_worker_count(value).unwrap_or(default_workers.max(1));
 
@@ -194,9 +197,8 @@ pub fn runtime_worker_config() -> RuntimeWorkerConfig {
 }
 
 pub(crate) fn environment_worker_config() -> RuntimeWorkerConfig {
-    RuntimeWorkerConfig::from_env_value(
-        std::env::var("WILLOW_WORKERS").ok().as_deref(),
-        default_worker_count(),
+    RuntimeWorkerConfig::with_workers(
+        willow_abi::settings::worker_count().unwrap_or(default_worker_count()),
     )
 }
 

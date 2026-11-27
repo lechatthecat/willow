@@ -120,14 +120,9 @@ impl PreemptConfig {
     /// back to the defaults so a long-running task can never be handed a
     /// degenerate zero-length quantum.
     pub fn from_env_values(budget: Option<&str>, quantum_ms: Option<&str>) -> Self {
-        let task_budget = budget
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_TASK_BUDGET);
-        let time_quantum_ms = quantum_ms
-            .and_then(|raw| raw.trim().parse::<u64>().ok())
-            .filter(|value| *value > 0)
-            .unwrap_or(DEFAULT_TIME_QUANTUM_MS);
+        let task_budget = willow_abi::settings::preempt_value(budget, DEFAULT_TASK_BUDGET);
+        let time_quantum_ms =
+            willow_abi::settings::preempt_value(quantum_ms, DEFAULT_TIME_QUANTUM_MS);
         Self {
             task_budget,
             time_quantum_ms,
@@ -153,11 +148,9 @@ impl PreemptConfig {
 /// is how every test that sets these variables runs; tests that need a specific
 /// config in-process use [`begin_quantum`] instead.
 pub fn runtime_preempt_config() -> PreemptConfig {
-    static CONFIG: LazyLock<PreemptConfig> = LazyLock::new(|| {
-        PreemptConfig::from_env_values(
-            std::env::var("WILLOW_TASK_BUDGET").ok().as_deref(),
-            std::env::var("WILLOW_TIME_QUANTUM_MS").ok().as_deref(),
-        )
+    static CONFIG: LazyLock<PreemptConfig> = LazyLock::new(|| PreemptConfig {
+        task_budget: willow_abi::settings::task_budget(DEFAULT_TASK_BUDGET),
+        time_quantum_ms: willow_abi::settings::time_quantum_ms(DEFAULT_TIME_QUANTUM_MS),
     });
     *CONFIG
 }

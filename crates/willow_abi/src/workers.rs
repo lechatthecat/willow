@@ -14,9 +14,7 @@ pub fn default_worker_count() -> usize {
 /// Accept positive counts verbatim; absent, zero, invalid and overflowing
 /// values leave the caller to select its default.
 pub fn parse_worker_count(value: Option<&str>) -> Option<usize> {
-    value
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|workers| *workers > 0)
+    crate::settings::positive_count(value)
 }
 
 #[cfg(test)]

@@ -102,8 +102,8 @@ impl Default for Options {
             solver: std::env::var_os("WILLOW_Z3")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| "z3".into()),
-            timeout_ms: budget("WILLOW_VERIFICATION_TIMEOUT_MS", 5_000),
-            resource_limit: budget("WILLOW_VERIFICATION_RLIMIT", 1_000_000),
+            timeout_ms: willow_abi::settings::verification_timeout_ms(),
+            resource_limit: willow_abi::settings::verification_resource_limit(),
             artifacts: Some(
                 std::env::var_os("WILLOW_VERIFICATION_DIR")
                     .map(PathBuf::from)
@@ -115,11 +115,6 @@ impl Default for Options {
 fn valid_budget(options: &Options) -> bool {
     (1..=60_000).contains(&options.timeout_ms)
         && (1..=1_000_000_000).contains(&options.resource_limit)
-}
-fn budget(name: &str, default: u64) -> u64 {
-    std::env::var(name)
-        .map(|v| v.parse().unwrap_or(0))
-        .unwrap_or(default)
 }
 #[derive(Default)]
 pub struct Verification {

@@ -1252,8 +1252,7 @@ impl<'a, 'b> FuncGen<'a, 'b> {
             .panic_depth_snapshot
             .and_then(|(block, depth)| {
                 (self.builder.current_block() == Some(block)
-                    && std::env::var_os("WILLOW_PANIC_SNAPSHOT_REUSE")
-                        .is_none_or(|value| value != "0")
+                    && willow_abi::settings::panic_snapshot_reuse()
                     && self
                         .builder
                         .func

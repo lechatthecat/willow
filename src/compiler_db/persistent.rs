@@ -358,7 +358,7 @@ pub(crate) fn run(
     }
     // Persistence is experimental: its restore/save cost can exceed a clean
     // check. Neither a cache directory nor statistics implicitly enables it.
-    if std::env::var_os("WILLOW_QUERY_CACHE").is_none_or(|v| v != "1") {
+    if !willow_abi::settings::query_cache() {
         return crate::run_frontend_revision(source, root, map, inputs, emitter, None, None);
     }
     run_enabled(source, root, map, inputs, emitter)

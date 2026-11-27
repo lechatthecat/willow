@@ -521,14 +521,7 @@ struct GcState {
 }
 
 fn gc_memory_limit_from_env() -> Option<usize> {
-    let value = std::env::var("WILLOW_GC_MEMORY_LIMIT").ok()?;
-    Some(
-        value
-            .parse::<usize>()
-            .ok()
-            .filter(|value| *value > 0)
-            .expect("WILLOW_GC_MEMORY_LIMIT must be a positive byte count"),
-    )
+    willow_abi::settings::gc_memory_limit()
 }
 
 #[derive(Default)]

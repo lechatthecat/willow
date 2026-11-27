@@ -99,13 +99,6 @@ struct BlockingPool {
     metrics: PoolMetrics,
 }
 
-fn env_count(name: &str) -> Option<usize> {
-    std::env::var(name)
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|count| *count > 0)
-}
-
 // A caller-side FFI catch cannot observe a detached thread's panic. Cover
 // initialization, dequeue/wakeup, job execution and accounting on this thread.
 fn blocking_worker_entry(
@@ -139,8 +132,8 @@ impl BlockingPool {
         match kind {
             PoolKind::General => {
                 let threads =
-                    env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
-                let capacity = env_count("WILLOW_BLOCKING_QUEUE")
+                    willow_abi::settings::blocking_threads().unwrap_or(DEFAULT_BLOCKING_THREADS);
+                let capacity = willow_abi::settings::blocking_queue()
                     .unwrap_or_else(|| threads.saturating_mul(DEFAULT_BLOCKING_QUEUE_PER_THREAD));
                 Self::with_workers(threads, capacity, "willow-blocking", owner, kind)
             }
@@ -624,7 +617,7 @@ pub(crate) mod test_support {
 
     /// Pool thread count as the pool itself resolves it.
     pub(crate) fn pool_threads() -> usize {
-        env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS)
+        willow_abi::settings::blocking_threads().unwrap_or(DEFAULT_BLOCKING_THREADS)
     }
 
     /// Block every pool thread until released. Returns once all threads are
@@ -855,7 +848,8 @@ mod tests {
         let capacity = willow_blocking_queue_capacity();
         assert!(capacity > 0);
         if std::env::var_os("WILLOW_BLOCKING_QUEUE").is_none() {
-            let threads = env_count("WILLOW_BLOCKING_THREADS").unwrap_or(DEFAULT_BLOCKING_THREADS);
+            let threads =
+                willow_abi::settings::blocking_threads().unwrap_or(DEFAULT_BLOCKING_THREADS);
             assert_eq!(
                 capacity as usize,
                 threads * DEFAULT_BLOCKING_QUEUE_PER_THREAD

@@ -57,7 +57,7 @@ impl State {
 }
 
 pub(super) fn concurrent_enabled() -> bool {
-    std::env::var("WILLOW_GC_CONCURRENT_MARK").as_deref() != Ok("0")
+    willow_abi::settings::concurrent_mark()
 }
 
 #[cfg(test)]
@@ -142,24 +142,17 @@ pub(super) struct RemarkBudget {
     observation: RuntimeBudgetObservation,
 }
 
-fn positive_setting(setting: Option<&str>, default: u64, maximum: u64) -> u64 {
-    setting
-        .and_then(|s| s.parse().ok())
-        .filter(|&n| n > 0 && n <= maximum)
-        .unwrap_or(default)
-}
+#[cfg(test)]
+use willow_abi::settings::bounded_count as positive_setting;
 
 impl RemarkBudget {
     pub(super) fn configured(now: u64) -> Self {
-        fn positive(name: &str, default: u64, maximum: u64) -> u64 {
-            positive_setting(std::env::var(name).ok().as_deref(), default, maximum)
-        }
         let observation =
             RuntimeBudgetObservation::capture(|| &super::runtime().remark_observation);
         Self::with_observation(
-            positive("WILLOW_GC_REMARK_MAX_SLOTS", 4096, 1_000_000),
-            positive("WILLOW_GC_REMARK_MAX_BYTES", 1024 * 1024, 16 * 1024 * 1024),
-            positive("WILLOW_GC_REMARK_MAX_WORK_NS", 1_000_000, 100_000_000),
+            willow_abi::settings::remark_max_slots(),
+            willow_abi::settings::remark_max_bytes(),
+            willow_abi::settings::remark_max_work_ns(),
             now,
             observation,
         )

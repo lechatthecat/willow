@@ -81,23 +81,22 @@ pub(super) fn begin_in(owner: &crate::runtime::Runtime) -> Option<(u64, Arc<Conc
                 // when refilled, so it lags by at most one chunk per allocator.
                 let runway = goal.saturating_sub(inputs.pressure_bytes.max(before));
                 cycle.slices = slices;
-                cycle.assist_pacing = if !old_cycle::concurrent_enabled()
-                    || std::env::var("WILLOW_GC_ASSIST").as_deref() == Ok("0")
-                {
-                    None
-                } else {
-                    let decision = state.pacer.decision(pacer_inputs_in(owner, &state));
-                    Some(
-                        assist::Pacing::new(
-                            decision
-                                .expected_work
-                                .max(state.last_major_mark_work)
-                                .max(before),
-                            runway,
+                cycle.assist_pacing =
+                    if !old_cycle::concurrent_enabled() || !willow_abi::settings::gc_assist() {
+                        None
+                    } else {
+                        let decision = state.pacer.decision(pacer_inputs_in(owner, &state));
+                        Some(
+                            assist::Pacing::new(
+                                decision
+                                    .expected_work
+                                    .max(state.last_major_mark_work)
+                                    .max(before),
+                                runway,
+                            )
+                            .with_background(decision.assist_work_per_byte_ppm),
                         )
-                        .with_background(decision.assist_work_per_byte_ppm),
-                    )
-                };
+                    };
                 cycle
                     .tracing_enabled
                     .store(old_cycle::concurrent_enabled(), Ordering::Relaxed);

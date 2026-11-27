@@ -193,9 +193,7 @@ fn analyze_program_with_queries(
 }
 
 fn optimization_enabled() -> bool {
-    std::env::var("WILLOW_PANIC_EFFECTS")
-        .map(|value| value != "0" && !value.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+    willow_abi::settings::panic_effects()
 }
 
 impl UnitCodegenContext<'_> {

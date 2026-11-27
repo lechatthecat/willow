@@ -190,7 +190,7 @@ impl UnitCodegenContext<'_> {
                 ),
             );
         }
-        let frame_all = std::env::var("WILLOW_ASYNC_FRAME_ALL").is_ok()
+        let frame_all = willow_abi::settings::async_frame_all()
             || lir
                 .blocks
                 .iter()

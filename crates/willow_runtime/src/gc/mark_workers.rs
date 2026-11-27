@@ -72,15 +72,7 @@ pub(crate) const fn marker_configuration() -> LazyLock<usize> {
 }
 
 fn resolve_configured_count() -> usize {
-    std::env::var("WILLOW_GC_MARK_THREADS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .map(|count| count.min(64))
-        .unwrap_or_else(|| {
-            std::thread::available_parallelism()
-                .map(|count| count.get().saturating_sub(1).clamp(1, 4))
-                .unwrap_or(1)
-        })
+    willow_abi::settings::mark_threads()
 }
 
 impl Pool {

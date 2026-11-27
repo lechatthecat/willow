@@ -23,19 +23,11 @@ fn assert_stopped_owners(coord: &super::GcCoord) {
 }
 
 pub(super) fn configured_capacity() -> usize {
-    capacity_from_setting(
-        std::env::var("WILLOW_GC_SATB_BUFFER_ENTRIES")
-            .ok()
-            .as_deref(),
-    )
+    willow_abi::settings::satb_capacity()
 }
 
-fn capacity_from_setting(setting: Option<&str>) -> usize {
-    setting
-        .and_then(|s| s.parse().ok())
-        .filter(|n| (1..=65536).contains(n))
-        .unwrap_or(256)
-}
+#[cfg(test)]
+use willow_abi::settings::satb_capacity_value as capacity_from_setting;
 
 /// Deterministic operation-count probes. Outside tests they are empty inline
 /// functions, so production paths carry no test-only branch.

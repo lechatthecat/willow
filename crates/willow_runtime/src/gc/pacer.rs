@@ -343,7 +343,7 @@ pub(super) struct Sampler {
 impl Default for Sampler {
     fn default() -> Self {
         Self {
-            enabled: std::env::var("WILLOW_GC_PACER").as_deref() != Ok("0"),
+            enabled: willow_abi::settings::gc_pacer(),
             last: None,
             allocation_rate: 0,
             mark_rate: None,

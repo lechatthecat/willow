@@ -80,13 +80,8 @@ impl RuntimeDiagnostics {
                 env_capacity("WILLOW_GC_TRACE_CAPACITY", CAPACITY, MAX_CAPACITY)
             }),
             gc_handshake_timeout: LazyLock::new(|| {
-                let seconds = match std::env::var("WILLOW_GC_HANDSHAKE_TIMEOUT_SECS")
-                    .ok()
-                    .and_then(|value| value.trim().parse::<u64>().ok())
-                {
-                    Some(seconds) => seconds,
-                    None => DEFAULT_HANDSHAKE_TIMEOUT_SECS,
-                };
+                let seconds =
+                    willow_abi::settings::handshake_timeout_seconds(DEFAULT_HANDSHAKE_TIMEOUT_SECS);
                 (seconds != 0).then(|| std::time::Duration::from_secs(seconds))
             }),
             trace_stops: OnceLock::new(),
