@@ -53,6 +53,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - name: Production Rust file size
+        run: cargo test --locked -p willow --test production_file_size
       - name: GC stop trace parser
         run: python scripts/gc_stop_trace_check.py --self-test
       - name: GC stop trace completeness

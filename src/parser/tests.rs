@@ -1,0 +1,3043 @@
+use super::*;
+use crate::lexer::Lexer;
+
+fn parse_ok(source: &str) -> Program {
+    let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+    let (program, errors) = Parser::new(tokens).parse();
+    assert!(errors.is_empty(), "parse errors: {errors:#?}");
+    program
+}
+
+fn parse_errors(source: &str) -> Vec<Diagnostic> {
+    let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+    let (_, errors) = Parser::new(tokens).parse();
+    errors
+}
+
+fn first_function(program: &Program) -> &FunctionDecl {
+    match &program.items[0] {
+        Item::Function(function) => function,
+        _ => panic!("expected first item to be a function"),
+    }
+}
+
+#[test]
+fn method_spelling_round_trips_original_string_format() {
+    use crate::semantic::intrinsics::MethodName;
+    assert_eq!(
+        std::mem::size_of::<MethodSpelling>(),
+        std::mem::size_of::<String>()
+    );
+    for (name, kind) in [
+        ("freeze", MethodName::Freeze),
+        ("len", MethodName::Len),
+        ("mine", MethodName::Unknown),
+        (
+            "to_i16",
+            MethodName::Convert(crate::semantic::intrinsics::ScalarTarget::I16),
+        ),
+    ] {
+        let raw = serde_json::to_string(name).unwrap();
+        let member: MethodSpelling = serde_json::from_str(&raw).unwrap();
+        assert!(member.kind() == kind);
+        assert_eq!(member.as_str(), name);
+        assert_eq!(serde_json::to_string(&member.clone()).unwrap(), raw);
+    }
+}
+
+#[test]
+fn parse_cascade_recovery_token_reads_scale_linearly() {
+    let mut samples = Vec::new();
+    for count in [16, 64, 256] {
+        let source = format!(
+            "fn main() {{ let x = ; {} }}",
+            "println(absent);".repeat(count)
+        );
+        PARSER_TOKEN_READS.with(|v| v.set(0));
+        assert_eq!(parse_errors(&source).len(), 1);
+        samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+    }
+    let slope = (samples[1].1 - samples[0].1) / 48;
+    assert_eq!(samples[1].1 - samples[0].1, slope * 48);
+    assert_eq!(samples[2].1 - samples[1].1, slope * 192);
+    eprintln!("parse recovery token reads: {samples:?}");
+}
+
+#[test]
+fn control_head_token_reads_scale_linearly() {
+    let mut samples = Vec::new();
+    for count in [8, 16, 32, 64] {
+        let source = format!("fn main() {{ {} }}", "if x == Dir::Idle {} ".repeat(count));
+        PARSER_TOKEN_READS.with(|v| v.set(0));
+        parse_ok(&source);
+        samples.push((count, PARSER_TOKEN_READS.with(|v| v.get())));
+    }
+    let per_head = (samples[1].1 - samples[0].1) / (samples[1].0 - samples[0].0);
+    for pair in samples.windows(2) {
+        assert_eq!(pair[1].1 - pair[0].1, per_head * (pair[1].0 - pair[0].0));
+    }
+    eprintln!("control-head token reads: {samples:?}");
+}
+
+#[test]
+fn control_head_brace_perspectives() {
+    let cases = [
+        "if x == Dir::Idle {}",
+        "if x != Dir::Idle {} else {}",
+        "if Dir::Idle == x {}",
+        "if (x == Dir::Idle) {}",
+        "if x == (Dir::Idle) {}",
+        "if x == Dir::Idle && yes {}",
+        "if yes || x == Dir::Idle {}",
+        "if x == Dir::Idle {} else if x == Dir::Moving {}",
+        "while x == Dir::Idle {}",
+        "while (x != Dir::Idle) {}",
+        "if x == m::Dir::Idle {}",
+        "match Dir::Idle { Dir::Idle => 1, Dir::Moving => 2 };",
+        "for x in Values {}",
+        "if (Point { x: 1 }).x == 1 {}",
+        "if (m::Point { x: 1 }).x == 1 {}",
+        "if valid(Point { x: 1 }) {}",
+        "if valid(m::Point { x: 1 }) {}",
+        "if [Point { x: 1 }][0].x == 1 {}",
+        "if xs[index(Point { x: 1 })] {}",
+        "if x == Dir::Idle { let p = Point { x: 1 }; }",
+        "while x == Dir::Idle { if x == Dir::Idle {} }",
+        "let p = Point { x: 1 };",
+        "let p = m::Point { x: 1 };",
+        "if choose ? x == Dir::Idle : y == Dir::Moving {}",
+    ];
+    for (i, body) in cases.iter().enumerate() {
+        let errors = parse_errors(&format!("fn main() {{ {body} }}"));
+        assert!(
+            errors.is_empty(),
+            "perspective {}: {body}: {errors:?}",
+            i + 1
+        );
+    }
+    for body in [
+        "if x == {}",
+        "if x == Dir:: {}",
+        "while {}",
+        "if (Point { x: }) {}",
+        "if x == Dir::Idle",
+        "for x in {}",
+    ] {
+        assert!(
+            !parse_errors(&format!("fn main() {{ {body} }}")).is_empty(),
+            "{body}"
+        );
+    }
+    // A failed restricted parse must restore the mode for the next item.
+    let tokens = Lexer::new("fn bad() { if x == ; } fn good() { let p = Point { x: 1 }; }")
+        .tokenize()
+        .unwrap();
+    let (program, errors) = Parser::new(tokens).parse();
+    assert!(!errors.is_empty());
+    assert_eq!(program.items.len(), 2);
+}
+
+#[test]
+fn for_loop_01_parses_name_iterable_and_body() {
+    let p = parse_ok("fn main() { for value in values { println(value); } }");
+    let f = first_function(&p);
+    let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+        panic!("expected a for statement");
+    };
+    assert_eq!(for_stmt.name, "value");
+    assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _, _) if name == "values"));
+    assert_eq!(for_stmt.body.stmts.len(), 1);
+}
+
+#[test]
+fn for_loop_02_parses_underscore_binding() {
+    let p = parse_ok("fn main() { for _ in values { println(1); } }");
+    let f = first_function(&p);
+    let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+        panic!("expected a for statement");
+    };
+    assert_eq!(for_stmt.name, "_");
+    assert!(matches!(for_stmt.iterable, Expr::Var(ref name, _, _) if name == "values"));
+}
+
+#[test]
+fn for_loop_03_parses_i64_range_iterable() {
+    let p = parse_ok("fn main() { for n in 1..101 { println(n); } }");
+    let f = first_function(&p);
+    let Stmt::For(for_stmt) = &f.body.stmts[0] else {
+        panic!("expected a for statement");
+    };
+    assert_eq!(for_stmt.name, "n");
+    let Expr::Range(range) = &for_stmt.iterable else {
+        panic!("expected a range iterable");
+    };
+    assert!(matches!(range.start, Expr::Integer(1, _, _)));
+    assert!(matches!(range.end, Expr::Integer(101, _, _)));
+}
+
+#[test]
+fn constructor_01_explicit_self_is_required() {
+    let errs = parse_errors("class User { pub init(name: String) {} }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0849));
+}
+
+#[test]
+fn constructor_02_explicit_self_is_not_stored_as_a_user_param() {
+    let p = parse_ok("class User { pub init(self, name: String) {} }\n");
+    let Item::Class(class) = &p.items[0] else {
+        panic!("expected a class");
+    };
+    let ctor = &class.constructors[0];
+    assert!(ctor.public());
+    assert!(!ctor.protected());
+    assert_eq!(ctor.params.len(), 1);
+    assert_eq!(ctor.params[0].name, "name");
+}
+
+#[test]
+fn constructor_03_visibility_flags_are_preserved() {
+    let p = parse_ok(
+        r#"
+class PrivateCtor { init(self) {} }
+class PublicCtor { pub init(self) {} }
+class ProtectedCtor { prot init(self) {} }
+"#,
+    );
+    let flags = p
+        .items
+        .iter()
+        .map(|item| match item {
+            Item::Class(class) => {
+                let ctor = &class.constructors[0];
+                (class.name.as_str(), ctor.public(), ctor.protected())
+            }
+            _ => panic!("expected classes only"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flags,
+        vec![
+            ("PrivateCtor", false, false),
+            ("PublicCtor", true, false),
+            ("ProtectedCtor", false, true),
+        ]
+    );
+}
+
+#[test]
+fn constructor_04_self_receiver_must_be_bare() {
+    let errs = parse_errors("class User { pub init(self: User) {} }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0849));
+}
+
+#[test]
+fn constructor_05_static_modifier_is_rejected() {
+    let errs = parse_errors("class User { static init(self) {} }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+}
+
+#[test]
+fn constructor_06_fn_init_method_syntax_is_rejected() {
+    let errs = parse_errors("class User { fn init(self) {} }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+}
+
+#[test]
+fn constructor_07_static_fn_init_method_syntax_is_rejected() {
+    let errs = parse_errors("class User { static fn init() {} }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+}
+
+#[test]
+fn constructor_08_interface_fn_init_is_rejected() {
+    let errs = parse_errors("interface Bad { fn init(self); }\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E0850));
+}
+
+// ── Module declarations (module declarations, spec 4.1 / 20.1) ──────────────────
+
+#[test]
+fn module_decl_simple() {
+    let p = parse_ok("module math;\nfn main() {}\n");
+    assert_eq!(p.module.as_ref().map(|m| m.path.as_str()), Some("math"));
+}
+
+#[test]
+fn module_decl_rejects_dot_separator() {
+    // Module paths use `::` only (like imports); `.` is for member access.
+    let errs = parse_errors("module myapp.util;\nfn main() {}\n");
+    assert!(
+        !errs.is_empty(),
+        "dot-separated module declarations must be rejected (use `::`)"
+    );
+}
+
+#[test]
+fn module_decl_colon_separated() {
+    let p = parse_ok("module myapp::util;\nfn main() {}\n");
+    assert_eq!(
+        p.module.as_ref().map(|m| m.path.as_str()),
+        Some("myapp::util")
+    );
+}
+
+#[test]
+fn module_decl_before_imports_ok() {
+    let p = parse_ok("module myapp;\nimport math;\nfn main() {}\n");
+    assert!(p.module.is_some());
+    assert_eq!(p.imports.len(), 1);
+}
+
+#[test]
+fn module_decl_after_item_rejected() {
+    let errs = parse_errors("fn f() {}\nmodule myapp;\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E2008));
+}
+
+#[test]
+fn module_decl_after_import_rejected() {
+    let errs = parse_errors("import math;\nmodule myapp;\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E2008));
+}
+
+#[test]
+fn module_decl_duplicate_rejected() {
+    let errs = parse_errors("module a;\nmodule b;\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E2009));
+}
+
+#[test]
+fn module_decl_std_rejected() {
+    let errs = parse_errors("module std::foo;\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E2010));
+}
+
+#[test]
+fn module_decl_bare_std_rejected() {
+    let errs = parse_errors("module std;\nfn main() {}\n");
+    assert!(errs.iter().any(|e| e.code == ErrorCode::E2010));
+}
+
+#[test]
+fn no_module_decl_is_none() {
+    let p = parse_ok("fn main() {}\n");
+    assert!(p.module.is_none());
+}
+
+#[test]
+fn import_path_uses_colons_only() {
+    // Import paths use `::` exclusively; `.` is reserved for member access.
+    let p = parse_ok("import std::collections::Array;\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 1);
+    assert_eq!(p.imports[0].path, "std::collections::Array");
+}
+
+#[test]
+fn import_path_rejects_dot_separator() {
+    // `import a.b.c;` (dot) is not accepted — only `import a::b::c;`.
+    let errs = parse_errors("import std.collections.Array;\nfn main() {}\n");
+    assert!(
+        !errs.is_empty(),
+        "dot-separated import paths must be rejected (use `::`)"
+    );
+}
+
+// Grouped-import perspectives:
+// P01 two std items expand in source order
+// P02 a one-item group is valid
+// P03 a trailing comma is valid
+// P04 aliases are retained per item
+// P05 keyword-like builtin item names are valid
+// P06 nested user-module prefixes are retained
+// P07 grouped and ordinary imports preserve statement order
+// P08 duplicate group entries remain visible to duplicate diagnostics
+// P09 grouping directly below a one-segment prefix is valid
+// P10 an empty group is rejected
+// P11 an ordinary glob is rejected with a clear diagnostic
+// P12 a glob inside a group is rejected with the same diagnostic
+// P13 a missing comma is rejected
+// P14 a missing closing brace is rejected
+// P15 a missing semicolon is rejected
+// P16 an alias on the group itself is rejected
+// P17 nested paths inside a group are rejected
+//
+// Resolver perspectives P18-P22 live in module::resolver's unit tests.
+
+#[test]
+fn grouped_import_p01_expands_two_std_items_in_order() {
+    let p = parse_ok("import std::collections::{Array, Map};\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 2);
+    assert_eq!(p.imports[0].path, "std::collections::Array");
+    assert_eq!(p.imports[1].path, "std::collections::Map");
+}
+
+#[test]
+fn grouped_import_p02_accepts_one_item() {
+    let p = parse_ok("import std::collections::{Array};\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 1);
+    assert_eq!(p.imports[0].path, "std::collections::Array");
+}
+
+#[test]
+fn grouped_import_p03_accepts_trailing_comma() {
+    let p = parse_ok("import std::collections::{Array, Map,};\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 2);
+}
+
+#[test]
+fn grouped_import_p04_retains_per_item_aliases() {
+    let p = parse_ok("import std::collections::{Array as List, Map as Dict};\nfn main() {}\n");
+    assert_eq!(p.imports[0].alias.as_deref(), Some("List"));
+    assert_eq!(p.imports[1].alias.as_deref(), Some("Dict"));
+}
+
+#[test]
+fn grouped_import_p05_accepts_builtin_keyword_items() {
+    let p = parse_ok("import std::io::{print, println};\nfn main() {}\n");
+    assert_eq!(p.imports[0].path, "std::io::print");
+    assert_eq!(p.imports[1].path, "std::io::println");
+}
+
+#[test]
+fn grouped_import_p06_retains_nested_user_module_prefix() {
+    let p = parse_ok("import app::math::{add, sub};\nfn main() {}\n");
+    assert_eq!(p.imports[0].path, "app::math::add");
+    assert_eq!(p.imports[1].path, "app::math::sub");
+}
+
+#[test]
+fn grouped_import_p07_preserves_order_with_ordinary_imports() {
+    let p = parse_ok(
+        "import before;\nimport std::collections::{Array, Map};\nimport after;\nfn main() {}\n",
+    );
+    assert_eq!(
+        p.imports
+            .iter()
+            .map(|import| import.path.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "before",
+            "std::collections::Array",
+            "std::collections::Map",
+            "after"
+        ]
+    );
+}
+
+#[test]
+fn grouped_import_p08_preserves_duplicate_entries() {
+    let p = parse_ok("import std::collections::{Array, Array};\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 2);
+    assert_eq!(p.imports[0].path, p.imports[1].path);
+}
+
+#[test]
+fn grouped_import_p09_accepts_one_segment_prefix() {
+    let p = parse_ok("import std::{collections};\nfn main() {}\n");
+    assert_eq!(p.imports.len(), 1);
+    assert_eq!(p.imports[0].path, "std::collections");
+}
+
+#[test]
+fn grouped_import_p10_rejects_empty_group() {
+    let errors = parse_errors("import std::collections::{};\nfn main() {}\n");
+    assert!(errors.iter().any(|error| {
+        error.code == ErrorCode::E0102 && error.message.contains("must contain at least one item")
+    }));
+}
+
+#[test]
+fn grouped_import_p11_rejects_ordinary_glob_clearly() {
+    let errors = parse_errors("import std::collections::*;\nfn main() {}\n");
+    assert!(
+        errors.iter().any(|error| {
+            error.code == ErrorCode::E0102 && error.message.contains("glob imports")
+        })
+    );
+}
+
+#[test]
+fn grouped_import_p12_rejects_grouped_glob_clearly() {
+    let errors = parse_errors("import std::collections::{Array, *};\nfn main() {}\n");
+    assert!(
+        errors.iter().any(|error| {
+            error.code == ErrorCode::E0102 && error.message.contains("glob imports")
+        })
+    );
+}
+
+#[test]
+fn grouped_import_p13_rejects_missing_comma() {
+    let errors = parse_errors("import std::collections::{Array Map};\nfn main() {}\n");
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn grouped_import_p14_rejects_missing_closing_brace() {
+    let errors = parse_errors("import std::collections::{Array, Map;\nfn main() {}\n");
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn grouped_import_p15_rejects_missing_semicolon() {
+    let errors = parse_errors("import std::collections::{Array, Map}\nfn main() {}\n");
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn grouped_import_p16_rejects_alias_on_whole_group() {
+    let errors = parse_errors("import std::collections::{Array, Map} as Both;\nfn main() {}\n");
+    assert!(!errors.is_empty());
+}
+
+#[test]
+fn grouped_import_p17_rejects_nested_paths_inside_group() {
+    let errors = parse_errors("import std::{collections::Array};\nfn main() {}\n");
+    assert!(!errors.is_empty());
+}
+
+fn function_named<'a>(program: &'a Program, name: &str) -> &'a FunctionDecl {
+    program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Function(function) if function.name == name => Some(function),
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("expected function `{name}`"))
+}
+
+fn assert_reference_param(param: &Param, ty: Type, mutable: bool) {
+    assert_eq!(param.ty, ty);
+    assert!(matches!(
+        &param.mode,
+        ParamMode::Reference { mutable: actual, .. } if *actual == mutable
+    ));
+}
+
+fn assert_reference_arg(arg: &CallArg) {
+    assert!(matches!(&arg.mode, CallArgMode::Reference { .. }));
+}
+
+#[test]
+fn parses_mutable_reference_parameter_with_marker_and_type_spans() {
+    let source = "fn bump(x: &mut i64, y: bool) {}";
+    let program = parse_ok(source);
+    let function = first_function(&program);
+
+    assert_eq!(function.params.len(), 2);
+    assert_eq!(function.params[0].name, "x");
+    assert_eq!(function.params[0].ty, Type::I64);
+    assert_eq!(
+        &source[function.params[0].type_span.start..function.params[0].type_span.end],
+        "i64"
+    );
+    match &function.params[0].mode {
+        ParamMode::Reference {
+            mutable,
+            ampersand_span,
+            mut_span,
+        } => {
+            assert!(*mutable);
+            assert_eq!(&source[ampersand_span.start..ampersand_span.end], "&");
+            let mut_span = mut_span.expect("expected mut span");
+            assert_eq!(&source[mut_span.start..mut_span.end], "mut");
+        }
+        ParamMode::Value => panic!("expected first parameter to be a mutable reference"),
+    }
+
+    assert_eq!(function.params[1].name, "y");
+    assert_eq!(function.params[1].ty, Type::Bool);
+    assert!(matches!(&function.params[1].mode, ParamMode::Value));
+}
+
+#[test]
+fn method_parameter_list_delimiters_and_diagnostics() {
+    for (prefix, suffix) in [("class C { fn f(", " {} }"), ("interface I { fn f(", "; }")] {
+        for list in [
+            "",
+            "self",
+            "self,",
+            "self, x: i64, y: bool",
+            "x: i64,",
+            "x: i64, y: bool",
+        ] {
+            parse_ok(&format!("{prefix}{list}){suffix}"));
+        }
+        for (tail, token, code, message) in [
+            (
+                "self, x: i64,)",
+                ")",
+                ErrorCode::E0102,
+                "expected identifier",
+            ),
+            ("self,,", ",", ErrorCode::E0102, "expected identifier"),
+            ("self,", "", ErrorCode::E0102, "expected identifier"),
+            (
+                "self x",
+                "x",
+                ErrorCode::E0104,
+                "expected `)` to close parenthesis",
+            ),
+            (
+                "x: i64,",
+                "",
+                ErrorCode::E0104,
+                "expected `)` to close parenthesis",
+            ),
+            (
+                "x)",
+                ")",
+                ErrorCode::E0102,
+                "expected `:` after parameter name",
+            ),
+        ] {
+            let source = format!("{prefix}{tail}");
+            let errors = parse_errors(&source);
+            let [error] = errors.as_slice() else {
+                panic!("{source}: {errors:?}")
+            };
+            assert_eq!(
+                (error.code, error.message.as_str()),
+                (code, message),
+                "{source}"
+            );
+            let start = source.rfind(token).unwrap();
+            let label =
+                Label::primary(Span::new(start, start + token.len(), 1, start + 1), message);
+            assert_eq!(error.labels, [label], "{source}");
+            assert!(error.helps.is_empty(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn parses_immutable_reference_method_parameter_after_self() {
+    let source = "class Box { fn get(self, value: & String?) {} }";
+    let program = parse_ok(source);
+    let class = match &program.items[0] {
+        Item::Class(class) => class,
+        _ => panic!("expected first item to be a class"),
+    };
+    let method = &class.methods[0];
+
+    assert!(!method.is_static());
+    assert_eq!(method.params.len(), 1);
+    assert_eq!(method.params[0].name, "value");
+    assert_eq!(
+        &source[method.params[0].type_span.start..method.params[0].type_span.end],
+        "String?"
+    );
+    assert!(matches!(
+        &method.params[0].mode,
+        ParamMode::Reference { mutable: false, .. }
+    ));
+}
+
+#[test]
+fn parses_immutable_i64_reference_parameter() {
+    let program = parse_ok("fn read(x: & i64) {}");
+    let function = first_function(&program);
+
+    assert_reference_param(&function.params[0], Type::I64, false);
+}
+
+#[test]
+fn parses_mutable_bool_reference_parameter() {
+    let program = parse_ok("fn flip(x: &mut bool) {}");
+    let function = first_function(&program);
+
+    assert_reference_param(&function.params[0], Type::Bool, true);
+}
+
+#[test]
+fn parses_mutable_f64_reference_parameter() {
+    let program = parse_ok("fn add(x: &mut f64) {}");
+    let function = first_function(&program);
+
+    assert_reference_param(&function.params[0], Type::F64, true);
+}
+
+#[test]
+fn parses_optional_sugar_named_reference_parameter() {
+    let program = parse_ok("fn visit(node: & Node?) {}");
+    let function = first_function(&program);
+
+    assert_reference_param(
+        &function.params[0],
+        Type::Generic("Option".to_string(), vec![Type::Named("Node".to_string())]),
+        false,
+    );
+}
+
+#[test]
+fn repeated_question_suffix_is_nested_option_sugar() {
+    let program = parse_ok("fn visit(node: Node??) {}");
+    let function = first_function(&program);
+    assert_eq!(
+        function.params[0].ty,
+        Type::Generic(
+            "Option".to_string(),
+            vec![Type::Generic(
+                "Option".to_string(),
+                vec![Type::Named("Node".to_string())],
+            )],
+        )
+    );
+}
+
+#[test]
+fn parses_multiple_reference_parameters() {
+    let program = parse_ok("fn mix(a: &mut i64, b: & bool, c: &mut f64) {}");
+    let function = first_function(&program);
+
+    assert_reference_param(&function.params[0], Type::I64, true);
+    assert_reference_param(&function.params[1], Type::Bool, false);
+    assert_reference_param(&function.params[2], Type::F64, true);
+}
+
+#[test]
+fn parses_value_reference_value_parameter_order() {
+    let program = parse_ok("fn mix(prefix: String, n: & i64, enabled: bool) {}");
+    let function = first_function(&program);
+
+    assert!(matches!(&function.params[0].mode, ParamMode::Value));
+    assert_reference_param(&function.params[1], Type::I64, false);
+    assert!(matches!(&function.params[2].mode, ParamMode::Value));
+}
+
+#[test]
+fn parses_mutable_reference_method_parameter_after_self() {
+    let program = parse_ok("class Box { fn set(self, value: &mut i64) {} }");
+    let class = match &program.items[0] {
+        Item::Class(class) => class,
+        _ => panic!("expected first item to be a class"),
+    };
+
+    assert_reference_param(&class.methods[0].params[0], Type::I64, true);
+}
+
+#[test]
+fn parses_ampersand_only_as_call_argument_marker() {
+    let source = "fn main() { f(&x, y); }";
+    let program = parse_ok(source);
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::Call(call),
+            ..
+        }) => call,
+        other => panic!("expected call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.args.len(), 2);
+    assert_eq!(
+        &source[call.args[0].span.start..call.args[0].span.end],
+        "&x"
+    );
+    assert!(matches!(
+        &call.args[0].mode,
+        CallArgMode::Reference { ampersand_span } if &source[ampersand_span.start..ampersand_span.end] == "&"
+    ));
+    assert!(matches!(&call.args[0].expr, Expr::Var(name, _, _) if name == "x"));
+    assert!(matches!(&call.args[1].mode, CallArgMode::Value));
+    assert!(matches!(&call.args[1].expr, Expr::Var(name, _, _) if name == "y"));
+}
+
+#[test]
+fn parses_reference_argument_in_method_call() {
+    let program =
+        parse_ok("class Box { fn set(self, value: &mut i64) {} } fn main() { box.set(&n); }");
+    let function = function_named(&program, "main");
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::MethodCall(call),
+            ..
+        }) => call,
+        other => panic!("expected method call expression, got {other:#?}"),
+    };
+
+    assert_reference_arg(&call.args[0]);
+}
+
+#[test]
+fn parses_reference_argument_in_static_call() {
+    let program = parse_ok("fn main() { Math::set(&n); }");
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_reference_arg(&call.args[0]);
+}
+
+#[test]
+fn parses_generic_static_call_type_arguments() {
+    let program = parse_ok("fn main() { Channel<i64>::new(); }");
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.class, "Channel");
+    assert_eq!(call.method, "new");
+    assert_eq!(call.type_args, vec![Type::I64]);
+}
+
+#[test]
+fn compound_index_expansion_is_constant_per_statement() {
+    for count in [1, 16, 64] {
+        let source = format!(
+            "fn main() {{ let mut a = [0]; {} }}",
+            "a[0] += 1;".repeat(count)
+        );
+        let program = parse_ok(&source);
+        let body = &first_function(&program).body;
+        assert_eq!(body.stmts.len(), count + 1);
+        for stmt in &body.stmts[1..] {
+            let Stmt::If(expansion) = stmt else {
+                panic!("compound index must capture its place once: {stmt:?}");
+            };
+            assert_eq!(expansion.then_block.stmts.len(), 3);
+        }
+    }
+}
+
+#[test]
+fn parses_module_qualified_static_call() {
+    let program = parse_ok("fn main() { geom::Point::new(1, 2); }");
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.class, "geom::Point");
+    assert_eq!(call.method, "new");
+    assert_eq!(call.args.len(), 2);
+}
+
+#[test]
+fn parses_upper_self_static_call() {
+    let program = parse_ok("fn main() { Self::new(1); }");
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.class, "Self");
+    assert_eq!(call.method, "new");
+    assert_eq!(call.args.len(), 1);
+}
+
+#[test]
+fn parses_lower_self_static_call() {
+    let program = parse_ok("class C { fn f(self) { self::make(); } }");
+    let class = program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Class(class) => Some(class),
+            _ => None,
+        })
+        .expect("expected class");
+    let call = match &class.methods[0].body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.class, "Self");
+    assert_eq!(call.method, "make");
+    assert!(call.args.is_empty());
+}
+
+#[test]
+fn parses_module_qualified_no_arg_variant_value() {
+    let program = parse_ok("fn main() { geom::Color::Red; }");
+    let function = first_function(&program);
+    let call = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::StaticCall(call),
+            ..
+        }) => call,
+        other => panic!("expected static call expression, got {other:#?}"),
+    };
+
+    assert_eq!(call.class, "geom::Color");
+    assert_eq!(call.method, "Red");
+    assert!(call.args.is_empty());
+}
+
+#[test]
+fn parses_reference_argument_inside_nested_call() {
+    let program = parse_ok("fn main() { outer(inner(&n)); }");
+    let function = first_function(&program);
+    let outer = match &function.body.stmts[0] {
+        Stmt::Expr(ExprStmt {
+            expr: Expr::Call(call),
+            ..
+        }) => call,
+        other => panic!("expected outer call expression, got {other:#?}"),
+    };
+    let inner = match &outer.args[0].expr {
+        Expr::Call(call) => call,
+        other => panic!("expected inner call expression, got {other:#?}"),
+    };
+
+    assert_reference_arg(&inner.args[0]);
+}
+
+#[test]
+fn rejects_ampersand_as_general_reference_expression() {
+    let errors = parse_errors("fn main() { let y = &x; }");
+    assert!(
+        errors.iter().any(|error| error.code == ErrorCode::E0102),
+        "expected parser error for reference expression, got {errors:#?}"
+    );
+}
+
+#[test]
+fn rejects_legacy_inout_parameter_syntax() {
+    let errors = parse_errors("fn bump(x: inout i64) {}");
+    assert!(
+        !errors.is_empty(),
+        "expected parser error for legacy inout syntax"
+    );
+}
+
+#[test]
+fn rejects_reference_parameter_without_type() {
+    let errors = parse_errors("fn read(x: &) {}");
+    assert!(
+        !errors.is_empty(),
+        "expected parser error for missing reference parameter type"
+    );
+}
+
+#[test]
+fn rejects_mutable_reference_parameter_without_type() {
+    let errors = parse_errors("fn read(x: &mut) {}");
+    assert!(
+        !errors.is_empty(),
+        "expected parser error for missing mutable reference parameter type"
+    );
+}
+
+// ── Interface declarations & implements (interface declarations, spec 4 / 5 / 6) ────
+
+fn first_interface(program: &Program) -> &InterfaceDecl {
+    program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Interface(i) => Some(i),
+            _ => None,
+        })
+        .expect("expected an interface item")
+}
+
+fn first_class(program: &Program) -> &ClassDecl {
+    program
+        .items
+        .iter()
+        .find_map(|item| match item {
+            Item::Class(c) => Some(c),
+            _ => None,
+        })
+        .expect("expected a class item")
+}
+
+#[test]
+fn interface_01_simple_single_method() {
+    let p = parse_ok("interface Animal { fn speak(self) -> String; }");
+    let i = first_interface(&p);
+    assert_eq!(i.name, "Animal");
+    assert!(!i.public);
+    assert!(i.type_params.is_empty());
+    assert_eq!(i.methods.len(), 1);
+    assert_eq!(i.methods[0].name, "speak");
+    assert_eq!(i.methods[0].return_type, Type::String);
+    assert!(!i.methods[0].is_static);
+}
+
+#[test]
+fn interface_extends_single_and_multiple() {
+    let p = parse_ok("interface Pet extends Animal { fn owner(self) -> String; }");
+    let i = first_interface(&p);
+    assert_eq!(i.extends, vec!["Animal".to_string()]);
+
+    let p2 = parse_ok("interface C extends A, B { fn c(self) -> i64; }");
+    assert_eq!(
+        first_interface(&p2).extends,
+        vec!["A".to_string(), "B".to_string()]
+    );
+
+    // No extends clause -> empty.
+    let p3 = parse_ok("interface Plain { fn f(self) -> i64; }");
+    assert!(first_interface(&p3).extends.is_empty());
+}
+
+#[test]
+fn interface_generic_single_type_param() {
+    // `interface Box<T> { fn get(self) -> T; }`.
+    let p = parse_ok("interface Box<T> { fn get(self) -> T; }");
+    let i = first_interface(&p);
+    assert_eq!(i.name, "Box");
+    assert_eq!(i.type_params, vec!["T".to_string()]);
+    assert_eq!(i.methods[0].return_type, Type::Named("T".to_string()));
+}
+
+#[test]
+fn interface_generic_two_type_params() {
+    let p = parse_ok("interface Conv<A, B> { fn run(self, a: A) -> B; }");
+    let i = first_interface(&p);
+    assert_eq!(i.type_params, vec!["A".to_string(), "B".to_string()]);
+}
+
+#[test]
+fn interface_02_pub_interface() {
+    // NB: `print`/`println` are builtin keywords and cannot be method names
+    // (a pre-existing limitation that also applies to class methods), so the
+    // method here is `render`.
+    let p = parse_ok("pub interface Printable { fn render(self); }");
+    let i = first_interface(&p);
+    assert!(i.public);
+    assert_eq!(i.name, "Printable");
+}
+
+#[test]
+fn interface_03_multiple_methods_preserve_order() {
+    let p = parse_ok(
+        "interface Animal { fn speak(self) -> String; fn name(self) -> String; fn legs(self) -> i64; }",
+    );
+    let i = first_interface(&p);
+    let names: Vec<&str> = i.methods.iter().map(|m| m.name.as_str()).collect();
+    assert_eq!(names, ["speak", "name", "legs"]);
+}
+
+#[test]
+fn interface_04_method_without_return_type_is_void() {
+    let p = parse_ok("interface Sink { fn push(self, x: i64); }");
+    let i = first_interface(&p);
+    assert_eq!(i.methods[0].return_type, Type::Void);
+}
+
+#[test]
+fn interface_05_method_self_with_extra_params() {
+    let p = parse_ok("interface Adder { fn add(self, a: i64, b: i64) -> i64; }");
+    let m = &first_interface(&p).methods[0];
+    assert!(!m.is_static);
+    assert_eq!(m.params.len(), 2);
+    assert_eq!(m.params[0].ty, Type::I64);
+    assert_eq!(m.params[1].ty, Type::I64);
+    assert_eq!(m.return_type, Type::I64);
+}
+
+#[test]
+fn interface_06_method_without_self() {
+    let p = parse_ok("interface Factory { fn make(x: i64) -> i64; }");
+    let m = &first_interface(&p).methods[0];
+    assert!(m.is_static);
+    assert_eq!(m.params.len(), 1);
+}
+
+#[test]
+fn interface_07_empty_interface() {
+    let p = parse_ok("interface Marker {}");
+    assert!(first_interface(&p).methods.is_empty());
+}
+
+#[test]
+fn interface_08_class_implements_single() {
+    let p = parse_ok(
+        "class Dog implements Animal { pub fn speak(self) -> String { return \"woof\"; } }",
+    );
+    let c = first_class(&p);
+    assert_eq!(c.implements.len(), 1);
+    assert_eq!(c.implements[0], Type::Named("Animal".to_string()));
+    assert!(c.base_class.is_none());
+}
+
+#[test]
+fn interface_09_class_implements_multiple() {
+    let p = parse_ok("class Dog implements Animal, Printable {}");
+    let c = first_class(&p);
+    assert_eq!(
+        c.implements,
+        vec![
+            Type::Named("Animal".to_string()),
+            Type::Named("Printable".to_string())
+        ]
+    );
+}
+
+#[test]
+fn interface_10_extends_then_implements() {
+    let p = parse_ok("class Dog extends Mammal implements Animal, Printable {}");
+    let c = first_class(&p);
+    assert_eq!(c.base_class.as_ref().map(|b| b.name()), Some("Mammal"));
+    assert_eq!(c.implements.len(), 2);
+}
+
+#[test]
+fn interface_11_implements_without_extends() {
+    let p = parse_ok("class Dog implements Animal {}");
+    let c = first_class(&p);
+    assert!(c.base_class.is_none());
+    assert_eq!(c.implements.len(), 1);
+}
+
+#[test]
+fn interface_12_no_implements_is_empty() {
+    let p = parse_ok("class Dog {}");
+    assert!(first_class(&p).implements.is_empty());
+}
+
+#[test]
+fn interface_13_qualified_interface_path() {
+    let p = parse_ok("class Dog implements animals::Animal {}");
+    let c = first_class(&p);
+    assert_eq!(c.implements[0], Type::Named("animals::Animal".to_string()));
+}
+
+#[test]
+fn interface_14_method_body_rejected() {
+    // A body WITH `self` is a valid default method.
+    let p = parse_ok("interface Greet { fn hi(self) { return; } }");
+    let i = first_interface(&p);
+    assert_eq!(i.methods[0].name, "hi");
+    assert!(
+        i.methods[0].default_body.is_some(),
+        "method with a body should be a default"
+    );
+
+    // A required method (no body) has no default.
+    let p2 = parse_ok("interface Sig { fn need(self) -> i64; }");
+    assert!(first_interface(&p2).methods[0].default_body.is_none());
+
+    // A body WITHOUT `self` is rejected (E0420): there is no receiver.
+    let errs = parse_errors("interface Bad { fn f() { return; } }");
+    assert!(
+        errs.iter().any(|e| e.code == ErrorCode::E0420),
+        "expected E0420, got {errs:#?}"
+    );
+}
+
+#[test]
+fn interface_15_field_rejected() {
+    let errs = parse_errors("interface Bad { value: i64; }");
+    assert!(
+        errs.iter().any(|e| e.code == ErrorCode::E0421),
+        "expected E0421, got {errs:#?}"
+    );
+}
+
+#[test]
+fn interface_16_implements_before_extends_rejected() {
+    // `implements` must come after `extends`; the reverse order is a parse error.
+    let errs = parse_errors("class Dog implements Animal extends Mammal {}");
+    assert!(
+        !errs.is_empty(),
+        "expected a parse error for wrong clause order"
+    );
+}
+
+#[test]
+fn interface_17_open_interface_rejected() {
+    let errs = parse_errors("open interface Bad { fn f(self); }");
+    assert!(
+        errs.iter().any(|e| e.code == ErrorCode::E0105),
+        "expected E0105, got {errs:#?}"
+    );
+}
+
+#[test]
+fn interface_18_method_missing_semicolon_rejected() {
+    let errs = parse_errors("interface Bad { fn f(self) -> i64 }");
+    assert!(!errs.is_empty(), "expected error for missing `;`");
+}
+
+#[test]
+fn interface_19_trailing_comma_in_implements_rejected() {
+    let errs = parse_errors("class Dog implements Animal, {}");
+    assert!(!errs.is_empty(), "expected error for trailing comma");
+}
+
+#[test]
+fn interface_20_class_with_body_and_implements() {
+    let p = parse_ok(
+        "class Dog implements Animal { pub name: String; pub fn speak(self) -> String { return \"woof\"; } }",
+    );
+    let c = first_class(&p);
+    assert_eq!(c.implements.len(), 1);
+    assert_eq!(c.fields.len(), 1);
+    assert_eq!(c.methods.len(), 1);
+}
+
+#[test]
+fn interface_21_param_types_preserved() {
+    let p = parse_ok("interface Greeter { fn greet(self, who: String) -> String; }");
+    let m = &first_interface(&p).methods[0];
+    assert_eq!(m.params[0].name, "who");
+    assert_eq!(m.params[0].ty, Type::String);
+}
+
+#[test]
+fn interface_23_trait_like_example_file_parses() {
+    // The on-disk runnable example must parse cleanly.
+    let src = include_str!("../../example/trait_like_interfaces.wi");
+    let p = parse_ok(src);
+    assert!(p.items.iter().any(|i| matches!(i, Item::Interface(_))));
+    let dog = first_class(&p);
+    assert_eq!(dog.implements.len(), 2);
+}
+
+// ── ternary `?` vs try-propagate `?` disambiguation ──
+// The heuristic peeks at the token after `?`; every token that can START a
+// ternary then-branch must be listed, or the `?` is misread as try-propagate.
+// 8 perspectives: string/array/new/self/paren/negative/call/nested branches,
+// plus try-propagate regressions.
+
+#[test]
+fn ternary_q1_string_literal_branches() {
+    let p = parse_ok("fn f(c: bool) -> String { let s = c ? \"a\" : \"b\"; return s; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+#[test]
+fn ternary_q2_array_literal_branches() {
+    let p = parse_ok("fn f(c: bool) { let xs = c ? [1] : [2]; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+#[test]
+fn ternary_q3_new_branches() {
+    let p = parse_ok("class A {} fn f(c: bool) { let x = c ? new A() : new A(); }");
+    let f = function_named(&p, "f");
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+#[test]
+fn ternary_q4_self_branches_parse() {
+    // `self` in expression position after `?` (method context).
+    let p = parse_ok(
+        "class A { v: i64; pub fn pick(self, c: bool) -> i64 { return c ? self.v : 0; } }",
+    );
+    assert!(p.items.iter().any(|i| matches!(i, Item::Class(_))));
+}
+
+#[test]
+fn ternary_q5_string_in_call_argument() {
+    // The original failing shape: a ternary with string branches inside
+    // a call's argument list.
+    let p = parse_ok("fn f(c: bool) { println(c ? \"a\" : \"b\"); }");
+    let f = first_function(&p);
+    assert!(matches!(f.body.stmts[0], Stmt::Expr(_)));
+}
+
+#[test]
+fn ternary_q6_try_propagate_still_parses_before_semicolon() {
+    // `expr?;` — `?` followed by `;` stays try-propagate.
+    let p =
+        parse_ok("fn f(r: Result<i64, String>) -> Result<i64, String> { let v = r?; return r; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::TryPropagate(_, _, _))
+    ));
+}
+
+#[test]
+fn ternary_q7_try_propagate_in_arithmetic() {
+    // `a? + b?` — `?` followed by an operator stays try-propagate.
+    let p = parse_ok(
+        "fn f(a: Result<i64, String>, b: Result<i64, String>) -> Result<i64, String> { let v = a? + b?; return a; }",
+    );
+    let f = first_function(&p);
+    assert!(matches!(f.body.stmts[0], Stmt::Let(_)));
+}
+
+#[test]
+fn ternary_q8_nested_ternary_with_strings() {
+    let p = parse_ok(
+        "fn f(a: bool, b: bool) -> String { let s = a ? \"x\" : b ? \"y\" : \"z\"; return s; }",
+    );
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+// ── exhaustive `?`-disambiguation classifier ────────────────────────────
+// `classify_after_question` matches EVERY TokenKind with no wildcard arm.
+// Adding a new token variant breaks this compile, forcing a decision on
+// whether it can start a ternary then-branch — the exact failure mode that
+// produced the literal lookahead regression (StringLiteral & co. missing from the heuristic).
+
+/// How a `?` reads when this token follows it.
+#[derive(Debug, PartialEq)]
+enum AfterQuestion {
+    /// Unambiguous expression start → ternary.
+    Ternary,
+    /// Cannot start an expression → try-propagate.
+    Try,
+    /// Both readings are grammatical → resolved by the colon-scan
+    /// (`ternary_colon_ahead`): a `:` at the same nesting level means
+    /// ternary, otherwise try-propagate.
+    Contextual,
+}
+
+fn classify_after_question(kind: &TokenKind) -> AfterQuestion {
+    match kind {
+            // Expression-starting tokens → ternary.
+            TokenKind::CharLiteral(_) | TokenKind::Integer(_)
+            | TokenKind::Float(_)
+            | TokenKind::StringLiteral(_)
+            | TokenKind::Ident(_)
+            | TokenKind::True
+            | TokenKind::False
+            | TokenKind::Nil
+            | TokenKind::LParen
+            | TokenKind::LBracket
+            | TokenKind::Bang
+            | TokenKind::New
+            | TokenKind::SelfKw
+            | TokenKind::Match
+            | TokenKind::Await
+            | TokenKind::Select
+            | TokenKind::Print
+            | TokenKind::Println
+            | TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::U16 | TokenKind::U32 | TokenKind::U64 | TokenKind::Char
+            | TokenKind::U8 | TokenKind::I64
+            | TokenKind::F64 => AfterQuestion::Ternary,
+
+            // `r? - 1` (binary minus on the try result) vs `c ? -1 : 2`
+            // (negative then-branch); `r? || b` vs `c ? || 1 : || 2` (lambda).
+            // `r? | m` (bitwise or) vs `c ? |x| x : f` (lambda).
+            TokenKind::Minus | TokenKind::Or | TokenKind::Pipe => AfterQuestion::Contextual,
+
+            // Binary/postfix operators and punctuation cannot start an
+            // expression → try-propagate.
+            TokenKind::Plus
+            | TokenKind::PlusEq
+            | TokenKind::MinusEq
+            | TokenKind::Star
+            | TokenKind::StarEq
+            | TokenKind::StarStar
+            | TokenKind::Slash
+            | TokenKind::SlashEq
+            | TokenKind::Percent
+            | TokenKind::PercentEq
+            | TokenKind::Eq
+            | TokenKind::EqEq
+            | TokenKind::BangEq
+            | TokenKind::Lt
+            | TokenKind::LtEq
+            | TokenKind::Gt
+            | TokenKind::GtEq
+            | TokenKind::And
+            // `&` before an expression only marks a call argument, so after
+            // `?` it is always the bitwise operator.
+            | TokenKind::Ampersand
+            | TokenKind::AmpersandEq
+            | TokenKind::PipeEq
+            | TokenKind::Caret
+            | TokenKind::CaretEq
+            | TokenKind::Question
+            | TokenKind::Semicolon
+            | TokenKind::Colon
+            | TokenKind::ColonColon
+            | TokenKind::Comma
+            | TokenKind::Dot
+            | TokenKind::DotDot
+            | TokenKind::LBrace
+            | TokenKind::RBrace
+            | TokenKind::RParen
+            | TokenKind::RBracket
+            | TokenKind::Arrow
+            | TokenKind::FatArrow
+            | TokenKind::Eof => AfterQuestion::Try,
+
+            // Keywords that cannot start an expression → try-propagate.
+            TokenKind::At
+            | TokenKind::Fn
+            | TokenKind::Let
+            | TokenKind::Mut
+            | TokenKind::If
+            | TokenKind::Else
+            | TokenKind::While
+            | TokenKind::Break
+            | TokenKind::Continue
+            | TokenKind::Defer
+            | TokenKind::For
+            | TokenKind::In
+            | TokenKind::Return
+            | TokenKind::Class
+            | TokenKind::Pub
+            | TokenKind::Prot
+            | TokenKind::Override
+            | TokenKind::Static
+            | TokenKind::Extends
+            | TokenKind::Interface
+            | TokenKind::Implements
+            | TokenKind::Import
+            | TokenKind::Module
+            | TokenKind::As
+            | TokenKind::Async
+            | TokenKind::Enum
+            | TokenKind::Const
+            | TokenKind::Bool => AfterQuestion::Try,
+        }
+}
+
+/// One concrete instance of every TokenKind variant. Kept next to
+/// `classify_after_question`: extend BOTH when adding a token.
+fn all_token_kinds() -> Vec<TokenKind> {
+    vec![
+        TokenKind::At,
+        TokenKind::Fn,
+        TokenKind::Let,
+        TokenKind::Mut,
+        TokenKind::If,
+        TokenKind::Else,
+        TokenKind::While,
+        TokenKind::Break,
+        TokenKind::Continue,
+        TokenKind::Defer,
+        TokenKind::For,
+        TokenKind::In,
+        TokenKind::Return,
+        TokenKind::Print,
+        TokenKind::Println,
+        TokenKind::True,
+        TokenKind::False,
+        TokenKind::Nil,
+        TokenKind::Class,
+        TokenKind::Pub,
+        TokenKind::Prot,
+        TokenKind::Override,
+        TokenKind::Static,
+        TokenKind::New,
+        TokenKind::Extends,
+        TokenKind::Interface,
+        TokenKind::Implements,
+        TokenKind::SelfKw,
+        TokenKind::Import,
+        TokenKind::Module,
+        TokenKind::As,
+        TokenKind::Async,
+        TokenKind::Await,
+        TokenKind::Select,
+        TokenKind::Match,
+        TokenKind::Enum,
+        TokenKind::Const,
+        TokenKind::ColonColon,
+        TokenKind::I64,
+        TokenKind::Bool,
+        TokenKind::F64,
+        TokenKind::Integer(1),
+        TokenKind::Float(1.0),
+        TokenKind::StringLiteral("s".to_string()),
+        TokenKind::Ident("x".to_string()),
+        TokenKind::Plus,
+        TokenKind::PlusEq,
+        TokenKind::Minus,
+        TokenKind::MinusEq,
+        TokenKind::Star,
+        TokenKind::StarEq,
+        TokenKind::StarStar,
+        TokenKind::Slash,
+        TokenKind::SlashEq,
+        TokenKind::Percent,
+        TokenKind::PercentEq,
+        TokenKind::Eq,
+        TokenKind::EqEq,
+        TokenKind::BangEq,
+        TokenKind::Lt,
+        TokenKind::LtEq,
+        TokenKind::Gt,
+        TokenKind::GtEq,
+        TokenKind::And,
+        TokenKind::Ampersand,
+        TokenKind::AmpersandEq,
+        TokenKind::Or,
+        TokenKind::Pipe,
+        TokenKind::PipeEq,
+        TokenKind::Caret,
+        TokenKind::CaretEq,
+        TokenKind::Bang,
+        TokenKind::Question,
+        TokenKind::Semicolon,
+        TokenKind::Colon,
+        TokenKind::Comma,
+        TokenKind::Dot,
+        TokenKind::DotDot,
+        TokenKind::LBrace,
+        TokenKind::RBrace,
+        TokenKind::LParen,
+        TokenKind::RParen,
+        TokenKind::LBracket,
+        TokenKind::RBracket,
+        TokenKind::Arrow,
+        TokenKind::FatArrow,
+        TokenKind::Eof,
+    ]
+}
+
+// The runtime heuristic must agree with the exhaustive classifier for
+// EVERY token kind. A new variant first breaks `classify_after_question`
+// at compile time; this test then catches any drift between the
+// classification and `is_try_propagate_question`.
+#[test]
+fn ternary_q9_heuristic_matches_exhaustive_classifier() {
+    let tok = |kind: TokenKind| Token {
+        kind,
+        span: Span::dummy(),
+    };
+    for kind in all_token_kinds() {
+        // Minimal context: `? X <eof>` — a Contextual token has no ternary
+        // colon ahead, so it must read as try-propagate.
+        let expected_try = match classify_after_question(&kind) {
+            AfterQuestion::Ternary => false,
+            AfterQuestion::Try | AfterQuestion::Contextual => true,
+        };
+        let parser = Parser::new(vec![
+            tok(TokenKind::Question),
+            tok(kind.clone()),
+            tok(TokenKind::Eof),
+        ]);
+        assert_eq!(
+            parser.is_try_propagate_question(),
+            expected_try,
+            "minimal-context drift for {kind:?}"
+        );
+
+        // Colon context: `? X x : <eof>` — a Contextual token now sees the
+        // ternary's colon and must read as a ternary.
+        if classify_after_question(&kind) == AfterQuestion::Contextual {
+            let parser = Parser::new(vec![
+                tok(TokenKind::Question),
+                tok(kind.clone()),
+                tok(TokenKind::Ident("x".to_string())),
+                tok(TokenKind::Colon),
+                tok(TokenKind::Eof),
+            ]);
+            assert!(
+                !parser.is_try_propagate_question(),
+                "colon-context drift for {kind:?}"
+            );
+        }
+    }
+}
+
+// Behavior checks for the newly classified expression-start tokens.
+#[test]
+fn ternary_q10_await_branches_parse() {
+    let p = parse_ok(
+        "async fn g() -> i64 { return 1; } \
+             async fn f(c: bool) -> i64 { return c ? await g() : await g(); }",
+    );
+    assert!(p.items.len() == 2);
+}
+
+#[test]
+fn ternary_q11_lambda_branch_parses() {
+    let p = parse_ok("fn f(c: bool) { let g = c ? |x: i64| x : |x: i64| x * 2; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+#[test]
+fn ternary_q12_try_then_logical_or_stays_try() {
+    // `r? || b` — Or favors try-propagate by design.
+    let p = parse_ok(
+        "fn f(r: Result<bool, String>, b: bool) -> Result<bool, String> { let v = r? || b; return r; }",
+    );
+    let f = first_function(&p);
+    assert!(matches!(f.body.stmts[0], Stmt::Let(_)));
+}
+
+#[test]
+fn ternary_q13_try_minus_binary_no_parens() {
+    // `r? - 1` — no colon ahead → try-propagate feeding a subtraction.
+    let p = parse_ok(
+        "fn f(r: Result<i64, String>) -> Result<i64, String> { let v = r? - 1; return r; }",
+    );
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Binary(_))
+    ));
+}
+
+#[test]
+fn ternary_q14_negative_then_branch_still_ternary() {
+    let p = parse_ok("fn f(c: bool) -> i64 { return c ? -1 : 2; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Return(ref r) if matches!(r.value, Some(Expr::Ternary(_)))
+    ));
+}
+
+#[test]
+fn ternary_q15_empty_param_lambda_branches_no_parens() {
+    // `c ? || 1 : || 2` — the colon-scan sees the ternary colon, so the
+    // `||` reads as an empty-parameter lambda without parens.
+    let p = parse_ok("fn f(c: bool) { let g = c ? || 1 : || 2; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Let(ref l) if matches!(l.init, Expr::Ternary(_))
+    ));
+}
+
+#[test]
+fn ternary_q16_try_minus_inside_call_args() {
+    // Inside call args the scan stops at the argument comma / closing
+    // paren, so `f(r? - 1, x)` keeps the try-propagate reading.
+    let p = parse_ok(
+        "fn g(a: i64, b: i64) -> i64 { return a + b; } \
+             fn f(r: Result<i64, String>) -> Result<i64, String> { let v = g(r? - 1, 2); return r; }",
+    );
+    assert_eq!(p.items.len(), 2);
+}
+
+#[test]
+fn ternary_q17_nested_ternary_colon_not_confused_by_parens() {
+    // The scan skips colons inside nested parens/brackets.
+    let p = parse_ok("fn f(c: bool, xs: Array<i64>) -> i64 { return c ? -xs[0] : xs[1]; }");
+    let f = first_function(&p);
+    assert!(matches!(
+        f.body.stmts[0],
+        Stmt::Return(ref r) if matches!(r.value, Some(Expr::Ternary(_)))
+    ));
+}
+
+// ── assignment targets + statement-level recovery ─────────
+// 10 parser perspectives (runtime behavior covered in integration tests):
+// 1 nested field target parses as FieldAssign, 2 index-then-field,
+// 3 call-then-field, 4 deep chain, 5 invalid call target -> E0106 (not a
+// misleading `expected ;`), 6 invalid literal target -> E0106, 7 the rest
+// of the block SURVIVES a bad statement (no false missing-main cascade),
+// 8 two bad statements -> two errors, 9 `==` never mistaken for `=`,
+// 10 recovery skips a nested brace block without desync.
+
+#[test]
+fn assign_t01_nested_field_target() {
+    let p = parse_ok(
+        "class B { pub v: i64; } class A { pub b: B; } \
+                          fn f(a: A) { a.b.v = 2; }",
+    );
+    let f = function_named(&p, "f");
+    assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+}
+
+#[test]
+fn assign_t02_index_then_field_target() {
+    let p = parse_ok("class P { pub x: i64; } fn f(ps: Array<P>) { ps[0].x = 5; }");
+    let f = function_named(&p, "f");
+    assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+}
+
+#[test]
+fn assign_t03_call_then_field_target() {
+    let p = parse_ok(
+        "class P { pub x: i64; } fn make() -> P { return new P(1); } fn f() { make().x = 5; }",
+    );
+    let f = function_named(&p, "f");
+    assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+}
+
+#[test]
+fn assign_t04_deep_chain_target() {
+    let p = parse_ok(
+        "class C { pub v: i64; } class B { pub c: C; } class A { pub b: B; } \
+             fn f(a: A) { a.b.c.v = 9; }",
+    );
+    let f = function_named(&p, "f");
+    assert!(matches!(f.body.stmts[0], Stmt::FieldAssign(_)));
+}
+
+#[test]
+fn assign_t05_call_target_rejected_with_e0106() {
+    let errors = parse_errors("fn g() -> i64 { return 1; } fn main() { g() = 5; }");
+    assert!(
+        errors.iter().any(|e| format!("{:?}", e.code) == "E0106"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn assign_t06_literal_target_rejected_with_e0106() {
+    let errors = parse_errors("fn main() { 5 = 6; }");
+    assert!(
+        errors.iter().any(|e| format!("{:?}", e.code) == "E0106"),
+        "{errors:?}"
+    );
+}
+
+#[test]
+fn assign_t07_block_survives_bad_statement() {
+    // The bad statement errors, but main and its later statements survive
+    // — no false `missing entry point` cascade.
+    let src = "fn g() -> i64 { return 1; } fn main() { g() = 5; println(7); }";
+    let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+    let (program, errors) = Parser::new(tokens).parse();
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    let main = function_named(&program, "main");
+    assert_eq!(main.body.stmts.len(), 1, "later stmt survives");
+}
+
+#[test]
+fn assign_t08_two_bad_statements_two_errors() {
+    let src = "fn main() { 1 = 2; 3 = 4; println(5); }";
+    let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+    let (program, errors) = Parser::new(tokens).parse();
+    assert_eq!(errors.len(), 2, "{errors:?}");
+    let main = function_named(&program, "main");
+    assert_eq!(main.body.stmts.len(), 1);
+}
+
+#[test]
+fn assign_t09_equality_not_mistaken_for_assignment() {
+    let p = parse_ok("class P { pub x: i64; } fn f(p: P) -> bool { return p.x == 5; }");
+    let f = function_named(&p, "f");
+    assert!(matches!(f.body.stmts[0], Stmt::Return(_)));
+}
+
+#[test]
+fn assign_t10_recovery_skips_nested_braces() {
+    // The malformed statement contains a block; recovery must skip it
+    // wholesale and resume at the enclosing block's next statement.
+    let src = "fn main() { 1 = match 2 { _ => 3, }; println(4); }";
+    let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+    let (program, errors) = Parser::new(tokens).parse();
+    assert!(!errors.is_empty());
+    let main = function_named(&program, "main");
+    assert!(
+        main.body.stmts.iter().any(|s| matches!(s, Stmt::Expr(_))),
+        "println survives: {:?}",
+        main.body.stmts.len()
+    );
+}
+
+// ── parser robustness mini-fuzzer (parser robustness bug CLASS detector) ──────
+// Systematic single-token mutations (deletion and duplication) over
+// representative programs: the parser must NEVER panic or hang on
+// malformed input — it must return diagnostics. This is the generalized
+// net for recovery bugs: any future recovery change that can crash or
+// desynchronize the parser fails here across hundreds of mutants.
+
+fn fuzz_sources() -> Vec<&'static str> {
+    vec![
+        "class B { pub v: i64; } class A { pub b: B; } \
+             fn main() { let a = new A(new B(1)); a.b.v = 2; println(a.b.v); }",
+        "enum Shape { Circle(i64), Empty, } \
+             fn area(s: Shape) -> i64 { return match s { Shape::Circle(r) => r * r, Shape::Empty => 0, }; } \
+             fn main() { println(area(Shape::Circle(3))); }",
+        "interface Animal { fn speak(self) -> i64; } \
+             class Dog implements Animal { pub fn speak(self) -> i64 { return 7; } } \
+             fn main() { let d = new Dog(); println(d.speak()); }",
+        "async fn compute(n: i64) -> i64 { await sleep(1); return n * n; } \
+             async fn main() { let t = compute(6); println(await t); }",
+        "fn apply(f: fn(i64) -> i64, v: i64) -> i64 { return f(v); } \
+             fn main() { let mut t = 0; for i in 0..4 { t = t + i; } \
+             println(apply(|x: i64| x * 2, t)); println(t > 2 ? \"big\" : \"small\"); }",
+    ]
+}
+
+#[test]
+fn fuzz_01_token_deletion_never_panics() {
+    for src in fuzz_sources() {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        for skip in 0..tokens.len().saturating_sub(1) {
+            let mutated: Vec<Token> = tokens
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != skip)
+                .map(|(_, t)| t.clone())
+                .collect();
+            // Must terminate and return; a panic fails the test.
+            let (_, _errors) = Parser::new(mutated).parse();
+        }
+    }
+}
+
+#[test]
+fn fuzz_02_token_duplication_never_panics() {
+    for src in fuzz_sources() {
+        let tokens = crate::lexer::Lexer::new(src).tokenize().expect("lex");
+        for dup in 0..tokens.len().saturating_sub(1) {
+            let mut mutated: Vec<Token> = Vec::with_capacity(tokens.len() + 1);
+            for (i, t) in tokens.iter().enumerate() {
+                mutated.push(t.clone());
+                if i == dup {
+                    mutated.push(t.clone());
+                }
+            }
+            let (_, _errors) = Parser::new(mutated).parse();
+        }
+    }
+}
+
+#[test]
+fn fuzz_03_stmt_junk_never_cascades_to_missing_main() {
+    // Statement-level junk inside main must produce errors WITHOUT losing
+    // main itself (the parser recovery cascade). Junk snippets are inserted as a
+    // statement in an otherwise-valid main.
+    let junks = [
+        "1 = 2;",
+        "g() = 5;",
+        "match { }",
+        "x +;",
+        "= 3;",
+        "let = 4;",
+        "new ;",
+    ];
+    for junk in junks {
+        let src = format!("fn main() {{ let x = 1; {junk} println(x); }}");
+        let tokens = crate::lexer::Lexer::new(&src).tokenize().expect("lex");
+        let (program, errors) = Parser::new(tokens).parse();
+        assert!(!errors.is_empty(), "junk `{junk}` must error");
+        assert!(
+            program
+                .items
+                .iter()
+                .any(|i| matches!(i, Item::Function(f) if f.name == "main")),
+            "junk `{junk}` swallowed main (recovery cascade)"
+        );
+    }
+}
+
+#[test]
+fn interface_22_interface_and_class_coexist() {
+    let p = parse_ok(
+        "interface Animal { fn speak(self) -> String; } class Dog implements Animal { pub fn speak(self) -> String { return \"woof\"; } } fn main() {}",
+    );
+    assert!(matches!(p.items[0], Item::Interface(_)));
+    assert!(matches!(p.items[1], Item::Class(_)));
+    assert!(matches!(p.items[2], Item::Function(_)));
+    assert_eq!(
+        first_class(&p).implements[0],
+        Type::Named("Animal".to_string())
+    );
+}
+
+// select case forms drop `CallArgMode`, so a reference argument has to be
+// rejected at parse time or it is silently downgraded to a value argument.
+//
+#[test]
+fn select_ref_01_send_reference_argument_is_rejected() {
+    let errors = parse_errors(
+        "fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }",
+    );
+    assert!(
+        errors.iter().any(|e| e.code == ErrorCode::E1703),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn select_ref_02_sleep_reference_argument_is_rejected() {
+    let errors =
+        parse_errors("fn main() { let ms = 5; select { sleep(&ms) => {} default => {} } }");
+    assert!(
+        errors.iter().any(|e| e.code == ErrorCode::E1703),
+        "{errors:#?}"
+    );
+}
+
+#[test]
+fn select_binding_spans_scale_with_case_count() {
+    for count in [1, 8, 64, 512] {
+        let mut source = "fn main() { select {".to_string();
+        let mut expected = Vec::new();
+        for _ in 0..count {
+            let start = source.len();
+            source.push_str("let /* comment */ resp = ch.recv() => { println(resp); }");
+            expected.push((start, start + "let /* comment */ resp".len()));
+        }
+        source.push_str("} }");
+        let program = parse_ok(&source);
+        let Stmt::Expr(stmt) = &first_function(&program).body.stmts[0] else {
+            panic!("expected select statement");
+        };
+        let Expr::Select(select) = &stmt.expr else {
+            panic!("expected select");
+        };
+        assert_eq!(select.cases.len(), count);
+        for (case, (start, end)) in select.cases.iter().zip(expected) {
+            assert_eq!((case.span.start, case.span.end), (start, end));
+            assert_eq!(
+                source[case.span.start..case.span.end]
+                    .matches("resp")
+                    .count(),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn select_ref_03_value_arguments_still_parse() {
+    let p = parse_ok(
+        "fn main() { let ch = Channel<i64>::new(); let v = 1; let ms = 5; select { ch.send(v) => {} sleep(ms) => {} } }",
+    );
+    let f = first_function(&p);
+    let Stmt::Expr(stmt) = &f.body.stmts[3] else {
+        panic!("expected an expression statement");
+    };
+    let Expr::Select(select) = &stmt.expr else {
+        panic!("expected a select expression");
+    };
+    assert!(matches!(select.cases[0].kind, SelectCaseKind::Send { .. }));
+    assert!(matches!(
+        select.cases[1].kind,
+        SelectCaseKind::Timeout { .. }
+    ));
+}
+
+#[test]
+fn select_ref_04_reference_argument_error_points_at_the_ampersand() {
+    let errors = parse_errors(
+        "fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }",
+    );
+    let diagnostic = errors
+        .iter()
+        .find(|e| e.code == ErrorCode::E1703)
+        .expect("E1703");
+    let span = diagnostic.labels[0].span;
+    assert_eq!(
+        &"fn main() { let ch = Channel<i64>::new(); let v = 1; select { ch.send(&v) => {} default => {} } }"
+            [span.start..span.start + 1],
+        "&"
+    );
+}
+
+// ── Exponentiation `**` precedence and associativity ─────
+//
+// `**` sits between unary and multiplicative in the grammar: it binds
+// tighter than `*` AND tighter than prefix `-`, and it is right
+// associative. Asserting that by walking `Expr` by hand is unreadable, so
+// these tests compare a fully parenthesized rendering of the tree.
+
+/// Render an expression with every binding made explicit. Only the node
+/// kinds these precedence tests can produce are spelled out; anything else
+/// is a bug in the test, not in the parser, so it panics loudly.
+fn shape(e: &Expr) -> String {
+    match e {
+        Expr::Integer(v, _, _) => v.to_string(),
+        Expr::Float(v, _, _) => format!("{v}"),
+        Expr::Bool(v, _, _) => v.to_string(),
+        Expr::Var(name, _, _) => name.clone(),
+        Expr::Binary(b) => {
+            format!("({} {} {})", shape(&b.lhs), b.op.symbol(), shape(&b.rhs))
+        }
+        Expr::Unary(u) => {
+            let op = match u.op {
+                UnaryOp::Neg => "-",
+                UnaryOp::Not => "!",
+            };
+            format!("({op}{})", shape(&u.expr))
+        }
+        Expr::Await(a) => format!("(await {})", shape(&a.expr)),
+        Expr::Call(c) => {
+            let args: Vec<String> = c.args.iter().map(|a| shape(&a.expr)).collect();
+            format!("{}({})", c.callee, args.join(", "))
+        }
+        Expr::MethodCall(m) => {
+            let args: Vec<String> = m.args.iter().map(|a| shape(&a.expr)).collect();
+            format!("{}.{}({})", shape(&m.object), m.method, args.join(", "))
+        }
+        Expr::FieldAccess(object, name, _, _) => format!("{}.{name}", shape(object)),
+        Expr::Index(array, index, _, _) => format!("{}[{}]", shape(array), shape(index)),
+        other => panic!("shape() does not render {other:?}"),
+    }
+}
+
+/// Parse `expr` as the initializer of a `let` in `main` and render it.
+fn expr_shape(expr: &str) -> String {
+    let program = parse_ok(&format!("fn main() {{ let x = {expr}; }}"));
+    let function = first_function(&program);
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    shape(&let_stmt.init)
+}
+
+/// The same, but inside an `async fn` so `await` is allowed.
+fn async_expr_shape(expr: &str) -> String {
+    let program = parse_ok(&format!(
+        "async fn run() {{ let x = {expr}; }}\nfn main() {{}}"
+    ));
+    let Item::Function(function) = &program.items[0] else {
+        panic!("expected a function");
+    };
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    shape(&let_stmt.init)
+}
+
+// ── Bitwise and shift precedence ────────────────────────
+#[test]
+fn bitwise_precedence_follows_rust() {
+    assert_eq!(expr_shape("a | b ^ c & d"), "(a | (b ^ (c & d)))");
+    assert_eq!(expr_shape("a & b << c"), "(a & (b << c))");
+    assert_eq!(expr_shape("1 << n - 1"), "(1 << (n - 1))");
+    assert_eq!(expr_shape("a >> 2 * b"), "(a >> (2 * b))");
+    assert_eq!(expr_shape("x & m == 0"), "((x & m) == 0)");
+    assert_eq!(expr_shape("a | b < c"), "((a | b) < c)");
+    assert_eq!(
+        expr_shape("a == b && c | d != 0"),
+        "((a == b) && ((c | d) != 0))"
+    );
+    assert_eq!(expr_shape("!a & -b"), "((!a) & (-b))");
+    assert_eq!(expr_shape("2 ** 3 << 1"), "((2 ** 3) << 1)");
+}
+
+#[test]
+fn bitwise_operators_are_left_associative() {
+    assert_eq!(expr_shape("a - b << c >> d"), "(((a - b) << c) >> d)");
+    assert_eq!(expr_shape("a & b & c"), "((a & b) & c)");
+    assert_eq!(expr_shape("a ^ b ^ c"), "((a ^ b) ^ c)");
+    assert_eq!(expr_shape("a | b | c"), "((a | b) | c)");
+}
+
+#[test]
+fn shift_needs_touching_angle_brackets() {
+    let program = parse_ok("fn main() { let x = 1 << 2; }");
+    let Stmt::Let(let_stmt) = &first_function(&program).body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let Expr::Binary(b) = &let_stmt.init else {
+        panic!("expected a binary expression");
+    };
+    // The operator span covers both characters.
+    assert_eq!(b.span.end - b.span.start, 2);
+    assert!(!parse_errors("fn main() { let x = 1 < < 2; }").is_empty());
+    assert!(!parse_errors("fn main() { let mut x = 1; x < <= 2; }").is_empty());
+}
+
+#[test]
+fn nested_generic_closer_is_not_a_shift() {
+    parse_ok("fn main() { let x: Option<Option<i64>> = None; let y = x; }");
+    parse_ok(
+        "fn main() { let x: Map<i64, Option<Option<i64>>> = new Map<i64, Option<Option<i64>>>(); }",
+    );
+}
+
+/// The per-position rescan that `ternary_colon_table` replaces.
+fn ternary_colon_scan(tokens: &[Token], from: usize) -> bool {
+    let mut depth: i32 = 0;
+    for token in tokens.iter().skip(from) {
+        match &token.kind {
+            TokenKind::LParen | TokenKind::LBracket => depth += 1,
+            TokenKind::RParen | TokenKind::RBracket => {
+                if depth == 0 {
+                    return false;
+                }
+                depth -= 1;
+            }
+            TokenKind::Colon if depth == 0 => return true,
+            kind if ends_ternary_scan(kind) => return false,
+            TokenKind::Comma if depth == 0 => return false,
+            _ => {}
+        }
+    }
+    false
+}
+
+#[test]
+fn ternary_colon_table_matches_a_rescan_at_every_position() {
+    for source in [
+        "fn main() { let f = c ? |x: i64| x | 1 : |x: i64| x & 1; }",
+        "fn f(o: Option<i64>) -> Option<i64> { return Some(o? | (a ? b : c) | g(x, y: z)); }",
+        "fn main() { let v = c ? [1, 2][0] : (p ? 1 : 2); h(a? | b, [x ? 1 : 2]); }",
+        "fn main() { let v = (a ? ( b : c; d ] : e) ) : x; match y { _ => z ? 1 : 2 } }",
+        "fn main() { let v = a ? (b",
+    ] {
+        let tokens = Lexer::new(source).tokenize().expect("lexing failed");
+        let table = ternary_colon_table(&tokens);
+        assert_eq!(table.len(), tokens.len() + 1, "{source}");
+        for (from, &ahead) in table.iter().enumerate() {
+            assert_eq!(
+                ahead,
+                ternary_colon_scan(&tokens, from),
+                "{source} at token {from}"
+            );
+        }
+    }
+}
+
+#[test]
+fn long_try_or_chain_parses_as_bitwise_or() {
+    let operands = 2000;
+    let chain = (0..operands)
+        .map(|i| format!("o{i}?"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let program = parse_ok(&format!(
+        "fn f(o0: Option<i64>) -> Option<i64> {{ return Some({chain}); }}"
+    ));
+    let Stmt::Return(ReturnStmt {
+        value: Some(Expr::Call(call)),
+        ..
+    }) = &first_function(&program).body.stmts[0]
+    else {
+        panic!("expected a `Some(...)` call");
+    };
+    let mut ors = 0;
+    let mut expr = &call.args[0].expr;
+    while let Expr::Binary(b) = expr {
+        assert_eq!(b.op, BinOp::BitOr);
+        ors += 1;
+        expr = &b.lhs;
+    }
+    assert_eq!(ors, operands - 1);
+}
+
+#[test]
+fn compound_bitwise_assignments_desugar_to_binary_ops() {
+    for (op, expected) in [
+        ("&=", BinOp::BitAnd),
+        ("|=", BinOp::BitOr),
+        ("^=", BinOp::BitXor),
+        ("<<=", BinOp::Shl),
+        (">>=", BinOp::Shr),
+    ] {
+        let program = parse_ok(&format!("fn main() {{ let mut x = 1; x {op} 3; }}"));
+        let Stmt::Assign(assign) = &first_function(&program).body.stmts[1] else {
+            panic!("{op}: expected an assignment");
+        };
+        let Expr::Binary(b) = &assign.value else {
+            panic!("{op}: expected a binary value");
+        };
+        assert_eq!(b.op, expected, "{op}");
+    }
+}
+
+// Perspective 1: a bare power parses as one Binary node with BinOp::Pow.
+#[test]
+fn pow_01_parses_as_a_binary_pow_node() {
+    let program = parse_ok("fn main() { let x = 2 ** 3; }");
+    let function = first_function(&program);
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let Expr::Binary(b) = &let_stmt.init else {
+        panic!("expected a binary expression");
+    };
+    assert_eq!(b.op, BinOp::Pow);
+    assert!(matches!(b.lhs, Expr::Integer(2, _, _)));
+    assert!(matches!(b.rhs, Expr::Integer(3, _, _)));
+}
+
+// Perspective 2: `**` is right associative, unlike every other binary
+// operator in the language.
+#[test]
+fn pow_02_is_right_associative() {
+    assert_eq!(expr_shape("2 ** 3 ** 2"), "(2 ** (3 ** 2))");
+}
+
+// Perspective 3: right associativity holds for four operands too.
+#[test]
+fn pow_03_right_associative_chain_of_four() {
+    assert_eq!(expr_shape("2 ** 3 ** 4 ** 5"), "(2 ** (3 ** (4 ** 5)))");
+}
+
+// Perspective 4: explicit parentheses override associativity.
+#[test]
+fn pow_04_parentheses_force_left_association() {
+    assert_eq!(expr_shape("(2 ** 3) ** 2"), "((2 ** 3) ** 2)");
+}
+
+// Perspective 5: `**` binds tighter than unary minus, so `-2 ** 2` is
+// `-(2 ** 2)` — the Python rule, not the "negate first" rule.
+#[test]
+fn pow_05_unary_minus_applies_to_the_whole_power() {
+    assert_eq!(expr_shape("-2 ** 2"), "(-(2 ** 2))");
+}
+
+// Perspective 6: parenthesizing the base restores negate-then-power.
+#[test]
+fn pow_06_parenthesized_negative_base() {
+    assert_eq!(expr_shape("(-2) ** 2"), "((-2) ** 2)");
+}
+
+// Perspective 7: logical `!` binds looser than `**` for the same reason.
+#[test]
+fn pow_07_logical_not_applies_to_the_whole_power() {
+    assert_eq!(expr_shape("!a ** b"), "(!(a ** b))");
+}
+
+// Perspective 8: `**` binds tighter than `*`.
+#[test]
+fn pow_08_binds_tighter_than_multiplication() {
+    assert_eq!(expr_shape("2 * 3 ** 2"), "(2 * (3 ** 2))");
+}
+
+// Perspective 9: the same when the power is on the left of `*`.
+#[test]
+fn pow_09_binds_tighter_than_multiplication_on_the_left() {
+    assert_eq!(expr_shape("3 ** 2 * 2"), "((3 ** 2) * 2)");
+}
+
+// Perspective 10: `**` binds tighter than `/` and `%`.
+#[test]
+fn pow_10_binds_tighter_than_division_and_remainder() {
+    assert_eq!(expr_shape("8 / 2 ** 2"), "(8 / (2 ** 2))");
+    assert_eq!(expr_shape("9 % 2 ** 3"), "(9 % (2 ** 3))");
+}
+
+// Perspective 11: `**` binds tighter than `+` and `-`.
+#[test]
+fn pow_11_binds_tighter_than_addition() {
+    assert_eq!(expr_shape("1 + 2 ** 3"), "(1 + (2 ** 3))");
+    assert_eq!(expr_shape("1 - 2 ** 3"), "(1 - (2 ** 3))");
+}
+
+// Perspective 12: `**` binds tighter than comparison.
+#[test]
+fn pow_12_binds_tighter_than_comparison() {
+    assert_eq!(expr_shape("2 ** 3 < 9"), "((2 ** 3) < 9)");
+}
+
+// Perspective 13: a negative exponent needs no parentheses, because the
+// right operand of `**` is parsed as a unary expression.
+#[test]
+fn pow_13_negative_exponent_needs_no_parentheses() {
+    assert_eq!(expr_shape("2 ** -3"), "(2 ** (-3))");
+}
+
+// Perspective 14: a negative exponent combines with right associativity.
+#[test]
+fn pow_14_negative_exponent_in_a_chain() {
+    assert_eq!(expr_shape("2 ** -3 ** 2"), "(2 ** (-(3 ** 2)))");
+}
+
+// Perspective 15: postfix forms (call, method call, field, index) bind
+// tighter than `**` on both sides.
+#[test]
+fn pow_15_postfix_binds_tighter_than_pow() {
+    assert_eq!(expr_shape("f(2) ** g(3)"), "(f(2) ** g(3))");
+    assert_eq!(expr_shape("a.b ** c.d"), "(a.b ** c.d)");
+    assert_eq!(expr_shape("xs[0] ** ys[1]"), "(xs[0] ** ys[1])");
+    assert_eq!(expr_shape("a.pow(2) ** 3"), "(a.pow(2) ** 3)");
+}
+
+// Perspective 16: `**` inside call arguments is one argument, not two.
+#[test]
+fn pow_16_inside_call_arguments() {
+    assert_eq!(expr_shape("f(2 ** 3, 4)"), "f((2 ** 3), 4)");
+}
+
+// Perspective 17: prefix `await` binds tighter than `**`, so
+// `await t ** 2` raises the awaited value rather than awaiting a power.
+#[test]
+fn pow_17_await_binds_tighter_than_pow() {
+    assert_eq!(async_expr_shape("await t ** 2"), "((await t) ** 2)");
+}
+
+// Perspective 18: `await` on the exponent side is also the operand of `**`.
+#[test]
+fn pow_18_await_as_exponent() {
+    assert_eq!(async_expr_shape("2 ** await t"), "(2 ** (await t))");
+}
+
+// Perspective 19: float operands parse identically — the operator is not
+// specialized in the grammar.
+#[test]
+fn pow_19_float_operands_parse() {
+    assert_eq!(expr_shape("2.0 ** 3.0"), "(2 ** 3)");
+}
+
+// Perspective 20: a missing right operand is a parse error, not a silent
+// unary `**`.
+#[test]
+fn pow_20_missing_exponent_is_a_parse_error() {
+    assert!(!parse_errors("fn main() { let x = 2 ** ; }").is_empty());
+}
+
+// Perspective 21: a missing left operand is a parse error — `**` has no
+// prefix form.
+#[test]
+fn pow_21_missing_base_is_a_parse_error() {
+    assert!(!parse_errors("fn main() { let x = ** 3; }").is_empty());
+}
+
+// Perspective 22: `***` is `**` then a dangling `*`, which fails to parse.
+#[test]
+fn pow_22_triple_star_is_a_parse_error() {
+    assert!(!parse_errors("fn main() { let x = 2 *** 3; }").is_empty());
+}
+
+// Perspective 23: there is no `**=` compound assignment.
+#[test]
+fn pow_23_star_star_equals_is_a_parse_error() {
+    assert!(!parse_errors("fn main() { let mut x = 2; x **= 3; }").is_empty());
+}
+
+// Perspective 24: double prefix minus is still rejected, exactly as before
+// this operator existed — `-` takes a power, not another unary.
+#[test]
+fn pow_24_double_prefix_minus_is_still_rejected() {
+    assert!(!parse_errors("fn main() { let x = - -3; }").is_empty());
+}
+
+// Perspective 25: `**` participates in the ternary/`?` disambiguation, so
+// `cond ? a ** b : c` keeps the power inside the then-branch.
+#[test]
+fn pow_25_inside_a_ternary_branch() {
+    let program = parse_ok("fn main() { let x = 1 < 2 ? 2 ** 3 : 4; }");
+    let function = first_function(&program);
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let Expr::Ternary(t) = &let_stmt.init else {
+        panic!("expected a ternary expression");
+    };
+    assert_eq!(shape(&t.then_expr), "(2 ** 3)");
+    assert_eq!(shape(&t.else_expr), "4");
+}
+
+// Perspective 26: multiplication itself stays left associative — the
+// restructured precedence chain must not have changed `*`.
+#[test]
+fn pow_26_multiplication_is_still_left_associative() {
+    assert_eq!(expr_shape("2 * 3 * 4"), "((2 * 3) * 4)");
+}
+
+// Perspective 27: `BinOp::Pow` renders as `**` in diagnostics.
+#[test]
+fn pow_27_symbol_is_double_star() {
+    assert_eq!(BinOp::Pow.symbol(), "**");
+}
+
+// ── `lock` statement grammar ────────────────────────────
+//
+// `lock`, `read` and `write` are CONTEXTUAL keywords: a program that used
+// any of them as an ordinary identifier before this feature existed must
+// keep parsing exactly as it did. Perspectives 1-6 pin the three grammar
+// forms, 7-14 pin the identifier compatibility, 15-19 the shape details.
+
+fn first_stmt_lock(source: &str) -> LockStmt {
+    let program = parse_ok(source);
+    let function = first_function(&program);
+    match &function.body.stmts[0] {
+        Stmt::Lock(lock) => lock.clone(),
+        other => panic!("expected a lock statement, got {other:?}"),
+    }
+}
+
+// Perspective 1: `lock <target> as <binding> { .. }` is the Mutex form.
+#[test]
+fn lock_parse_01_mutex_form() {
+    let lock = first_stmt_lock("async fn main() { lock m as value { println(value); } }");
+    assert_eq!(lock.mode, LockMode::Mutex);
+    assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "m"));
+    assert_eq!(lock.binding, "value");
+    assert!(!lock.mutable);
+    assert_eq!(lock.body.stmts.len(), 1);
+}
+
+// Perspective 2: the Mutex form takes a `mut` binding.
+#[test]
+fn lock_parse_02_mutex_mut_binding() {
+    let lock = first_stmt_lock("async fn main() { lock m as mut value { value = 1; } }");
+    assert_eq!(lock.mode, LockMode::Mutex);
+    assert!(lock.mutable);
+}
+
+// Perspective 3: `lock read <target> as <binding>` is the shared form.
+#[test]
+fn lock_parse_03_read_form() {
+    let lock = first_stmt_lock("async fn main() { lock read r as value { println(value); } }");
+    assert_eq!(lock.mode, LockMode::Read);
+    assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "r"));
+    assert!(!lock.mutable);
+}
+
+// Perspective 4: `lock write <target> as mut <binding>` is the exclusive form.
+#[test]
+fn lock_parse_04_write_form_with_mut() {
+    let lock = first_stmt_lock("async fn main() { lock write r as mut value { value = 1; } }");
+    assert_eq!(lock.mode, LockMode::Write);
+    assert!(lock.mutable);
+}
+
+// Perspective 5: a `mut` binding on a read lock is a parse error — the
+// shared view is never writable, so the mistake is caught at the grammar.
+#[test]
+fn lock_parse_05_read_rejects_mut_binding() {
+    let errors = parse_errors("async fn main() { lock read r as mut value { } }");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.code == ErrorCode::E2601 && e.message.contains("cannot be `mut`")),
+        "{errors:?}"
+    );
+}
+
+// Perspective 6: `lock write <target> as <binding>` without `mut` is legal —
+// an exclusive lock does not force a mutable binding.
+#[test]
+fn lock_parse_06_write_without_mut() {
+    let lock = first_stmt_lock("async fn main() { lock write r as value { println(value); } }");
+    assert_eq!(lock.mode, LockMode::Write);
+    assert!(!lock.mutable);
+}
+
+// Perspective 7: `lock` is still a usable variable name.
+#[test]
+fn lock_parse_07_lock_is_still_an_identifier() {
+    let program = parse_ok("fn main() { let lock = 1; println(lock); }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[0], Stmt::Let(l) if l.name == "lock"));
+}
+
+// Perspective 8: assigning to a variable named `lock` is not a lock stmt.
+#[test]
+fn lock_parse_08_assignment_to_lock_variable() {
+    let program = parse_ok("fn main() { let mut lock = 1; lock = 2; }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[1], Stmt::Assign(a) if a.name == "lock"));
+}
+
+// Perspective 9: calling a function named `lock` is not a lock stmt.
+#[test]
+fn lock_parse_09_call_to_lock_function() {
+    let program = parse_ok("fn main() { lock(1); }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[0], Stmt::Expr(_)));
+}
+
+// Perspective 10: field access through a variable named `lock` still parses.
+#[test]
+fn lock_parse_10_field_access_on_lock_variable() {
+    let program = parse_ok("fn main() { lock.count = 1; }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[0], Stmt::FieldAssign(f) if f.field == "count"));
+}
+
+// Perspective 11: `m.lock()` — the pre-existing method-call spelling — is
+// untouched, because `lock` is not the first token of the statement.
+#[test]
+fn lock_parse_11_method_named_lock() {
+    let program = parse_ok("fn main() { let v = m.lock(); }");
+    let function = first_function(&program);
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method.as_str() == "lock"));
+}
+
+// Perspective 12: `read` and `write` remain ordinary identifiers.
+#[test]
+fn lock_parse_12_read_and_write_are_identifiers() {
+    let program = parse_ok("fn main() { let read = 1; let write = 2; println(read + write); }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[0], Stmt::Let(l) if l.name == "read"));
+    assert!(matches!(&function.body.stmts[1], Stmt::Let(l) if l.name == "write"));
+}
+
+// Perspective 13: `lock read as value { .. }` locks a Mutex NAMED `read` —
+// the `as` right after the word proves it was the target, not the mode.
+#[test]
+fn lock_parse_13_target_named_read() {
+    let lock = first_stmt_lock("async fn main() { lock read as value { println(value); } }");
+    assert_eq!(lock.mode, LockMode::Mutex);
+    assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "read"));
+}
+
+// Perspective 14: same for a target named `write`, with a `mut` binding
+// (which the Mutex form allows and the write form would too — the point is
+// that the target, not the mode, is what changed).
+#[test]
+fn lock_parse_14_target_named_write() {
+    let lock = first_stmt_lock("async fn main() { lock write as mut value { value = 1; } }");
+    assert_eq!(lock.mode, LockMode::Mutex);
+    assert!(matches!(&lock.target, Expr::Var(name, _, _) if name == "write"));
+    assert!(lock.mutable);
+}
+
+// Perspective 15: the target may be any expression that starts with an
+// identifier — a field, an index, a call.
+#[test]
+fn lock_parse_15_complex_targets() {
+    let field = first_stmt_lock("async fn main() { lock registry.mutex as value { } }");
+    assert!(matches!(&field.target, Expr::FieldAccess(_, name, _, _) if name == "mutex"));
+
+    let indexed = first_stmt_lock("async fn main() { lock registry.locks[0] as value { } }");
+    assert!(matches!(&indexed.target, Expr::Index(..)));
+
+    let call = first_stmt_lock("async fn main() { lock mutex_for(1) as value { } }");
+    assert!(matches!(&call.target, Expr::Call(_)));
+}
+
+// Perspective 16: `lock self.field as value` — `self` is a keyword token,
+// so the lookahead has to accept it as a target start.
+#[test]
+fn lock_parse_16_self_target() {
+    let program = parse_ok(
+        "class Counter { async fn bump(self) { lock self.mutex as mut value { value = 1; } } }",
+    );
+    let Item::Class(class) = &program.items[0] else {
+        panic!("expected a class");
+    };
+    assert!(matches!(&class.methods[0].body.stmts[0], Stmt::Lock(_)));
+}
+
+// Perspective 17: a missing `as` is a parse error rather than a silent
+// reinterpretation of the statement.
+#[test]
+fn lock_parse_17_missing_as_is_an_error() {
+    assert!(!parse_errors("async fn main() { lock m value { } }").is_empty());
+}
+
+// Perspective 18: the statement span covers `lock` through the closing
+// brace, so diagnostics can underline the whole critical section.
+#[test]
+fn lock_parse_18_span_covers_keyword_through_body() {
+    let source = "async fn main() { lock m as value { println(value); } }";
+    let lock = first_stmt_lock(source);
+    assert_eq!(
+        &source[lock.span.start..lock.span.end],
+        "lock m as value { println(value); }"
+    );
+}
+
+// Perspective 19: locks nest syntactically (the type checker, not the
+// parser, is what rejects an unordered nested acquisition).
+#[test]
+fn lock_parse_19_nested_locks_parse() {
+    let outer = first_stmt_lock("async fn main() { lock a as x { lock b as y { } } }");
+    assert!(matches!(&outer.body.stmts[0], Stmt::Lock(_)));
+}
+
+// Perspective 20: `LockMode` reports the keyword, the required lock type
+// and whether a `mut` binding is allowed — the parser and the checker share
+// these, so a wrong answer desynchronizes the two.
+#[test]
+fn lock_parse_20_mode_metadata() {
+    assert_eq!(LockMode::Mutex.keyword(), "lock");
+    assert_eq!(LockMode::Read.keyword(), "lock read");
+    assert_eq!(LockMode::Write.keyword(), "lock write");
+    assert_eq!(LockMode::Mutex.lock_type_name(), "Mutex");
+    assert_eq!(LockMode::Read.lock_type_name(), "RwLock");
+    assert_eq!(LockMode::Write.lock_type_name(), "RwLock");
+    assert!(LockMode::Mutex.allows_mut_binding());
+    assert!(!LockMode::Read.allows_mut_binding());
+    assert!(LockMode::Write.allows_mut_binding());
+}
+
+// Perspective 21: a missing binding identifier is a parse error.
+#[test]
+fn lock_parse_21_missing_binding_is_an_error() {
+    assert!(!parse_errors("async fn main() { lock m as { } }").is_empty());
+    assert!(!parse_errors("async fn main() { lock m as mut { } }").is_empty());
+}
+
+// Perspective 22: a missing body block is a parse error.
+#[test]
+fn lock_parse_22_missing_block_is_an_error() {
+    assert!(!parse_errors("async fn main() { lock m as value; }").is_empty());
+}
+
+// Perspective 23: `read` and `write` still work as METHOD names — the
+// contextual keywords are positional, and a method call is never in the
+// position that follows `lock`.
+#[test]
+fn lock_parse_23_read_and_write_as_method_names() {
+    let program = parse_ok("fn main() { let v = r.read(); r.write(v); }");
+    let function = first_function(&program);
+    let Stmt::Let(let_stmt) = &function.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    assert!(matches!(&let_stmt.init, Expr::MethodCall(m) if m.method.as_str() == "read"));
+    let Stmt::Expr(expr_stmt) = &function.body.stmts[1] else {
+        panic!("expected an expression statement");
+    };
+    assert!(matches!(&expr_stmt.expr, Expr::MethodCall(m) if m.method.as_str() == "write"));
+}
+
+// Perspective 24: `read` and `write` still work as FIELD names, including
+// as the target of a lock statement.
+#[test]
+fn lock_parse_24_read_and_write_as_field_names() {
+    let program = parse_ok("fn main() { config.write = config.read; }");
+    let function = first_function(&program);
+    assert!(matches!(&function.body.stmts[0], Stmt::FieldAssign(f) if f.field == "write"));
+
+    let lock = first_stmt_lock("async fn main() { lock config.read as value { } }");
+    assert!(matches!(&lock.target, Expr::FieldAccess(_, name, _, _) if name == "read"));
+}
+
+// Perspective 25: the target expression is stored ONCE in the AST, so no
+// later stage can accidentally re-evaluate it by walking two copies.
+#[test]
+fn lock_parse_25_target_is_stored_once() {
+    let lock = first_stmt_lock("async fn main() { lock next_mutex() as value { } }");
+    let Expr::Call(call) = &lock.target else {
+        panic!("expected a call target");
+    };
+    assert_eq!(call.args.len(), 0);
+    assert!(
+        !lock
+            .body
+            .stmts
+            .iter()
+            .any(|stmt| matches!(stmt, Stmt::Expr(_))),
+        "the target must not be duplicated into the body"
+    );
+}
+
+// Perspective 26: `target_span` covers the whole operand, from its first
+// token through the token before `as`, in every mode and across lines,
+// even where `target.span()` names only a trailing field token.
+#[test]
+fn lock_parse_26_target_span_covers_the_whole_operand() {
+    for (source, operand) in [
+        ("async fn main() { lock m as value { } }", "m"),
+        (
+            "async fn main() { lock read self.cache as value { } }",
+            "self.cache",
+        ),
+        (
+            "async fn main() { lock write a.b.c as mut value { } }",
+            "a.b.c",
+        ),
+        (
+            "async fn main() { lock next_mutex() as value { } }",
+            "next_mutex()",
+        ),
+        ("async fn main() { lock read as value { } }", "read"),
+        (
+            "async fn main() { lock h\n        .cache as value { } }",
+            "h\n        .cache",
+        ),
+        ("async fn main() { lock items[0] as value { } }", "items[0]"),
+    ] {
+        let lock = first_stmt_lock(source);
+        let span = lock.target_span;
+        assert_eq!(&source[span.start..span.end], operand, "{source}");
+        assert!(span.start >= lock.span.start && span.end < lock.binding_span.start);
+    }
+}
+
+// Node identity. The checker and the backend key their side
+// tables by `Expr::id`/`Pattern::id` rather than by `Span`, so these pin
+// what an ID promises: unique per parsed node, stable across a clone, and
+// never reused by a node the compiler builds later.
+
+/// Collects every expression and pattern ID the walker reaches.
+#[derive(Default)]
+struct IdTrace {
+    exprs: Vec<ExprId>,
+    patterns: Vec<PatternId>,
+}
+
+fn trace_ids(source: &str) -> IdTrace {
+    use super::iter::{AstEvent, AstWalk};
+    let program = parse_ok(source);
+    let mut trace = IdTrace::default();
+    for item in &program.items {
+        if let Item::Function(function) = item {
+            for event in AstWalk::new(AstEvent::Block(&function.body)) {
+                match event {
+                    AstEvent::Expr(expr) => trace.exprs.push(expr.id()),
+                    AstEvent::Pattern(pattern) => trace.patterns.push(pattern.id()),
+                    _ => {}
+                }
+            }
+        }
+    }
+    trace
+}
+
+const ID_SOURCE: &str = "fn f(n: i64) -> i64 {\n\
+        let a = 1 + 2;\n\
+        let b = [1, 2, 3];\n\
+        let c = b[0];\n\
+        let d = |x: i64| x + 1;\n\
+        let e = match n { 1 => 1, _ => 0 };\n\
+        println(a + c + d(1) + e);\n\
+        return n;\n\
+    }\nfn main() { println(f(1)); }\n";
+
+#[test]
+fn node_id_01_every_expression_in_a_program_is_unique() {
+    let trace = trace_ids(ID_SOURCE);
+    let mut ids = trace.exprs.clone();
+    ids.sort();
+    ids.dedup();
+    assert!(trace.exprs.len() > 20, "expected a broad walk");
+    assert_eq!(ids.len(), trace.exprs.len(), "duplicate expression ID");
+}
+
+#[test]
+fn node_id_02_every_pattern_in_a_program_is_unique() {
+    let trace = trace_ids(ID_SOURCE);
+    let mut ids = trace.patterns.clone();
+    ids.sort();
+    ids.dedup();
+    assert!(!trace.patterns.is_empty(), "expected match patterns");
+    assert_eq!(ids.len(), trace.patterns.len(), "duplicate pattern ID");
+}
+
+#[test]
+fn node_id_03_two_parses_of_one_source_share_no_ids() {
+    let first = trace_ids(ID_SOURCE);
+    let second = trace_ids(ID_SOURCE);
+    // Identical text, identical spans -- and disjoint identities, which is
+    // exactly what span keying could not give a two-unit build.
+    assert!(
+        !first.exprs.iter().any(|id| second.exprs.contains(id)),
+        "a second parse reused expression IDs"
+    );
+    assert!(
+        !first.patterns.iter().any(|id| second.patterns.contains(id)),
+        "a second parse reused pattern IDs"
+    );
+}
+
+#[test]
+fn node_id_04_cloning_an_expression_preserves_its_id() {
+    let p = parse_ok("fn f() { let a = 1 + 2; }");
+    let f = first_function(&p);
+    let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let clone = let_stmt.init.clone();
+    assert_eq!(clone.id(), let_stmt.init.id());
+}
+
+#[test]
+fn node_id_05_cloning_a_pattern_preserves_its_id() {
+    let p = parse_ok("fn f(n: i64) { let a = match n { 1 => 1, _ => 0 }; }");
+    let f = first_function(&p);
+    let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let Expr::Match(match_expr) = &let_stmt.init else {
+        panic!("expected a match expression");
+    };
+    let pattern = &match_expr.arms[0].pattern;
+    assert_eq!(pattern.clone().id(), pattern.id());
+}
+
+#[test]
+fn node_id_06_a_parent_and_its_operands_have_distinct_ids() {
+    let p = parse_ok("fn f() { let a = 1 + 2; }");
+    let f = first_function(&p);
+    let Stmt::Let(let_stmt) = &f.body.stmts[0] else {
+        panic!("expected a let statement");
+    };
+    let Expr::Binary(binary) = &let_stmt.init else {
+        panic!("expected a binary expression");
+    };
+    assert_ne!(binary.id, binary.lhs.id());
+    assert_ne!(binary.id, binary.rhs.id());
+    assert_ne!(binary.lhs.id(), binary.rhs.id());
+    assert_eq!(let_stmt.init.id(), binary.id);
+}
+
+#[test]
+fn node_id_07_a_synthesized_node_never_collides_with_a_parsed_one() {
+    let trace = trace_ids(ID_SOURCE);
+    // What a rewriting pass (`ast_passes`, `coop_anf`) builds after checking.
+    let synthesized: Vec<ExprId> = (0..8).map(|_| ExprId::fresh()).collect();
+    assert!(
+        !synthesized.iter().any(|id| trace.exprs.contains(id)),
+        "a fresh ID collided with a parsed node"
+    );
+    let mut unique = synthesized.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), synthesized.len());
+    let fresh_patterns: Vec<PatternId> = (0..8).map(|_| PatternId::fresh()).collect();
+    assert!(!fresh_patterns.iter().any(|id| trace.patterns.contains(id)));
+}
+
+#[test]
+fn node_id_08_ids_are_ordered_by_creation() {
+    let first = ExprId::fresh();
+    let second = ExprId::fresh();
+    assert!(first < second, "{first} is not before {second}");
+    assert!(PatternId::fresh() < PatternId::fresh());
+}
+
+// ── `else if` chains ───────────────────────────────────
+
+/// Structural rendering of an if-ladder: `if(<cond>){<n>}else{...}`.
+/// Distinguishes a synthetic single-statement else block from a
+/// hand-written one only by content, which is the point: they must match.
+fn if_shape(stmt: &Stmt) -> String {
+    let Stmt::If(if_stmt) = stmt else {
+        return "stmt".to_string();
+    };
+    let cond = match &if_stmt.cond {
+        Expr::Var(name, _, _) => name.clone(),
+        Expr::Bool(value, _, _) => value.to_string(),
+        _ => "expr".to_string(),
+    };
+    let mut out = format!("if({cond}){{{}}}", if_stmt.then_block.stmts.len());
+    if let Some(else_block) = &if_stmt.else_block {
+        let inner: Vec<String> = else_block.stmts.iter().map(if_shape).collect();
+        out.push_str(&format!("else{{{}}}", inner.join(";")));
+    }
+    out
+}
+
+fn first_body_stmt(program: &Program) -> &Stmt {
+    &first_function(program).body.stmts[0]
+}
+
+fn if_parts(stmt: &Stmt) -> &IfStmt {
+    let Stmt::If(if_stmt) = stmt else {
+        panic!("expected an if statement, got {stmt:?}");
+    };
+    if_stmt
+}
+
+// Perspective 1: `else if` becomes an else block holding one `if`.
+#[test]
+fn else_if_01_desugars_to_single_statement_else_block() {
+    let p = parse_ok("fn main() { if a { f(); } else if b { g(); } }");
+    let outer = if_parts(first_body_stmt(&p));
+    let else_block = outer.else_block.as_ref().expect("else block");
+    assert_eq!(else_block.stmts.len(), 1);
+    let inner = if_parts(&else_block.stmts[0]);
+    assert!(matches!(&inner.cond, Expr::Var(name, _, _) if name == "b"));
+    assert!(inner.else_block.is_none());
+}
+
+// Perspective 2: a multi-rung ladder with a final else nests right.
+#[test]
+fn else_if_02_ladder_with_final_else_nests_to_the_right() {
+    let p = parse_ok(
+        "fn main() { if a { f(); } else if b { g(); } else if c { h(); h(); } else { i(); } }",
+    );
+    assert_eq!(
+        if_shape(first_body_stmt(&p)),
+        "if(a){1}else{if(b){1}else{if(c){2}else{stmt}}}"
+    );
+}
+
+// Perspective 3: a ladder without final else leaves the last rung bare.
+#[test]
+fn else_if_03_ladder_without_final_else() {
+    let p = parse_ok("fn main() { if a { } else if b { } else if c { } }");
+    assert_eq!(
+        if_shape(first_body_stmt(&p)),
+        "if(a){0}else{if(b){0}else{if(c){0}}}"
+    );
+}
+
+// Perspective 4: sugar and hand-written nesting produce the same tree.
+#[test]
+fn else_if_04_matches_hand_written_nesting() {
+    let sugar = parse_ok("fn main() { if a { f(); } else if b { g(); } else { h(); } }");
+    let nested = parse_ok("fn main() { if a { f(); } else { if b { g(); } else { h(); } } }");
+    assert_eq!(
+        if_shape(first_body_stmt(&sugar)),
+        if_shape(first_body_stmt(&nested))
+    );
+}
+
+// Perspective 5: each nested rung's span starts at its own `if` keyword.
+#[test]
+fn else_if_05_rung_span_points_at_its_if_keyword() {
+    let src = "fn main() { if a { } else if b { } }";
+    let p = parse_ok(src);
+    let outer = if_parts(first_body_stmt(&p));
+    let inner = if_parts(&outer.else_block.as_ref().unwrap().stmts[0]);
+    assert_eq!(outer.span.start, src.find("if a").unwrap());
+    assert_eq!(inner.span.start, src.find("if b").unwrap());
+}
+
+// Perspective 6: the synthetic block spans from the rung's `if` through
+// the end of the ladder's last block.
+#[test]
+fn else_if_06_synthetic_block_span_covers_rest_of_ladder() {
+    let src = "fn main() { if a { } else if b { } else { f(); } }";
+    let p = parse_ok(src);
+    let outer = if_parts(first_body_stmt(&p));
+    let synthetic = outer.else_block.as_ref().unwrap();
+    let inner = if_parts(&synthetic.stmts[0]);
+    let last = inner.else_block.as_ref().unwrap();
+    assert_eq!(synthetic.span.start, src.find("if b").unwrap());
+    assert_eq!(synthetic.span.end, last.span.end);
+    let without_else = "fn main() { if a { } else if b { g(); } }";
+    let p = parse_ok(without_else);
+    let outer = if_parts(first_body_stmt(&p));
+    let synthetic = outer.else_block.as_ref().unwrap();
+    let inner = if_parts(&synthetic.stmts[0]);
+    assert_eq!(synthetic.span.end, inner.then_block.span.end);
+}
+
+// Perspective 7: every block of a ladder has a distinct body identity.
+#[test]
+fn else_if_07_blocks_get_distinct_body_ids() {
+    let p = parse_ok("fn main() { if a { } else if b { } else if c { } else { } }");
+    let mut ids = Vec::new();
+    let mut current = Some(first_body_stmt(&p));
+    while let Some(stmt) = current {
+        let if_stmt = if_parts(stmt);
+        ids.push(if_stmt.then_block.id);
+        current = if_stmt.else_block.as_ref().and_then(|block| {
+            ids.push(block.id);
+            block.stmts.first().filter(|s| matches!(s, Stmt::If(_)))
+        });
+    }
+    assert_eq!(ids.len(), 6);
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len());
+}
+
+// Perspective 8: a rung without a condition is a parse error.
+#[test]
+fn else_if_08_missing_condition_is_an_error() {
+    assert!(!parse_errors("fn main() { if a { } else if { } }").is_empty());
+}
+
+// Perspective 9: a rung without a block reports the missing `{`.
+#[test]
+fn else_if_09_missing_block_is_an_error() {
+    let errors = parse_errors("fn main() { if a { } else if b f(); }");
+    assert!(
+        errors.iter().any(|e| e.code == ErrorCode::E0102),
+        "{errors:#?}"
+    );
+}
+
+// Perspective 10: `else` followed by anything but `if`/`{` still fails.
+#[test]
+fn else_if_10_else_followed_by_other_token_is_an_error() {
+    let errors = parse_errors("fn main() { if a { } else while b { } }");
+    assert!(
+        errors.iter().any(|e| e.code == ErrorCode::E0102),
+        "{errors:#?}"
+    );
+}
+
+// Perspective 11: a bad rung does not swallow the following statements.
+#[test]
+fn else_if_11_error_recovery_resumes_after_bad_rung() {
+    let tokens = Lexer::new("fn main() { if a { } else if { } let x = 1; }\nfn other() { }")
+        .tokenize()
+        .unwrap();
+    let (program, errors) = Parser::new(tokens).parse();
+    assert!(!errors.is_empty());
+    assert!(
+        program
+            .items
+            .iter()
+            .any(|item| matches!(item, Item::Function(function) if function.name == "other"))
+    );
+}
+
+// Perspective 12: ladders nest inside a rung's then block.
+#[test]
+fn else_if_12_ladder_inside_a_rung() {
+    let p = parse_ok(
+        "fn main() { if a { if b { } else if c { } } else if d { if e { } else if f { } } }",
+    );
+    assert_eq!(if_shape(first_body_stmt(&p)), "if(a){1}else{if(d){1}}");
+    let outer = if_parts(first_body_stmt(&p));
+    assert_eq!(
+        if_shape(&outer.then_block.stmts[0]),
+        "if(b){0}else{if(c){0}}"
+    );
+}
+
+// Perspective 13: whitespace, newlines and comments may separate the
+// `else` and `if` keywords.
+#[test]
+fn else_if_13_else_and_if_may_be_separated_by_trivia() {
+    let p = parse_ok("fn main() { if a { }\n  else\n  // why\n  if b { }\n}");
+    assert_eq!(if_shape(first_body_stmt(&p)), "if(a){0}else{if(b){0}}");
+}
+
+// Perspective 14: the ladder is a statement; the next statement follows it
+// rather than being absorbed by the last rung.
+#[test]
+fn else_if_14_statement_after_ladder_is_a_sibling() {
+    let p = parse_ok("fn main() { if a { } else if b { } g(); }");
+    let body = &first_function(&p).body.stmts;
+    assert_eq!(body.len(), 2);
+    assert_eq!(if_shape(&body[0]), "if(a){0}else{if(b){0}}");
+}
+
+// Perspective 15: the parser folds a long ladder without recursing, so a
+// ladder far deeper than the stack can hold as recursive calls still parses
+// on a small thread. Node drop is recursive, so the tree is leaked here.
+#[test]
+fn else_if_15_long_ladder_parses_on_small_stack() {
+    const RUNGS: usize = 20_000;
+    let mut source = String::from("fn main() { if x == 0 { }");
+    for index in 1..RUNGS {
+        source.push_str(&format!(" else if x == {index} {{ }}"));
+    }
+    source.push_str(" else { } }");
+    let tokens = Lexer::new(&source).tokenize().unwrap();
+    let depth = std::thread::Builder::new()
+        .name("else-if ladder on 256 KiB".into())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let (program, errors) = Parser::new(tokens).parse();
+            assert!(errors.is_empty());
+            let program = Box::leak(Box::new(program));
+            let mut depth = 0;
+            let mut current = Some(first_body_stmt(program));
+            while let Some(stmt) = current {
+                depth += 1;
+                current = if_parts(stmt)
+                    .else_block
+                    .as_ref()
+                    .and_then(|block| block.stmts.first())
+                    .filter(|s| matches!(s, Stmt::If(_)));
+            }
+            depth
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(depth, RUNGS);
+}
