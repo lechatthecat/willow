@@ -6,6 +6,7 @@ use super::*;
     lower_conditional_suspend,
     lower_for,
     lower_lock,
+    lower_lock_walk,
     lower_defer_region,
     lower_match_arm_body,
     lower_match_arms_cfg,
@@ -36,7 +37,7 @@ impl<'r> Builder<'r> {
     /// Scopes without a `defer` get no markers at all because nothing would
     /// run at their exit.
     pub(super) fn lower_scope(&mut self, stmts: &[HirStmt]) {
-        self.lower_scope_inner(stmts, None);
+        self.lower_scope_inner(stmts, None, None);
     }
 
     /// [`Self::lower_scope`], but `lock` names the critical section this scope
@@ -47,7 +48,12 @@ impl<'r> Builder<'r> {
     /// gives the critical section a cleanup block, and a panic inside the
     /// section has to release the lock on its way out even when the section
     /// defers nothing.
-    pub(super) fn lower_scope_inner(&mut self, stmts: &[HirStmt], lock: Option<LirLockSlots>) {
+    pub(super) fn lower_scope_inner(
+        &mut self,
+        stmts: &[HirStmt],
+        lock: Option<LirLockSlots>,
+        walk: Option<(&HirExpr, Span)>,
+    ) {
         // Record direct ownership for ordinary exits and the full local range
         // for recovery, which can bypass nested scopes' normal closes.
         let lexical_scope = self.scope_starts.len();
@@ -56,7 +62,10 @@ impl<'r> Builder<'r> {
             self.scope_roots.len(),
         ));
         let mut scope = std::collections::HashMap::new();
-        let sites: Vec<(LirDeferId, Span)> = stmts
+        // Traversal's outer scope owns the changing lock; user defers belong
+        // to the inner per-node scope and run before attempting the next node.
+        let scope_stmts = if walk.is_some() { &[][..] } else { stmts };
+        let sites: Vec<(LirDeferId, Span)> = scope_stmts
             .iter()
             .filter_map(|s| match s {
                 HirStmt::Defer {
@@ -85,7 +94,7 @@ impl<'r> Builder<'r> {
         // Only a scope that can actually swallow a panic continues at its
         // resume block; a scope whose defers merely run cleanup lets the panic
         // through, so it adds no edge.
-        let recovers = stmts.iter().any(|stmt| match stmt {
+        let recovers = scope_stmts.iter().any(|stmt| match stmt {
             HirStmt::Defer { id, body, .. } => self
                 .nested_defer_access
                 .as_ref()
@@ -99,12 +108,16 @@ impl<'r> Builder<'r> {
         self.push(SourceInst::EnterDeferScope {
             sites: sites.clone(),
             resume: None,
-            lock,
+            lock: lock.clone(),
         });
         self.defer_scopes.push(scope);
         self.defer_depth += 1;
         let body_start = self.blocks.len();
-        self.lower_stmts(stmts);
+        if let Some((target, span)) = walk {
+            self.lower_lock_walk(stmts, lock.as_ref().expect("walk lock slots"), target, span);
+        } else {
+            self.lower_stmts(stmts);
+        }
         self.defer_depth -= 1;
         let mut sites: Vec<_> = self
             .defer_scopes
@@ -587,6 +600,12 @@ impl<'r> Builder<'r> {
                 self.switch_to(merge_block);
             }
             HirStmt::While { cond, body, .. } => {
+                // Source flow sees the parser's ordinary loop/loan scopes;
+                // the ownership transfer itself is a dedicated CFG edge.
+                if let [lock @ HirStmt::Lock { walk: true, .. }] = body.as_slice() {
+                    self.lower_stmt(lock);
+                    return;
+                }
                 let header = self.new_block();
                 self.terminate(SourceTerminator::Jump(header));
                 self.switch_to(header);
@@ -640,6 +659,7 @@ impl<'r> Builder<'r> {
                 span,
             } => self.lower_for(name, iterable, body, *span),
             HirStmt::Lock {
+                walk,
                 additional,
                 mode,
                 target,
@@ -647,7 +667,7 @@ impl<'r> Builder<'r> {
                 body,
                 span,
                 ..
-            } => self.lower_lock(*mode, target, binding, additional, body, *span),
+            } => self.lower_lock(*mode, target, binding, additional, body, (*span, *walk)),
         }
     }
 
@@ -762,8 +782,9 @@ impl<'r> Builder<'r> {
         binding: &str,
         additional: &[crate::ir::typed_ast::HirLockTarget],
         body: &[HirStmt],
-        span: Span,
+        location: (Span, bool),
     ) {
+        let (span, walk) = location;
         if !self.is_async {
             self.lower_scope(body);
             return;
@@ -818,9 +839,57 @@ impl<'r> Builder<'r> {
             slots: slots.clone(),
             defer_depth: self.defer_depth,
         });
-        self.lower_scope_inner(body, Some(slots.clone()));
+        self.lower_scope_inner(body, Some(slots.clone()), walk.then_some((target, span)));
         self.active_locks.pop();
         self.push(SourceInst::ReleaseLock(slots));
+    }
+
+    /// One iteration has a fresh binding scope and defers. Both `continue`
+    /// and fallthrough take the same transfer edge; `break` reaches the outer
+    /// lock scope's release. Return/panic/cancel use its ordinary cleanup.
+    fn lower_lock_walk(
+        &mut self,
+        body: &[HirStmt],
+        slots: &LirLockSlots,
+        target: &HirExpr,
+        span: Span,
+    ) {
+        let entry = self.new_block();
+        let handoff = self.new_block();
+        let exit = self.new_block();
+        self.terminate(SourceTerminator::Jump(entry));
+        self.switch_to(entry);
+        self.loop_stack.push(LirLoopFrame {
+            exit,
+            next: handoff,
+            defer_depth: self.defer_depth,
+            scope_depth: self.scope_starts.len(),
+        });
+        self.lower_scope(body);
+        self.loop_stack.pop();
+        self.terminate(SourceTerminator::Jump(handoff));
+        self.switch_to(handoff);
+        // A source variable may read through a mutable-capture cell in HIR.
+        // Evaluate that storage after the iteration's defers, on every handoff,
+        // and root the loaded handle across value boxing and preemption. Plain
+        // locals already have the required slot and need no additional copy.
+        let next = if let HirExprKind::Var(name) = &target.kind {
+            self.local_by_name[name]
+        } else {
+            let name = self.synthetic_name("lock_next");
+            let next = self.push_synth_let(&name, false, target.clone());
+            self.scope_roots.push(next);
+            next
+        };
+        self.terminate(SourceTerminator::Suspend {
+            operation: SuspendOp::LockHandoff {
+                slots: slots.clone(),
+                next,
+                span,
+            },
+            resume: entry,
+        });
+        self.switch_to(exit);
     }
 
     /// Desugar `for` into a while-shaped header/body/exit with an induction

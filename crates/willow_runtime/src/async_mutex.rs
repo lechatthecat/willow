@@ -56,6 +56,8 @@ use crate::task::RuntimeTaskId;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 mod abi;
+mod handoff;
+pub use handoff::*;
 
 // Atomic admission switch. Low bits are a monotonic fast generation: odd
 // means owned, even means free. Queued contention closes atomic admission until the queue

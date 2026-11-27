@@ -149,6 +149,18 @@ edge. E2604 is needed to exclude other modeled waits while locks are held.
 Neither rule excludes channel/await deadlocks outside critical sections,
 starvation, infinite holders or native lock cycles.
 
+`lock walk` is a separate operational extension, not part of this finite-graph
+model. Its initial acquisition holds no other lock; each subsequent acquisition
+makes one nonwaiting attempt and raises a recoverable panic on failure. Such
+an attempt adds no task-wait edge. The compiler rejects lexical nesting into
+or around a walk and retains E2604 and protected-value escape checking. Thus a
+walk cannot complete a cycle of lock-acquisition waits, although an application
+can still traverse a cyclic list forever. Runtime exclusion, acquire-before-
+release and panic/cancellation cleanup are exercised by
+`tests/integration/concurrency/lock_coupling.rs` and
+`crates/willow_runtime/src/async_mutex/handoff.rs`; they are not claimed as
+machine-checked by the graph enumeration below.
+
 Machine checking enumerates all 512 graphs on three locks. A permutation-based
 rank-certificate checker is compared with E2605 on source generated from all
 graphs, independently of the compiler's SCC implementation. A separate

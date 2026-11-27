@@ -796,6 +796,10 @@ pub struct LockTarget {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct LockStmt {
+    /// Hand-over-hand traversal. The parser encloses this in a `while true`
+    /// so all source flow analyses see an ordinary loop with a fresh loan.
+    #[serde(default)]
+    pub walk: bool,
     pub additional: Vec<LockTarget>,
     pub mode: LockMode,
     pub target: Expr,

@@ -77,6 +77,11 @@ The type spelling `T?` is retained as parser sugar and means exactly
 `Option<Option<T>>`. Willow does not implicitly wrap a `T` as `Some(T)`.
 See `option_absence.wi`, `gc_linked_list.wi`, and `option_linked_chain.wi`.
 
+[lock_coupling.wi](lock_coupling.wi) traverses a linked list with `lock walk`:
+the next node is acquired before the previous node is released. A contested
+handover fails with a recoverable panic; it never parks while retaining the
+previous node. Each iteration has a fresh protected-value scope.
+
 ## `if let`, `while let` and match guards
 
 [if_let_guards.wi](if_let_guards.wi) matches a single pattern without a full

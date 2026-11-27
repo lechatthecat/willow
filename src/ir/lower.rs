@@ -1608,6 +1608,7 @@ fn lower_stmt(stmt: &Stmt, ctx: &mut LowerCtx) -> Result<HirStmt, Diagnostic> {
             ctx.deferred_callees.skipped = enclosing_skipped;
             ctx.pop_scope();
             Ok(HirStmt::Lock {
+                walk: l.walk,
                 additional,
                 mode: l.mode,
                 target,

@@ -54,6 +54,23 @@ impl TypeChecker {
     /// `emit_coop_lock`. Only `lock read` / `lock write` on an
     /// `RwLock<T>` remain behind the staged gate (E2502) until Stage 5.
     pub(in crate::semantic::type_checker) fn check_lock_stmt(&mut self, s: &LockStmt) {
+        if s.walk
+            && (s.mode != LockMode::Mutex
+                || !s.additional.is_empty()
+                || !matches!(&s.target, Expr::Var(name, ..) if name != &s.binding))
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E2601,
+                    "lock walk requires one Mutex cursor variable and a distinct value binding",
+                )
+                .with_label(Label::primary(
+                    s.header_span(),
+                    "use `lock walk cursor as value { ... }`",
+                )),
+            );
+        }
         // A target that already reported its own error (an unknown name, a bad
         // call) has a placeholder type; a second "wrong lock type" diagnostic on
         // top of it would only be noise.

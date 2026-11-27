@@ -80,6 +80,7 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
             }
         },
         HirStmt::Lock {
+            walk,
             additional,
             mode,
             target,
@@ -90,8 +91,9 @@ fn format_stmt(stmt: &HirStmt, level: usize, out: &mut String) {
         } => {
             let mutability = if *mutable { "mut " } else { "" };
             out.push_str(&format!(
-                "{} {} as {mutability}{binding}",
+                "{}{} {} as {mutability}{binding}",
                 mode.keyword(),
+                if *walk { " walk" } else { "" },
                 format_expr(target)
             ));
             for member in additional {

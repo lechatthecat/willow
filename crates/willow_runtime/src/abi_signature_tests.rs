@@ -63,6 +63,20 @@ fn scheduler_callbacks_and_frame_handles_are_native_pointers() {
 }
 
 #[test]
+fn lock_coupling_abi_preserves_pointer_offsets_and_storage_word() {
+    let _: unsafe extern "C" fn(*mut u8, i64, i64, i64, *mut u8, i64) -> i32 =
+        crate::async_mutex::willow_async_mutex_handoff;
+    assert_schema(
+        "willow_async_mutex_handoff",
+        &[Ptr, I64, I64, I64, Ptr, Word],
+        Some(I32),
+    );
+    let _: unsafe extern "C" fn(*const u8, i32, i32) =
+        crate::async_mutex::willow_async_mutex_handoff_panic;
+    assert_schema("willow_async_mutex_handoff_panic", &[Ptr, I32, I32], None);
+}
+
+#[test]
 fn parallel_mapper_is_a_managed_function_value() {
     fn mapper_alias(callback: parallel::I64Mapper) -> unsafe extern "C" fn(i64, *mut u8) -> i64 {
         callback

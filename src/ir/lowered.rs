@@ -331,6 +331,13 @@ pub enum SuspendOp {
         /// The `lock` keyword's location, for the reentrancy panic.
         span: Span,
     },
+    /// Nonwaiting next-node admission and ownership transfer, then a preemption point.
+    /// All operands are framed, including the cursor retained across value boxing.
+    LockHandoff {
+        slots: LirLockSlots,
+        next: LirLocalId,
+        span: Span,
+    },
     Preempt,
 }
 
@@ -422,6 +429,12 @@ impl SuspendOp {
                 for local in slots.all_locals() {
                     insert(local);
                 }
+            }
+            SuspendOp::LockHandoff { slots, next, .. } => {
+                for local in slots.all_locals() {
+                    insert(local);
+                }
+                insert(*next);
             }
             SuspendOp::SelectWait { operations } => {
                 for operation in operations {

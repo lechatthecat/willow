@@ -348,6 +348,7 @@ pub enum HirStmt {
         span: Span,
     },
     Lock {
+        walk: bool,
         additional: Vec<HirLockTarget>,
         mode: LockMode,
         target: HirExpr,

@@ -352,6 +352,7 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             span: *span,
         },
         HirStmt::Lock {
+            walk,
             additional,
             mode,
             target: _,
@@ -360,6 +361,7 @@ fn shallow_stmt(source: &HirStmt) -> HirStmt {
             body,
             span,
         } => HirStmt::Lock {
+            walk: *walk,
             additional: additional
                 .iter()
                 .map(|m| HirLockTarget {

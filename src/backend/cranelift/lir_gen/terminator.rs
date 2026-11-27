@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::ir::ir_variants;
+use cranelift_codegen::ir::TrapCode;
 use willow_abi::runtime_symbols::names as rt;
 
 impl<'a, 'b> FuncGen<'a, 'b> {
@@ -390,6 +391,10 @@ impl<'a, 'b> FuncGen<'a, 'b> {
                     suspends,
                     frame,
                 );
+            }
+            SuspendOp::LockHandoff { slots, next, span } => {
+                self.emit_lir_lock_handoff(function, slots, *next, *span, frame);
+                self.emit_coop_statement_safepoint(suspends, frame);
             }
             SuspendOp::AwaitTask {
                 task,
@@ -835,6 +840,60 @@ impl<'a, 'b> FuncGen<'a, 'b> {
         slots
             .locals()
             .map(|local| self.suspension.lir_frame_offsets[&local])
+    }
+
+    fn emit_lir_lock_handoff(
+        &mut self,
+        function: &LirFunction,
+        slots: &LirLockSlots,
+        next: LirLocalId,
+        span: crate::diagnostics::Span,
+        frame: cranelift_codegen::ir::Value,
+    ) {
+        let [handle_offset, token_offset, phase_offset, _] = self.lir_lock_offsets(slots);
+        let value = self.load_lir_local(function, slots.binding);
+        let word = self.emit_to_storage_word(value, &slots.value_ty);
+        // Boxing a pair can collect: reload the cursor from its rooted frame slot.
+        let next = self.load_lir_local(function, next);
+        let handle_at = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(handle_offset));
+        let token_at = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(token_offset));
+        let phase_at = self
+            .builder
+            .ins()
+            .iconst(types::I64, i64::from(phase_offset));
+        let acquired = self.emit_value_runtime_call(
+            rt::willow_async_mutex_handoff,
+            &[frame, handle_at, token_at, phase_at, next, word],
+        );
+        let owned = self.builder.create_block();
+        let failed = self.builder.create_block();
+        self.builder.ins().brif(acquired, owned, &[], failed, &[]);
+        self.builder.switch_to_block(failed);
+        self.builder.seal_block(failed);
+        let file = self.emit_string_literal(self.diagnostics.source_file);
+        let line = self.builder.ins().iconst(types::I32, span.line as i64);
+        let col = self.builder.ins().iconst(types::I32, span.col as i64);
+        self.emit_void_runtime_call(rt::willow_async_mutex_handoff_panic, &[file, line, col]);
+        self.builder.ins().trap(TrapCode::unwrap_user(1));
+        self.builder.switch_to_block(owned);
+        self.builder.seal_block(owned);
+        let handle = self.load_lir_local(function, slots.handle);
+        let token = self.load_lir_local(function, slots.token);
+        let word = self.emit_value_runtime_call(rt::willow_async_mutex_load, &[handle, token]);
+        let value = self.emit_from_storage_word(word, &slots.value_ty);
+        self.store_lir_local(function, slots.binding, value);
+        let loaded = self.builder.ins().iconst(types::I64, 1);
+        self.builder
+            .ins()
+            .store(MemFlagsData::new(), loaded, frame, phase_offset);
+        // The binding store uses the normal frame GC barrier; the runtime
+        // already published handle/token with phase zero inside NoPreemptGuard.
     }
 
     fn emit_lir_shared_normal_cleanup(

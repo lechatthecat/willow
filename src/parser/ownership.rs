@@ -568,7 +568,15 @@ clone_shell_struct!(LockTarget {
     syntax: [target]
 });
 clone_shell_struct!(LockStmt {
-    metadata: [mode, target_span, binding, binding_span, mutable, span],
+    metadata: [
+        walk,
+        mode,
+        target_span,
+        binding,
+        binding_span,
+        mutable,
+        span
+    ],
     syntax: [target, additional, body]
 });
 clone_shell_struct!(ForStmt {

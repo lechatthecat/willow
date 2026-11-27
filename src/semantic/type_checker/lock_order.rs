@@ -472,9 +472,12 @@ impl Analysis<'_> {
                             );
                         }
                     }
-                    let unknown = identities
-                        .iter()
-                        .any(|(identity, _)| identity.class.is_none());
+                    // The cursor changes between iterations. Its dynamic acquisition
+                    // is nonwaiting; ordinary nested acquisition still needs a proof.
+                    let unknown = lock.walk
+                        || identities
+                            .iter()
+                            .any(|(identity, _)| identity.class.is_none());
                     let mut nodes = Vec::new();
                     for ((identity, key), &(_, span)) in identities.into_iter().zip(&targets) {
                         let Some(class) = identity.class else {

@@ -349,6 +349,14 @@ impl Parser {
         let keyword_span = self.current_span();
         self.advance(); // `lock`
 
+        let walk = matches!(self.peek_kind(), TokenKind::Ident(word) if word == "walk")
+            && matches!(
+                self.peek_kind_at(1),
+                TokenKind::Ident(_) | TokenKind::SelfKw
+            );
+        if walk {
+            self.advance();
+        }
         let first = self.parse_lock_target()?;
         let mut additional = Vec::new();
         while self.eat(TokenKind::Comma) {
@@ -372,7 +380,8 @@ impl Parser {
         let body = result?;
         let span = keyword_span.to(body.span);
 
-        Ok(Stmt::Lock(LockStmt {
+        let lock = Stmt::Lock(LockStmt {
+            walk,
             additional,
             mode,
             target,
@@ -382,7 +391,22 @@ impl Parser {
             mutable,
             body,
             span,
-        }))
+        });
+        if walk {
+            Ok(Stmt::While(WhileStmt {
+                cond: Expr::Bool(true, keyword_span, ExprId::fresh()),
+                invariants: Vec::new(),
+                variant: None,
+                body: Block {
+                    id: BodyId::fresh(),
+                    stmts: vec![lock],
+                    span,
+                },
+                span,
+            }))
+        } else {
+            Ok(lock)
+        }
     }
 
     fn parse_lock_target(&mut self) -> Result<LockTarget, Diagnostic> {

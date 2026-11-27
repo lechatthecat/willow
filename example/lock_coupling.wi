@@ -1,0 +1,31 @@
+// Each iteration holds the current node until the next node has been acquired.
+// Update the cursor for fallthrough/continue; break finishes the traversal.
+// A competing owner or a self-link raises a recoverable panic without waiting.
+class Node {
+    pub value: i64;
+    pub next: Option<Mutex<Node>>;
+}
+
+async fn total(head: Mutex<Node>) -> i64 {
+    let mut cursor = head;
+    let mut sum = 0;
+    lock walk cursor as node {
+        sum += node.value;
+        match node.next {
+            Some(next) => { cursor = next; },
+            None => { break; }
+        }
+    }
+    return sum;
+}
+
+async fn main() {
+    let tail = Mutex::new(new Node(3, None));
+    let middle = Mutex::new(new Node(2, Some(tail)));
+    let head = Mutex::new(new Node(1, Some(middle)));
+    println(await total(head)); // 6
+    // All three locks have been released and can be acquired again.
+    lock head as a, middle as b, tail as c {
+        println(a.value + b.value + c.value); // 6
+    }
+}

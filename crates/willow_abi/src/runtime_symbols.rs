@@ -369,9 +369,12 @@ runtime_abi_schema! {
     SUSPEND; willow_async_mutex_poll => ([Ptr, I64] -> Some(I32));
     NONE; willow_async_mutex_load => ([Ptr, I64] -> Some(Word));
     NONE; willow_async_mutex_commit => ([Ptr, I64, Word] -> Some(I32));
-    NONE; willow_async_mutex_commit_release => ([Ptr, I64, Word] -> Some(I32));
-    NONE; willow_async_mutex_release => ([Ptr, I64] -> Some(I32));
-    NONE; willow_async_mutex_cancel => ([] -> Some(I32));
+    // Releasing ownership can wake a waiter and collect under scheduler GC stress.
+    ALLOC; willow_async_mutex_commit_release => ([Ptr, I64, Word] -> Some(I32));
+    ALLOC; willow_async_mutex_handoff => ([Ptr, I64, I64, I64, Ptr, Word] -> Some(I32));
+    PANIC_ALLOC; willow_async_mutex_handoff_panic => ([Ptr, I32, I32] -> None);
+    ALLOC; willow_async_mutex_release => ([Ptr, I64] -> Some(I32));
+    ALLOC; willow_async_mutex_cancel => ([] -> Some(I32));
     PANIC_ALLOC; willow_async_mutex_recursive_panic => ([Ptr, I32, I32] -> None);
     NONE; willow_async_mutex_invalid_status => ([I32, I32] -> None);
     // Scheduler-aware RwLock<T>. Mode is 1=read, 2=write;

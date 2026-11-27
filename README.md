@@ -298,6 +298,24 @@ before parking. Duplicate handles are rejected. Group acquisition is not fair
 and has no retry bound, so starvation remains possible. See the [group implementation
 and limitations](crates/willow_runtime/src/lock_group.rs).
 
+**Hand-over-hand traversal** uses `lock walk cursor as node { ... }`, where
+`cursor` is a local `Mutex<T>` variable distinct from `node`. Set `cursor` to
+the next handle in the body. Fallthrough and `continue` acquire that handle
+while the current mutex is still held, then commit/release the current mutex
+and start a fresh iteration. `break` finishes the walk; `return`, panic and
+cancellation release its current lock. Body defers run at each iteration's
+exit, before attempting the next acquisition.
+
+The initial acquisition parks normally. Every handover makes one nonwaiting
+attempt: contention, a racing acquisition, or a self-link raises a recoverable
+panic. This deliberately permits failure without proving a cycle; opposing
+walks cannot wait on each other. A longer cycle may revisit a node already
+released, so the application must choose when to stop. There is no automatic
+retry or rollback of writes. The walk holds at most two mutexes during transfer
+and one during user code. E2604 and protected-value escape checks still apply;
+nesting another lock inside a walk, or a walk inside a held lock, is rejected
+by E2605. See the [linked-list example](example/lock_coupling.wi).
+
 ### Semantic tooling for people and AI agents
 
 The CLI provides `effects`, `impact`, `refs`, `type`, `symbol`, `rename` and

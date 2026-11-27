@@ -238,7 +238,8 @@ pub(in crate::backend::cranelift) fn lir_rejection_reason(
             // HANDLE needs no check of its own: the lowerer hoisted it into a
             // `let`, which the instruction loop above already vetted.
             Terminator::Suspend {
-                operation: SuspendOp::LockAcquire { slots, span },
+                operation:
+                    SuspendOp::LockAcquire { slots, span } | SuspendOp::LockHandoff { slots, span, .. },
                 ..
             } => {
                 let value_ty = &slots.value_ty;

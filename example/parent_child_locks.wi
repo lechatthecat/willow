@@ -3,7 +3,8 @@
 // its value type, which puts every parent before every child.
 //
 // A recursive type has one lock type at every level, so its nodes cannot nest.
-// `total` walks a list with one node locked at a time instead.
+// `total` walks a list with one node locked at a time instead. For an atomic
+// handover between adjacent nodes, see lock_coupling.wi (`lock walk`).
 
 class Account {
     pub balance: Mutex<i64>;
