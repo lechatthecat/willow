@@ -62,7 +62,7 @@ pub(super) fn apply<'a>(
                     review::recorded(root).ok().flatten().as_deref()
                         == Some(&build.review_fingerprint)
                 })
-                .map(|build| build.legacy_review_fingerprint),
+                .map(|build| build.review_fingerprint),
             Err(error) => {
                 // Still fail closed, but keep the reason the review cannot be
                 // current (for example an uncovered source layout).
@@ -76,19 +76,13 @@ pub(super) fn apply<'a>(
     inputs.capture_analysis |= current.is_some();
     let mut diagnostics = Vec::new();
     for (_, symbol) in &mut declarations {
-        let valid = current.as_ref().is_some_and(|legacy| {
-            symbol.native.is_some()
-                || symbol
-                    .nonblocking
-                    .as_ref()
-                    .is_none_or(|claim| claim.fingerprint == *legacy)
-        });
+        let valid = current.is_some();
         symbol.apply_review(valid);
         if !valid && symbol.has_assumptions() {
             use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity};
             let mut diagnostic = Diagnostic::new(Severity::Error, ErrorCode::E2612,
                 format!("rust_nonblocking_review_required: external assumptions for `{}` are inactive", symbol.willow_function))
-                .with_help("Review the current sources and dependencies with `willow query rust-bridge --format json`; explicitly update rust-review.toml and any legacy nonblocking fingerprint. No claim is effective until the review is current.");
+                .with_help("Review the current sources and dependencies with `willow query rust-bridge --format json`; explicitly update rust-review.toml. No claim is effective until the review is current.");
             if let Some(error) = &inspection_error {
                 diagnostic = diagnostic.with_note(error.clone());
             }

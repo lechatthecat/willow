@@ -1,6 +1,6 @@
 //! Compiler-owned bridge boundaries. Rust internals are deliberately opaque.
 use super::*;
-use crate::rust_bridge_ir::{NonblockingReview, Record, RustBridgeSymbol, Scalar};
+use crate::rust_bridge_ir::{Record, RustBridgeSymbol, Scalar};
 use serde_json::{Value, json};
 use std::borrow::Cow;
 
@@ -10,7 +10,6 @@ pub struct InteropGraph {
     pub bridges: Vec<Bridge>,
     /// Shared conservative adapter dependency set, never duplicated per bridge.
     pub crates: Vec<RustCrateIdentity>,
-    pub rust_adapter: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,13 +126,11 @@ pub struct BridgeRecord<'a> {
     pub identity: &'a Option<SymbolIdentity>,
     #[serde(rename = "crate")]
     pub crate_identity: Option<&'a RustCrateIdentity>,
-    pub rust_adapter: &'a Option<String>,
     pub abi_symbol: &'a str,
     pub effects: u8,
     pub execution: &'static str,
     #[serde(rename = "async")]
     pub is_async: bool,
-    pub nonblocking: Option<&'a NonblockingReview>,
     pub assume_no_block: bool,
     pub no_io: bool,
     pub assumptions: BridgeAssumptions,
@@ -183,7 +180,6 @@ impl InteropGraph {
                     function: &b.function,
                     identity: &b.identity,
                     crate_identity: (self.crates.len() == 1).then(|| &self.crates[0]),
-                    rust_adapter: &self.rust_adapter,
                     abi_symbol: &b.symbol.abi_symbol,
                     effects: b.symbol.effects,
                     execution: if b.symbol.is_async {
@@ -194,15 +190,10 @@ impl InteropGraph {
                         "direct"
                     },
                     is_async: b.symbol.is_async,
-                    nonblocking: if b.symbol.native.is_some() {
-                        None
-                    } else {
-                        b.symbol.nonblocking.as_deref()
-                    },
-                    assume_no_block: b.symbol.native.is_some() && b.symbol.nonblocking.is_some(),
+                    assume_no_block: b.symbol.no_block,
                     no_io: b.symbol.no_io,
                     assumptions: BridgeAssumptions {
-                        no_block: b.symbol.nonblocking.is_some(),
+                        no_block: b.symbol.no_block,
                         no_io: b.symbol.no_io,
                     },
                     review_current: b.symbol.review_current,
@@ -221,7 +212,7 @@ impl InteropGraph {
                         start: span.start,
                         end: span.end,
                     }),
-                    trust: if b.symbol.nonblocking.is_some() || b.symbol.no_io {
+                    trust: if b.symbol.no_block || b.symbol.no_io {
                         BridgeTrust::DeveloperDeclared
                     } else {
                         BridgeTrust::Undeclared
@@ -253,7 +244,6 @@ impl InteropGraph {
             return Ok(());
         }
         let manifest = crate::project::ProjectManifest::load(&root.join("project.toml"))?;
-        self.rust_adapter = manifest.rust.as_ref().map(|r| r.bridge.clone());
         let input_hash = crate::package::lock::rust_input_hash(
             &manifest,
             crate::rust_bridge_ir::WRAPPER_SCHEMA,
@@ -579,29 +569,6 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&graph.bridges[0].symbol).unwrap(),
             original
-        );
-    }
-
-    #[test]
-    fn legacy_query_preserves_unqualified_bridge_type_names() {
-        use crate::rust_bridge_ir::{RustBridgeSymbol, Scalar};
-        let graph = InteropGraph {
-            bridges: vec![Bridge {
-                function: "legacy-id".into(),
-                identity: None,
-                declaration: vec![],
-                declaration_text: String::new(),
-                symbol: RustBridgeSymbol::new(
-                    "legacy::read".into(),
-                    vec![Scalar::Opaque("Handle".into())],
-                    Scalar::String,
-                ),
-            }],
-            ..Default::default()
-        };
-        assert_eq!(
-            graph.query(None)["bridges"][0]["signature"]["inputs"],
-            json!([{"Opaque": "Handle"}])
         );
     }
 

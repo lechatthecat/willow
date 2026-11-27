@@ -20,7 +20,7 @@ impl Fixture {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_bridge/path");
         for file in [
             "project.toml",
-            "bridge.rs",
+            "src/native.rs",
             "native/Cargo.toml",
             "native/src/lib.rs",
         ] {
@@ -33,7 +33,7 @@ impl Fixture {
     }
     fn sources(&self, willow: &str, rust: &str) {
         fs::write(self.root.join("src/main.wi"), willow).unwrap();
-        fs::write(self.root.join("bridge.rs"), rust).unwrap();
+        fs::write(self.root.join("src/native.rs"), rust).unwrap();
     }
     fn command(&self, args: &[&str]) -> Output {
         self.command_env(args, &[])
@@ -83,7 +83,10 @@ impl Drop for Fixture {
 #[test]
 fn async_bridge_scalar_smoke() {
     let f = Fixture::new();
-    f.sources("extern rust { async fn add(a: i64, b: i64) -> i64; } async fn main() { println(await add(20,22)); }", "pub async fn add(a:i64,b:i64)->i64 { a+b }");
+    f.sources(
+        "import native::add; async fn main() { println(await add(20,22)); }",
+        "pub async fn add(a:i64,b:i64)->i64 { a+b }",
+    );
     let result = f.successful(&["run", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&result.stdout), "42\n");
 }
@@ -94,26 +97,8 @@ fn async_bridge_owned_values_under_moving_gc() {
     f.sources(
         r#"
 import std::collections;
-extern rust {
-    async fn integer(x: i64) -> i64;
-    async fn float(x: f64) -> f64;
-    async fn boolean(x: bool) -> bool;
-    async fn touch();
-    async fn text(x: String) -> String;
-    async fn bytes(x: Array<u8>) -> Array<u8>;
-    async fn texts(x: Array<String>) -> Array<String>;
-    async fn floats(x: Array<f64>) -> Array<f64>;
-    async fn bools(x: Array<bool>) -> Array<bool>;
-    async fn optional(x: Option<i64>) -> Option<i64>;
-    async fn nested(x: Option<Option<String>>) -> Option<Option<String>>;
-    async fn pair(x: Result<i64,bool>) -> Result<i64,bool>;
-    async fn result(x: Result<String,String>) -> Result<String,String>;
-    opaque Resource;
-    async fn make() -> Resource;
-    async fn read(r: Resource) -> i64;
-    class Packet { pub text: String; pub number: i64; }
-    async fn packet(p: Packet) -> Packet;
-}
+import native::{integer, float, boolean, touch, text, bytes, texts, floats,
+    bools, optional, nested, pair, result, make, packet, Packet};
 async fn main() {
     println(await integer(-9223372036854775807) == -9223372036854775807);
     println(await float(2.5) == 2.5);
@@ -133,7 +118,7 @@ async fn main() {
     println((await pair(Err(true))).is_err());
     println((await result(Ok("ok"))).unwrap() == "ok");
     println((await result(Err("error"))).is_err());
-    let r = await make(); println(await read(r) == 42);
+    use r = await make(); println(await r.read() == 42);
     let p = await packet(new Packet("record",42)); println(p.text == "record" && p.number == 42);
 }
 "#,
@@ -153,10 +138,9 @@ pub async fn pair(x:Result<i64,bool>)->Result<i64,bool>{x}
 pub async fn result(x:Result<String,String>)->Result<String,String>{x}
 pub struct Resource(i64);
 pub async fn make()->Box<Resource>{Box::new(Resource(42))}
-pub async fn read(r:crate::AsyncHandle<Resource>)->i64{r.0}
-pub async fn packet(p:crate::record_owned::Packet)->crate::record_outputs::Packet {
-    crate::records::Packet {text:p.text,number:p.number}
-}
+impl Resource { pub async fn read(&self)->i64{self.0} }
+pub struct Packet { pub text: String, pub number: i64 }
+pub async fn packet(p:Packet)->Packet { p }
 "#,
     );
     let result = f.command_env(
@@ -174,7 +158,7 @@ pub async fn packet(p:crate::record_owned::Packet)->crate::record_outputs::Packe
 #[test]
 fn async_bridge_diagnostics_and_query() {
     let f = Fixture::new();
-    let decl = "extern rust { async fn touch(); }";
+    let decl = "import native::touch;";
     for (body, code) in [
         ("fn main() { touch(); }", "E0801"),
         ("fn helper() { touch(); } fn main() { helper(); }", "E0801"),
@@ -207,7 +191,7 @@ fn async_bridge_diagnostics_and_query() {
         );
     }
     f.sources(
-        "extern rust native { async fn touch(); } fn main() { native::touch(); }",
+        "import native; fn main() { native::touch(); }",
         "pub async fn touch() {}",
     );
     let output = f.command(&["check", "."]);
@@ -232,18 +216,16 @@ fn async_bridge_diagnostics_and_query() {
 fn async_bridge_worker_progress_and_cancel_drop() {
     let f = Fixture::new();
     f.sources(r#"
-extern rust {
-    async fn pending() -> i64;
-    async fn started() -> bool;
-    async fn drops() -> i64;
-}
-async fn heartbeat() -> i64 { await sleep(1); return 42; }
+import native::{pending, started, drops, drop_started, release_drop};
+async fn heartbeat() -> i64 { await yield(); return 42; }
 async fn main() {
     let task = pending();
-    while !(await started()) { await sleep(1); }
+    while !(await started()) { await yield(); }
     println(await heartbeat());
     task.cancel();
+    while !drop_started() { await yield(); }
     println(await heartbeat());
+    release_drop();
     await task.result();
     println(await drops());
 }
@@ -251,6 +233,9 @@ async fn main() {
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 static STARTED: AtomicBool = AtomicBool::new(false);
 static DROPS: AtomicI64 = AtomicI64::new(0);
+static DROP_STARTED: AtomicBool = AtomicBool::new(false);
+static RELEASE_DROP: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
 struct Pending;
 impl std::future::Future for Pending {
     type Output = i64;
@@ -259,7 +244,22 @@ impl std::future::Future for Pending {
         std::task::Poll::Pending
     }
 }
-impl Drop for Pending { fn drop(&mut self) { std::thread::sleep(std::time::Duration::from_millis(30)); DROPS.fetch_add(1,Ordering::SeqCst); } }
+impl Drop for Pending {
+    fn drop(&mut self) {
+        DROP_STARTED.store(true, Ordering::SeqCst);
+        let (released, _) = RELEASE_DROP.1.wait_timeout_while(
+            RELEASE_DROP.0.lock().unwrap(), std::time::Duration::from_secs(30),
+            |released| !*released,
+        ).unwrap();
+        assert!(*released, "scheduler failed to release the destructor");
+        DROPS.fetch_add(1, Ordering::SeqCst);
+    }
+}
+pub fn drop_started()->bool { DROP_STARTED.load(Ordering::SeqCst) }
+pub fn release_drop() {
+    *RELEASE_DROP.0.lock().unwrap() = true;
+    RELEASE_DROP.1.notify_one();
+}
 pub async fn pending()->i64 { Pending.await }
 pub async fn started()->bool { STARTED.load(Ordering::SeqCst) }
 pub async fn drops()->i64 { DROPS.load(Ordering::SeqCst) }
@@ -277,7 +277,7 @@ pub async fn drops()->i64 { DROPS.load(Ordering::SeqCst) }
 fn async_bridge_poll_panic_is_a_willow_error() {
     let f = Fixture::new();
     f.sources(
-        "extern rust { async fn fail() -> i64; } async fn main() { println(await fail()); }",
+        "import native::fail; async fn main() { println(await fail()); }",
         "pub async fn fail()->i64 { panic!(\"future failure\") }",
     );
     let output = f.command(&["run", "--offline"]);
@@ -296,7 +296,7 @@ fn async_bridge_pull_example() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_async_pull");
     for file in [
         "project.toml",
-        "bridge.rs",
+        "src/native.rs",
         "native/Cargo.toml",
         "native/src/lib.rs",
         "src/main.wi",
@@ -315,10 +315,10 @@ fn async_bridge_cancel_destructor_panic_is_a_willow_error() {
     let f = Fixture::new();
     f.sources(
         r#"
-extern rust { async fn pending(); async fn started() -> bool; }
+import native::{pending, started};
 async fn main() {
     let task = pending();
-    while !(await started()) { await sleep(1); }
+    while !(await started()) { await yield(); }
     task.cancel();
     await task.result();
 }
@@ -391,7 +391,7 @@ fn async_bridge_many_pending_futures_resume_without_lost_wakes() {
     f.sources(
         r#"
 import std::collections::Array;
-extern rust { async fn wait(n: i64)->i64; async fn release(); }
+import native::{wait, release};
 async fn main() {
     let tasks: Array<Task<i64>> = [];
     for n in 0..256 { tasks.push(wait(n)); }
@@ -440,36 +440,57 @@ pub async fn release() {
 }
 
 #[test]
-fn async_bridge_rejects_borrowed_inputs_and_non_send_futures() {
+fn async_bridge_borrowed_native_inputs_keep_owned_storage() {
     let f = Fixture::new();
-    for (declaration, call, rust, diagnostic) in [
-        (
-            "async fn text(s: String) -> String;",
-            "text(\"owned\")",
-            "pub async fn text(s:&str)->String {s.to_owned()}",
-            "mismatched types",
-        ),
-        (
-            "async fn hold() -> i64;",
-            "hold()",
-            "pub async fn hold()->i64 {let value=std::rc::Rc::new(42); std::future::pending::<()>().await; *value}",
-            "cannot be sent",
-        ),
-    ] {
-        f.sources(
-            &format!(
-                "extern rust {{ {declaration} }} async fn main() {{ println(await {call}); }}"
-            ),
-            rust,
-        );
-        let output = f.command(&["build", "--offline"]);
-        assert!(!output.status.success());
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(diagnostic),
-            "{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    f.sources(
+        r#"import native::{text, bytes}; async fn main() {
+            let text_task = text("owned 日本語");
+            let byte_task = bytes([0,128,255]);
+            await yield();
+            println(await text_task);
+            println((await byte_task)[2] == 255);
+        }"#,
+        r#"
+async fn suspend_once() {
+    let mut pending = true;
+    std::future::poll_fn(|cx| {
+        if pending { pending = false; cx.waker().wake_by_ref(); std::task::Poll::Pending }
+        else { std::task::Poll::Ready(()) }
+    }).await
+}
+pub async fn text(s:&str)->String { suspend_once().await; s.to_owned() }
+pub async fn bytes(s:&[u8])->Vec<u8> { suspend_once().await; s.to_vec() }
+"#,
+    );
+    let output = f.command_env(
+        &["run", "--offline"],
+        &[("WILLOW_GC_STRESS", "alloc,scheduler,relocate")],
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        "owned 日本語\ntrue\n"
+    );
+}
+
+#[test]
+fn async_bridge_rejects_non_send_futures() {
+    let f = Fixture::new();
+    f.sources(
+        "import native::hold; async fn main() { println(await hold()); }",
+        "pub async fn hold()->i64 {let value=std::rc::Rc::new(42); std::future::pending::<()>().await; *value}",
+    );
+    let output = f.command(&["build", "--offline"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("cannot be sent"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]
@@ -478,27 +499,38 @@ fn async_bridge_owned_record_aliases_do_not_shadow_native_types() {
     f.sources(
         r#"
 import std::collections::Array;
-extern rust {
-    class usize { pub values: Array<i64>; }
-    class Vec { pub values: Array<String>; }
-    async fn bytes(v: usize) -> usize;
-    async fn texts(v: Vec) -> Vec;
-}
+import native::{bytes, texts, usize, Texts};
 async fn main() {
     let a = await bytes(new usize([0,255]));
-    let b = await texts(new Vec(["owned"]));
+    let b = await texts(new Texts(["owned"]));
     println(a.values[1] == 255 && b.values[0] == "owned");
 }
 "#,
         r#"
-pub async fn bytes(v: crate::record_owned::usize)->crate::record_outputs::usize {
-    crate::records::usize { values:v.values }
-}
-pub async fn texts(v: crate::record_owned::Vec)->crate::record_outputs::Vec {
-    crate::records::Vec { values:v.values }
-}
+#[allow(non_camel_case_types)]
+pub struct usize { pub values: std::vec::Vec<i64> }
+pub struct Texts { pub values: std::vec::Vec<String> }
+pub async fn bytes(v: usize)->usize { v }
+pub async fn texts(v: Texts)->Texts { v }
 "#,
     );
     let output = f.successful(&["run", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
+}
+
+#[test]
+fn async_bridge_reserved_record_names_are_diagnosed() {
+    let f = Fixture::new();
+    f.sources(
+        "import native; async fn main() {}",
+        "pub struct Vec { pub values: std::vec::Vec<String> } pub async fn texts(v: Vec)->Vec { v }",
+    );
+    let output = f.command(&["check", "--offline"]);
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("public struct name conflicts with a bridge builtin type"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

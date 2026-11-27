@@ -7264,7 +7264,16 @@ fn io_contract_effect_queries_report_external_access() {
         }
     }
     let foreign = |annotation: &str| {
-        fs::write(f.0.join("src/main.wi"), format!("extern rust {{ {annotation} fn foreign(); }} fn relay() {{ foreign(); }} fn main() {{}}")).unwrap();
+        fs::write(
+            f.0.join("src/native.rs"),
+            format!("{annotation} pub fn foreign() {{}}"),
+        )
+        .unwrap();
+        fs::write(
+            f.0.join("src/main.wi"),
+            "import native::foreign; fn relay() { foreign(); } fn main() {}",
+        )
+        .unwrap();
     };
     foreign("");
     let value = f.json(&["effects", "main::relay"], 1);
@@ -7277,7 +7286,7 @@ fn io_contract_effect_queries_report_external_access() {
     assert_eq!(fact["state"], "unknown", "{value}");
     // An unreviewed external `no_io` claim is never evidence: the query fails
     // closed instead of reporting `none`.
-    foreign("@effects(no_io)");
+    foreign("#[willow::assume(no_io)]");
     let output = f.run(&["effects", "main::relay", "--format", "json"]);
     assert_eq!(output.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&output.stderr);

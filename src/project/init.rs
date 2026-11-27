@@ -28,7 +28,6 @@ pub fn manifest(name: &str) -> Result<String> {
             manifest_version: 1,
         }),
         rust_dependencies: BTreeMap::new(),
-        rust: None,
         native: None,
     }
     .validate()

@@ -17,7 +17,6 @@ source = Path(__file__).resolve().parent
 root.mkdir(parents=True, exist_ok=True)
 for name in ["src", "adapter"]:
     shutil.copytree(source / name, root / name, dirs_exist_ok=True)
-shutil.copyfile(source / "bridge.rs", root / "bridge.rs")
 artifact = root / "artifacts"
 artifact.mkdir(exist_ok=True)
 host = next(line[6:] for line in subprocess.check_output(["rustc", "-vV"], text=True).splitlines() if line.startswith("host: "))
@@ -73,8 +72,6 @@ name = "native_library"
 version = "0.1.0"
 [rust-dependencies]
 native_adapter = {{ path = "adapter" }}
-[rust]
-bridge = "bridge.rs"
 [native]
 roots = ["addition"]
 reproducible = {str(not args.shared).lower()}

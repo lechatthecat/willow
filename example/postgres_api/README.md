@@ -62,7 +62,7 @@ Run focused codec tests with:
 cargo test --manifest-path example/postgres_api/Cargo.toml pg_
 ```
 
-The reviewed nonblocking fingerprints cover this bridge and the dependency set.
-After changing either bridge, inspect `willow query rust-bridge --project-dir
-example/postgres_api` and refresh the declarations after review. The shared TLS
-bridge also has declarations in `example/https_api` which must remain current.
+`src/native.rs` supplies the imported Rust types and inherent methods. `use`
+bindings release handles on success, error and cancellation. Calls use the default
+bounded Rust blocking pool; these examples require no direct-call assertions or
+review fingerprints in Willow source.

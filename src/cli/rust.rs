@@ -9,6 +9,43 @@ use willow_compiler::toolchain::rust_bridge_build::commands::{self, Mutation};
 use willow_compiler::toolchain::rust_bridge_build::{BridgeOptions, build_bridge, inspect_bridge};
 use willow_compiler::{BuildMode, CompilerOptions, toolchain::HostToolchain};
 
+struct WillowDiagnostics {
+    human: bool,
+    values: Vec<Value>,
+}
+
+impl willow_compiler::diagnostics::DiagnosticEmitter for WillowDiagnostics {
+    fn emit(
+        &mut self,
+        diagnostic: &willow_compiler::diagnostics::Diagnostic,
+        sources: &dyn willow_compiler::diagnostics::source_map::SourceLookup,
+    ) -> std::io::Result<()> {
+        if self.human {
+            return willow_compiler::diagnostics::HumanEmitter.emit(diagnostic, sources);
+        }
+        let mut value = serde_json::to_value(diagnostic).map_err(std::io::Error::other)?;
+        value["severity"] = json!(diagnostic.severity.as_str());
+        for (label, location) in value["labels"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&diagnostic.labels)
+        {
+            label["path"] = json!(sources.display_path(location.span.file_id));
+        }
+        for (fix, location) in value["fix_suggestions"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .zip(&diagnostic.fix_suggestions)
+        {
+            fix["path"] = json!(sources.display_path(location.span.file_id));
+        }
+        self.values.push(value);
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct RustCommand {
     operation: String,
@@ -19,7 +56,7 @@ pub(super) struct RustCommand {
     mutation: Option<Box<Mutation>>,
 }
 
-/// Native-only projects have no legacy bridge setting. Discover presence using
+/// Discover native source presence using
 /// directory entries only; signature derivation owns the one source read.
 fn has_native_sources(root: &std::path::Path) -> Result<bool> {
     if !root.is_dir() {
@@ -180,6 +217,7 @@ impl RustCommand {
         root: &std::path::Path,
         snapshot: &mut willow_compiler::ai::Snapshot,
         enabled: bool,
+        diagnostics: &WillowDiagnostics,
     ) -> Result<()> {
         self.options.read_only = true;
         let has_native_sources = snapshot.sources.keys().any(|path| {
@@ -189,31 +227,44 @@ impl RustCommand {
         });
         let graph = &mut snapshot.semantic.interop;
         let mut review = None;
-        let mut legacy_review = None;
-        let has_legacy = self
-            .options
-            .symbols
-            .iter()
-            .any(|symbol| symbol.native.is_none());
         let has_claim = self.options.symbols.iter().any(|s| s.has_assumptions());
         let recorded = willow_compiler::toolchain::rust_bridge_build::review::recorded(root)?;
-        if enabled && (!has_native_sources || has_legacy || has_claim || recorded.is_some()) {
+        if enabled && (!has_native_sources || has_claim || recorded.is_some()) {
             let build =
                 inspect_bridge(project, root, &self.options)?.context("Rust bridge missing")?;
             graph.resolved_crates(&build.direct_dependencies)?;
-            legacy_review = Some(build.legacy_review_fingerprint);
             review = Some(build.review_fingerprint);
         }
         let mut value = graph.query(self.selector.as_deref());
         value["review_fingerprint"] = serde_json::json!(review);
-        if has_legacy && (has_claim || recorded.is_some()) {
-            value["legacy_review_fingerprint"] = serde_json::json!(legacy_review);
-        }
+        value["willow_diagnostics"] = json!(diagnostics.values);
         super::write_machine_output(&value)?;
         Ok(())
     }
 
-    pub(super) fn execute(mut self) -> Result<i32> {
+    pub(super) fn execute(self) -> Result<i32> {
+        use willow_compiler::package::CommandErrorFamily;
+        let family = match self.operation.as_str() {
+            "doctor" => CommandErrorFamily::Doctor,
+            "rust-bridge" => CommandErrorFamily::Query,
+            _ => CommandErrorFamily::Rust,
+        };
+        let mut diagnostics = WillowDiagnostics {
+            human: self.format == OutputFormat::Human,
+            values: Vec::new(),
+        };
+        match self.execute_with_diagnostics(&mut diagnostics) {
+            Err(error) if !diagnostics.human && !diagnostics.values.is_empty() => {
+                let mut value = family.render(&error);
+                value["error"]["willow_diagnostics"] = json!(diagnostics.values);
+                super::write_machine_output(&value)?;
+                Ok(1)
+            }
+            result => result,
+        }
+    }
+
+    fn execute_with_diagnostics(mut self, diagnostics: &mut WillowDiagnostics) -> Result<i32> {
         let directory = std::fs::canonicalize(&self.directory)?;
         let (_, root) =
             project::find_project_manifest(&directory).context("no project.toml found")?;
@@ -240,12 +291,9 @@ impl RustCommand {
                 Some(root.clone()),
             );
             let snapshot = if self.operation == "rust-bridge" {
-                session
-                    .analysis_for_verification(&mut willow_compiler::diagnostics::HumanEmitter)?
+                session.analysis_for_verification(diagnostics)?
             } else {
-                session.analysis_for_edit_with_emitter(
-                    &mut willow_compiler::diagnostics::HumanEmitter,
-                )?
+                session.analysis_for_edit_with_emitter(diagnostics)?
             };
             self.options.symbols = snapshot.semantic.rust_bridges.clone();
             Some(snapshot)
@@ -265,6 +313,7 @@ impl RustCommand {
                     .as_mut()
                     .context("query rust-bridge requires Willow sources")?,
                 enabled,
+                diagnostics,
             )?;
             return Ok(0);
         }
@@ -332,7 +381,7 @@ impl RustCommand {
             if let Some(build) = build {
                 value["toolchain"] = json!({"cargo":build.toolchain.cargo_version, "rustc":build.toolchain.rustc_version});
                 value["direct_dependencies"] = build.direct_dependencies;
-                value["bridge"] = json!({"source":project.rust.as_ref().map(|rust|rust.resolve_bridge(&root)).transpose()?, "artifact":build.staticlib,
+                value["bridge"] = json!({"artifact":build.staticlib,
                     "manifest":build.directory.join("Cargo.toml")});
                 value["diagnostics"] = json!(build.messages.diagnostics);
                 if self.operation == "tree" {
@@ -404,6 +453,7 @@ impl RustCommand {
                 }
             }
         } else {
+            value["willow_diagnostics"] = json!(diagnostics.values);
             super::write_machine_output(&value)?;
         }
         Ok(i32::from(value["ok"] == false))

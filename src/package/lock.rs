@@ -43,12 +43,7 @@ pub(crate) fn rust_input_hash(
     abi_revision: &str,
 ) -> Result<String> {
     use sha2::{Digest, Sha256};
-    let rust = (
-        &project.rust_dependencies,
-        &project.rust,
-        wrapper_schema,
-        abi_revision,
-    );
+    let rust = (&project.rust_dependencies, wrapper_schema, abi_revision);
     // A foreign assertion also covers native code reached through the adapter.
     // Bind its pinned artifacts and link configuration to the same review.
     // Keep projects without native libraries on their existing review identity.
@@ -753,9 +748,7 @@ mod review_input_tests {
         use sha2::{Digest, Sha256};
         let mut project: crate::project::ProjectManifest =
             toml::from_str("[project]\nname='review_inputs'\nversion='0.1.0'\n").unwrap();
-        let legacy =
-            serde_json::to_vec(&(&project.rust_dependencies, &project.rust, "wrapper", "abi"))
-                .unwrap();
+        let legacy = serde_json::to_vec(&(&project.rust_dependencies, "wrapper", "abi")).unwrap();
         let rust_only = rust_input_hash(&project, "wrapper", "abi").unwrap();
         assert_eq!(
             rust_only,

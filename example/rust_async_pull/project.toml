@@ -3,5 +3,3 @@ name = "rust_async_pull"
 version = "0.1.0"
 [rust-dependencies]
 event_source = { path = "native" }
-[rust]
-bridge = "bridge.rs"

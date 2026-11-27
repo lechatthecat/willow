@@ -400,16 +400,19 @@ fn native_modules_execute_all_bridge_shapes_and_share_a_locked_crate() {
 }
 
 #[test]
-fn native_and_legacy_bridges_coexist_without_redeclarations() {
+fn native_modules_share_one_project_without_redeclarations() {
     let fixture = Fixture::new();
     fixture.write(
         "project.toml",
-        "[project]\nname = \"coexist\"\nversion = \"0.1.0\"\n[rust]\nbridge = \"bridge.rs\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n",
+        "[project]\nname = \"coexist\"\nversion = \"0.1.0\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n",
     );
     fixture.local_dependency();
-    fixture.write("bridge.rs", "pub fn legacy() -> i64 { 7 }");
+    fixture.write("src/extra.rs", "pub fn legacy() -> i64 { 7 }");
     fixture.write("src/native.rs", "pub fn answer() -> i64 { 35 }");
-    fixture.write("src/main.wi", "import native; extern rust { fn legacy() -> i64; } fn main() { println(native::answer() + legacy()); }");
+    fixture.write(
+        "src/main.wi",
+        "import native; import extra::legacy; fn main() { println(native::answer() + legacy()); }",
+    );
     let run = fixture.success(&["run", ".", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
     let lock = fs::read(fixture.root.join("project.lock")).unwrap();
@@ -471,97 +474,51 @@ fn native_module_symlinks_cannot_create_duplicate_source_identities() {
 }
 
 #[test]
-fn native_modules_preserve_legacy_nonblocking_review_recovery() {
-    let fixture = Fixture::new();
-    fixture.write(
-        "project.toml",
-        "[project]\nname=\"mixed_review\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"bridge.rs\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n",
+fn native_modules_share_review_recovery_across_sources() {
+    let f = Fixture::new();
+    f.write(
+        "src/extra.rs",
+        "#[willow::assume(no_block)] pub fn value()->i64 { 7 }",
     );
-    fixture.local_dependency();
-    fixture.write("bridge.rs", "pub fn legacy() -> i64 { 7 }");
-    fixture.write("src/native.rs", "pub fn answer() -> i64 { 35 }");
-    // Inspection discovers this module; executable builds do not import it.
-    fixture.write("src/spare.rs", "pub fn unused() -> i64 { 123 }");
-    fixture.write(
-        "src/spare_user.wi",
-        "import spare; pub fn unused() -> i64 { return spare::unused(); }",
+    f.write("src/native.rs", "pub fn answer()->i64 { 35 }");
+    f.write("src/spare.rs", "pub fn unused()->i64 { 123 }");
+    f.write(
+        "src/main.wi",
+        "import native; import extra; fn main(){println(native::answer()+extra::value());}",
     );
-    let entry = |fingerprint: &str| {
-        format!(
-            "import native; extern rust {{ nonblocking(\"{fingerprint}\") fn legacy() -> i64; }} fn main() {{ println(native::answer() + legacy()); }}"
-        )
-    };
-    fixture.write("src/main.wi", &entry(&"0".repeat(64)));
-    let review = || {
-        let value = fixture.review_query();
+    let first = f.approve_native();
+    assert_eq!(f.success(&["run", ".", "--offline"]).stdout, b"42\n");
+    for (path, body, expected) in [
+        ("src/native.rs", "pub fn answer()->i64 { 36 }", b"43\n"),
         (
-            value["review_fingerprint"].as_str().unwrap().to_owned(),
-            value["legacy_review_fingerprint"]
-                .as_str()
-                .unwrap()
-                .to_owned(),
-        )
-    };
-    let approve = |fingerprint: &str| {
-        fixture.write(
-            "rust-review.toml",
-            &format!("fingerprint = \"{fingerprint}\"\n"),
-        );
-    };
-    let run_fails_review = || {
-        let stale = fixture
-            .command(&["run", ".", "--offline"])
-            .output()
-            .unwrap();
+            "src/extra.rs",
+            "#[willow::assume(no_block)] pub fn value()->i64 { 8 }",
+            b"44\n",
+        ),
+        ("src/spare.rs", "pub fn unused()->i64 { 124 }", b"44\n"),
+    ] {
+        f.write(path, body);
+        let stale = f.command(&["check", ".", "--offline"]).output().unwrap();
         assert!(!stale.status.success());
         assert!(
             String::from_utf8_lossy(&stale.stderr).contains("rust_nonblocking_review_required")
         );
-    };
-    let first = review();
-    fixture.write("src/main.wi", &entry(&first.1));
-    // The inline legacy claim covers the legacy bridge; the shared record
-    // covers every Rust module. Both must be current.
-    run_fails_review();
-    approve(&first.0);
-    assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"42\n");
-    fixture.write("src/native.rs", "pub fn answer() -> i64 { 36 }");
-    let native_edit = review();
-    assert_eq!(native_edit.1, first.1);
-    assert_ne!(native_edit.0, first.0);
-    run_fails_review();
-    approve(&native_edit.0);
-    assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"43\n");
-    fixture.write("bridge.rs", "pub fn legacy() -> i64 { 8 }");
-    let second = review();
-    assert_ne!(first.1, second.1);
-    approve(&second.0);
-    run_fails_review();
-    fixture.write("src/main.wi", &entry(&second.1));
-    assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"44\n");
-    fixture.write("src/native.rs", "pub struct Data { pub value: i64 }");
-    fs::remove_file(fixture.root.join("src/spare.rs")).unwrap();
-    fs::remove_file(fixture.root.join("src/spare_user.wi")).unwrap();
-    let legacy_only = |fingerprint: &str| {
-        format!(
-            "import native; extern rust {{ nonblocking(\"{fingerprint}\") fn legacy() -> i64; }} fn main() {{ println(legacy()); }}"
-        )
-    };
-    fixture.write("src/main.wi", &legacy_only(&second.1));
-    // Removing a discovered module changes the crate both reviews describe.
-    let third = review();
-    approve(&third.0);
-    fixture.write("src/main.wi", &legacy_only(&third.1));
-    assert_eq!(review(), third);
-    assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"8\n");
+        assert_ne!(f.approve_native(), first);
+        assert_eq!(f.success(&["run", ".", "--offline"]).stdout, expected);
+    }
+    fs::remove_file(f.root.join("src/spare.rs")).unwrap();
+    let stale = f.command(&["check", ".", "--offline"]).output().unwrap();
+    assert!(!stale.status.success());
+    f.approve_native();
+    assert_eq!(f.success(&["run", ".", "--offline"]).stdout, b"44\n");
 }
 
 #[test]
 fn native_inspection_preserves_resolution_with_discovery_only_modules() {
     let fixture = Fixture::new();
-    fixture.write("project.toml", "[project]\nname=\"discovery\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"bridge.rs\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n");
+    fixture.write("project.toml", "[project]\nname=\"discovery\"\nversion=\"0.1.0\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n");
     fixture.local_dependency();
-    fixture.write("bridge.rs", "pub fn legacy() -> i64 { 7 }");
+    fixture.write("src/extra.rs", "pub fn legacy() -> i64 { 7 }");
     fixture.write("src/native.rs", "pub fn answer() -> i64 { 35 }");
     fixture.write(
         "src/unused.wi",
@@ -569,7 +526,7 @@ fn native_inspection_preserves_resolution_with_discovery_only_modules() {
     );
     fixture.write(
         "src/main.wi",
-        "extern rust { fn legacy() -> i64; } fn main() { println(legacy()); }",
+        "import extra::legacy; fn main() { println(legacy()); }",
     );
     assert_eq!(fixture.success(&["run", ".", "--offline"]).stdout, b"7\n");
     let original = fs::read(fixture.root.join("project.lock")).unwrap();
@@ -591,9 +548,9 @@ fn native_inspection_preserves_resolution_with_discovery_only_modules() {
 }
 
 #[test]
-fn native_presence_probe_preserves_legacy_metadata_without_willow_entry() {
+fn native_presence_probe_preserves_metadata_without_willow_entry() {
     let fixture = Fixture::new();
-    fixture.write("project.toml", "[project]\nname=\"rust_metadata\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"src/bridge.rs\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n");
+    fixture.write("project.toml", "[project]\nname=\"rust_metadata\"\nversion=\"0.1.0\"\n[rust-dependencies]\nnative_probe = { path = \"dependency\" }\n");
     fixture.local_dependency();
     fixture.write("src/bridge.rs", "pub fn legacy() -> i64 { 7 }");
     for (operation, flag) in [("metadata", "--offline"), ("tree", "--frozen")] {
@@ -881,20 +838,50 @@ fn native_assume_macro_supports_standalone_rustc_and_cargo() {
 #[test]
 fn native_assume_example_runs() {
     let f = Fixture::new();
-    f.write(
-        "src/main.wi",
-        include_str!("../example/rust_assume/src/main.wi"),
-    );
-    f.write(
-        "src/native.rs",
-        include_str!("../example/rust_assume/src/native.rs"),
-    );
-    f.write(
-        "rust-review.toml",
-        include_str!("../example/rust_assume/rust-review.toml"),
-    );
-    let output = f.success(&["run", ".", "--offline"]);
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n42\n");
+    // Exercise the shipped inputs in isolation, without issuing a new review.
+    let inputs = [
+        (
+            "project.toml",
+            include_str!("../example/rust_assume/project.toml"),
+        ),
+        (
+            "project.lock",
+            include_str!("../example/rust_assume/project.lock"),
+        ),
+        (
+            ".willow/rust/Cargo.lock",
+            include_str!("../example/rust_assume/.willow/rust/Cargo.lock"),
+        ),
+        (
+            "src/main.wi",
+            include_str!("../example/rust_assume/src/main.wi"),
+        ),
+        (
+            "src/native.rs",
+            include_str!("../example/rust_assume/src/native.rs"),
+        ),
+        (
+            "rust-review.toml",
+            include_str!("../example/rust_assume/rust-review.toml"),
+        ),
+    ];
+    for (path, source) in inputs {
+        f.write(path, source);
+    }
+    for args in [
+        &["run", ".", "--offline", "--locked"][..],
+        &["run", ".", "--offline"][..],
+    ] {
+        let output = f.success(args);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n42\n");
+        for (path, source) in inputs {
+            assert_eq!(
+                fs::read_to_string(f.root.join(path)).unwrap(),
+                source,
+                "{path} changed during execution"
+            );
+        }
+    }
 }
 
 #[test]
@@ -951,44 +938,34 @@ fn native_assume_external_sources_fail_closed() {
 }
 
 #[test]
-fn native_assume_external_sources_in_unused_and_legacy_files_fail_closed() {
-    for mixed_legacy in [false, true] {
-        let f = Fixture::new();
-        f.write(
-            "src/main.wi",
-            "import native; fn main() { println(native::answer()); }",
+fn native_assume_external_sources_in_unused_files_fail_closed() {
+    let f = Fixture::new();
+    f.write(
+        "src/main.wi",
+        "import native; fn main() { println(native::answer()); }",
+    );
+    f.write(
+        "src/native.rs",
+        "#[willow::assume(no_block)] pub fn answer() -> i64 { 42 }",
+    );
+
+    let record = f.approve_native();
+    let path = "src/unused.rs";
+    f.write(path, "#[path = \"helper.rs\"] mod helper;");
+    f.write("helper.rs", "pub fn value() -> i64 { 1 }");
+    f.write("src/helper.rs", "pub fn value() -> i64 { 1 }");
+    for command in ["check", "build", "run"] {
+        let output = f.command(&[command, ".", "--offline"]).output().unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("rust_review_source_layout"),
+            "native/{command}: {error}"
         );
-        f.write(
-            "src/native.rs",
-            "#[willow::assume(no_block)] pub fn answer() -> i64 { 42 }",
+        assert_eq!(
+            fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
+            record
         );
-        if mixed_legacy {
-            f.write("project.toml", "[project]\nname=\"review_layout\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"bridge.rs\"\n[rust-dependencies]\nnative_probe={path=\"dependency\"}\n");
-            f.local_dependency();
-            f.write("bridge.rs", "pub fn legacy() -> i64 { 1 }");
-        }
-        let record = f.approve_native();
-        let path = if mixed_legacy {
-            "bridge.rs"
-        } else {
-            "src/unused.rs"
-        };
-        f.write(path, "#[path = \"helper.rs\"] mod helper;");
-        f.write("helper.rs", "pub fn value() -> i64 { 1 }");
-        f.write("src/helper.rs", "pub fn value() -> i64 { 1 }");
-        for command in ["check", "build", "run"] {
-            let output = f.command(&[command, ".", "--offline"]).output().unwrap();
-            assert!(!output.status.success());
-            let error = String::from_utf8_lossy(&output.stderr);
-            assert!(
-                error.contains("rust_review_source_layout"),
-                "{mixed_legacy}/{command}: {error}"
-            );
-            assert_eq!(
-                fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
-                record
-            );
-        }
     }
 }
 
@@ -1186,13 +1163,13 @@ fn main() {{ println(exercise()); }}
 }
 
 #[test]
-fn unified_assumption_native_library_legacy_no_io_requires_shared_review() {
+fn unified_assumption_native_library_no_io_requires_shared_review() {
     use willow_abi::RuntimeEffects;
     let f = Fixture::new();
     f.local_dependency();
-    f.write("project.toml", "[project]\nname=\"native_review\"\nversion=\"0.1.0\"\n[rust]\nbridge=\"bridge.rs\"\n[rust-dependencies]\nnative_probe={path=\"dependency\"}\n");
-    f.write("bridge.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\npub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 } }\n");
-    f.write("src/main.wi", "extern rust { @effects(no_io) fn absolute(value: i64) -> i64; }\nfn helper() -> i64 { return absolute(-7); }\n@effects(no_io) fn exercise() -> i64 { return helper(); }\nfn main() { println(exercise()); }\n");
+    f.write("project.toml", "[project]\nname=\"native_review\"\nversion=\"0.1.0\"\n[rust-dependencies]\nnative_probe={path=\"dependency\"}\n");
+    f.write("src/extra.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\n#[willow::assume(no_io)] pub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 } }\n");
+    f.write("src/main.wi", "import extra::absolute;\nfn helper() -> i64 { return absolute(-7); }\n@effects(no_io) fn exercise() -> i64 { return helper(); }\nfn main() { println(exercise()); }\n");
     let missing = f.review_query();
     assert_eq!(missing["schema"], 2);
     assert_eq!(missing["bridges"][0]["review_current"], false);
@@ -1217,9 +1194,9 @@ fn unified_assumption_native_library_legacy_no_io_requires_shared_review() {
         evidence["assumptions"]["no_io"]["location"]["path"]
             .as_str()
             .unwrap()
-            .ends_with("main.wi")
+            .ends_with("extra.rs")
     );
-    f.write("bridge.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\npub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 + 1 } }\n");
+    f.write("src/extra.rs", "unsafe extern \"C\" { fn abs(value: i32) -> i32; }\n#[willow::assume(no_io)] pub fn absolute(value: i64) -> i64 { unsafe { abs(value as i32) as i64 + 1 } }\n");
     let output = f.command(&["check", ".", "--offline"]).output().unwrap();
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("E2612"));
@@ -1227,78 +1204,38 @@ fn unified_assumption_native_library_legacy_no_io_requires_shared_review() {
 }
 
 #[test]
-fn unified_assumption_legacy_claim_edits_invalidate_shared_review() {
+fn unified_assumption_native_claim_edits_invalidate_shared_review() {
     let f = Fixture::new();
-    f.local_dependency();
-    f.write("project.toml", "[project]\nname='legacy_claims'\nversion='0.1.0'\n[rust]\nbridge='bridge.rs'\n[rust-dependencies]\nnative_probe={path='dependency'}\n");
-    f.write(
-        "bridge.rs",
-        "pub fn safe() -> i64 { 42 }\npub fn noisy() -> i64 { println!(\"I/O\"); 7 }\n",
-    );
-    let source = |safe: &str, noisy: &str, callee: &str| {
+    let rust = |safe: &str, noisy: &str| {
         format!(
-            "extern rust {{ {safe} fn safe() -> i64; {noisy} fn noisy() -> i64; }}\n@effects(no_io) fn guard() -> i64 {{ return {callee}(); }}\nfn main() {{ println(guard()); }}\n"
+            "{safe} pub fn safe()->i64 {{42}}\n{noisy} pub fn noisy()->i64 {{println!(\"I/O\");7}}\n"
         )
     };
-    let original = source("@effects(no_io)", "", "safe");
-    f.write("src/main.wi", &original);
+    f.write("src/main.wi", "import native; @effects(no_io) fn guard()->i64{return native::safe();} fn main(){println(guard());}");
+    f.write("src/native.rs", &rust("#[willow::assume(no_io)]", ""));
     let record = f.approve_native();
     f.success(&["check", ".", "--offline"]);
-    let reviewed = f.review_query();
-    let inline = reviewed["legacy_review_fingerprint"].as_str().unwrap();
-    let shared = &reviewed["review_fingerprint"];
-
-    // Layout and declaration iteration order are not new claims.
-    f.write("src/main.wi", "// moved declarations\nextern rust { fn noisy() -> i64;\n    @effects(no_io) fn safe() -> i64; }\n@effects(no_io) fn guard() -> i64 { return safe(); }\nfn main() { println(guard()); }\n");
-    let reordered = f.review_query();
-    assert_eq!(&reordered["review_fingerprint"], shared);
-    assert_eq!(reordered["legacy_review_fingerprint"], inline);
-    assert!(
-        reordered["bridges"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|b| b["symbol"] == "safe" && b["review_current"] == true)
-    );
-    f.success(&["check", ".", "--offline"]);
-
-    for (mutation, edited) in [
-        (
-            "add no_io to an already-declared I/O function",
-            source("@effects(no_io)", "@effects(no_io)", "noisy"),
-        ),
-        ("remove no_io", source("", "", "safe")),
-        (
-            "change no_io to no_block",
-            source(&format!("nonblocking(\"{inline}\")"), "", "safe"),
-        ),
+    for (safe, noisy) in [
+        ("#[willow::assume(no_io)]", "#[willow::assume(no_io)]"),
+        ("", ""),
+        ("#[willow::assume(no_block)]", ""),
     ] {
-        f.write("src/main.wi", &edited);
-        let query = f.review_query();
-        assert_ne!(&query["review_fingerprint"], shared, "{mutation}: {query}");
-        assert_eq!(query["legacy_review_fingerprint"], inline, "{mutation}");
-        assert!(
-            query["bridges"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|b| b["review_current"] == false),
-            "{mutation}: {query}"
-        );
-        let output = f.command(&["check", ".", "--offline"]).output().unwrap();
-        let error = String::from_utf8_lossy(&output.stderr);
-        assert!(!output.status.success(), "{mutation}");
-        assert!(
-            error.contains("E2612") && error.contains("no_io"),
-            "{mutation}: {error}"
-        );
+        f.write("src/native.rs", &rust(safe, noisy));
+        let stale = f.command(&["check", ".", "--offline"]).output().unwrap();
+        assert!(!stale.status.success());
         assert_eq!(
             fs::read_to_string(f.root.join("rust-review.toml")).unwrap(),
             record
         );
+        assert!(
+            f.review_query()["bridges"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|b| b["review_current"] != true)
+        );
     }
-    f.write("src/main.wi", &original);
-    assert_eq!(&f.review_query()["review_fingerprint"], shared);
+    f.write("src/native.rs", &rust("#[willow::assume(no_io)]", ""));
     f.success(&["check", ".", "--offline"]);
 }
 
@@ -1375,86 +1312,54 @@ fn unified_assumption_dependency_input_escape_fails_closed() {
 
 #[test]
 fn unified_assumption_root_native_link_archive_replacement_fails_closed() {
-    for legacy in [false, true] {
-        let f = Fixture::new();
-        f.local_dependency();
-        let bridge_setting = if legacy {
-            "[rust]\nbridge='bridge.rs'\n"
-        } else {
-            ""
-        };
-        f.write("project.toml", &format!("[project]\nname='root_link'\nversion='0.1.0'\n{bridge_setting}[rust-dependencies]\nnative_probe={{path='dependency'}}\n"));
-        let path = if legacy { "bridge.rs" } else { "src/native.rs" };
-        let attribute = if legacy {
-            ""
-        } else {
-            "#[willow::assume(no_block, no_io)]\n"
-        };
-        f.write(
-            path,
-            &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
-        );
-        let main = |fingerprint: &str| {
-            let prefix = if legacy {
-                format!(
-                    "extern rust {{ @effects(no_io) nonblocking(\"{fingerprint}\") fn answer() -> i64; }}\n"
-                )
-            } else {
-                "import native;\n".into()
-            };
-            let call = if legacy { "answer" } else { "native::answer" };
-            format!(
-                "{prefix}@effects(no_io, no_wait) fn guard() -> i64 {{ return {call}(); }}\nfn main() {{ println(guard()); }}\n"
+    let f = Fixture::new();
+    f.local_dependency();
+    f.write("project.toml", "[project]\nname='root_link'\nversion='0.1.0'\n[rust-dependencies]\nnative_probe={path='dependency'}\n");
+    let path = "src/native.rs";
+    let attribute = "#[willow::assume(no_block, no_io)]\n";
+    f.write(
+        path,
+        &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
+    );
+    f.write("src/main.wi", "import native;\n@effects(no_io, no_wait) fn guard() -> i64 { return native::answer(); }\nfn main() { println(guard()); }\n");
+    let native = root_link_archive(&f, false);
+    let run = |args: &[&str]| {
+        f.command(args)
+            .env_remove("RUSTFLAGS")
+            .env(
+                "CARGO_ENCODED_RUSTFLAGS",
+                format!("-L\u{1f}native={}", native.display()),
             )
-        };
-        f.write("src/main.wi", &main(&"0".repeat(64)));
-        let native = root_link_archive(&f, false);
-        let run = |args: &[&str]| {
-            f.command(args)
-                .env_remove("RUSTFLAGS")
-                .env(
-                    "CARGO_ENCODED_RUSTFLAGS",
-                    format!("-L\u{1f}native={}", native.display()),
-                )
-                .output()
-                .unwrap()
-        };
-        let query_args = [
-            "query",
-            "rust-bridge",
-            "--project-dir",
-            ".",
-            "--offline",
-            "--format",
-            "json",
-        ];
-        if legacy {
-            let output = run(&query_args);
-            assert!(output.status.success(), "{output:?}");
-            let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-            f.write(
-                "src/main.wi",
-                &main(query["legacy_review_fingerprint"].as_str().unwrap()),
-            );
-        }
-        let output = run(&query_args);
-        assert!(output.status.success(), "{output:?}");
-        let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        let record = format!(
-            "fingerprint='{}'\n",
-            query["review_fingerprint"].as_str().unwrap()
-        );
-        f.write("rust-review.toml", &record);
-        let checked = run(&["check", ".", "--offline"]);
-        assert!(checked.status.success(), "{checked:?}");
+            .output()
+            .unwrap()
+    };
+    let query_args = [
+        "query",
+        "rust-bridge",
+        "--project-dir",
+        ".",
+        "--offline",
+        "--format",
+        "json",
+    ];
 
-        f.write(path, &format!("#[link(name=\"willow_payload\", kind=\"static\")]\nunsafe extern \"C\" {{ fn payload() -> i64; }}\n{attribute}pub fn answer() -> i64 {{ unsafe {{ payload() }} }}\n"));
-        for io in [false, true] {
-            if io {
-                assert_eq!(root_link_archive(&f, true), native);
-            }
-            reject_opaque_root_claims(&f, &run, &record);
+    let output = run(&query_args);
+    assert!(output.status.success(), "{output:?}");
+    let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let record = format!(
+        "fingerprint='{}'\n",
+        query["review_fingerprint"].as_str().unwrap()
+    );
+    f.write("rust-review.toml", &record);
+    let checked = run(&["check", ".", "--offline"]);
+    assert!(checked.status.success(), "{checked:?}");
+
+    f.write(path, &format!("#[link(name=\"willow_payload\", kind=\"static\")]\nunsafe extern \"C\" {{ fn payload() -> i64; }}\n{attribute}pub fn answer() -> i64 {{ unsafe {{ payload() }} }}\n"));
+    for io in [false, true] {
+        if io {
+            assert_eq!(root_link_archive(&f, true), native);
         }
+        reject_opaque_root_claims(&f, &run, &record);
     }
 }
 
@@ -1495,69 +1400,39 @@ fn reject_opaque_root_claims(fixture: &Fixture, run: &impl Fn(&[&str]) -> Output
 
 #[test]
 fn unified_assumption_root_assembly_input_replacement_fails_closed() {
-    for legacy in [false, true] {
-        let f = Fixture::new();
-        f.local_dependency();
-        let bridge = if legacy {
-            "[rust]\nbridge='bridge.rs'\n"
-        } else {
-            ""
-        };
-        f.write("project.toml", &format!("[project]\nname='root_assembly'\nversion='0.1.0'\n{bridge}[rust-dependencies]\nnative_probe={{path='dependency'}}\n"));
-        let path = if legacy { "bridge.rs" } else { "src/native.rs" };
-        let attribute = if legacy {
-            ""
-        } else {
-            "#[willow::assume(no_block, no_io)]\n"
-        };
-        f.write(
-            path,
-            &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
-        );
-        let main = |fingerprint: &str| {
-            let prefix = if legacy {
-                format!(
-                    "extern rust {{ @effects(no_io) nonblocking(\"{fingerprint}\") fn answer() -> i64; }}\n"
-                )
-            } else {
-                "import native;\n".into()
-            };
-            let call = if legacy { "answer" } else { "native::answer" };
-            format!(
-                "{prefix}@effects(no_io, no_wait) fn guard() -> i64 {{ return {call}(); }}\nfn main() {{ println(guard()); }}\n"
-            )
-        };
-        f.write("src/main.wi", &main(&"0".repeat(64)));
-        if legacy {
-            let query = f.review_query();
-            f.write(
-                "src/main.wi",
-                &main(query["legacy_review_fingerprint"].as_str().unwrap()),
-            );
-        }
-        let record = f.approve_native();
-        f.success(&["check", ".", "--offline"]);
-        let external = f.temp.join("external_payload.s");
-        let run = |args: &[&str]| f.command(args).output().unwrap();
-        for (mac, operation) in [
-            ("global_asm", ".include"),
-            ("asm", ".include"),
-            ("asm", ".incbin"),
-            ("naked_asm", ".include"),
+    let f = Fixture::new();
+    f.local_dependency();
+    f.write("project.toml", "[project]\nname='root_assembly'\nversion='0.1.0'\n[rust-dependencies]\nnative_probe={path='dependency'}\n");
+    let path = "src/native.rs";
+    let attribute = "#[willow::assume(no_block, no_io)]\n";
+    f.write(
+        path,
+        &format!("{attribute}pub fn answer() -> i64 {{ 42 }}\n"),
+    );
+    f.write("src/main.wi", "import native;\n@effects(no_io, no_wait) fn guard() -> i64 { return native::answer(); }\nfn main() { println(guard()); }\n");
+
+    let record = f.approve_native();
+    f.success(&["check", ".", "--offline"]);
+    let external = f.temp.join("external_payload.s");
+    let run = |args: &[&str]| f.command(args).output().unwrap();
+    for (mac, operation) in [
+        ("global_asm", ".include"),
+        ("asm", ".include"),
+        ("asm", ".incbin"),
+        ("naked_asm", ".include"),
+    ] {
+        let directive = format!("{operation} {:?}", external.to_string_lossy());
+        let source = root_assembly_source(attribute, mac, &directive);
+        f.write(path, &source);
+        // These inputs are deliberately never assembled by this test:
+        // the reviewed-source gate must reject them on every host.
+        for payload in [
+            ".text\n.globl assembly_payload\nassembly_payload:\nmov rax, 42\nret\n",
+            ".text\n.globl assembly_payload\nassembly_payload:\nsub rsp, 8\nlea rdi, [rip + message]\ncall puts\nadd rsp, 8\nmov rax, 42\nret\n.section .rodata\nmessage: .asciz \"unexpected I/O\"\n",
         ] {
-            let directive = format!("{operation} {:?}", external.to_string_lossy());
-            let source = root_assembly_source(attribute, mac, &directive);
-            f.write(path, &source);
-            // These inputs are deliberately never assembled by this test:
-            // the reviewed-source gate must reject them on every host.
-            for payload in [
-                ".text\n.globl assembly_payload\nassembly_payload:\nmov rax, 42\nret\n",
-                ".text\n.globl assembly_payload\nassembly_payload:\nsub rsp, 8\nlea rdi, [rip + message]\ncall puts\nadd rsp, 8\nmov rax, 42\nret\n.section .rodata\nmessage: .asciz \"unexpected I/O\"\n",
-            ] {
-                fs::write(&external, payload).unwrap();
-                reject_opaque_root_claims(&f, &run, &record);
-                assert_eq!(fs::read_to_string(f.root.join(path)).unwrap(), source);
-            }
+            fs::write(&external, payload).unwrap();
+            reject_opaque_root_claims(&f, &run, &record);
+            assert_eq!(fs::read_to_string(f.root.join(path)).unwrap(), source);
         }
     }
 }
@@ -1661,7 +1536,12 @@ fn unified_assumption_native_manifest_review_and_execution() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    f.write("src/main.wi", "extern rust { @effects(no_io) fn add(a: i64, b: i64) -> i64; }\n@effects(no_io) fn exercise() -> i64 { return add(20, 22); }\nfn main() { println(exercise()); }\n");
+    let adapter = fs::read_to_string(f.root.join("src/native.rs")).unwrap();
+    f.write(
+        "src/native.rs",
+        &adapter.replace("pub fn add", "#[willow::assume(no_io)] pub fn add"),
+    );
+    f.write("src/main.wi", "import native::add;\n@effects(no_io) fn exercise() -> i64 { return add(20, 22); }\nfn main() { println(exercise()); }\n");
     f.success(&["fetch", "--offline"]);
     assert_eq!(f.review_query()["bridges"][0]["review_current"], false);
     let output = f.command(&["check", ".", "--offline"]).output().unwrap();

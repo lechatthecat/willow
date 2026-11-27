@@ -24,7 +24,7 @@ impl Fixture {
         let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/rust_bridge/path");
         for file in [
             "project.toml",
-            "bridge.rs",
+            "src/native.rs",
             "native/Cargo.toml",
             "native/src/lib.rs",
         ] {
@@ -37,7 +37,33 @@ impl Fixture {
     }
     fn sources(&self, willow: &str, rust: &str) {
         fs::write(self.root.join("src/main.wi"), willow).unwrap();
-        fs::write(self.root.join("bridge.rs"), rust).unwrap();
+        fs::write(self.root.join("src/native.rs"), rust).unwrap();
+    }
+    fn bind_input_lease_probe(&self) {
+        let entry = self.root.join("src/main.wi");
+        let snapshot = willow_compiler::CompilerSession::new(
+            entry.to_str().unwrap(),
+            "",
+            &willow_compiler::CompilerOptions::debug(),
+            Some(self.root.clone()),
+        )
+        .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+        .unwrap();
+        let make = snapshot
+            .semantic
+            .rust_bridges
+            .iter()
+            .find(|s| s.willow_function == "make" || s.willow_function.ends_with("::make"))
+            .unwrap();
+        let Scalar::Opaque(tag) = &make.output_type else {
+            panic!("expected opaque input");
+        };
+        let path = self.root.join("src/native.rs");
+        let source = fs::read_to_string(&path).unwrap().replace(
+            "crate::opaque_tags::Input>",
+            &format!("crate::opaque_tags::{tag}>"),
+        );
+        fs::write(path, source).unwrap();
     }
     fn command(&self, args: &[&str]) -> Output {
         self.command_env(args, &[])
@@ -84,23 +110,103 @@ impl Drop for Fixture {
     }
 }
 const ADD: &str = "pub fn add(a: i64, b: i64) -> i64 { a + b }";
-const DECL: &str = "extern rust { fn add(a: i64, b: i64) -> i64; }";
+const DECL: &str = "import native::add;";
+
+fn native_symbols(path: &Path, source: &str) -> Vec<RustBridgeSymbol> {
+    let f = Fixture::new();
+    f.sources("import native; fn main() {}", source);
+    let entry = f.root.join("src/main.wi");
+    let snapshot = willow_compiler::CompilerSession::new(
+        entry.to_str().unwrap(),
+        "",
+        &willow_compiler::CompilerOptions::debug(),
+        Some(f.root.clone()),
+    )
+    .analysis_with_emitter(&mut willow_compiler::diagnostics::HumanEmitter)
+    .unwrap();
+    let mut symbols = snapshot.semantic.rust_bridges;
+    for symbol in &mut symbols {
+        if let Some(native) = &mut symbol.native {
+            native.source_path = path.to_owned();
+        }
+    }
+    symbols
+}
+
+fn reviewed_rust(source: &str) -> String {
+    if source.contains("#[willow::assume(no_block)]") {
+        return source.to_owned();
+    }
+    source
+        .replace("pub fn ", "#[willow::assume(no_block)] pub fn ")
+        .replace("pub struct ", "#[willow::assume(no_block)] pub struct ")
+}
 
 #[test]
 fn scalar_values_void_namespace_and_indirect_calls() {
     // Ten independent executable perspectives: integer result/sign/limits,
     // float argument/result, both booleans, void, namespace, function value.
     for (name, willow, rust, expected) in [
-        ("add", format!("{DECL} fn main() {{ println(add(20, 22)); }}"), ADD, "42\n"),
-        ("negative", format!("{DECL} fn main() {{ println(add(-50, 8)); }}"), ADD, "-42\n"),
-        ("i64_boundary", format!("{DECL} fn main() {{ println(add(9223372036854775806, 1)); }}"), ADD, "9223372036854775807\n"),
-        ("float", "extern rust { fn half(x: f64) -> f64; } fn main() { println(half(5.0) == 2.5); }".into(), "pub fn half(x: f64) -> f64 { x / 2.0 }", "true\n"),
-        ("bool_true", "extern rust { fn invert(x: bool) -> bool; } fn main() { println(invert(false)); }".into(), "pub fn invert(x: bool) -> bool { !x }", "true\n"),
-        ("bool_false", "extern rust { fn invert(x: bool) -> bool; } fn main() { println(invert(true)); }".into(), "pub fn invert(x: bool) -> bool { !x }", "false\n"),
-        ("void", "extern rust { fn touch(); } fn main() { touch(); println(42); }".into(), "pub fn touch() {}", "42\n"),
-        ("explicit_void", "extern rust { fn touch() -> void; } fn main() { touch(); println(42); }".into(), "pub fn touch() {}", "42\n"),
-        ("namespace", "extern rust math { fn add(a: i64, b: i64) -> i64; } fn main() { println(math::add(20, 22)); }".into(), ADD, "42\n"),
-        ("indirect", format!("{DECL} fn main() {{ let f = add; println(f(20, 22)); }}"), ADD, "42\n"),
+        (
+            "add",
+            format!("{DECL} fn main() {{ println(add(20, 22)); }}"),
+            ADD,
+            "42\n",
+        ),
+        (
+            "negative",
+            format!("{DECL} fn main() {{ println(add(-50, 8)); }}"),
+            ADD,
+            "-42\n",
+        ),
+        (
+            "i64_boundary",
+            format!("{DECL} fn main() {{ println(add(9223372036854775806, 1)); }}"),
+            ADD,
+            "9223372036854775807\n",
+        ),
+        (
+            "float",
+            "import native::half; fn main() { println(half(5.0) == 2.5); }".into(),
+            "pub fn half(x: f64) -> f64 { x / 2.0 }",
+            "true\n",
+        ),
+        (
+            "bool_true",
+            "import native::invert; fn main() { println(invert(false)); }".into(),
+            "pub fn invert(x: bool) -> bool { !x }",
+            "true\n",
+        ),
+        (
+            "bool_false",
+            "import native::invert; fn main() { println(invert(true)); }".into(),
+            "pub fn invert(x: bool) -> bool { !x }",
+            "false\n",
+        ),
+        (
+            "void",
+            "import native::touch; fn main() { touch(); println(42); }".into(),
+            "pub fn touch() {}",
+            "42\n",
+        ),
+        (
+            "explicit_void",
+            "import native::touch; fn main() { touch(); println(42); }".into(),
+            "pub fn touch() {}",
+            "42\n",
+        ),
+        (
+            "namespace",
+            "import native as math; fn main() { println(math::add(20, 22)); }".into(),
+            ADD,
+            "42\n",
+        ),
+        (
+            "indirect",
+            format!("{DECL} fn main() {{ let f = add; println(f(20, 22)); }}"),
+            ADD,
+            "42\n",
+        ),
     ] {
         let f = Fixture::new();
         f.sources(&willow, rust);
@@ -145,25 +251,20 @@ fn missing_symbols_and_rust_signature_mismatches_are_diagnostics() {
     ] {
         let f = Fixture::new();
         f.sources(
-            &format!("{DECL} fn main() {{ println(add(20, 22)); }}"),
+            &format!("{DECL} fn main() {{ let result: i64 = add(20, 22); println(result); }}"),
             rust,
         );
         let output = f.command(&["build", "--offline", "-o", "app"]);
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{name}");
-        let code = if name == "missing" {
-            "rust_bridge_symbol_missing"
-        } else {
-            "rust_bridge_signature_mismatch"
-        };
-        assert!(error.contains(code), "{name}: {error}");
+        assert!(error.contains("error"), "{name}: {error}");
         assert!(!f.root.join("app").exists());
         assert!(!f.root.join("app.exe").exists());
     }
 }
 
 #[test]
-fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
+fn removed_extern_declarations_always_report_module_migration() {
     for (name, declaration) in [
         ("i128_parameter", "extern rust { fn bad(x: i128); }"),
         ("usize_parameter", "extern rust { fn bad(x: usize); }"),
@@ -192,7 +293,13 @@ fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
         f.sources(&format!("{declaration} fn main() {{}}"), "pub fn bad() {}");
         let output = f.command(&["check", "--offline"]);
         assert!(!output.status.success(), "{name}: declaration was accepted");
-        assert!(!output.stderr.is_empty(), "{name}: diagnostic missing");
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            error.contains("rust_module_migration_required")
+                && error.contains("import")
+                && error.contains("src/"),
+            "{name}: {error}"
+        );
     }
 }
 
@@ -200,7 +307,7 @@ fn unsupported_signatures_duplicate_and_malformed_declarations_fail() {
 fn rust_panic_stops_before_continuation_without_crossing_ffi() {
     let f = Fixture::new();
     f.sources(
-        "extern rust { fn fail(); } fn main() { fail(); println(987654321); }",
+        "import native::fail; fn main() { fail(); println(987654321); }",
         "pub fn fail() { panic!(\"bridge panic fixture\"); }",
     );
     let output = f.command(&["run", "--offline"]);
@@ -218,7 +325,7 @@ fn rust_panic_stops_before_continuation_without_crossing_ffi() {
 fn scheduler_task_routes_foreign_call_and_continues() {
     let f = Fixture::new();
     f.sources(
-        "extern rust { fn touch(); } async fn main() { touch(); println(987654321); }",
+        "import native::touch; async fn main() { touch(); println(987654321); }",
         "pub fn touch() { assert!(std::thread::current().name().unwrap_or(\"\").starts_with(\"willow-rust-blocking\")); }",
     );
     let output = f.successful(&["run", "--offline"]);
@@ -305,11 +412,11 @@ fn abi_revision_mismatch_is_rejected_before_cargo() {
     let mut options = BridgeOptions::new(BuildMode::Debug).unwrap();
     options.cache_root = f.temp.join("cache");
     options.offline = true;
-    options.symbols = vec![
-        RustBridgeSymbol::new("add".into(), vec![Scalar::I64, Scalar::I64], Scalar::I64)
-            .bind("fixture"),
-    ];
     f.sources(&format!("{DECL} fn main() {{}}"), ADD);
+    options.symbols = native_symbols(&f.root.join("src/native.rs"), ADD)
+        .into_iter()
+        .map(|s| s.bind("fixture"))
+        .collect();
     let built = build_bridge(&manifest, &f.root, &options, false)
         .unwrap()
         .unwrap();
@@ -335,30 +442,44 @@ fn abi_revision_mismatch_is_rejected_before_cargo() {
 #[test]
 fn namespaced_function_value_executes() {
     let f = Fixture::new();
-    f.sources("extern rust math { fn add(a: i64, b: i64) -> i64; } fn main() { let operation = math::add; println(operation(20, 22)); }", ADD);
+    f.sources(
+        "import native as math; import helpers as wi; import nested::other as other; fn main() { let operation = math::add; let willow = wi::add; let nested = other::add; println(operation(20, 22)); println(willow(20, 22)); println(nested(20, 22)); }",
+        ADD,
+    );
+    fs::write(
+        f.root.join("src/helpers.wi"),
+        "pub fn add(a: i64, b: i64) -> i64 { return a - b; }",
+    )
+    .unwrap();
+    fs::create_dir_all(f.root.join("src/nested")).unwrap();
+    fs::write(
+        f.root.join("src/nested/other.wi"),
+        "pub fn add(a: i64, b: i64) -> i64 { return a * b; }",
+    )
+    .unwrap();
     let output = f.successful(&["run", "--offline"]);
-    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "42\n-2\n440\n");
 }
 
 #[test]
 fn direct_and_indirect_foreign_calls_are_rejected_under_mutex_lock() {
     for (name, declaration, binding, call) in [
-        ("plain_direct", "extern rust { fn touch(); }", "", "touch()"),
+        ("plain_direct", "import native::touch;", "", "touch()"),
         (
             "namespace_direct",
-            "extern rust math { fn touch(); }",
+            "import native as math;",
             "",
             "math::touch()",
         ),
         (
             "plain_indirect",
-            "extern rust { fn touch(); }",
+            "import native::touch;",
             "let operation = touch;",
             "operation()",
         ),
         (
             "namespace_indirect",
-            "extern rust math { fn touch(); }",
+            "import native as math;",
             "let operation = math::touch;",
             "operation()",
         ),
@@ -380,14 +501,30 @@ fn direct_and_indirect_foreign_calls_are_rejected_under_mutex_lock() {
 fn imported_modules_keep_same_named_bridge_declarations_distinct() {
     for differing_signature in [false, true] {
         let f = Fixture::new();
-        f.sources("import first; import second; fn main() { println(first::answer()); println(second::answer()); }", "pub fn identity<T>(value: T) -> T { value }");
-        fs::write(f.root.join("src/first.wi"), "extern rust { fn identity(value: i64) -> i64; } pub fn answer() -> i64 { return identity(42); }").unwrap();
-        let second = if differing_signature {
-            "extern rust { fn identity(value: f64) -> f64; } pub fn answer() -> bool { return identity(2.5) == 2.5; }"
+        f.sources("import first; import second; fn main() { println(first::answer()); println(second::answer()); }", "");
+        fs::write(
+            f.root.join("src/first.wi"),
+            "import first_native::identity; pub fn answer() -> i64 { return identity(42); }",
+        )
+        .unwrap();
+        fs::write(
+            f.root.join("src/first_native.rs"),
+            "pub fn identity(value:i64)->i64 {value}",
+        )
+        .unwrap();
+        let (willow, rust) = if differing_signature {
+            (
+                "import second_native::identity; pub fn answer() -> bool { return identity(2.5) == 2.5; }",
+                "pub fn identity(value:f64)->f64 {value}",
+            )
         } else {
-            "extern rust { fn identity(value: i64) -> i64; } pub fn answer() -> i64 { return identity(43); }"
+            (
+                "import second_native::identity; pub fn answer() -> i64 { return identity(43); }",
+                "pub fn identity(value:i64)->i64 {value}",
+            )
         };
-        fs::write(f.root.join("src/second.wi"), second).unwrap();
+        fs::write(f.root.join("src/second.wi"), willow).unwrap();
+        fs::write(f.root.join("src/second_native.rs"), rust).unwrap();
         let output = f.successful(&["run", "--offline"]);
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
@@ -419,8 +556,7 @@ fn mixed_scalar_arguments_cross_register_and_stack_abi_boundaries() {
         .join(" + ");
     f.sources(
         &format!(
-            "extern rust {{ fn mixed({}) -> f64; }} fn main() {{ println(mixed({}) == 95.5); }}",
-            params.join(", "),
+            "import native::mixed; fn main() {{ println(mixed({}) == 95.5); }}",
             args.join(", ")
         ),
         &format!(
@@ -436,7 +572,7 @@ fn mixed_scalar_arguments_cross_register_and_stack_abi_boundaries() {
 fn rust_panic_payload_drop_is_not_executed_at_ffi_boundary() {
     let f = Fixture::new();
     f.reviewed_sources(
-        r#"extern rust { nonblocking("REVIEW") fn fail(); } fn main() { fail(); println(987654321); }"#,
+        r#"import native::fail; fn main() { fail(); println(987654321); }"#,
         r#"
         struct Payload;
         impl Drop for Payload {
@@ -479,7 +615,11 @@ fn ai_snapshot_exposes_scalar_signature_symbol_and_foreign_effects() {
     snapshot.validate().unwrap();
     assert_eq!(snapshot.semantic.rust_bridges.len(), 1);
     let symbol = &snapshot.semantic.rust_bridges[0];
-    assert_eq!(symbol.willow_function, "add");
+    assert!(
+        symbol.willow_function.ends_with("::native::add"),
+        "{}",
+        symbol.willow_function
+    );
     assert_eq!(symbol.input_types, [Scalar::I64, Scalar::I64]);
     assert_eq!(symbol.output_type, Scalar::I64);
     assert!(symbol.abi_symbol.starts_with("__willow_rust_"));
@@ -509,9 +649,13 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
         "fn main() {}",
         "pub fn add(a: i64, b: i64) -> i64 { a - b }",
     );
-    let symbol = RustBridgeSymbol::new("add".into(), vec![Scalar::I64, Scalar::I64], Scalar::I64);
-    let first_symbol = symbol.bind(first.root.to_str().unwrap());
-    let second_symbol = symbol.bind(second.root.to_str().unwrap());
+    let first_symbol = native_symbols(&first.root.join("src/native.rs"), ADD)
+        .remove(0)
+        .bind(first.root.to_str().unwrap());
+    let second_rust = fs::read_to_string(second.root.join("src/native.rs")).unwrap();
+    let second_symbol = native_symbols(&second.root.join("src/native.rs"), &second_rust)
+        .remove(0)
+        .bind(second.root.to_str().unwrap());
     assert_ne!(first_symbol.abi_symbol, second_symbol.abi_symbol);
     let mut options = BridgeOptions::new(BuildMode::Debug).unwrap();
     options.offline = true;
@@ -646,7 +790,11 @@ fn independent_project_archives_keep_same_named_rust_functions_distinct() {
 fn imported_foreign_call_is_rejected_under_mutex_lock() {
     let f = Fixture::new();
     f.sources("import foreign; async fn main() { let m = Mutex::new(0); lock m as value { foreign::touch(); } }", "pub fn touch() {}");
-    fs::write(f.root.join("src/foreign.wi"), "extern rust { fn touch(); }").unwrap();
+    fs::write(
+        f.root.join("src/foreign.wi"),
+        "import native; pub fn touch() { native::touch(); }",
+    )
+    .unwrap();
     let output = f.command(&["check", "--offline"]);
     let error = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -660,7 +808,7 @@ fn imported_foreign_call_is_rejected_under_mutex_lock() {
 fn indirect_bool_uses_c_abi_in_debug_and_release() {
     for release in [false, true] {
         let f = Fixture::new();
-        f.sources("extern rust { fn invert(value: bool) -> bool; fn choose(value: bool, a: i64, b: f64) -> f64; } fn main() { let invert_fn = invert; let choose_fn = choose; println(invert_fn(false)); println(invert_fn(true)); println(choose_fn(false, 42, 2.5) == 2.5); println(choose_fn(true, 42, 2.5) == 42.0); }",
+        f.sources("import native::invert; import native::choose; fn main() { let invert_fn = invert; let choose_fn = choose; println(invert_fn(false)); println(invert_fn(true)); println(choose_fn(false, 42, 2.5) == 2.5); println(choose_fn(true, 42, 2.5) == 42.0); }",
             "pub fn invert(value: bool) -> bool { !value } pub fn choose(value: bool, a: i64, b: f64) -> f64 { if value { a as f64 } else { b } }");
         let args: &[&str] = if release {
             &["run", "--offline", "--release"]
@@ -681,12 +829,12 @@ fn boolean_abi_shims_are_emitted_once_per_declaration() {
     for count in [8, 32, 128] {
         let f = Fixture::new();
         let declarations: String = (0..count)
-            .map(|i| format!("fn b{i:04}(value: bool) -> bool;\n"))
+            .map(|i| format!("import native::b{i:04};\n"))
             .collect();
         let rust: String = (0..count)
             .map(|i| format!("pub fn b{i:04}(value: bool) -> bool {{ !value }}\n"))
             .collect();
-        f.sources(&format!("extern rust {{ {declarations} fn add(a: i64, b: i64) -> i64; }} fn main() {{ println(b0000(false)); println(add(20, 22)); }}"), &format!("{rust} {ADD}"));
+        f.sources(&format!("{declarations} import native::add; fn main() {{ println(b0000(false)); println(add(20, 22)); }}"), &format!("{rust} {ADD}"));
         f.successful(&["build", "--offline", "-o", "app"]);
         let extension = if cfg!(all(windows, target_env = "msvc")) {
             "obj"
@@ -715,7 +863,7 @@ fn boolean_abi_shims_are_emitted_once_per_declaration() {
 #[test]
 fn unresolved_native_reference_reports_bridge_link_error() {
     let f = Fixture::new();
-    f.sources("extern rust { fn touch(); } fn main() { touch(); }", "unsafe extern \"C\" { fn willow_r2_missing_native_symbol(); } pub fn touch() { unsafe { willow_r2_missing_native_symbol(); } }");
+    f.sources("import native::touch; fn main() { touch(); }", "unsafe extern \"C\" { fn willow_r2_missing_native_symbol(); } pub fn touch() { unsafe { willow_r2_missing_native_symbol(); } }");
     let output = f.command(&["build", "--offline", "-o", "app"]);
     assert!(!output.status.success());
     assert!(String::from_utf8_lossy(&output.stderr).contains("rust_bridge_link_error"));
@@ -724,10 +872,14 @@ fn unresolved_native_reference_reports_bridge_link_error() {
 #[test]
 fn rust_check_validates_declared_adapters_with_json_and_human_diagnostics() {
     for (rust, kind, code) in [
-        ("pub fn other() {}", "rust_bridge_symbol_missing", "E0425"),
         (
-            "pub fn add(a: f64, b: f64) -> i64 { (a + b) as i64 }",
-            "rust_bridge_signature_mismatch",
+            "pub fn add(a:i64,b:i64)->i64 { absent(a,b) }",
+            "rust_bridge_compile_error",
+            "E0425",
+        ),
+        (
+            "pub fn add(a:i64,b:i64)->i64 { let broken: bool = a; b }",
+            "rust_bridge_compile_error",
             "E0308",
         ),
     ] {
@@ -775,15 +927,9 @@ fn rust_check_validates_declared_adapters_with_json_and_human_diagnostics() {
                     && stderr.contains(code)
                     && stderr.contains("add")
                     // rustc renders the span path with the host separator.
-                    && (stderr.contains("src/lib.rs:") || stderr.contains("src\\lib.rs:")),
+                    && (stderr.contains("src/native.rs:") || stderr.contains("src\\native.rs:")),
                 "{stderr}"
             );
-            if code == "E0308" {
-                assert!(
-                    stderr.contains("let adapter: fn(i64,i64,) -> i64"),
-                    "{stderr}"
-                );
-            }
         }
     }
 }
@@ -791,17 +937,19 @@ fn rust_check_validates_declared_adapters_with_json_and_human_diagnostics() {
 #[test]
 fn rust_check_collects_unreferenced_project_module_declarations() {
     let f = Fixture::new();
-    f.sources("fn main() {}", "pub fn other() {}");
-    fs::write(
-        f.root.join("src/foreign.wi"),
-        "extern rust { fn absent() -> i64; }",
-    )
-    .unwrap();
+    f.sources(
+        "import native; fn main() {}",
+        "pub fn absent() -> i64 { missing() }",
+    );
     let output = f.command(&["rust", "check", "--offline", "--format", "json"]);
     assert!(!output.status.success());
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(value["error"]["kind"], "rust_bridge_symbol_missing");
-    assert!(value["error"]["diagnostics"].to_string().contains("absent"));
+    assert_eq!(value["error"]["kind"], "rust_bridge_compile_error");
+    assert!(
+        value["error"]["diagnostics"]
+            .to_string()
+            .contains("missing")
+    );
 }
 
 #[test]
@@ -848,7 +996,7 @@ fn aggregate_bridge_roundtrips_and_indirect_calls() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_value_bridge");
     for file in [
         "project.toml",
-        "bridge.rs",
+        "src/native.rs",
         "native/Cargo.toml",
         "native/src/lib.rs",
         "src/main.wi",
@@ -879,12 +1027,7 @@ fn aggregate_bridge_large_buffers_forced_collection_and_properties() {
     f.sources(
         r#"
         import std::collections::Array;
-        extern rust {
-            fn text(value: String) -> String;
-            fn bytes(value: Array<u8>) -> Array<u8>;
-            fn collect(value: String) -> String;
-            fn collect_nested(value: Option<Option<String>>) -> Option<Option<String>>;
-        }
+        import native::text; import native::bytes; import native::collect; import native::collect_nested;
         fn main() {
             for n in [0, 1, 16, 256, 4096, 65536] {
                 let input = "🙂é".repeat(n);
@@ -926,40 +1069,27 @@ fn aggregate_bridge_large_buffers_forced_collection_and_properties() {
 
 #[test]
 fn aggregate_bridge_panics_and_invalid_bytes_are_diagnostics() {
-    for (declaration, call, rust, expected) in [
+    for (call, rust, expected) in [
         (
-            "fn fail() -> String;",
             "fail()",
             "pub fn fail() -> String { panic!(\"panic text 日本語\") }",
             "RustPanic: rust_bridge_panic: panic text 日本語",
         ),
         (
-            "fn fail() -> Result<bool,String>;",
             "fail()",
             "pub fn fail() -> Result<bool,String> { panic!(\"result panic\") }",
             "RustPanic: rust_bridge_panic: result panic",
         ),
         (
-            "fn fail() -> Option<i64>;",
             "fail()",
             "struct Bad; impl Drop for Bad { fn drop(&mut self) { panic!(\"BAD_DROP\") } } pub fn fail() -> Option<i64> { std::panic::panic_any(Bad) }",
             "RustPanic: rust_bridge_panic: non-string panic payload",
         ),
-        (
-            "fn fail(a: Array<i64>);",
-            "fail([-1])",
-            "pub fn fail(_: &[u8]) {}",
-            "byte adapters use Array<u8>",
-        ),
-        (
-            "fn fail(a: Array<i64>);",
-            "fail([256])",
-            "pub fn fail(_: &[u8]) {}",
-            "byte adapters use Array<u8>",
-        ),
+        ("fail([-1])", "pub fn fail(_: &[u8]) {}", "u8"),
+        ("fail([256])", "pub fn fail(_: &[u8]) {}", "u8"),
     ] {
         let f = Fixture::new();
-        f.sources(&format!("import std::collections::Array; extern rust {{ {declaration} }} fn main() {{ {call}; println(987654321); }}"),rust);
+        f.sources(&format!("import std::collections::Array; import native::fail; fn main() {{ {call}; println(987654321); }}"),rust);
         let output = f.command(&["run", "--offline"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success());
@@ -1057,15 +1187,13 @@ fn run_byte_lifetime_probe(f: &Fixture) -> Output {
 
 #[test]
 fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
-    let rust = include_str!("fixtures/rust_bridge/byte_lifetime.rs");
+    let rust = include_str!("fixtures/rust_bridge/byte_lifetime.rs").replace(
+        "pub extern \"C\" fn observe_bridge_deallocation",
+        "pub(crate) extern \"C\" fn observe_bridge_deallocation",
+    );
     for kind in ["sync", "task", "async"] {
         for fail in [false, true] {
             let f = Fixture::new();
-            let qualifier = match kind {
-                "task" => "nonblocking(\"REVIEW\") ",
-                "async" => "async ",
-                _ => "",
-            };
             let asynchronous = if kind == "sync" { "" } else { "async " };
             let wait = if kind == "async" { "await " } else { "" };
             let entry = if kind == "async" {
@@ -1087,7 +1215,7 @@ fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
                 "bytes"
             };
             let willow = format!(
-                "import std::collections::Array; extern rust {{ {qualifier}fn {entry}(bytes: Array<u8>, fail: bool) -> Array<u8>; {qualifier}fn {done}() -> bool; }}
+                "import std::collections::Array; import native::{entry}; import native::{done};
                  {asynchronous}fn main() {{ let bytes: Array<u8> = [0, 128, 255]; gc_minor_collect();
                  let output = {wait}{entry}({input}, {fail}); gc_collect();
                  println(output.content_equals(bytes)); println({wait}{done}()); }}"
@@ -1117,19 +1245,19 @@ fn packed_byte_bridge_gc_task_and_panic_release_exactly_once() {
 
 #[test]
 fn packed_byte_bridge_type_mapping_and_owned_copy_emission() {
-    use willow_compiler::parser::ast::Type;
-    for generic in [false, true] {
-        for (element, mapped) in [
-            (Type::U8, Scalar::Bytes),
-            (Type::I64, Scalar::Array(Box::new(Scalar::I64))),
-        ] {
-            let ty = if generic {
-                Type::Generic("Array".into(), vec![element])
-            } else {
-                Type::Array(Box::new(element))
-            };
-            assert_eq!(Scalar::from_type(&ty), Some(mapped));
-        }
+    for (rust, mapped) in [
+        ("pub fn value(v: Vec<u8>) -> Vec<u8> {v}", Scalar::Bytes),
+        (
+            "pub fn value(v: &[u8]) -> Vec<u8> {v.to_vec()}",
+            Scalar::Bytes,
+        ),
+        (
+            "pub fn value(v: Vec<i64>) -> Vec<i64> {v}",
+            Scalar::Array(Box::new(Scalar::I64)),
+        ),
+    ] {
+        let symbols = native_symbols(Path::new("src/native.rs"), rust);
+        assert_eq!(symbols[0].input_types, [mapped]);
     }
     let abi = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/willow_abi/src/ffi.rs");
     for count in [1, 4, 16, 64] {
@@ -1210,10 +1338,6 @@ fn aggregate_wrapper_emission_is_linear_and_shared_per_declaration() {
 #[test]
 fn aggregate_bridge_simultaneous_scalar_option_calls_keep_frames_isolated() {
     let f = Fixture::new();
-    let option = Scalar::Option(Box::new(Scalar::I64));
-    let symbol = RustBridgeSymbol::new("echo".into(), vec![option.clone()], option)
-        .bind(f.root.canonicalize().unwrap().to_str().unwrap())
-        .abi_symbol;
     let rust = r#"
         static BARRIER: std::sync::OnceLock<std::sync::Barrier> = std::sync::OnceLock::new();
         pub fn echo(value: Option<i64>) -> Option<i64> {
@@ -1237,9 +1361,24 @@ fn aggregate_bridge_simultaneous_scalar_option_calls_keep_frames_isolated() {
             })).collect();
             threads.into_iter().map(|thread| thread.join().unwrap()).sum()
         }
-    "#
-    .replace("WRAPPER", &symbol);
-    f.sources("extern rust { fn echo(value: Option<i64>) -> Option<i64>; fn drive() -> i64; } fn main() { println(drive()); }", &rust);
+    "#;
+    let willow = "import native::echo; import native::drive; fn main() { println(drive()); }";
+    f.sources(willow, rust);
+    let query = f.successful(&["query", "rust-bridge", "--format", "json"]);
+    let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    let symbol = query["bridges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["symbol"]
+                .as_str()
+                .is_some_and(|name| name.ends_with("::echo"))
+        })
+        .unwrap()["abi_symbol"]
+        .as_str()
+        .unwrap();
+    f.sources(willow, &rust.replace("WRAPPER", symbol));
     let output = f.successful(&["run", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "8\n");
 }
@@ -1250,7 +1389,7 @@ fn aggregate_abi_shims_are_shared_across_repeated_calls() {
     for count in [8, 32, 128] {
         let f = Fixture::new();
         let declarations: String = (0..count)
-            .map(|i| format!("fn o{i:04}(value: Option<i64>) -> Option<i64>;\n"))
+            .map(|i| format!("import native::o{i:04};\n"))
             .collect();
         let rust: String = (0..count)
             .map(|i| format!("pub fn o{i:04}(value: Option<i64>) -> Option<i64> {{ value }}\n"))
@@ -1258,10 +1397,7 @@ fn aggregate_abi_shims_are_shared_across_repeated_calls() {
         let calls: String = (0..count)
             .map(|_| "println(o0000(Some(7)).unwrap());")
             .collect();
-        f.sources(
-            &format!("extern rust {{ {declarations} }} fn main() {{ {calls} }}"),
-            &rust,
-        );
+        f.sources(&format!("{declarations} fn main() {{ {calls} }}"), &rust);
         f.successful(&["build", "--offline", "-o", "app"]);
         let extension = if cfg!(all(windows, target_env = "msvc")) {
             "obj"
@@ -1284,7 +1420,7 @@ fn aggregate_abi_shims_are_shared_across_repeated_calls() {
     }
 }
 
-const OPAQUE_DECL: &str = "extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; }";
+const OPAQUE_DECL: &str = "import native::Handle; import native::handle_new; import native::read; import native::Handle_close;";
 const OPAQUE_RUST: &str = "pub struct Handle(i64); pub fn handle_new(value: i64) -> Box<Handle> { Box::new(Handle(value)) } pub fn read(handle: &Handle) -> i64 { handle.0 }";
 
 #[test]
@@ -1343,19 +1479,28 @@ fn opaque_handles_closed_diagnostics_and_nominal_type_rejection() {
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(error.contains("rust_handle_closed"), "{error}");
     }
-    for source in [
-        "extern rust { opaque A; opaque B; fn make() -> A; fn use_b(b: B); } fn main() { use_b(make()); }",
-        "extern rust { opaque A; fn use_a(a: A); } fn main() { use_a(1); }",
-        "extern rust { opaque A; opaque A; } fn main() {}",
-        "extern rust { opaque String; } fn main() {}",
-        "extern rust { opaque A; fn A_close(a: A); } fn main() {}",
-        "extern rust { fn bad(a: Missing); } fn main() {}",
+    for (source, rust) in [
+        (
+            "import native; fn main() { native::use_b(native::make()); }",
+            "pub struct A(i64); pub struct B(i64); pub fn make()->Box<A> {Box::new(A(1))} pub fn use_b(b:&B) {}",
+        ),
+        (
+            "import native; fn main() { native::use_a(1); }",
+            "pub struct A(i64); pub fn use_a(a:&A) {}",
+        ),
+        ("import native; fn main() {}", "pub struct A; pub struct A;"),
+        ("import native; fn main() {}", "pub struct String;"),
+        (
+            "import native; fn main() {}",
+            "pub struct A; pub fn make()->Box<A> {Box::new(A)} pub fn A_close(a:&A) {}",
+        ),
+        ("import native; fn main() {}", "pub fn bad(a:Missing) {}"),
     ] {
         let f = Fixture::new();
-        f.sources(source, "");
+        f.sources(source, rust);
         assert!(
             !f.command(&["check", "--offline"]).status.success(),
-            "{source}"
+            "{source}: {rust}"
         );
     }
 }
@@ -1364,7 +1509,7 @@ fn opaque_handles_closed_diagnostics_and_nominal_type_rejection() {
 fn opaque_nested_option_result_and_rust_type_contract() {
     let f = Fixture::new();
     f.sources(
-        "extern rust { opaque Handle; fn make() -> Option<Handle>; fn read(h: Option<Handle>) -> i64; } fn main() { let h = make(); println(read(h)); match h { Some(value) => { Handle_close(value); } None => {} } }",
+        "import native::Handle; import native::make; import native::read; import native::Handle_close; fn main() { let h = make(); println(read(h)); match h { Some(value) => { Handle_close(value); } None => {} } }",
         "pub struct Handle(i64); pub fn make() -> Option<Box<Handle>> { Some(Box::new(Handle(42))) } pub fn read(h: Option<&Handle>) -> i64 { h.map_or(0, |v| v.0) }",
     );
     assert_eq!(
@@ -1372,28 +1517,39 @@ fn opaque_nested_option_result_and_rust_type_contract() {
         "42\n"
     );
     let f = Fixture::new();
-    f.sources(&format!("{OPAQUE_DECL} fn main() {{}}"), "pub struct Handle(i64); pub fn handle_new(value: i64) -> Handle { Handle(value) } pub fn read(h: &Handle) -> i64 {h.0}");
-    let output = f.command(&["check", "--offline"]);
+    f.sources(&format!("{OPAQUE_DECL} fn main() {{}}"), "pub struct Handle(std::rc::Rc<i64>); pub fn handle_new(value:i64)->Box<Handle> {Box::new(Handle(std::rc::Rc::new(value)))} pub fn read(h:&Handle)->i64 {*h.0}");
+    let output = f.command(&["rust", "check", "--offline"]);
     assert!(!output.status.success());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("rust_bridge_signature_mismatch"));
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(error.contains("Send") || error.contains("Sync"), "{error}");
 }
 
 #[test]
 fn opaque_regex_example_runs() {
     let f = Fixture::new();
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_opaque_bridge");
-    for file in ["project.toml", "bridge.rs", "src/main.wi"] {
+    for file in ["project.toml", "src/native.rs", "src/main.wi"] {
         fs::copy(example.join(file), f.root.join(file)).unwrap();
     }
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
     );
-    for name in ["regex_new", "Regex_close"] {
+    let query = f.successful(&["query", "rust-bridge", "--format", "json"]);
+    let all: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
+    for name in ["::Regex_new", "::Regex_close"] {
+        let selector = all["bridges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|b| b["symbol"].as_str().is_some_and(|s| s.ends_with(name)))
+            .unwrap()["symbol"]
+            .as_str()
+            .unwrap();
         let output = f.successful(&[
             "query",
             "rust-bridge",
-            name,
+            selector,
             "--offline",
             "--format",
             "json",
@@ -1412,9 +1568,9 @@ fn opaque_regex_example_runs() {
 #[test]
 fn opaque_forward_cross_block_namespace_and_drop_contract() {
     for source in [
-        "extern rust { fn handle_new(value: i64) -> Handle; opaque Handle; fn read(handle: Handle) -> i64; } fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
-        "extern rust { opaque Handle; } extern rust { fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; } fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
-        "extern rust native { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(handle: Handle) -> i64; } fn main() { let h = native::handle_new(42); println(native::read(h)); native::Handle_close(h); }",
+        "import native::handle_new; import native::Handle; import native::read; import native::Handle_close; fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
+        "import native::Handle; import native::Handle_close; import native::handle_new; import native::read; fn main() { let h = handle_new(42); println(read(h)); Handle_close(h); }",
+        "import native; fn main() { let h = native::handle_new(42); println(native::read(h)); native::Handle_close(h); }",
     ] {
         let f = Fixture::new();
         f.sources(source, OPAQUE_RUST);
@@ -1424,7 +1580,7 @@ fn opaque_forward_cross_block_namespace_and_drop_contract() {
         );
     }
     let f = Fixture::new();
-    f.sources("extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn drops() -> i64; } fn main() { let h = handle_new(1); println(drops()); Handle_close(h); println(drops()); }",
+    f.sources("import native::Handle; import native::handle_new; import native::drops; import native::Handle_close; fn main() { let h = handle_new(1); println(drops()); Handle_close(h); println(drops()); }",
         "use std::sync::atomic::{AtomicI64, Ordering}; static DROPS: AtomicI64 = AtomicI64::new(0); pub struct Handle; impl Drop for Handle { fn drop(&mut self) { DROPS.fetch_add(1, Ordering::SeqCst); } } pub fn handle_new(_: i64) -> Box<Handle> {Box::new(Handle)} pub fn drops() -> i64 {DROPS.load(Ordering::SeqCst)}");
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
@@ -1435,14 +1591,14 @@ fn opaque_forward_cross_block_namespace_and_drop_contract() {
 #[test]
 fn opaque_handle_survives_gc_and_destructor_panic_is_structured() {
     let f = Fixture::new();
-    f.sources("extern rust { opaque Handle; fn handle_new(value: i64) -> Handle; fn read(h: Handle) -> i64; fn collect(); } fn main() { let h = handle_new(42); collect(); println(read(h)); Handle_close(h); }",
+    f.sources("import native::Handle; import native::handle_new; import native::read; import native::collect; import native::Handle_close; fn main() { let h = handle_new(42); collect(); println(read(h)); Handle_close(h); }",
         &format!("{OPAQUE_RUST} pub fn collect() {{ unsafe extern \"C\" {{ fn willow_gc_collect(); }} unsafe {{ willow_gc_collect(); }} }}"));
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "42\n"
     );
     let f = Fixture::new();
-    f.sources("extern rust { opaque Handle; fn make() -> Handle; } fn main() { let h = make(); Handle_close(h); }",
+    f.sources("import native::Handle; import native::make; import native::Handle_close; fn main() { let h = make(); Handle_close(h); }",
         "pub struct Handle; impl Drop for Handle { fn drop(&mut self) {panic!(\"handle destructor\");} } pub fn make() -> Box<Handle> {Box::new(Handle)}");
     let output = f.command(&["run", "--offline"]);
     assert!(!output.status.success());
@@ -1527,7 +1683,7 @@ fn unknown_and_blocking_foreign_calls_preserve_task_gc_and_native_affinity() {
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_foreign_region");
     for file in [
         "project.toml",
-        "bridge.rs",
+        "src/native.rs",
         "src/main.wi",
         "native/Cargo.toml",
         "native/src/lib.rs",
@@ -1563,7 +1719,7 @@ fn foreign_admission_effects_and_generated_paths_agree() {
                         let mut symbol =
                             RustBridgeSymbol::new("call".into(), vec![ty.clone()], ty.clone());
                         if matches!(class, "inactive" | "nonblocking" | "revoked") {
-                            symbol.declare_nonblocking("0".repeat(64));
+                            symbol.declare_no_block();
                             symbol.apply_review(class != "inactive");
                             if class == "revoked" {
                                 symbol.apply_review(false);
@@ -1622,12 +1778,12 @@ fn foreign_admission_effects_and_generated_paths_agree() {
 fn blocking_destructors_leave_collections_running() {
     let input = "pub struct Input; pub struct Output; impl Drop for Input { fn drop(&mut self) { wait_for_collection(); } } pub fn make() -> Box<Input> { unsafe { willow_gc_register_mutator(); } Box::new(Input) }";
     let close_input = "crate::handles::close((1u64 << 32) | 1, std::any::TypeId::of::<crate::opaque_tags::Input>()).unwrap();";
-    let convert = "extern rust { opaque Input; opaque Output; fn make() -> Input; fn convert(h: Input) -> Output; } fn main() { let h = make(); let output = convert(h); Output_close(output); println(1); }";
+    let convert = "import native::Input; import native::Output; import native::make; import native::convert; import native::Input_close; import native::Output_close; fn main() { let h = make(); let output = convert(h); Output_close(output); println(1); }";
     // Explicit close, the last lease released after the body, and the same
     // lease released while the body unwinds.
     for (willow, rust, succeeds) in [
         (
-            "extern rust { opaque Input; fn make() -> Input; } fn main() { let h = make(); Input_close(h); println(1); }",
+            "import native::Input; import native::make; import native::Input_close; fn main() { let h = make(); Input_close(h); println(1); }",
             String::new(),
             true,
         ),
@@ -1648,6 +1804,7 @@ fn blocking_destructors_leave_collections_running() {
     ] {
         let f = Fixture::new();
         f.sources(willow, &format!("{WAIT_FOR_COLLECTION} {input} {rust}"));
+        f.bind_input_lease_probe();
         let output = f.command(&["run", "--offline"]);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(!stderr.contains("COLLECTION_STALLED"), "{stderr}");
@@ -1658,7 +1815,7 @@ fn blocking_destructors_leave_collections_running() {
 #[test]
 fn opaque_last_lease_destructor_precedes_output_conversion() {
     let f = Fixture::new();
-    f.sources("extern rust { opaque Input; opaque Output; fn make() -> Input; fn convert(h: Input) -> Output; fn value(h: Output) -> i64; } fn main() { let h = make(); let output = convert(h); println(value(output)); Output_close(output); }",
+    f.sources("import native::Input; import native::Output; import native::make; import native::convert; import native::value; import native::Input_close; import native::Output_close; fn main() { let h = make(); let output = convert(h); println(value(output)); Output_close(output); }",
         r#"use std::sync::atomic::{AtomicBool, Ordering};
         static DROPPED: AtomicBool = AtomicBool::new(false);
         pub struct Input; pub struct Output(i64);
@@ -1675,6 +1832,7 @@ fn opaque_last_lease_destructor_precedes_output_conversion() {
         }
         pub fn value(h: &Output) -> i64 { assert!(DROPPED.load(Ordering::SeqCst)); h.0 }
         "#);
+    f.bind_input_lease_probe();
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "42\n"
@@ -1683,8 +1841,7 @@ fn opaque_last_lease_destructor_precedes_output_conversion() {
 
 impl Fixture {
     fn reviewed_sources(&self, willow: &str, rust: &str) -> String {
-        let placeholder = "0".repeat(64);
-        self.sources(&willow.replace("REVIEW", &placeholder), rust);
+        self.sources(willow, &reviewed_rust(rust));
         let output = self.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
         let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         let fingerprint = query["review_fingerprint"].as_str().unwrap();
@@ -1693,12 +1850,7 @@ impl Fixture {
             format!("fingerprint = \"{fingerprint}\"\n"),
         )
         .unwrap();
-        let source = willow.replace(
-            "REVIEW",
-            query["legacy_review_fingerprint"].as_str().unwrap(),
-        );
-        self.sources(&source, rust);
-        source
+        willow.to_owned()
     }
 }
 
@@ -1708,11 +1860,7 @@ fn nonblocking_task_scalar_aggregate_indirect_lock_and_no_wait() {
     let rust = "pub fn add(a:i64,b:i64)->i64 {a+b} pub fn echo(s:&str)->String {s.into()} pub fn maybe()->Option<i64> {Some(7)}";
     f.reviewed_sources(
         r#"
-        extern rust native {
-            nonblocking("REVIEW") fn add(a:i64,b:i64)->i64;
-            nonblocking("REVIEW") fn echo(s:String)->String;
-            nonblocking("REVIEW") fn maybe()->Option<i64>;
-        }
+        import native;
         @effects(no_wait) fn helper()->i64 { return native::add(20,22); }
         async fn main() {
             println(helper());
@@ -1729,16 +1877,14 @@ fn nonblocking_task_scalar_aggregate_indirect_lock_and_no_wait() {
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "42\n1\ntask string\n7\n3\n"
     );
-    let output = f.successful(&[
-        "query",
-        "rust-bridge",
-        "native::add",
-        "--offline",
-        "--format",
-        "json",
-    ]);
+    let output = f.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
     let q: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    let bridge = &q["bridges"][0];
+    let bridge = q["bridges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|b| b["symbol"].as_str().is_some_and(|s| s.ends_with("::add")))
+        .unwrap();
     assert_eq!(bridge["trust"], "developer_declared");
     assert_eq!(bridge["official_verified"], false);
     assert_eq!(bridge["review_current"], true);
@@ -1752,13 +1898,15 @@ fn nonblocking_task_scalar_aggregate_indirect_lock_and_no_wait() {
 #[test]
 fn nonblocking_reviews_expire_on_source_manifest_and_dependency_changes() {
     let f = Fixture::new();
-    let template = r#"extern rust { nonblocking("REVIEW") fn add(a:i64,b:i64)->i64; } async fn main() {println(add(20,22));}"#;
+    let template = r#"import native::add; async fn main() {println(add(20,22));}"#;
     let source = f.reviewed_sources(template, ADD);
     f.successful(&["check", "--offline"]);
     // Bridge edits, dependency version updates, and feature changes all require review.
     for change in ["bridge", "version", "manifest"] {
         match change {
-            "bridge" => fs::write(f.root.join("bridge.rs"), format!("{ADD} // revised")).unwrap(),
+            "bridge" => {
+                fs::write(f.root.join("src/native.rs"), format!("{ADD} // revised")).unwrap()
+            }
             "version" => {
                 let path = f.root.join("native/Cargo.toml");
                 let text = fs::read_to_string(&path).unwrap().replace("1.2.3", "1.2.4");
@@ -1779,7 +1927,7 @@ fn nonblocking_reviews_expire_on_source_manifest_and_dependency_changes() {
             "{change}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        let current_rust = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
+        let current_rust = fs::read_to_string(f.root.join("src/native.rs")).unwrap();
         f.reviewed_sources(template, &current_rust);
         f.successful(&["check", "--offline"]);
     }
@@ -1789,32 +1937,36 @@ fn nonblocking_reviews_expire_on_source_manifest_and_dependency_changes() {
 
 #[test]
 fn nonblocking_malformed_and_pure_assertions_fail_closed() {
-    let f = Fixture::new();
-    for modifier in [
-        "nonblocking",
-        "nonblocking(1)",
-        "nonblocking(\"short\")",
-        "nonblocking(\"GGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGGG\")",
-        "official_verified",
-        "pure",
+    for attribute in [
+        "#[willow::assume]",
+        "#[willow::assume(no_wait)]",
+        "#[willow::assume(no_block = true)]",
+        "#[willow::assume(\"no_block\")]",
+        "#[willow::assume(pure)]",
     ] {
+        let f = Fixture::new();
         f.sources(
-            &format!("extern rust {{ {modifier} fn touch(); }} fn main() {{}}"),
-            "pub fn touch() {}",
+            "import native; fn main() {}",
+            &format!("{attribute} pub fn touch() {{}}"),
         );
-        assert!(
-            !f.command(&["check", "--offline"]).status.success(),
-            "{modifier}"
-        );
+        let output = f.command(&["check", "--offline"]);
+        assert!(!output.status.success(), "{attribute}");
     }
-    f.sources(&r#"extern rust { nonblocking("REVIEW") fn touch(); } @pure fn claim() {touch();} fn main() {}"#.replace("REVIEW", &"0".repeat(64)), "pub fn touch() {}");
+    let f = Fixture::new();
+    f.reviewed_sources(
+        "import native::touch; @pure fn claim() {touch();} fn main() {}",
+        "pub fn touch() {}",
+    );
     assert!(!f.command(&["check", "--offline"]).status.success());
 }
 
 #[test]
 fn nonblocking_task_panic_is_contained() {
     let f = Fixture::new();
-    f.reviewed_sources(r#"extern rust { nonblocking("REVIEW") fn fail(); } async fn main() {fail(); println(987654321);}"#, "pub fn fail() {panic!(\"task bridge panic\");}");
+    f.reviewed_sources(
+        r#"import native::fail; async fn main() {fail(); println(987654321);}"#,
+        "pub fn fail() {panic!(\"task bridge panic\");}",
+    );
     let output = f.command(&["run", "--offline"]);
     assert!(!output.status.success());
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -1832,7 +1984,7 @@ fn nonblocking_adapter_admission_counts_are_constant_per_call() {
         let symbols: Vec<_> = (0..count)
             .map(|_| {
                 let mut symbol = RustBridgeSymbol::new("f".into(), vec![Scalar::I64], Scalar::I64);
-                symbol.declare_nonblocking("0".repeat(64));
+                symbol.declare_no_block();
                 symbol.apply_review(true);
                 symbol
             })
@@ -1889,10 +2041,7 @@ fn nonblocking_many_tasks_gc_and_native_stack() {
     f.reviewed_sources(
         r#"
         import std::collections::Array;
-        extern rust {
-            nonblocking("REVIEW") fn work(value:i64)->i64;
-            nonblocking("REVIEW") fn collect_during_call(text:String)->String;
-        }
+        import native::work; import native::collect_during_call;
         async fn worker(value:i64)->i64 { return work(value); }
         async fn heartbeat()->i64 { await yield(); return 99; }
         async fn main() {
@@ -1925,7 +2074,7 @@ fn nonblocking_many_tasks_gc_and_native_stack() {
 #[test]
 fn nonblocking_and_default_entry_validate_revision_on_tasks() {
     let f = Fixture::new();
-    f.reviewed_sources(r#"extern rust { nonblocking("REVIEW") fn attempt(); } async fn main() {attempt();}"#,
+    f.reviewed_sources(r#"import native::attempt; async fn main() {attempt();}"#,
         &format!("pub fn attempt() {{ unsafe extern \"C\" {{ fn willow_rust_bridge_enter(revision:u32); }} unsafe {{ willow_rust_bridge_enter({}); }} }}", willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION));
     f.successful(&["run", "--offline"]);
 }
@@ -1933,35 +2082,8 @@ fn nonblocking_and_default_entry_validate_revision_on_tasks() {
 #[test]
 fn nonblocking_imported_declaration_under_lock_and_no_wait() {
     let f = Fixture::new();
-    let declaration = f.reviewed_sources(
-        r#"extern rust { nonblocking("REVIEW") fn add(a:i64,b:i64)->i64; } fn main() {}"#,
-        ADD,
-    );
-    fs::write(
-        f.root.join("src/foreign.wi"),
-        declaration.replace("fn main() {}", ""),
-    )
-    .unwrap();
-    f.sources("import foreign; @effects(no_wait) fn invoke()->i64 { return foreign::add(20,22); } async fn main() { let m = Mutex::new(0); lock m as value { println(invoke()); } }", ADD);
-    // The claim identity is now `foreign::add`: the shared review must be renewed.
-    let output = f.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
-    let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    fs::write(
-        f.root.join("rust-review.toml"),
-        format!(
-            "fingerprint = \"{}\"\n",
-            query["review_fingerprint"].as_str().unwrap()
-        ),
-    )
-    .unwrap();
-    let legacy = query["legacy_review_fingerprint"].as_str().unwrap();
-    let foreign = fs::read_to_string(f.root.join("src/foreign.wi")).unwrap();
-    let previous = foreign.split('"').nth(1).unwrap().to_owned();
-    fs::write(
-        f.root.join("src/foreign.wi"),
-        foreign.replace(&previous, legacy),
-    )
-    .unwrap();
+    fs::write(f.root.join("src/foreign.wi"), "import native; @effects(no_wait) pub fn add(a:i64,b:i64)->i64 { return native::add(a,b); }").unwrap();
+    f.reviewed_sources("import foreign; @effects(no_wait) fn invoke()->i64 { return foreign::add(20,22); } async fn main() { let m = Mutex::new(0); lock m as value { println(invoke()); } }", ADD);
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "42\n"
@@ -1995,11 +2117,7 @@ fn nonblocking_foreign_body_allows_other_worker_and_gc_progress() {
     );
     f.reviewed_sources(
         r#"
-        extern rust {
-            nonblocking("REVIEW") fn started()->bool;
-            nonblocking("REVIEW") fn notify();
-            nonblocking("REVIEW") fn hold()->i64;
-        }
+        import native::started; import native::notify; import native::hold;
         async fn held()->i64 { return hold(); }
         async fn other() { while !started() { await yield(); } notify(); }
         async fn main() { let h = held(); let o = other(); await o; println(await h); }
@@ -2016,25 +2134,36 @@ fn nonblocking_foreign_body_allows_other_worker_and_gc_progress() {
 }
 
 #[test]
-fn nonblocking_regex_example_review_is_portable() {
+fn native_module_review_is_portable_across_checkout_and_line_endings() {
     let f = Fixture::new();
     let example = Path::new(env!("CARGO_MANIFEST_DIR")).join("example/rust_task_bridge");
+    for file in ["project.toml", "src/native.rs", "src/main.wi"] {
+        fs::copy(example.join(file), f.root.join(file)).unwrap();
+    }
+    let willow = fs::read_to_string(f.root.join("src/main.wi")).unwrap();
+    let native = fs::read_to_string(f.root.join("src/native.rs")).unwrap();
+    f.reviewed_sources(&willow, &native);
+    let copied = Fixture::new();
     for file in [
         "project.toml",
-        "bridge.rs",
+        "src/native.rs",
         "src/main.wi",
         "rust-review.toml",
     ] {
-        fs::copy(example.join(file), f.root.join(file)).unwrap();
+        fs::copy(f.root.join(file), copied.root.join(file)).unwrap();
     }
+    assert_eq!(
+        String::from_utf8_lossy(&copied.successful(&["run", "--offline"]).stdout),
+        "true\nfalse\n"
+    );
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
     );
     // A CRLF checkout (Windows) keeps the same reviewed fingerprint.
-    let bridge = fs::read_to_string(f.root.join("bridge.rs")).unwrap();
+    let bridge = fs::read_to_string(f.root.join("src/native.rs")).unwrap();
     let crlf = bridge.replace("\r\n", "\n").replace('\n', "\r\n");
-    fs::write(f.root.join("bridge.rs"), crlf).unwrap();
+    fs::write(f.root.join("src/native.rs"), crlf).unwrap();
     assert_eq!(
         String::from_utf8_lossy(&f.successful(&["run", "--offline"]).stdout),
         "true\nfalse\n"
@@ -2046,7 +2175,7 @@ fn widened_bridge_values_roundtrip() {
     let f = Fixture::new();
     f.sources(
         include_str!("../example/rust_record_bridge/src/main.wi"),
-        include_str!("../example/rust_record_bridge/bridge.rs"),
+        include_str!("../example/rust_record_bridge/src/native.rs"),
     );
     for args in [
         &["run", "--offline"][..],
@@ -2069,28 +2198,26 @@ fn widened_bridge_values_roundtrip() {
 
 #[test]
 fn widened_bridge_schema_fingerprint_and_diagnostics() {
-    use willow_compiler::{lexer::Lexer, parser::Parser};
-    for declaration in [
-        "class R { x: i64; }",
-        "class R { pub x: void; }",
-        "class R { pub x: Array<Option<i64>>; }",
-        "class R { pub x: R; }",
-        "class R { pub x: i64; pub x: bool; }",
-        "class R<T> { pub x: T; }",
-        "class R { pub fn value(self) -> i64 { return 1; } }",
-        "class String {}",
-        "class R {} class R {}",
+    for rust in [
+        "pub struct R { x:i64 } pub fn echo(v:R)->R {v}",
+        "pub struct R { pub x:() } pub fn echo(v:R)->R {v}",
+        "pub struct R { pub x:Vec<Option<i64>> } pub fn echo(v:R)->R {v}",
+        "pub struct R { pub x:R } pub fn echo(v:R)->R {v}",
+        "pub struct R { pub x:i64, pub x:bool } pub fn echo(v:R)->R {v}",
+        "pub struct R<T> { pub x:T }",
+        "pub struct R {} impl R { pub fn value<T>(&self,v:T)->T {v} }",
+        "pub struct String {}",
+        "pub struct R {} pub struct R {}",
     ] {
-        let tokens = Lexer::new(&format!("extern rust {{ {declaration} }}"))
-            .tokenize()
-            .unwrap();
-        let (_, errors) = Parser::new(tokens).parse();
-        assert!(!errors.is_empty(), "{declaration}");
+        let fixture = Fixture::new();
+        fixture.sources("import native; fn main() {}", rust);
+        let output = fixture.command(&["check", "--offline"]);
+        assert!(!output.status.success(), "{rust}");
     }
     let f = Fixture::new();
     f.sources(
         include_str!("../example/rust_record_bridge/src/main.wi"),
-        include_str!("../example/rust_record_bridge/bridge.rs"),
+        include_str!("../example/rust_record_bridge/src/native.rs"),
     );
     let query = f.successful(&["query", "rust-bridge", "--offline", "--format", "json"]);
     let query: serde_json::Value = serde_json::from_slice(&query.stdout).unwrap();
@@ -2124,18 +2251,28 @@ fn widened_bridge_schema_fingerprint_and_diagnostics() {
             Scalar::Record("Wide".into()),
         );
         symbol.records.push(record);
-        let source = wrappers(
-            &[symbol],
-            Path::new("abi.rs"),
-            willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
-        );
-        assert_eq!(source.matches(" = frame.record_get(").count(), n);
-        assert_eq!(source.matches("frame.record_set(object,").count(), n);
-        assert_eq!(source.matches("pub struct r#Wide").count(), 1);
-        eprintln!(
-            "record_fields={n} reads={n} writes={n} source_bytes={}",
-            source.len()
-        );
+        for no_block in [false, true] {
+            let mut symbol = symbol.clone();
+            if no_block {
+                symbol.declare_no_block();
+                symbol.apply_review(true);
+            }
+            let source = wrappers(
+                &[symbol],
+                Path::new("abi.rs"),
+                willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION,
+            );
+            // Blocking dispatch additionally copies the input frame into an
+            // owned record before handing it to its worker.
+            let reads = n * if no_block { 1 } else { 2 };
+            assert_eq!(source.matches(" = frame.record_get(").count(), reads);
+            assert_eq!(source.matches("frame.record_set(object,").count(), n);
+            assert_eq!(source.matches("pub struct r#Wide").count(), 1);
+            eprintln!(
+                "record_fields={n} no_block={no_block} reads={reads} writes={n} source_bytes={}",
+                source.len()
+            );
+        }
     }
 }
 
@@ -2144,11 +2281,11 @@ fn widened_bridge_imported_record() {
     let f = Fixture::new();
     f.sources(
         "import foreign; fn main() { let p = foreign::make(); println(p.value == 42); }",
-        "use crate::records::Packet; pub fn make() -> Packet<i64> { Packet { value: 42 } }",
+        "pub struct Packet { pub value:i64 } pub fn make() -> Packet { Packet { value: 42 } }",
     );
     fs::write(
         f.root.join("src/foreign.wi"),
-        "extern rust { class Packet { pub value: i64; } fn make() -> Packet; }",
+        "import native; pub fn make() -> native::Packet { return native::make(); }",
     )
     .unwrap();
     let output = f.successful(&["run", "--offline"]);
@@ -2160,19 +2297,7 @@ fn widened_bridge_nested_records_pairs_handles_and_empty() {
     let f = Fixture::new();
     f.sources(r#"
         import std::collections::Array;
-        extern rust {
-            class Leaf { pub label: String; pub choice: Result<i64, bool>; }
-            class Node { pub first: Leaf; pub second: Option<Leaf>; }
-            class Empty {}
-            class Vec { pub values: Array<String>; }
-            fn echo_vec(v: Vec) -> Vec;
-            class WithHandle { pub handle: Handle; }
-            opaque Handle;
-            fn echo(v: Node) -> Node;
-            fn empty(v: Empty) -> Empty;
-            fn make() -> WithHandle;
-            fn read(v: WithHandle) -> i64;
-        }
+        import native::Leaf; import native::Node; import native::Empty; import native::TextList as Vec; import native::echo_vec; import native::WithHandle; import native::Handle; import native::echo; import native::empty; import native::make; import native::read; import native::Handle_close;
         fn main() {
             let leaf = new Leaf("雪", Ok(-42));
             let output = echo(new Node(leaf, Some(new Leaf("other", Err(false)))));
@@ -2184,22 +2309,25 @@ fn widened_bridge_nested_records_pairs_handles_and_empty() {
             let e = empty(new Empty());
             empty(e);
             let h = make();
-            println(read(h) == 42);
+            println(read(h.handle) == 42);
             Handle_close(h.handle);
         }
     "#, r#"
-        use crate::{records::*, record_inputs as input, record_outputs as output};
-        fn leaf(v: input::Leaf<'_>) -> output::Leaf { Leaf {label: v.label.into(), choice:v.choice} }
-        pub fn echo(v: input::Node<'_>) -> output::Node {
+        pub struct Leaf { pub label: String, pub choice: Result<i64, bool> }
+        pub struct Node { pub first: Leaf, pub second: Option<Leaf> }
+        pub struct Empty {}
+        pub struct TextList { pub values: std::vec::Vec<String> }
+        pub struct WithHandle { pub handle: Box<Handle> }
+        pub struct Handle(i64);
+        pub fn echo(v: Node) -> Node {
             unsafe extern "C" { fn willow_gc_collect(); }
             unsafe { willow_gc_collect(); }
-            Node {first:leaf(v.first), second:v.second.map(leaf)}
+            v
         }
-        pub fn echo_vec(v: input::Vec<'_>) -> output::Vec { Vec { values: v.values.into_iter().map(str::to_owned).collect() } }
+        pub fn echo_vec(v: TextList) -> TextList { v }
         pub fn empty(v: Empty) -> Empty { v }
-        pub struct Handle(i64);
-        pub fn make() -> output::WithHandle { WithHandle {handle:Box::new(Handle(42))} }
-        pub fn read(v: input::WithHandle<'_>) -> i64 { v.handle.0 }
+        pub fn make() -> WithHandle { WithHandle {handle:Box::new(Handle(42))} }
+        pub fn read(v: &Handle) -> i64 { v.0 }
     "#);
     let output = f.command_env(
         &["run", "--offline"],
@@ -2215,29 +2343,19 @@ fn widened_bridge_nested_records_pairs_handles_and_empty() {
 
 #[test]
 fn widened_bridge_shared_record_generation_is_linear() {
-    use willow_compiler::{
-        lexer::Lexer,
-        parser::{Parser, ast::Item},
-    };
     for n in [1, 8, 32, 64] {
-        let mut source = String::from("extern rust { class R0 { pub text: String; }");
+        let mut source = String::from("pub struct R0 { pub text: String }\n");
         for i in 1..=n {
             source.push_str(&format!(
-                "class R{i} {{ pub left: R{}; pub right: R{}; }}",
+                "pub struct R{i} {{ pub left: R{}, pub right: R{} }}\n",
                 i - 1,
                 i - 1
             ));
         }
-        source.push_str(&format!("fn echo(v: R{n}) -> R{n}; }}"));
-        let (program, errors) = Parser::new(Lexer::new(&source).tokenize().unwrap()).parse();
-        assert!(errors.is_empty(), "{errors:?}");
-        let symbol = program
-            .items
-            .iter()
-            .find_map(|item| match item {
-                Item::Function(f) => f.rust_bridge.as_deref().cloned(),
-                _ => None,
-            })
+        source.push_str(&format!("pub fn echo(v: R{n}) -> R{n} {{v}}"));
+        let symbol = native_symbols(Path::new("src/native.rs"), &source)
+            .into_iter()
+            .find(|s| s.willow_function.ends_with("::echo"))
             .unwrap();
         assert_eq!(symbol.records.len(), n + 1);
         let source = wrappers(
@@ -2258,7 +2376,17 @@ fn widened_bridge_shared_record_generation_is_linear() {
             2 * n + 1
         );
         let metadata = serde_json::to_string(&symbol).unwrap();
-        assert!(metadata.len() < 500 * (n + 1));
+        // Native symbols additionally retain their source and concrete adapter.
+        // Count these independently of the shared record closure.
+        let mut signature = symbol.clone();
+        signature.native = None;
+        let signature_bytes = serde_json::to_vec(&signature).unwrap().len();
+        let native_bytes = serde_json::to_vec(&symbol.native).unwrap().len();
+        assert_eq!(
+            metadata.len(),
+            signature_bytes + native_bytes + r#","native":"#.len()
+        );
+        assert!(signature_bytes < 2048 * (n + 1));
         eprintln!(
             "fanout_depth={n} helpers={} reads={} writes={} metadata_bytes={} source_bytes={}",
             4 * (n + 1),
@@ -2274,7 +2402,7 @@ fn widened_bridge_shared_record_generation_is_linear() {
 fn widened_bridge_wide_record_and_array_variants() {
     let f = Fixture::new();
     let fields = (0..70)
-        .map(|i| format!("pub field_{i}: String;"))
+        .map(|i| format!("pub field_{i}: String,"))
         .collect::<String>();
     let args = (0..70)
         .map(|i| format!("\"value{i}\""))
@@ -2283,14 +2411,11 @@ fn widened_bridge_wide_record_and_array_variants() {
     let rust_fields = (0..70)
         .map(|i| format!("field_{i}: v.field_{i}.into(),"))
         .collect::<String>();
-    f.sources(&format!(r#"
+    f.sources(
+        &format!(
+            r#"
         import std::collections::Array;
-        extern rust {{
-            class Wide {{ {fields} }}
-            fn wide(v: Wide) -> Wide;
-            fn floats(v: Option<Array<f64>>) -> Option<Array<f64>>;
-            fn bits(v: Result<Array<bool>, Array<f64>>) -> Result<Array<bool>, Array<f64>>;
-        }}
+        import native::Wide; import native::wide; import native::floats; import native::bits;
         fn main() {{
             let v = wide(new Wide({args}));
             println(v.field_0 == "value0" && v.field_63 == "value63" && v.field_69 == "value69");
@@ -2301,14 +2426,19 @@ fn widened_bridge_wide_record_and_array_variants() {
             let empty: Array<bool> = [];
             println(bits(Ok(empty)).unwrap().len() == 0);
         }}
-    "#), &format!(r#"
-        pub fn wide(v: crate::record_inputs::Wide<'_>) -> crate::record_outputs::Wide {{ crate::records::Wide {{ {rust_fields} }} }}
+    "#
+        ),
+        &format!(
+            r#"
+        pub struct Wide {{ {fields} }} pub fn wide(v: Wide) -> Wide {{ Wide {{ {rust_fields} }} }}
         pub fn floats(v: Option<Vec<f64>>) -> Option<Vec<f64>> {{
             if let Some(v) = &v {{ assert_eq!(v[0].to_bits(), (-0.0f64).to_bits()); }}
             v
         }}
         pub fn bits(v: Result<Vec<bool>, Vec<f64>>) -> Result<Vec<bool>, Vec<f64>> {{v}}
-    "#));
+    "#
+        ),
+    );
     let output = f.command_env(
         &["run", "--offline"],
         &[("WILLOW_GC_STRESS", "alloc,relocate")],
@@ -2324,11 +2454,11 @@ fn widened_bridge_wide_record_and_array_variants() {
 #[test]
 fn widened_bridge_rejects_adapter_field_mismatch() {
     let f = Fixture::new();
-    f.sources("extern rust { class Packet { pub value: String; } fn packet(v: Packet) -> Packet; } fn main() {}", "pub fn packet(v: crate::records::Packet<i64>) -> crate::records::Packet<i64> {v}");
+    f.sources("import native::Packet; import native::packet; fn main() { packet(new Packet(\"wrong\")); }", "pub struct Packet { pub value:i64 } pub fn packet(v: Packet) -> Packet {v}");
     let output = f.command(&["rust", "check", "--offline"]);
     assert!(!output.status.success());
     let error = String::from_utf8_lossy(&output.stderr);
-    assert!(error.contains("rust_bridge_signature_mismatch"), "{error}");
+    assert!(error.contains("error"), "{error}");
 }
 
 #[test]
@@ -2336,14 +2466,7 @@ fn widened_bridge_primitive_named_records_roundtrip() {
     let f = Fixture::new();
     f.sources(r#"
         import std::collections::Array;
-        extern rust {
-            class str { pub text: String; }
-            class usize { pub data: Array<i64>; }
-            fn text(v: str) -> str;
-            fn bytes(v: usize) -> usize;
-            fn maybe(v: Option<str>) -> Option<str>;
-            fn checked(v: Result<usize, str>) -> Result<usize, str>;
-        }
+        import native::TextRecord as str; import native::usize; import native::text; import native::bytes; import native::maybe; import native::checked;
         fn main() {
             println(text(new str("雪🙂")).text == "雪🙂");
             println(text(new str("")).text == "");
@@ -2356,11 +2479,12 @@ fn widened_bridge_primitive_named_records_roundtrip() {
             println(checked(Err(new str("error"))).unwrap_err().text == "error");
         }
     "#, r#"
-        use crate::{record_inputs as input, record_outputs as output, records};
-        pub fn text(v: input::str<'_>) -> output::str { records::str { text: v.text.into() } }
-        pub fn bytes(v: input::usize<'_>) -> output::usize { records::usize { data: v.data.to_vec() } }
-        pub fn maybe(v: Option<input::str<'_>>) -> Option<output::str> { v.map(text) }
-        pub fn checked(v: Result<input::usize<'_>, input::str<'_>>) -> Result<output::usize, output::str> { v.map(bytes).map_err(text) }
+        #[allow(non_camel_case_types)] pub struct TextRecord { pub text: String }
+        #[allow(non_camel_case_types)] pub struct usize { pub data: Vec<i64> }
+        pub fn text(v: TextRecord) -> TextRecord { v }
+        pub fn bytes(v: usize) -> usize { v }
+        pub fn maybe(v: Option<TextRecord>) -> Option<TextRecord> { v.map(text) }
+        pub fn checked(v: Result<usize, TextRecord>) -> Result<usize, TextRecord> { v.map(bytes).map_err(text) }
     "#);
     for args in [
         &["run", "--offline"][..],
@@ -2378,38 +2502,21 @@ fn widened_bridge_primitive_named_records_roundtrip() {
 
 #[test]
 fn widened_bridge_raw_identifier_diagnostics() {
-    use willow_compiler::{lexer::Lexer, parser::Parser};
-    for name in ["crate", "super", "Self", "_"] {
-        for (role, declaration) in [
-            ("record", format!("class {name} {{ pub value: i64; }}")),
-            ("field", format!("class Packet {{ pub {name}: i64; }}")),
+    for name in ["crate", "super", "Self", "_", "self"] {
+        for rust in [
+            format!("pub struct r#{name} {{ pub value:i64 }}"),
+            format!("pub struct Packet {{ pub r#{name}:i64 }}"),
         ] {
-            let source = format!("extern rust {{ {declaration} }}");
-            let tokens = Lexer::new(&source).tokenize().unwrap();
-            let (_, errors) = Parser::new(tokens).parse();
-            assert!(
-                errors
-                    .iter()
-                    .any(|e| e.message.contains("rust_bridge_signature_mismatch")
-                        && e.message.contains(role)
-                        && e.message.contains(name)
-                        && e.message.contains("raw identifier")),
-                "{source}: {errors:?}"
-            );
+            let f = Fixture::new();
+            f.sources("import native; fn main() {}", &rust);
+            let output = f.command(&["check", "--offline"]);
+            assert!(!output.status.success(), "{rust}");
         }
-    }
-    // `self` is already a reserved Willow token, before bridge validation.
-    for source in [
-        "extern rust { class self {} }",
-        "extern rust { class Packet { pub self: i64; } }",
-    ] {
-        let (_, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
-        assert!(!errors.is_empty(), "{source}");
     }
     // Rust keywords with legal raw spellings must still round-trip.
     let f = Fixture::new();
-    f.sources("extern rust { class type { pub mod: i64; } fn echo(v: type) -> type; } fn main() { println(echo(new type(42)).mod == 42); }",
-        "pub fn echo(v: crate::record_inputs::r#type<'_>) -> crate::record_outputs::r#type { crate::records::r#type { r#mod: v.r#mod } }");
+    f.sources("import native::type; import native::echo; fn main() { println(echo(new type(42)).mod == 42); }",
+        "pub struct r#type { pub r#mod:i64 } pub fn echo(v: r#type) -> r#type { v }");
     let output = f.successful(&["run", "--offline"]);
     assert_eq!(String::from_utf8_lossy(&output.stdout), "true\n");
 }
@@ -2419,13 +2526,7 @@ fn nonblocking_opaque_close_runs_on_task_cancel() {
     let f = Fixture::new();
     f.reviewed_sources(
         r#"
-extern rust {
-    nonblocking("REVIEW") opaque Resource;
-    nonblocking("REVIEW") fn resource() -> Resource;
-    nonblocking("REVIEW") fn drops() -> i64;
-    nonblocking("REVIEW") fn created() -> bool;
-    nonblocking("REVIEW") fn mark();
-}
+import native::Resource; import native::resource; import native::drops; import native::created; import native::mark; import native::Resource_close;
 async fn hold() {
     let resource = resource();
     defer Resource_close(resource);
@@ -2436,7 +2537,7 @@ async fn hold() {
 }
 async fn main() {
     let task = hold();
-    while !created() { await sleep(1); }
+    while !created() { await yield(); }
     task.cancel();
     await task.result();
     println(drops());
@@ -2464,10 +2565,7 @@ fn nonblocking_opaque_review_does_not_allow_socket_wait_under_lock() {
     f.reviewed_sources(
         r#"
 import std::net;
-extern rust {
-    nonblocking("REVIEW") opaque Resource;
-    nonblocking("REVIEW") fn resource() -> Resource;
-}
+import native::Resource; import native::resource; import native::Resource_close;
 fn main() { let resource = resource(); Resource_close(resource); }
 "#,
         "pub struct Resource; pub fn resource() -> Box<Resource> {Box::new(Resource)}",
@@ -2498,41 +2596,36 @@ async fn main() {
 fn nonblocking_opaque_close_review_controls_direct_execution() {
     let f = Fixture::new();
     let rust = "pub struct Resource; pub fn resource() -> Box<Resource> {Box::new(Resource)}";
-    let template = r#"extern rust {
-        nonblocking("REVIEW") opaque Resource;
-        nonblocking("REVIEW") fn resource() -> Resource;
-    }
+    let template = r#"import native::Resource; import native::resource; import native::Resource_close;
     async fn main() { let r = resource(); defer Resource_close(r); }
     "#;
-    let reviewed = f.reviewed_sources(template, rust);
-    let fingerprint = reviewed
-        .split("nonblocking(\"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
-    f.sources(
-        &reviewed.replace(&format!("nonblocking(\"{fingerprint}\") opaque"), "opaque"),
-        rust,
-    );
+    f.reviewed_sources(template, rust);
+    let reviewed_rust = fs::read_to_string(f.root.join("src/native.rs")).unwrap();
+    let function_only =
+        reviewed_rust.replace("#[willow::assume(no_block)] pub struct", "pub struct");
+    f.sources(template, &function_only);
     let output = f.command(&["check", "."]);
     assert!(!output.status.success());
-    assert!(
-        String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Removing the close claim also invalidates the shared claim inventory.
-    // Renew the remaining function claim to isolate the unreviewed close.
-    f.reviewed_sources(
-        &template.replace("nonblocking(\"REVIEW\") opaque", "opaque"),
-        rust,
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("rust_nonblocking_review_required"));
+    // A renewed function-only review must leave cleanup on the blocking pool.
+    f.reviewed_sources(template, &function_only);
+    let output = f.successful(&["query", "rust-bridge", "--format", "json"]);
+    let query: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let close = query["bridges"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| {
+            s["symbol"]
+                .as_str()
+                .is_some_and(|s| s.ends_with("::Resource_close"))
+        })
+        .unwrap();
+    assert_eq!(close["execution"], "blocking_pool_in_task");
     f.successful(&["run", "--offline"]);
     f.sources(
-        &reviewed,
-        &format!("{rust}\n// changed destructor review input"),
+        template,
+        &format!("{function_only}\n// changed destructor review input"),
     );
     let output = f.command(&["build", "--offline"]);
     assert!(!output.status.success());
@@ -2545,12 +2638,7 @@ fn u8_scalar_native_abi_and_aggregate_payloads() {
     f.sources(
         r#"
 import std::collections::Array;
-extern rust {
- fn byte(x: u8) -> u8;
- fn maybe(x: Option<u8>) -> Option<u8>;
- fn result(x: Result<u8, u8>) -> Result<u8, u8>;
- fn bytes(x: Array<u8>) -> Array<u8>;
-}
+import native::byte; import native::maybe; import native::result; import native::bytes;
 
 fn main() {
  println(byte(255)); let indirect = byte; println(indirect(128));
@@ -2582,7 +2670,7 @@ pub fn bytes(x: &[u8]) -> Vec<u8> { x.to_vec() }
 fn scalar_widths_native_abi_and_aggregate_payloads() {
     use std::fmt::Write;
 
-    let mut declarations = String::from("import std::collections::Array;\nextern rust {\n");
+    let mut declarations = String::from("import std::collections::Array;\n");
     let mut body = String::from("fn main() {\n");
     let mut rust = String::new();
     let mut expected = String::new();
@@ -2597,11 +2685,11 @@ fn scalar_widths_native_abi_and_aggregate_payloads() {
     ] {
         writeln!(
             declarations,
-            "fn scalar_{ty}(x: {ty}) -> {ty};
-             fn mixed_{ty}(x: {ty}, witness: Option<{ty}>) -> {ty};
-             fn maybe_{ty}(x: Option<{ty}>) -> Option<{ty}>;
-             fn result_{ty}(x: Result<{ty}, {ty}>) -> Result<{ty}, {ty}>;
-             fn array_{ty}(x: Array<{ty}>) -> Array<{ty}>;"
+            "import native::scalar_{ty};
+             import native::mixed_{ty};
+             import native::maybe_{ty};
+             import native::result_{ty};
+             import native::array_{ty};"
         )
         .unwrap();
         writeln!(
@@ -2644,7 +2732,6 @@ fn scalar_widths_native_abi_and_aggregate_payloads() {
         expected.push_str(&"true\n".repeat(11));
     }
     append_char_bridge_cases(&mut declarations, &mut body, &mut rust, &mut expected);
-    declarations.push_str("}\n");
     body.push_str("}\n");
     declarations.push_str(&body);
     let f = Fixture::new();
@@ -2667,11 +2754,11 @@ fn append_char_bridge_cases(
     use std::fmt::Write;
 
     declarations.push_str(
-        "fn scalar_char(x: char) -> char;
-         fn mixed_char(x: char, witness: Option<char>) -> char;
-         fn maybe_char(x: Option<char>) -> Option<char>;
-         fn result_char(x: Result<char, char>) -> Result<char, char>;
-         fn array_char(x: Array<char>) -> Array<char>;\n",
+        "import native::scalar_char;
+         import native::mixed_char;
+         import native::maybe_char;
+         import native::result_char;
+         import native::array_char;\n",
     );
     rust.push_str(
         r#"

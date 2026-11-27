@@ -34,10 +34,7 @@ pub fn recorded(root: &Path) -> Result<Option<String>> {
 }
 
 pub fn required<'a>(root: &Path, symbols: impl IntoIterator<Item = &'a RustBridgeSymbol>) -> bool {
-    root.join(RECORD).exists()
-        || symbols
-            .into_iter()
-            .any(|s| s.no_io || s.nonblocking.is_some())
+    root.join(RECORD).exists() || symbols.into_iter().any(|s| s.no_io || s.no_block)
 }
 
 pub fn validate(root: &Path, symbols: &[RustBridgeSymbol], current: &str) -> Result<()> {
@@ -56,26 +53,11 @@ pub(crate) fn source_input_fingerprint(root: &Path) -> Result<Option<String>> {
     if !root.join(RECORD).exists() {
         return Ok(None);
     }
-    let manifest = ProjectManifest::load(&root.join("project.toml"))?;
     let mut sources = BTreeMap::new();
     discover_source_hashes(root, &mut sources, hash_file)?;
-    let legacy = manifest
-        .rust
-        .as_ref()
-        .map(|rust| -> Result<_> {
-            let path = root.join(rust.relative_bridge()?);
-            let digest = match fs::read(&path) {
-                Ok(bytes) => Some(hash(&bytes)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(error.into()),
-            };
-            Ok((review_module_path(root, &path), digest))
-        })
-        .transpose()?;
     Ok(Some(hash(&serde_json::to_vec(&(
         "review-source-inputs-v1",
         sources,
-        legacy,
     ))?)))
 }
 
@@ -345,8 +327,6 @@ impl DependencySources {
 #[cfg(test)]
 thread_local! {
     static DEPENDENCY_FILES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CLAIM_IDENTITIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static CLAIM_RECORDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 fn discover_source_hashes(
@@ -382,7 +362,6 @@ pub(super) fn fingerprint(
     symbols: &[RustBridgeSymbol],
     lock: &str,
     input: &str,
-    legacy: Option<&str>,
 ) -> Result<String> {
     // Captured modules avoid duplicate source reads; discover unimported modules
     // as well so check, build and query share one project-wide review boundary.
@@ -396,53 +375,11 @@ pub(super) fn fingerprint(
         }
     }
     discover_source_hashes(root, &mut sources, reviewed_file_hash)?;
-    // Legacy claims live in Willow declarations, not the Rust source inventory.
-    // Bind their semantic identity and effect names, excluding source positions,
-    // admission state and the inline digest (which must not hash itself).
-    let mut claims = std::collections::BTreeSet::new();
-    let mut record_digests = std::collections::HashMap::new();
-    for symbol in symbols
-        .iter()
-        .filter(|symbol| symbol.native.is_none() && symbol.has_assumptions())
-    {
-        #[cfg(test)]
-        CLAIM_IDENTITIES.set(CLAIM_IDENTITIES.get() + 1);
-        let mut effects = Vec::new();
-        if symbol.nonblocking.is_some() {
-            effects.push("no_block");
-        }
-        if symbol.no_io {
-            effects.push("no_io");
-        }
-        // Cloned symbols share an immutable record closure. Canonicalize that
-        // closure once, rather than multiplying its size by the export count.
-        let records = match record_digests.entry(std::ptr::from_ref(&*symbol.records)) {
-            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                #[cfg(test)]
-                CLAIM_RECORDS.set(CLAIM_RECORDS.get() + symbol.records.len());
-                let mut records: Vec<_> = symbol.records.iter().collect();
-                records.sort_by(|a, b| a.name.cmp(&b.name));
-                entry.insert(hash(&serde_json::to_vec(&records)?))
-            }
-        };
-        claims.insert(serde_json::to_vec(&(
-            &symbol.willow_function,
-            &symbol.input_types,
-            &symbol.output_type,
-            records,
-            symbol.is_async,
-            symbol.close_handle,
-            effects,
-        ))?);
-    }
     Ok(hash(&serde_json::to_vec(&(
-        "native-review-v2",
+        "native-review-v3",
         lock,
         input,
-        legacy,
         sources,
-        claims,
     ))?))
 }
 
@@ -733,7 +670,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_review_source_inputs_track_unimported_and_legacy_changes() {
+    fn unified_review_source_inputs_track_imported_and_unimported_modules() {
         let root = std::env::temp_dir().join(format!(
             "willow-review-source-inputs-{}",
             std::process::id()
@@ -745,10 +682,10 @@ mod tests {
         assert_eq!(source_input_fingerprint(&root).unwrap(), None);
         fs::write(
             root.join("project.toml"),
-            "[project]\nname='review_inputs'\nversion='0.1.0'\n[rust]\nbridge='bridge.rs'\n",
+            "[project]\nname='review_inputs'\nversion='0.1.0'\n",
         )
         .unwrap();
-        fs::write(root.join("bridge.rs"), "pub fn answer() -> i64 { 1 }").unwrap();
+        fs::write(root.join("src/native.rs"), "pub fn answer() -> i64 { 1 }").unwrap();
         fs::write(
             root.join(RECORD),
             format!("fingerprint='{}'", "0".repeat(64)),
@@ -765,16 +702,16 @@ mod tests {
         assert_ne!(added, edited);
         fs::remove_file(root.join("src/added.rs")).unwrap();
         assert_eq!(source_input_fingerprint(&root).unwrap().unwrap(), edited);
-        fs::write(root.join("bridge.rs"), "pub fn answer() -> i64 { 2 }").unwrap();
-        let bridge = source_input_fingerprint(&root).unwrap().unwrap();
-        assert_ne!(bridge, edited);
+        fs::write(root.join("src/native.rs"), "pub fn answer() -> i64 { 2 }").unwrap();
+        let module = source_input_fingerprint(&root).unwrap().unwrap();
+        assert_ne!(module, edited);
         fs::rename(
             root.join("src/nested/unused.rs"),
             root.join("src/renamed.rs"),
         )
         .unwrap();
         let renamed = source_input_fingerprint(&root).unwrap().unwrap();
-        assert_ne!(renamed, bridge);
+        assert_ne!(renamed, module);
         fs::remove_file(root.join("src/renamed.rs")).unwrap();
         assert_ne!(source_input_fingerprint(&root).unwrap().unwrap(), renamed);
         fs::remove_file(root.join(RECORD)).unwrap();
@@ -783,95 +720,7 @@ mod tests {
     }
 
     #[test]
-    fn unified_review_legacy_claim_inventory_is_canonical_and_scales_once() {
-        let root =
-            std::env::temp_dir().join(format!("willow-claim-inventory-{}", std::process::id()));
-        assert!(!root.exists());
-        for count in [1, 16, 128, 512] {
-            let mut symbols: Vec<_> = (0..count)
-                .map(|i| {
-                    let mut symbol = RustBridgeSymbol::new(
-                        format!("module::function_{i}"),
-                        vec![],
-                        crate::rust_bridge_ir::Scalar::Void,
-                    );
-                    symbol.no_io = true;
-                    symbol.declare_nonblocking("0".repeat(64));
-                    symbol
-                })
-                .collect();
-            CLAIM_IDENTITIES.set(0);
-            let original = fingerprint(&root, &symbols, "lock", "input", Some("adapter")).unwrap();
-            assert_eq!(CLAIM_IDENTITIES.get(), count);
-            symbols.reverse();
-            for symbol in &mut symbols {
-                symbol.apply_review(true);
-                symbol.assumption_span = Some(crate::diagnostics::Span::new(5, 20, 1, 6));
-                symbol.nonblocking.as_mut().unwrap().fingerprint = "1".repeat(64);
-                symbol.rust_crate = "resolved binding".into();
-            }
-            assert_eq!(
-                fingerprint(&root, &symbols, "lock", "input", Some("adapter")).unwrap(),
-                original
-            );
-            symbols[0].no_io = false;
-            assert_ne!(
-                fingerprint(&root, &symbols, "lock", "input", Some("adapter")).unwrap(),
-                original
-            );
-            println!("legacy claims={count} serialized_identities={count}");
-        }
-    }
-
-    #[test]
-    fn unified_review_claims_share_canonical_record_closures() {
-        use crate::rust_bridge_ir::{Record, Scalar};
-        let root =
-            std::env::temp_dir().join(format!("willow-claim-records-{}", std::process::id()));
-        assert!(!root.exists());
-        for records in [1, 16, 128, 512] {
-            let mut symbol =
-                RustBridgeSymbol::new("f".into(), vec![Scalar::Record("R0".into())], Scalar::Void);
-            symbol.no_io = true;
-            symbol.records = (0..records)
-                .map(|i| Record {
-                    name: format!("R{i}"),
-                    fields: vec![("value".into(), Scalar::I64)],
-                })
-                .collect::<Vec<_>>()
-                .into();
-            for declarations in [1, 16, 128, 512] {
-                let mut symbols: Vec<_> = (0..declarations)
-                    .map(|i| {
-                        let mut copy = symbol.clone();
-                        copy.willow_function = format!("f{i}");
-                        copy
-                    })
-                    .collect();
-                CLAIM_RECORDS.set(0);
-                let original = fingerprint(&root, &symbols, "lock", "input", None).unwrap();
-                assert_eq!(
-                    CLAIM_RECORDS.get(),
-                    records,
-                    "{declarations} declarations, {records} records"
-                );
-                symbols[0].records.reverse();
-                assert_eq!(
-                    fingerprint(&root, &symbols, "lock", "input", None).unwrap(),
-                    original
-                );
-                symbols[0].records[0].fields[0].1 = Scalar::Bool;
-                assert_ne!(
-                    fingerprint(&root, &symbols, "lock", "input", None).unwrap(),
-                    original
-                );
-                println!("claims={declarations} shared_records={records} record_visits={records}");
-            }
-        }
-    }
-
-    #[test]
-    fn unified_review_required_for_native_and_legacy_io_claims() {
+    fn unified_review_required_for_native_effect_claims() {
         let root = std::env::temp_dir().join(format!(
             "willow-unified-review-absent-{}",
             std::process::id()
@@ -879,14 +728,6 @@ mod tests {
         assert!(!root.exists());
         let mut symbol =
             RustBridgeSymbol::new("answer".into(), vec![], crate::rust_bridge_ir::Scalar::I64);
-        assert!(!required(&root, [&symbol]));
-        // Legacy spelling remains accepted, but shares the project review gate.
-        symbol.declare_nonblocking("0".repeat(64));
-        assert!(required(&root, [&symbol]));
-        symbol.no_io = true;
-        assert!(required(&root, [&symbol]));
-        symbol.nonblocking = None;
-        assert!(required(&root, [&symbol]));
         symbol.native = Some(NativeBridge {
             module: "native".into(),
             source_path: root.join("src/native.rs"),
@@ -895,11 +736,15 @@ mod tests {
             target: String::new(),
             definitions: vec![],
         });
+        assert!(!required(&root, [&symbol]));
+        symbol.declare_no_block();
+        assert!(required(&root, [&symbol]));
+        symbol.no_io = true;
+        assert!(required(&root, [&symbol]));
+        symbol.no_block = false;
         assert!(required(&root, [&symbol]));
         symbol.no_io = false;
         assert!(!required(&root, [&symbol]));
-        symbol.declare_nonblocking(String::new());
-        assert!(required(&root, [&symbol]));
     }
 
     #[test]
@@ -927,10 +772,10 @@ mod tests {
                 definitions: vec![],
             });
             LAYOUT_VISITS.set(0);
-            let expected = fingerprint(&root, &[symbol.clone()], "lock", "input", None).unwrap();
+            let expected = fingerprint(&root, &[symbol.clone()], "lock", "input").unwrap();
             let once = LAYOUT_VISITS.get();
             LAYOUT_VISITS.set(0);
-            let actual = fingerprint(&root, &vec![symbol; count], "lock", "input", None).unwrap();
+            let actual = fingerprint(&root, &vec![symbol; count], "lock", "input").unwrap();
             assert_eq!(actual, expected);
             assert_eq!(LAYOUT_VISITS.get(), once);
             assert_eq!(once, 5 * count);
@@ -1079,14 +924,8 @@ mod tests {
                     s
                 })
                 .collect();
-            let value = fingerprint(
-                Path::new(root),
-                &symbols,
-                "same Cargo lock",
-                "same inputs",
-                None,
-            )
-            .unwrap();
+            let value =
+                fingerprint(Path::new(root), &symbols, "same Cargo lock", "same inputs").unwrap();
             assert_eq!(
                 value,
                 fingerprint(
@@ -1094,7 +933,6 @@ mod tests {
                     &symbols.iter().rev().cloned().collect::<Vec<_>>(),
                     "same Cargo lock",
                     "same inputs",
-                    None
                 )
                 .unwrap()
             );

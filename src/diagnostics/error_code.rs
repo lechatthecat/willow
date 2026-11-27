@@ -221,7 +221,7 @@ error_codes! {
     E2014, // unsupported manifest version
     // Rust dependency / bridge manifest configuration
     E2015, // invalid `[rust-dependencies]` entry or `[rust]` bridge path
-    E2016, // declared `[rust]` bridge file does not exist
+    // E2016 retired with manifest bridge paths.
     // Send / Sync marker interfaces & data-race policy E24xx
     E2401, // `Send`/`Sync` are compiler-known markers and cannot be implemented manually
     E2402, // cannot pass a non-Sync GC reference (or non-Send value) to an async call

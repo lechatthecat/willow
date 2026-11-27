@@ -1,9 +1,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use willow_compiler::BuildMode;
+use willow_compiler::diagnostics::HumanEmitter;
 use willow_compiler::project::ProjectManifest;
 use willow_compiler::toolchain::rust_bridge_build::*;
+use willow_compiler::{BuildMode, CompilerOptions, CompilerSession};
 
 static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
 struct Fixture {
@@ -25,7 +26,8 @@ impl Fixture {
             .join(name);
         for file in [
             "project.toml",
-            "bridge.rs",
+            "src/main.wi",
+            "src/native.rs",
             "native/Cargo.toml",
             "native/src/lib.rs",
         ] {
@@ -46,10 +48,34 @@ impl Fixture {
     fn manifest(&self) -> ProjectManifest {
         ProjectManifest::load(&self.root.join("project.toml")).unwrap()
     }
+    fn captured_options(&self) -> BridgeOptions {
+        let snapshot = CompilerSession::new(
+            self.root.join("src/main.wi").to_str().unwrap(),
+            "",
+            &CompilerOptions::debug(),
+            Some(self.root.clone()),
+        )
+        .analysis_for_verification(&mut HumanEmitter)
+        .unwrap();
+        let mut options = self.options.clone();
+        options.symbols = snapshot
+            .semantic
+            .interop
+            .bridges
+            .into_iter()
+            .map(|bridge| bridge.symbol)
+            .collect();
+        options
+    }
     fn build(&self, check: bool) -> BridgeBuild {
-        build_bridge(&self.manifest(), &self.root, &self.options, check)
-            .unwrap()
-            .unwrap()
+        build_bridge(
+            &self.manifest(),
+            &self.root,
+            &self.captured_options(),
+            check,
+        )
+        .unwrap()
+        .unwrap()
     }
 }
 impl Drop for Fixture {
@@ -153,7 +179,7 @@ fn source_schema_abi_manifest_lock_and_profile_invalidate_compilation() {
         match change {
             0 => {
                 fs::write(
-                    fixture.root.join("bridge.rs"),
+                    fixture.root.join("src/native.rs"),
                     "pub fn changed() -> i32 { willow_bridge_native::answer() }\n",
                 )
                 .unwrap();
@@ -162,6 +188,20 @@ fn source_schema_abi_manifest_lock_and_profile_invalidate_compilation() {
             2 => {
                 fixture.options.abi_revision =
                     (willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION + 1).to_string();
+                let error = build_bridge(
+                    &fixture.manifest(),
+                    &fixture.root,
+                    &fixture.captured_options(),
+                    false,
+                )
+                .unwrap_err();
+                assert!(error.to_string().contains("rust_bridge_abi_mismatch"));
+                fixture.options.abi_revision =
+                    willow_abi::ffi::WILLOW_RUST_BRIDGE_ABI_REVISION.to_string();
+                let unchanged = fixture.build(false);
+                assert!(fresh(&unchanged));
+                assert_eq!(key, unchanged.cache_key);
+                continue;
             }
             3 => {
                 let manifest = fixture.root.join("project.toml");
@@ -227,10 +267,15 @@ fn absent_cargo_is_cargo_missing() {
     let mut fixture = Fixture::new("path");
     fixture.options.cargo = fixture.temp.join("no-cargo");
     assert!(
-        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false)
-            .unwrap_err()
-            .to_string()
-            .contains("cargo_missing")
+        build_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("cargo_missing")
     );
 }
 
@@ -239,10 +284,15 @@ fn absent_rustc_is_rust_toolchain_missing() {
     let mut fixture = Fixture::new("path");
     fixture.options.rustc = fixture.temp.join("no-rustc");
     assert!(
-        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false)
-            .unwrap_err()
-            .to_string()
-            .contains("rust_toolchain_missing")
+        build_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rust_toolchain_missing")
     );
 }
 
@@ -251,10 +301,15 @@ fn invalid_target_is_rejected() {
     let mut fixture = Fixture::new("path");
     fixture.options.target = Some("invalid-target".into());
     assert!(
-        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false)
-            .unwrap_err()
-            .to_string()
-            .contains("rust_target_mismatch")
+        build_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+            false
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("rust_target_mismatch")
     );
 }
 
@@ -262,12 +317,17 @@ fn invalid_target_is_rejected() {
 fn compile_failure_retains_structured_diagnostic() {
     let fixture = Fixture::new("path");
     fs::write(
-        fixture.root.join("bridge.rs"),
+        fixture.root.join("src/native.rs"),
         "pub fn bad() { missing_function(); }\n",
     )
     .unwrap();
-    let error =
-        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false).unwrap_err();
+    let error = build_bridge(
+        &fixture.manifest(),
+        &fixture.root,
+        &fixture.captured_options(),
+        false,
+    )
+    .unwrap_err();
     let value = willow_compiler::package::package_error_json(&error);
     assert_eq!(value["error"]["kind"], "rust_bridge_compile_error");
     assert!(value["error"]["diagnostics"].to_string().contains("E0425"));
@@ -321,20 +381,28 @@ fn regex_registry_fixture_check_build_and_resolved_version() {
 }
 
 #[test]
-fn missing_bridge_configuration_is_reported() {
+fn dependencies_without_imported_modules_still_resolve_metadata() {
     let fixture = Fixture::new("path");
-    let mut manifest = fixture.manifest();
-    manifest.rust = None;
-    let error = build_bridge(&manifest, &fixture.root, &fixture.options, false).unwrap_err();
-    assert!(error.to_string().contains("rust_bridge_missing"));
+    let build = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
+        .unwrap()
+        .unwrap();
+    assert!(build.staticlib.is_none());
+    assert!(build.messages.artifacts.is_empty());
+    assert_eq!(build.direct_dependencies[0]["name"], "willow_bridge_native");
+    assert_eq!(build.direct_dependencies[0]["version"], "1.2.3");
 }
 
 #[test]
 fn cache_in_source_tree_is_rejected_before_creation() {
     let mut fixture = Fixture::new("path");
     fixture.options.cache_root = fixture.root.join("unwanted-cache");
-    let error =
-        build_bridge(&fixture.manifest(), &fixture.root, &fixture.options, false).unwrap_err();
+    let error = build_bridge(
+        &fixture.manifest(),
+        &fixture.root,
+        &fixture.captured_options(),
+        false,
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("outside the project"));
     assert!(!fixture.options.cache_root.exists());
 }
@@ -354,12 +422,12 @@ fn missing_archive_rebuilds_instead_of_reusing_a_stale_path() {
 fn cargo_tracks_bridge_child_modules_and_reuses_checks() {
     let fixture = Fixture::new("path");
     fs::write(
-        fixture.root.join("bridge.rs"),
+        fixture.root.join("src/native.rs"),
         "mod helper; pub fn answer() -> i32 { helper::answer() }\n",
     )
     .unwrap();
     fs::write(
-        fixture.root.join("helper.rs"),
+        fixture.root.join("src/helper.rs"),
         "pub fn answer() -> i32 { 42 }\n",
     )
     .unwrap();
@@ -369,7 +437,7 @@ fn cargo_tracks_bridge_child_modules_and_reuses_checks() {
     let key = initial.cache_key.clone();
     drop(initial);
     fs::write(
-        fixture.root.join("helper.rs"),
+        fixture.root.join("src/helper.rs"),
         "pub fn answer() -> i32 { 43 }\n",
     )
     .unwrap();
@@ -493,7 +561,7 @@ fn persistent_locks_warm_frozen_and_regeneration() {
     assert_eq!(bytes, fs::read(directory.join("Cargo.lock")).unwrap());
     // Removing the authoritative copy is forbidden under --locked.
     fs::remove_file(&cargo).unwrap();
-    let error = build_bridge(&f.manifest(), &f.root, &f.options, true).unwrap_err();
+    let error = build_bridge(&f.manifest(), &f.root, &f.captured_options(), true).unwrap_err();
     assert!(error.to_string().contains("rust_lockfile_stale"));
     assert!(!cargo.exists());
     f.options.locked = false;
@@ -546,7 +614,7 @@ fn locked_rejects_changed_direct_spec_and_live_path_version_without_writes() {
         let a = fs::read(&cargo).unwrap();
         let b = fs::read(&project).unwrap();
         f.options.locked = true;
-        let error = build_bridge(&f.manifest(), &f.root, &f.options, true).unwrap_err();
+        let error = build_bridge(&f.manifest(), &f.root, &f.captured_options(), true).unwrap_err();
         assert!(
             error.to_string().contains("rust_lockfile_stale"),
             "{change}: {error:#}"
@@ -567,7 +635,7 @@ fn offline_missing_registry_dependency_fails_without_publishing_rust_lock() {
             ..Default::default()
         },
     );
-    let error = build_bridge(&manifest, &f.root, &f.options, true).unwrap_err();
+    let error = build_bridge(&manifest, &f.root, &f.captured_options(), true).unwrap_err();
     assert!(format!("{error:#}").contains("offline"));
     assert!(!f.root.join(".willow/rust/Cargo.lock").exists());
 }
@@ -592,7 +660,11 @@ fn willow_lock_refresh_preserves_rust_summary() {
 fn cli_build_run_frozen_and_stale_rust_graph() {
     let f = Fixture::new("path");
     fs::create_dir_all(f.root.join("src")).unwrap();
-    fs::write(f.root.join("src/main.wi"), "fn main() { println(42); }\n").unwrap();
+    fs::write(
+        f.root.join("src/main.wi"),
+        "import native; fn main() { println(native::answer()); }\n",
+    )
+    .unwrap();
     let home = f.temp.join("home");
     fs::create_dir_all(&home).unwrap();
     let original_home = std::env::var_os("HOME")
@@ -668,7 +740,6 @@ fn cli_build_run_frozen_and_stale_rust_graph() {
 
 #[test]
 fn unified_review_binds_all_target_dependency_closures() {
-    use willow_compiler::rust_bridge_ir::{RustBridgeSymbol, Scalar};
     let mut fixture = Fixture::new("path");
     for platform in ["unix", "windows"] {
         let root = fixture.root.join("native").join(platform);
@@ -683,18 +754,23 @@ fn unified_review_binds_all_target_dependency_closures() {
     fs::write(&manifest_path, format!(
         "{manifest}\n[target.'cfg(unix)'.dependencies]\nreview_unix={{path=\"unix\",features=[\"reviewed\"]}}\n[target.'cfg(windows)'.dependencies]\nreview_windows={{path=\"windows\",features=[\"reviewed\"]}}\n"
     )).unwrap();
-    let mut symbol =
-        RustBridgeSymbol::new("add".into(), vec![Scalar::I64, Scalar::I64], Scalar::I64);
-    symbol.no_io = true;
-    fixture.options.symbols.push(symbol);
+    fs::write(
+        fixture.root.join("src/native.rs"),
+        "#[willow::assume(no_io)] pub fn answer() -> i32 { willow_bridge_native::answer() }\n",
+    )
+    .unwrap();
     fixture.options.read_only = true;
     let targets = ["x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"];
     let mut fingerprints = Vec::new();
     for target in targets {
         fixture.options.target = Some(target.into());
-        let build = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
-            .unwrap()
-            .unwrap();
+        let build = inspect_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+        )
+        .unwrap()
+        .unwrap();
         assert!(build.staticlib.is_none());
         assert!(build.messages.artifacts.is_empty());
         let packages = build.metadata["packages"].as_array().unwrap();
@@ -729,9 +805,13 @@ fn unified_review_binds_all_target_dependency_closures() {
     let mut changed = Vec::new();
     for target in targets {
         fixture.options.target = Some(target.into());
-        let build = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
-            .unwrap()
-            .unwrap();
+        let build = inspect_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+        )
+        .unwrap()
+        .unwrap();
         changed.push(build.review_fingerprint.clone());
     }
     assert_eq!(changed[0], changed[1]);
@@ -743,16 +823,12 @@ fn unified_review_binds_all_target_dependency_closures() {
 
 #[test]
 fn unified_review_rejects_unbounded_dependency_inputs() {
-    use willow_compiler::rust_bridge_ir::{RustBridgeSymbol, Scalar};
     let mut fixture = Fixture::new("path");
     fs::write(
-        fixture.root.join("bridge.rs"),
-        "pub fn answer() -> i64 { willow_bridge_native::answer() as i64 }\n",
+        fixture.root.join("src/native.rs"),
+        "#[willow::assume(no_io)] pub fn answer() -> i64 { willow_bridge_native::answer() as i64 }\n",
     )
     .unwrap();
-    let mut symbol = RustBridgeSymbol::new("answer".into(), vec![], Scalar::I64);
-    symbol.no_io = true;
-    fixture.options.symbols.push(symbol);
     fixture.options.read_only = true;
     let native = fixture.root.join("native");
     let source = native.join("src/lib.rs");
@@ -771,11 +847,15 @@ pub fn answer() -> i32 { helper::answer() + DATA[0] as i32 + LABEL.len() as i32 
     fs::write(native.join("data.bin"), [1]).unwrap();
     fs::write(native.join("label.txt"), "a").unwrap();
     let fingerprint = || {
-        inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
-            .unwrap()
-            .unwrap()
-            .review_fingerprint
-            .clone()
+        inspect_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+        )
+        .unwrap()
+        .unwrap()
+        .review_fingerprint
+        .clone()
     };
     let reviewed = fingerprint();
     let record_path = fixture.root.join("rust-review.toml");
@@ -793,9 +873,13 @@ pub fn answer() -> i32 { helper::answer() + DATA[0] as i32 + LABEL.len() as i32 
     }
     assert_eq!(fingerprint(), reviewed);
     let reject = |case: &str| {
-        let error = inspect_bridge(&fixture.manifest(), &fixture.root, &fixture.options)
-            .unwrap_err()
-            .to_string();
+        let error = inspect_bridge(
+            &fixture.manifest(),
+            &fixture.root,
+            &fixture.captured_options(),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(
             error.contains("rust_review_source_layout"),
             "{case}: {error}"

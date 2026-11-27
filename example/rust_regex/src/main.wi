@@ -1,6 +1,5 @@
-extern rust {
-    fn regex_is_match(pattern: String, text: String) -> Result<bool, String>;
-}
+import native::regex_is_match;
+
 
 fn main() {
     match regex_is_match("^hello [a-z]+$", "hello willow") {

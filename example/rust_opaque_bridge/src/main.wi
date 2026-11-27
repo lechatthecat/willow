@@ -1,14 +1,11 @@
-extern rust {
-    opaque Regex;
-    fn regex_new(pattern: String) -> Result<Regex, String>;
-    fn regex_is_match(regex: Regex, text: String) -> bool;
-}
+import native::Regex;
+
 fn main() {
-    match regex_new("^hello [a-z]+$") {
+    match Regex::new("^hello [a-z]+$") {
         Ok(regex) => {
-            defer Regex_close(regex);
-            println(regex_is_match(regex, "hello willow"));
-            println(regex_is_match(regex, "goodbye"));
+            use owned = regex;
+            println(owned.is_match("hello willow"));
+            println(owned.is_match("goodbye"));
         }
         Err(message) => { println(message); }
     }

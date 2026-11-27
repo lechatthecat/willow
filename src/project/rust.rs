@@ -1,13 +1,10 @@
-//! `[rust-dependencies]` and `[rust]` manifest configuration.
+//! `[rust-dependencies]` manifest configuration.
 //!
 //! Rust crates are an external native ecosystem, not Willow packages: nothing
 //! here reaches the Willow package resolver, and version resolution stays with
 //! Cargo. Deserialization only checks the shape of the table; every semantic
-//! rule is enforced by [`RustDependencySpec::normalize`] and
-//! [`RustSection::relative_bridge`] so failures carry the
-//! `rust_dependency_invalid` / `rust_bridge_missing` diagnostics instead of a
-//! generic manifest parse error.
-use std::path::{Component, Path, PathBuf};
+//! rule is enforced by [`RustDependencySpec::normalize`] so failures carry the
+//! `rust_dependency_invalid` diagnostic instead of a generic manifest parse error.
 
 use serde::{Deserialize, Deserializer, de::value::MapAccessDeserializer};
 
@@ -205,68 +202,6 @@ fn validate_rust_alias(alias: &str) -> Result<(), ManifestError> {
         Err(ManifestError::RustDependencyInvalid(format!(
             "`{alias}`: alias must be a Cargo package name (letters, digits, `_`, `-`)"
         )))
-    }
-}
-
-/// `[rust]` section: the single user-authored bridge module (spec §13).
-#[derive(Debug, Clone, Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct RustSection {
-    pub bridge: String,
-}
-
-impl RustSection {
-    /// Bridge path as declared, proven to stay inside the project root lexically.
-    pub fn relative_bridge(&self) -> Result<PathBuf, ManifestError> {
-        let invalid = |message: &str| {
-            ManifestError::RustDependencyInvalid(format!(
-                "[rust] bridge `{}`: {message}",
-                self.bridge
-            ))
-        };
-        if self.bridge.trim().is_empty() {
-            return Err(invalid("path must not be empty"));
-        }
-        let path = Path::new(&self.bridge);
-        let mut depth = 0usize;
-        for component in path.components() {
-            match component {
-                Component::Normal(_) => depth += 1,
-                Component::CurDir => {}
-                Component::ParentDir if depth > 0 => depth -= 1,
-                Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
-                    return Err(invalid("path must stay inside the project root"));
-                }
-            }
-        }
-        if depth == 0 {
-            return Err(invalid("path must name a file"));
-        }
-        Ok(path.to_owned())
-    }
-
-    /// Absolute bridge path, checked against the real file system so that a
-    /// symlink cannot lead outside the project root.
-    pub fn resolve_bridge(&self, project_root: &Path) -> Result<PathBuf, ManifestError> {
-        let declared = project_root.join(self.relative_bridge()?);
-        let resolved = std::fs::canonicalize(&declared).map_err(|error| {
-            ManifestError::RustBridgeMissing(format!("{}: {error}", declared.display()))
-        })?;
-        if !resolved.is_file() {
-            return Err(ManifestError::RustBridgeMissing(format!(
-                "{}: not a file",
-                declared.display()
-            )));
-        }
-        // `project_root` may itself be a symlink; compare canonical forms.
-        let root = std::fs::canonicalize(project_root).unwrap_or_else(|_| project_root.to_owned());
-        if !resolved.starts_with(&root) {
-            return Err(ManifestError::RustDependencyInvalid(format!(
-                "[rust] bridge `{}`: path must stay inside the project root",
-                self.bridge
-            )));
-        }
-        Ok(resolved)
     }
 }
 

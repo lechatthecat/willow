@@ -2000,8 +2000,6 @@ fn compile_and_run_protocol_fixture(
 [project]
 name = "runtime_protocol_fixture"
 version = "0.1.0"
-[rust]
-bridge = "bridge.rs"
 [rust-dependencies]
 willow_bridge_native = { path = "native", default-features = false, features = ["answer"] }
 "#,
@@ -2013,12 +2011,12 @@ willow_bridge_native = { path = "native", default-features = false, features = [
         fs::create_dir_all(root.join(file).parent().unwrap()).unwrap();
         fs::copy(bridge_fixture.join(file), root.join(file)).unwrap();
     }
-    fs::write(root.join("bridge.rs"), RUNTIME_PROTOCOL_BRIDGE).unwrap();
+    fs::write(root.join("src/native.rs"), RUNTIME_PROTOCOL_BRIDGE).unwrap();
     if virtual_time {
         use std::io::Write;
         let mut bridge = fs::OpenOptions::new()
             .append(true)
-            .open(root.join("bridge.rs"))
+            .open(root.join("src/native.rs"))
             .unwrap();
         bridge
             .write_all(
@@ -2040,22 +2038,36 @@ pub fn test_set_time(millis: i64) {
             )
             .unwrap();
     }
-    let clock_declaration = if virtual_time {
-        "nonblocking(\"REVIEW\") fn test_set_time(millis: i64); nonblocking(\"REVIEW\") fn test_sync_send_waits() -> i64; nonblocking(\"REVIEW\") fn test_sync_recv_waits() -> i64; nonblocking(\"REVIEW\") fn test_frames_reclaimed() -> i64;"
-    } else {
-        ""
-    };
-    // Bridge calls read task/TLS state or update bounded test coordination;
-    // none performs an I/O wait. Bind the test-only nonblocking assertion to
-    // exactly the bridge source and project inputs.
-    let fixture = format!(
-        "{source}\nextern rust {{ nonblocking(\"REVIEW\") fn test_current_task() -> i64; nonblocking(\"REVIEW\") fn test_task_parked(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_task_blocked_syscall(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_task_finished(id: i64) -> bool; nonblocking(\"REVIEW\") fn test_observe_next_task(); nonblocking(\"REVIEW\") fn test_observed_task() -> i64; nonblocking(\"REVIEW\") fn test_task_parks(id: i64) -> i64; nonblocking(\"REVIEW\") fn test_channel_waits() -> i64; nonblocking(\"REVIEW\") fn test_wake_task(id: i64); {clock_declaration} }}\n"
-    );
+    let mut names = vec![
+        "test_current_task",
+        "test_task_parked",
+        "test_task_blocked_syscall",
+        "test_task_finished",
+        "test_observe_next_task",
+        "test_observed_task",
+        "test_task_parks",
+        "test_channel_waits",
+        "test_wake_task",
+    ];
+    if virtual_time {
+        names.extend([
+            "test_set_time",
+            "test_sync_send_waits",
+            "test_sync_recv_waits",
+            "test_frames_reclaimed",
+        ]);
+    }
+    let imports = names
+        .iter()
+        .map(|name| format!("import native::{name};\n"))
+        .collect::<String>();
+    let native = fs::read_to_string(root.join("src/native.rs")).unwrap();
     fs::write(
-        root.join("src/main.wi"),
-        fixture.replace("REVIEW", &"0".repeat(64)),
+        root.join("src/native.rs"),
+        native.replace("pub fn ", "#[willow::assume(no_block)]\npub fn "),
     )
     .unwrap();
+    fs::write(root.join("src/main.wi"), format!("{imports}{source}")).unwrap();
     let review = Command::new(env!("CARGO_BIN_EXE_willow"))
         .current_dir(&root)
         .args(["query", "rust-bridge", "--offline", "--format", "json"])
@@ -2072,14 +2084,6 @@ pub fn test_set_time(millis: i64) {
         format!(
             "fingerprint = \"{}\"\n",
             review["review_fingerprint"].as_str().unwrap()
-        ),
-    )
-    .unwrap();
-    fs::write(
-        root.join("src/main.wi"),
-        fixture.replace(
-            "REVIEW",
-            review["legacy_review_fingerprint"].as_str().unwrap(),
         ),
     )
     .unwrap();

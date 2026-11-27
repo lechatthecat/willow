@@ -1,8 +1,6 @@
 //! Bridge type IR shared by declarations, adapters, and metadata.
 //! `Scalar` retains its R2 public name for API compatibility.
-use crate::parser::ast::Type;
 use crate::qualified_name::QualifiedName;
-use crate::semantic::builtin_types::BuiltinTypeId as Builtin;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fmt::Write;
@@ -46,87 +44,6 @@ impl Scalar {
         })
     }
 
-    pub fn from_type(ty: &Type) -> Option<Self> {
-        Self::from_type_with_opaque(ty, &Default::default())
-    }
-    pub fn from_type_with_opaque(
-        ty: &Type,
-        names: &std::collections::HashSet<String>,
-    ) -> Option<Self> {
-        Self::from_type_with_records(ty, names, &Default::default())
-    }
-    pub fn from_type_with_records(
-        ty: &Type,
-        names: &std::collections::HashSet<String>,
-        records: &std::collections::HashMap<String, Record>,
-    ) -> Option<Self> {
-        Some(match ty {
-            Type::Named(name) if records.contains_key(name) => Self::Record(name.clone()),
-            Type::Named(name) if names.contains(name) => Self::Opaque(name.clone()),
-            Type::I8 => Self::I8,
-            Type::I16 => Self::I16,
-            Type::I32 => Self::I32,
-            Type::U16 => Self::U16,
-            Type::U32 => Self::U32,
-            Type::U64 => Self::U64,
-            Type::Char => Self::Char,
-            Type::U8 => Self::U8,
-            Type::I64 => Self::I64,
-            Type::F64 => Self::F64,
-            Type::Bool => Self::Bool,
-            Type::Void => Self::Void,
-            Type::String => Self::String,
-            Type::Array(inner) if **inner == Type::U8 => Self::Bytes,
-            Type::Array(inner) => Self::array(inner)?,
-            // `Array` is a source-defined class, so the parser keeps
-            // `Array<u8>` as a plain generic application.
-            Type::Generic(name, args)
-                if Builtin::from_name(name) == Some(Builtin::Array)
-                    && args.as_slice() == [Type::U8] =>
-            {
-                Self::Bytes
-            }
-            Type::Generic(name, args)
-                if Builtin::from_name(name) == Some(Builtin::Array) && args.len() == 1 =>
-            {
-                Self::array(&args[0])?
-            }
-            Type::Generic(name, args)
-                if Builtin::from_name(name) == Some(Builtin::Option) && args.len() == 1 =>
-            {
-                Self::Option(Box::new(Self::from_type_with_records(
-                    &args[0], names, records,
-                )?))
-            }
-            Type::Generic(name, args)
-                if Builtin::from_name(name) == Some(Builtin::Result) && args.len() == 2 =>
-            {
-                Self::Result(
-                    Box::new(Self::from_type_with_records(&args[0], names, records)?),
-                    Box::new(Self::from_type_with_records(&args[1], names, records)?),
-                )
-            }
-            _ => return None,
-        })
-    }
-    fn array(inner: &Type) -> Option<Self> {
-        let element = match inner {
-            Type::I64 => Self::I64,
-            Type::I8 => Self::I8,
-            Type::I16 => Self::I16,
-            Type::I32 => Self::I32,
-            Type::U16 => Self::U16,
-            Type::U32 => Self::U32,
-            Type::U64 => Self::U64,
-            Type::Char => Self::Char,
-            Type::U8 => Self::U8,
-            Type::String => Self::String,
-            Type::F64 => Self::F64,
-            Type::Bool => Self::Bool,
-            _ => return None,
-        };
-        Some(Self::Array(Box::new(element)))
-    }
     fn rust(&self) -> &'static str {
         match self {
             Self::I8 => "i8",
@@ -165,12 +82,6 @@ impl Scalar {
         willow_abi::array_layout::storage_flags(width, self.reference())
     }
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct NonblockingReview {
-    pub fingerprint: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Record {
     pub name: String,
@@ -238,11 +149,9 @@ pub struct RustBridgeSymbol {
     pub native_receiver: bool,
     #[serde(default)]
     pub consume_inputs: Vec<usize>,
-    /// Developer assertion, bound to the resolved lock and bridge source.
-    /// Native declarations use an empty marker; their shared fingerprint lives
-    /// exclusively in rust-review.toml and is checked before execution.
+    /// Developer assertion; effective only while rust-review.toml is current.
     #[serde(default)]
-    pub nonblocking: Option<Box<NonblockingReview>>,
+    pub no_block: bool,
 }
 impl RustBridgeSymbol {
     /// Native wire type names are unique across Rust modules; Willow names
@@ -303,7 +212,7 @@ impl RustBridgeSymbol {
             native_method: None,
             native_receiver: false,
             consume_inputs: vec![],
-            nonblocking: None,
+            no_block: false,
             abi_symbol: name.clone(),
             willow_function: name,
             input_types: inputs,
@@ -312,12 +221,12 @@ impl RustBridgeSymbol {
             effects: effects.bits() | willow_abi::ffi::FOREIGN_CALL,
         }
     }
-    pub fn declare_nonblocking(&mut self, fingerprint: String) {
-        self.nonblocking = Some(Box::new(NonblockingReview { fingerprint }));
+    pub fn declare_no_block(&mut self) {
+        self.no_block = true;
     }
 
     pub fn assumes_no_block(&self) -> bool {
-        self.review_current && self.nonblocking.is_some()
+        self.review_current && self.no_block
     }
 
     pub fn assumes_no_io(&self) -> bool {
@@ -325,7 +234,7 @@ impl RustBridgeSymbol {
     }
 
     pub fn has_assumptions(&self) -> bool {
-        self.nonblocking.is_some() || self.no_io
+        self.no_block || self.no_io
     }
 
     /// Declaration metadata survives failed review; only effective capabilities change.

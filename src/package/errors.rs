@@ -35,9 +35,6 @@ fn manifest(error: &ManifestError) -> Value {
         ManifestError::RustDependencyInvalid(detail) => {
             json!({"kind":"rust_dependency_invalid", "detail":detail})
         }
-        ManifestError::RustBridgeMissing(detail) => {
-            json!({"kind":"rust_bridge_missing", "detail":detail})
-        }
     }
 }
 impl PackageError {

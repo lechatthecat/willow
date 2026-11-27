@@ -6,17 +6,7 @@ fn blocking_pool_values_close_and_function_values() {
     f.sources(
         r#"
         import std::collections::Array;
-        extern rust {
-            opaque Resource;
-            fn resource()->Resource;
-            fn value(r:Resource)->i64;
-            fn drops()->i64;
-            fn add(a:i64,b:i64)->i64;
-            fn echo(s:String)->String;
-            fn bytes(s:Array<u8>)->Array<u8>;
-            fn nested(s:Option<String>)->Result<String,i64>;
-            fn floats(s:Array<f64>)->Array<f64>;
-        }
+        import native::Resource; import native::resource; import native::value; import native::drops; import native::add; import native::echo; import native::bytes; import native::nested; import native::floats; import native::Resource_close;
         fn relay()->i64 { let f=add; return f(20,22); }
         async fn main() {
             println(relay());
@@ -68,9 +58,9 @@ fn blocking_pool_one_worker_progress_pins_gc_and_reviewed_affinity() {
         use std::sync::atomic::{{AtomicBool,Ordering}};
         static STARTED:AtomicBool=AtomicBool::new(false);
         static RELEASED:AtomicBool=AtomicBool::new(false);
-        pub fn started()->bool {{ STARTED.load(Ordering::SeqCst) }}
-        pub fn release() {{ RELEASED.store(true,Ordering::SeqCst); }}
-        pub fn direct()->bool {{ !std::thread::current().name().unwrap_or("").starts_with("willow-rust-blocking") }}
+        #[willow::assume(no_block)] pub fn started()->bool {{ STARTED.load(Ordering::SeqCst) }}
+        #[willow::assume(no_block)] pub fn release() {{ RELEASED.store(true,Ordering::SeqCst); }}
+        #[willow::assume(no_block)] pub fn direct()->bool {{ !std::thread::current().name().unwrap_or("").starts_with("willow-rust-blocking") }}
         pub fn hold(s:&str)->String {{
             assert!(std::thread::current().name().unwrap_or("").starts_with("willow-rust-blocking"));
             STARTED.store(true,Ordering::SeqCst);
@@ -83,12 +73,7 @@ fn blocking_pool_one_worker_progress_pins_gc_and_reviewed_affinity() {
     );
     f.reviewed_sources(
         r#"
-        extern rust {
-            fn hold(s:String)->String;
-            nonblocking("REVIEW") fn started()->bool;
-            nonblocking("REVIEW") fn release();
-            nonblocking("REVIEW") fn direct()->bool;
-        }
+        import native::hold; import native::started; import native::release; import native::direct;
         async fn held()->String { return hold("survives collection"); }
         async fn other() { while !started() { await yield(); } println(direct()); release(); }
         async fn main() { let h=held(); let o=other(); await o; println(await h); }
@@ -114,7 +99,7 @@ fn blocking_pool_one_worker_progress_pins_gc_and_reviewed_affinity() {
 fn blocking_pool_panic_recovers_and_pool_is_reused() {
     let f = Fixture::new();
     f.sources(r#"
-        extern rust { fn fail(); fn answer()->i64; }
+        import native::fail; import native::answer;
         fn caught() { defer match recover() { Some(info)=>println(info.message), None=>{} } fail(); println("unreachable"); }
         async fn main() { caught(); println(answer()); caught(); println(answer()); }
     "#,r#"pub fn fail() { panic!("pool panic"); } pub fn answer()->i64 {42}"#);
@@ -163,7 +148,7 @@ fn blocking_pool_contracts_and_lock_diagnostics() {
         ),
     ] {
         f.sources(
-            &format!("extern rust {{ fn touch(); }} {body}"),
+            &format!("import native::touch; {body}"),
             "pub fn touch() {}",
         );
         let output = f.command(&["check", "--offline"]);
@@ -182,7 +167,7 @@ fn blocking_pool_rejects_thread_local_opaque_types() {
         "pub struct Local(std::rc::Rc<i64>); pub fn local()->Box<Local> {Box::new(Local(std::rc::Rc::new(42)))}",
         "pub struct Local(std::cell::Cell<i64>); pub fn local()->Box<Local> {Box::new(Local(std::cell::Cell::new(42)))}",
     ] {
-        f.sources("extern rust { opaque Local; fn local()->Local; } async fn main() {let x=local(); defer Local_close(x);}",native);
+        f.sources("import native::Local; import native::local; import native::Local_close; async fn main() {let x=local(); defer Local_close(x);}",native);
         let output = f.command(&["build", "--offline"]);
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "non-transferable type accepted");
@@ -207,7 +192,7 @@ fn blocking_pool_wrapper_counts_are_linear_and_reviewed_has_no_dispatch() {
         assert_eq!(source.matches("fn blocking_call<").count(), 1);
         let mut reviewed = symbols;
         for s in &mut reviewed {
-            s.declare_nonblocking("0".repeat(64));
+            s.declare_no_block();
             s.apply_review(true);
         }
         let direct = wrappers(&reviewed, Path::new("ffi.rs"), 1);
@@ -303,18 +288,13 @@ fn blocking_pool_cancel_runs_unreviewed_close_and_destructor_gc_region() {
             wait_for_collection(); DROPS.fetch_add(1,Ordering::SeqCst);
         }} }}
         pub fn resource()->Box<Resource> {{Box::new(Resource)}}
-        pub fn mark() {{CREATED.store(true,Ordering::SeqCst);}}
-        pub fn created()->bool {{CREATED.load(Ordering::SeqCst)}}
+        #[willow::assume(no_block)] pub fn mark() {{CREATED.store(true,Ordering::SeqCst);}}
+        #[willow::assume(no_block)] pub fn created()->bool {{CREATED.load(Ordering::SeqCst)}}
         pub fn drops()->i64 {{DROPS.load(Ordering::SeqCst)}}
     "#
     );
     f.reviewed_sources(r#"
-        extern rust {
-            opaque Resource; fn resource()->Resource;
-            nonblocking("REVIEW") fn created()->bool;
-            nonblocking("REVIEW") fn mark();
-            fn drops()->i64;
-        }
+        import native::Resource; import native::resource; import native::created; import native::mark; import native::drops; import native::Resource_close;
         async fn hold() { let r=resource(); defer Resource_close(r); mark(); while true {await yield();} }
         async fn main() { let h=hold(); while !created() {await yield();} h.cancel(); await h.result(); println(drops()); }
     "#,&rust);
@@ -331,7 +311,7 @@ fn blocking_pool_cancel_runs_unreviewed_close_and_destructor_gc_region() {
 fn blocking_pool_aggregate_and_destructor_panics_release_then_recover() {
     let f = Fixture::new();
     f.sources(r#"
-        extern rust { opaque Resource; fn resource()->Resource; fn fail(s:String)->String; fn drops()->i64; }
+        import native::Resource; import native::resource; import native::fail; import native::drops; import native::Resource_close;
         fn aggregate() { defer match recover() {Some(info)=>println(info.message),None=>{}} fail("owned"); println("unreachable"); }
         fn close() { let r=resource(); defer match recover() {Some(info)=>println(info.message),None=>{}} Resource_close(r); println("unreachable"); }
         async fn main() { aggregate(); close(); println(drops()); aggregate(); }
@@ -387,7 +367,7 @@ fn blocking_pool_panic_payload_destructor_stays_in_gc_region() {
     "#
     );
     f.sources(r#"
-        extern rust { fn fail(); fn drops()->i64; }
+        import native::fail; import native::drops;
         fn caught() { defer match recover() {Some(info)=>println(info.message),None=>{}} fail(); println("unreachable"); }
         async fn main() { caught(); println(drops()); caught(); println(drops()); }
     "#, &native);

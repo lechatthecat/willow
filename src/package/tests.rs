@@ -392,10 +392,9 @@ fn rust_dependencies_never_enter_the_package_graph() {
     let app = fixture.package(
         "app",
         false,
-        "[dependencies]\nb = { path = '../b' }\n\n[rust-dependencies]\nregex = '1.12'\nmy_native = { path = '../my-native' }\n\n[rust]\nbridge = 'rust/bridge.rs'",
+        "[dependencies]\nb = { path = '../b' }\n\n[rust-dependencies]\nregex = '1.12'\nmy_native = { path = '../my-native' }",
     );
-    std::fs::create_dir_all(app.join("rust")).unwrap();
-    std::fs::write(app.join("rust/bridge.rs"), "pub fn f() {}\n").unwrap();
+    std::fs::write(app.join("src/native.rs"), "pub fn f() {}\n").unwrap();
     fixture.package("b", true, "");
     // `../my-native` does not exist as a Willow package and must never be visited.
     let graph = resolve_path_packages(&app).unwrap();

@@ -5,5 +5,3 @@ version="0.1.0"
 manifest-version=1
 [rust-dependencies]
 regex={path="native"}
-[rust]
-bridge="bridge.rs"

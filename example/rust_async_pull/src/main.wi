@@ -1,15 +1,12 @@
 // A Rust producer drives events; the Willow consumer parks between requests.
-extern rust {
-    opaque Source;
-    async fn source() -> Source;
-    async fn next_request(source: Source) -> Option<String>;
-    async fn respond(request: String) -> String;
-}
+import native::Source;
+import native::respond;
+
 async fn main() {
-    let events = await source();
+    use events = await Source::new();
     let mut running = true;
     while running {
-        match await next_request(events) {
+        match await events.next_request() {
             Some(request) => { println(await respond(request)); }
             None => { running = false; }
         }

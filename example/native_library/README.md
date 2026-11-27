@@ -10,7 +10,7 @@ cargo run --bin willow -- run target/native-library-example --frozen
 ```
 
 Both runs print `42`. The Rust adapter exposes the C function through Willow's
-existing scalar bridge. The explicit native entry supplies the C archive to the
+native Rust module (`src/native.rs`, imported by `src/main.wi`). The explicit native entry supplies the C archive to the
 final linker. Regenerate the project after rebuilding C inputs; `--locked` rejects
 changes to its recorded native identity. Generated archives and locks stay in the
 output directory.

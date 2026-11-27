@@ -4,6 +4,3 @@ version = "0.1.0"
 
 [rust-dependencies]
 willow_foreign_region = { path = "native" }
-
-[rust]
-bridge = "bridge.rs"

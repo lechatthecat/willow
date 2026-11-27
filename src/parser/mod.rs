@@ -9,7 +9,6 @@ pub mod iter;
 mod modifiers;
 pub(crate) mod ownership;
 mod pattern;
-mod rust_declarations;
 mod stmt;
 pub(crate) mod tuples;
 mod types;
@@ -20,9 +19,6 @@ use ast::*;
 
 pub struct Parser {
     default_import_usage: import_usage::DefaultImportUsage,
-    rust_namespaces: std::collections::HashSet<String>,
-    rust_records: std::collections::HashMap<String, crate::rust_bridge_ir::Record>,
-    rust_opaque_names: std::collections::HashSet<String>,
     tuple_arities: std::collections::HashSet<usize>,
     /// Payload nesting of the pattern being parsed; bounded by
     /// `pattern::MAX_PATTERN_DEPTH` so every pattern walk has a bounded depth.
@@ -110,29 +106,7 @@ fn ternary_colon_table(tokens: &[Token]) -> Vec<bool> {
 #[willow_continuations::parser]
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        let rust_namespaces = tokens
-            .windows(4)
-            .filter_map(|window| {
-                match (
-                    &window[0].kind,
-                    &window[1].kind,
-                    &window[2].kind,
-                    &window[3].kind,
-                ) {
-                    (
-                        TokenKind::Ident(extern_),
-                        TokenKind::Ident(rust),
-                        TokenKind::Ident(namespace),
-                        TokenKind::LBrace,
-                    ) if extern_ == "extern" && rust == "rust" => Some(namespace.clone()),
-                    _ => None,
-                }
-            })
-            .collect();
         Self {
-            rust_records: Default::default(),
-            rust_opaque_names: rust_declarations::opaque_names(&tokens),
-            rust_namespaces,
             default_import_usage: Default::default(),
             tuple_arities: Default::default(),
             pattern_depth: 0,
@@ -219,14 +193,19 @@ impl Parser {
                 self.recover_to_next_item();
                 continue;
             }
-            if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "extern") {
-                match self.parse_rust_bridge() {
-                    Ok(declarations) => items.extend(declarations),
-                    Err(error) => {
-                        errors.push(error);
-                        self.recover_to_next_item();
-                    }
-                }
+            if matches!(self.peek_kind(), TokenKind::Ident(name) if name == "extern")
+                && matches!(self.peek_kind_at(1), TokenKind::Ident(name) if name == "rust")
+            {
+                errors.push(
+                    self.err(
+                        ErrorCode::E0102,
+                        "rust_module_migration_required: `extern rust` declarations have been removed",
+                    )
+                    .with_help(
+                        "move the Rust implementation to `src/<name>.rs`, replace this declaration with `import <name>;`, and call `<name>::function(...)`; remove `[rust] bridge` from project.toml",
+                    ),
+                );
+                self.skip_removed_rust_declaration();
                 continue;
             }
             self.default_import_usage.begin(false);
@@ -240,29 +219,6 @@ impl Parser {
             }
         }
 
-        let bridge_names: std::collections::HashSet<_> = items
-            .iter()
-            .filter_map(|item| match item {
-                Item::Function(f) if f.rust_bridge.is_some() => Some(f.name.as_str()),
-                _ => None,
-            })
-            .collect();
-        let mut seen_bridges = std::collections::HashSet::new();
-        for item in &items {
-            if let Item::Function(f) = item
-                && bridge_names.contains(f.name.as_str())
-                && !seen_bridges.insert(f.name.as_str())
-            {
-                errors.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0102,
-                        "rust_bridge_symbol_collision: duplicate Willow declaration",
-                    )
-                    .with_label(Label::primary(f.span, "duplicate bridge function")),
-                );
-            }
-        }
         errors.append(&mut self.recovered_errors);
         errors.sort_by_key(|error| {
             error
@@ -573,6 +529,41 @@ impl Parser {
         Diagnostic::new(Severity::Error, code, msg.clone()).with_label(Label::primary(span, msg))
     }
 
+    /// Discard the rejected declaration as one unit, including nested record
+    /// bodies. Every token is consumed once; malformed or truncated blocks stop
+    /// at EOF, and declarations inside them never become Willow functions.
+    fn skip_removed_rust_declaration(&mut self) {
+        self.advance(); // extern
+        self.advance(); // rust
+        #[cfg(test)]
+        rust_migration_tests::SKIPPED_TOKENS.set(rust_migration_tests::SKIPPED_TOKENS.get() + 2);
+        while !self.at_eof() && !self.check(TokenKind::LBrace) {
+            if self.at_item_start() {
+                return;
+            }
+            #[cfg(test)]
+            rust_migration_tests::SKIPPED_TOKENS
+                .set(rust_migration_tests::SKIPPED_TOKENS.get() + 1);
+            if self.eat(TokenKind::Semicolon) {
+                return;
+            }
+            self.advance();
+        }
+        if self.at_eof() {
+            return;
+        }
+        let outer_depth = self.brace_depth;
+        self.advance();
+        #[cfg(test)]
+        rust_migration_tests::SKIPPED_TOKENS.set(rust_migration_tests::SKIPPED_TOKENS.get() + 1);
+        while !self.at_eof() && self.brace_depth > outer_depth {
+            self.advance();
+            #[cfg(test)]
+            rust_migration_tests::SKIPPED_TOKENS
+                .set(rust_migration_tests::SKIPPED_TOKENS.get() + 1);
+        }
+    }
+
     fn recover_to_next_item(&mut self) {
         if !self.at_eof() {
             self.advance();
@@ -664,3 +655,106 @@ mod unit_diagnostic_tests;
 
 #[cfg(test)]
 mod misplaced_import_tests;
+
+#[cfg(test)]
+mod rust_migration_tests {
+    use super::*;
+    use crate::lexer::Lexer;
+
+    thread_local! {
+        pub(super) static SKIPPED_TOKENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn parse(source: &str) -> (Program, Vec<Diagnostic>) {
+        Parser::new(Lexer::new(source).tokenize().unwrap()).parse()
+    }
+
+    #[test]
+    fn removed_rust_declarations_explain_module_migration() {
+        for declaration in [
+            "extern rust { fn value() -> i64; }",
+            "extern rust native { fn value() -> i64; }",
+            "extern rust { class Value { pub field: i64; } fn value() -> Value; }",
+            "extern rust { nonblocking(\"obsolete\") fn value(); }",
+            "extern rust { fn broken( ; }",
+        ] {
+            let (program, errors) = parse(&format!("{declaration} fn main() {{}}"));
+            assert_eq!(errors.len(), 1, "{declaration}: {errors:?}");
+            let error = &errors[0];
+            assert_eq!(error.code, ErrorCode::E0102);
+            assert!(error.message.contains("rust_module_migration_required"));
+            let help = error.helps.join(" ");
+            assert!(help.contains("src/<name>.rs") && help.contains("import <name>;"));
+            assert!(help.contains("[rust] bridge"));
+            assert!(
+                program
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Function(f) if f.name == "main"))
+            );
+            assert!(
+                !program
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Function(f) if f.rust_bridge.is_some()))
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_rust_declarations_stop_without_cascading() {
+        for source in [
+            "extern rust",
+            "extern rust native",
+            "extern rust {",
+            "extern rust { fn value() -> i64;",
+            "extern rust { class Record { pub field: i64; }",
+        ] {
+            let (_, errors) = parse(source);
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert!(errors[0].message.contains("rust_module_migration_required"));
+        }
+    }
+
+    #[test]
+    fn removed_rust_recovery_scales_with_tokens() {
+        for count in [1, 16, 256] {
+            let source = format!(
+                "extern rust {{ {} }} fn main() {{}}",
+                "class Record { pub field: i64; } ".repeat(count)
+            );
+            let tokens = Lexer::new(&source).tokenize().unwrap();
+            let token_count = tokens.len();
+            SKIPPED_TOKENS.set(0);
+            let (program, errors) = Parser::new(tokens).parse();
+            assert_eq!(errors.len(), 1);
+            // Six tokens belong to `fn main() {}`, and one is EOF.
+            assert_eq!(SKIPPED_TOKENS.get(), token_count - 7);
+            eprintln!(
+                "removed records={count} skipped_tokens={}",
+                SKIPPED_TOKENS.get()
+            );
+            assert!(
+                program
+                    .items
+                    .iter()
+                    .any(|item| matches!(item, Item::Function(f) if f.name == "main"))
+            );
+        }
+    }
+
+    #[test]
+    fn native_module_imports_and_qualified_calls_remain_valid() {
+        let (program, errors) = parse(
+            "import native; fn main() { let value = native::answer; println(native::answer()); }",
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(program.imports.len(), 1);
+        assert!(
+            program
+                .items
+                .iter()
+                .any(|item| matches!(item, Item::Function(f) if f.name == "main"))
+        );
+    }
+}

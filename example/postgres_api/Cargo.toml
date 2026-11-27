@@ -5,7 +5,7 @@ edition = "2024"
 publish = false
 [workspace]
 [lib]
-path = "bridge.rs"
+path = "src/native.rs"
 [dependencies]
 postgres-protocol = "=0.6.12"
 bytes = "=1.12.1"

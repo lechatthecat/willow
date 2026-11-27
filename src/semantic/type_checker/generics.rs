@@ -200,7 +200,7 @@ pub(crate) struct Generics {
     pub logical_types: Map<String, Type>,
     /// Instantiation nominal aliases (`$type$mono$...`) to the module-qualified
     /// identity they hash, so analysis can spell an instance's types.
-    pub nominal_aliases: Map<String, String>,
+    pub nominal_aliases: Rc<Map<String, String>>,
     pub active_class_depth: usize,
     pub calls: Map<ExprId, String>,
     pub function_paths: Map<String, String>,
@@ -227,7 +227,7 @@ impl Default for Generics {
             imported_types: Map::new("generic.imported_types"),
             emitted: Default::default(),
             logical_types: Map::new("generic.logical_types"),
-            nominal_aliases: Map::new("generic.nominal_aliases"),
+            nominal_aliases: Rc::new(Map::new("generic.nominal_aliases")),
             active_class_depth: Default::default(),
             calls: Map::new("generic.calls"),
             function_paths: Map::new("generic.function_paths"),
@@ -295,9 +295,7 @@ mod name_provenance_replay_tests {
                         canonical,
                         SyntheticKind::NominalAlias,
                     );
-                    checker
-                        .generics
-                        .nominal_aliases
+                    Rc::make_mut(&mut checker.generics.nominal_aliases)
                         .insert(alias.clone(), canonical.into());
                     (names, alias)
                 },
@@ -1453,8 +1451,7 @@ impl TypeChecker {
                     // The alias hashes `canonical`, so every unit records the
                     // same module-qualified value for it.
                     if !self.generics.nominal_aliases.contains_key(&alias) {
-                        self.generics
-                            .nominal_aliases
+                        Rc::make_mut(&mut self.generics.nominal_aliases)
                             .insert(alias.clone(), canonical);
                     }
                     classes.entry(alias.clone()).or_insert_with(|| {
@@ -1497,15 +1494,15 @@ impl TypeChecker {
         // Carry its display name too, once per alias, so diagnostics need only
         // a name lookup rather than reading full declaration metadata.
         let canonical = self.generic_nominal_identity(info.name(), info.declaration_span());
-        self.generics
-            .nominal_aliases
-            .insert(alias.to_owned(), canonical);
+        if self.generics.nominal_aliases.get(alias) != Some(&canonical) {
+            Rc::make_mut(&mut self.generics.nominal_aliases).insert(alias.to_owned(), canonical);
+        }
         match info.as_ref() {
             InstantiationType::Class(info) => {
                 self.symbols.define_class(alias.to_string(), info.clone())
             }
             InstantiationType::Enum(info) => {
-                self.symbols.define_enum(alias.to_string(), info.clone())
+                self.symbols.define_enum(alias.to_string(), info.clone());
             }
             InstantiationType::Interface(info) => self
                 .symbols
@@ -1666,6 +1663,10 @@ impl TypeChecker {
         checker.generics.classes = self.generics.classes.clone();
         checker.generics.function_paths = self.generics.function_paths.clone();
         checker.generics.class_paths = self.generics.class_paths.clone();
+        // Symbols carry caller-owned nominal aliases. Their normalization map
+        // must accompany them into the isolated checker; otherwise enum aliases
+        // collapse to caller-local names that the provider cannot resolve.
+        checker.generics.nominal_aliases = Rc::clone(&self.generics.nominal_aliases);
         checker.generics.registry.borrow_mut().module_paths =
             Rc::clone(&self.generics.registry.borrow().module_paths);
         checker.generics.registry.borrow_mut().classes =
@@ -2713,7 +2714,9 @@ impl Generics {
             "generic.instances" => self.instances.restore_value(key, value)?,
             "generic.imported_types" => self.imported_types.restore_value(key, value)?,
             "generic.logical_types" => self.logical_types.restore_value(key, value)?,
-            "generic.nominal_aliases" => self.nominal_aliases.restore_value(key, value)?,
+            "generic.nominal_aliases" => {
+                Rc::make_mut(&mut self.nominal_aliases).restore_value(key, value)?
+            }
             "generic.calls" => self.calls.restore_value(key, value)?,
             "generic.function_paths" => self.function_paths.restore_value(key, value)?,
             "generic.class_paths" => self.class_paths.restore_value(key, value)?,
@@ -2722,5 +2725,91 @@ impl Generics {
             _ => anyhow::bail!("unknown generic replay field"),
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod carried_enum_tests {
+    use super::*;
+    use crate::semantic::symbols::EnumInfo;
+
+    #[test]
+    fn carried_enum_identity_is_shared_without_exposing_bare_names() {
+        for identity in ["consumer::Value", "Local"] {
+            for count in [1, 16, 256] {
+                let mut checker = TypeChecker::new();
+                let before = checker.symbols.enums.len();
+                let info = Rc::new(InstantiationType::Enum(EnumInfo {
+                    name: identity.into(),
+                    public: true,
+                    type_params: Vec::new(),
+                    variants: Vec::new(),
+                    declaration_span: Span::dummy(),
+                }));
+                for i in 0..count {
+                    let alias = format!("$type$carried{i}");
+                    checker.register_instantiation_type(&alias, Rc::clone(&info));
+                    assert_eq!(checker.symbols.lookup_enum(&alias).unwrap().name, identity);
+                }
+                assert!(checker.symbols.lookup_enum(identity).is_none());
+                assert!(!checker.enum_nameable_bare(identity));
+                let added = checker.symbols.enums.len() - before;
+                assert_eq!(added, count);
+                let (mut program, errors) = crate::parser::Parser::new(
+                    crate::lexer::Lexer::new("fn probe<T>(value: T) {}")
+                        .tokenize()
+                        .unwrap(),
+                )
+                .parse();
+                assert!(errors.is_empty());
+                let Item::Function(function) = &mut program.items[0] else {
+                    panic!()
+                };
+                function.params[0].ty = Type::Named(format!("$type$carried{}", count - 1));
+                let template = checker
+                    .generics
+                    .registry
+                    .borrow_mut()
+                    .intern_function(function);
+                checker.generics.functions.insert("probe".into(), template);
+                checker.validate_generic_templates(function.span.file_id, &program);
+                assert!(
+                    checker.errors.is_empty(),
+                    "{identity}: {:?}",
+                    checker.errors
+                );
+                assert!(!checker.enum_nameable_bare(identity));
+                for _ in 0..count {
+                    let mut body = checker.fork_body();
+                    assert!(Rc::ptr_eq(
+                        &checker.generics.nominal_aliases,
+                        &body.generics.nominal_aliases
+                    ));
+                    let alias_name = format!("$type$carried{}", count - 1);
+                    body.register_instantiation_type(&alias_name, Rc::clone(&info));
+                    assert!(Rc::ptr_eq(
+                        &checker.generics.nominal_aliases,
+                        &body.generics.nominal_aliases
+                    ));
+                    let alias = Type::Named(alias_name);
+                    let ty = body.normalize_type(&alias, Span::dummy());
+                    assert_eq!(ty, alias);
+                    body.validate_type(&ty, Span::dummy());
+                    assert!(body.errors.is_empty());
+                    assert!(!body.enum_nameable_bare(identity));
+                }
+                let mut changed = checker.fork_body();
+                changed.register_instantiation_type("$type$new", Rc::clone(&info));
+                assert!(!Rc::ptr_eq(
+                    &checker.generics.nominal_aliases,
+                    &changed.generics.nominal_aliases
+                ));
+                assert!(!checker.generics.nominal_aliases.contains_key("$type$new"));
+                assert!(changed.generics.nominal_aliases.contains_key("$type$new"));
+                eprintln!(
+                    "carried enum={identity} aliases={count} registrations={added} shared_reregistrations={count}"
+                );
+            }
+        }
     }
 }

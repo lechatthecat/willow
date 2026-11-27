@@ -511,7 +511,18 @@ mod tests {
 
     fn errors(source: &str, native: bool) -> Vec<Diagnostic> {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
-        let (program, diagnostics) = crate::parser::Parser::new(tokens).parse();
+        let (mut program, diagnostics) = crate::parser::Parser::new(tokens).parse();
+        for item in &mut program.items {
+            if let crate::parser::ast::Item::Function(f) = item
+                && f.name == "foreign"
+            {
+                f.rust_bridge = Some(Box::new(crate::rust_bridge_ir::RustBridgeSymbol::new(
+                    f.name.clone(),
+                    vec![crate::rust_bridge_ir::Scalar::I64; f.params.len()],
+                    crate::rust_bridge_ir::Scalar::I64,
+                )));
+            }
+        }
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         let mut checker = crate::semantic::TypeChecker::new().with_sync_stack_preemption(native);
         let queries = std::rc::Rc::new(EffectQueries::default());
@@ -640,13 +651,13 @@ mod tests {
 
     #[test]
     fn preemption_matching_foreign_value_uses_bounded_dispatch() {
-        let source = "extern rust { fn foreign(x:i64)->i64; } fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(foreign));}";
+        let source = "pub fn foreign(x:i64)->i64 {return x;} fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(foreign));}";
         assert!(errors(source, true).is_empty());
     }
 
     #[test]
     fn preemption_arity_partitions_unrelated_foreign_values() {
-        let source = "extern rust { fn foreign(x:i64,y:i64)->i64; } fn keep()->fn(i64,i64)->i64{return foreign;} fn add(x:i64)->i64{return x+1;} fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(add));}";
+        let source = "pub fn foreign(x:i64,y:i64)->i64 {return x+y;} fn keep()->fn(i64,i64)->i64{return foreign;} fn add(x:i64)->i64{return x+1;} fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(add));}";
         let errors = errors(source, true);
         assert!(errors.is_empty(), "{errors:?}");
     }

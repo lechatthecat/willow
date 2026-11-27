@@ -352,3 +352,20 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(out, "invalid Unicode scalar\n".repeat(7));
 }
+
+#[test]
+fn json_module_only_import_rechecks_collection_enum_arguments() {
+    let source = r#"
+import std::json;
+fn main() {
+    println(json::serialize(json::parse("{}").unwrap()).unwrap());
+    println(json::serialize(json::parse("[null,true,2]").unwrap()).unwrap());
+    println(json::serialize(json::parse("{\"items\":[{\"value\":3}]}").unwrap()).unwrap());
+}
+"#;
+    for run in [compile_and_run, compile_and_run_gc_stress] {
+        let (output, success) = run(source);
+        assert!(success, "{output}");
+        assert_eq!(output, "{}\n[null,true,2]\n{\"items\":[{\"value\":3}]}\n");
+    }
+}

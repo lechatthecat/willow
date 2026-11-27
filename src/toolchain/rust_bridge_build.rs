@@ -177,7 +177,6 @@ pub struct BridgeBuild {
     pub directory: PathBuf,
     pub cache_key: String,
     pub review_fingerprint: String,
-    pub legacy_review_fingerprint: String,
     pub target: String,
     pub staticlib: Option<PathBuf>,
     pub messages: CargoMessages,
@@ -560,15 +559,6 @@ fn prepare_bridge(
     if let Some(lease) = &project_lease {
         lease.ensure_no_ai_edit()?;
     }
-    let bridge = project
-        .rust
-        .as_ref()
-        .map(|rust| rust.resolve_bridge(&root))
-        .transpose()?;
-    anyhow::ensure!(
-        bridge.is_some() || has_native_modules,
-        "rust_bridge_missing: [rust] bridge is required"
-    );
     let toolchain = RustToolchain::detect(&options.cargo, &options.rustc, &root)?;
     let target = options.target.as_deref().unwrap_or(&toolchain.host);
     // Parse before Cargo/linking; Cargo validates installation of the target.
@@ -625,8 +615,7 @@ fn prepare_bridge(
     )?;
     let previous = prepare_bridge_lock(&root, &directory, options, action, &input_hash)?;
     write_changed(&manifest_path, manifest.as_bytes())?;
-    let (source, native_hash) =
-        generated_bridge_source(&root, &directory, bridge.as_deref(), &options.symbols)?;
+    let (source, native_hash) = generated_bridge_source(&root, &directory, &options.symbols)?;
     // Cargo metadata needs a lib target, but never rewrite a previous fingerprint
     // before determining the new key: that would invalidate every warm build.
     if !lib_path.exists() {
@@ -662,15 +651,8 @@ fn prepare_bridge(
     {
         bail!("rust_lockfile_stale: Cargo resolution or direct version summary changed");
     }
-    let (bridge_hash, review, legacy_review) = bridge_reviews(
-        &root,
-        options,
-        action,
-        bridge.as_deref(),
-        native_hash,
-        &rust_lock,
-        &metadata,
-    )?;
+    let (bridge_hash, review) =
+        bridge_reviews(&root, options, action, native_hash, &rust_lock, &metadata)?;
     let source_hash = hash(&serde_json::to_vec(&(&bridge_hash, &options.symbols))?);
     let manifest_hash = hash(manifest.as_bytes());
     let cache_key = BridgeCacheKey {
@@ -694,7 +676,6 @@ fn prepare_bridge(
             directory,
             cache_key,
             review_fingerprint: review,
-            legacy_review_fingerprint: legacy_review,
             target: target.to_owned(),
             staticlib: None,
             messages: CargoMessages::default(),
@@ -718,7 +699,6 @@ fn prepare_bridge(
         directory,
         cache_key,
         review_fingerprint: review,
-        legacy_review_fingerprint: legacy_review,
         target: target.to_owned(),
         staticlib,
         messages,
@@ -764,76 +744,45 @@ fn bridge_reviews(
     root: &Path,
     options: &BridgeOptions,
     action: BridgeAction<'_>,
-    bridge: Option<&Path>,
-    native_hash: Option<String>,
+    native_hash: String,
     rust_lock: &crate::package::lock::RustLock,
     metadata: &Value,
-) -> Result<(String, String, String)> {
-    // Compute once for all declarations. Source and manifest changes require
-    // review even when Cargo's resolved package versions have not changed.
-    // Root Rust sources normalize line endings. Dependency trees bind exact
-    // bytes because arbitrary files may be consumed by build/include code.
-    let native_review = review::required(root, &options.symbols);
-    let legacy_hash = bridge
-        .map(|path| {
-            if native_review {
-                review::reviewed_file_hash(path)
-            } else {
-                hash_source_file(path)
-            }
-        })
-        .transpose()?;
-    // Preserve legacy review semantics while native reviews bind every module.
-    let bridge_hash = legacy_hash
-        .clone()
-        .or(native_hash)
-        .context("rust_bridge_missing: bridge source is required")?;
-    let legacy_review = hash(&serde_json::to_vec(&(
-        &rust_lock.cargo_lock_hash,
-        &bridge_hash,
-        &rust_lock.bridge_input_hash,
-    ))?);
-    let review = if native_review {
+) -> Result<(String, String)> {
+    // The closed-source review policy is required only for asserted effects.
+    // Ordinary Rust implementations may use private macros and file loaders;
+    // imposing the review scanner on them would reject valid native modules.
+    let review = if review::required(root, &options.symbols) {
         let sources = review::fingerprint(
             root,
             &options.symbols,
             &rust_lock.cargo_lock_hash,
             &rust_lock.bridge_input_hash,
-            legacy_hash.as_deref(),
         )?;
         hash(&serde_json::to_vec(&(
-            "foreign-review-v2",
+            "foreign-review-v3",
             sources,
             review::dependency_fingerprint(root, metadata)?,
         ))?)
     } else {
-        legacy_review.clone()
+        hash(&serde_json::to_vec(&(
+            "native-inputs-v1",
+            &native_hash,
+            &rust_lock.cargo_lock_hash,
+            &rust_lock.bridge_input_hash,
+        ))?)
     };
     if !matches!(action, BridgeAction::Metadata | BridgeAction::Edit { .. }) {
         review::validate(root, &options.symbols, &review)?;
-        for symbol in &options.symbols {
-            if symbol.native.is_none()
-                && let Some(declared) = &symbol.nonblocking
-                && declared.fingerprint != legacy_review
-            {
-                bail!(
-                    "rust_nonblocking_review_required: {}: review current bridge and dependencies, then use nonblocking(\"{}\")",
-                    symbol.willow_function,
-                    legacy_review
-                );
-            }
-        }
     }
-    Ok((bridge_hash, review, legacy_review))
+    Ok((native_hash, review))
 }
 
 fn generated_bridge_source(
     root: &Path,
     directory: &Path,
-    legacy: Option<&Path>,
     symbols: &[crate::rust_bridge_ir::RustBridgeSymbol],
-) -> Result<(String, Option<String>)> {
-    let (mut source, native_hash) = module_sources(root, legacy, symbols)?;
+) -> Result<(String, String)> {
+    let (mut source, native_hash) = module_sources(root, symbols)?;
     if !symbols.is_empty() {
         let abi = directory.join("src/willow_bridge_abi.rs");
         write_changed(&abi, include_bytes!("../../crates/willow_abi/src/ffi.rs"))?;
@@ -867,9 +816,8 @@ fn review_module_path(root: &Path, path: &Path) -> String {
 /// Adapters share the existing bridge namespace and therefore the existing ABI.
 fn module_sources(
     root: &Path,
-    legacy: Option<&Path>,
     symbols: &[crate::rust_bridge_ir::RustBridgeSymbol],
-) -> Result<(String, Option<String>)> {
+) -> Result<(String, String)> {
     let mut module_index = std::collections::HashMap::new();
     let mut modules = Vec::new();
     let mut adapters = String::new();
@@ -889,16 +837,6 @@ fn module_sources(
         adapters.push_str(&native.adapter);
         adapters.push('\n');
     }
-    if modules.is_empty() {
-        let legacy = legacy.context("rust_bridge_missing: bridge source is required")?;
-        return Ok((
-            format!(
-                "#[path = {:?}]\npub mod bridge;\n",
-                legacy.to_str().context("non-UTF8 bridge path")?
-            ),
-            None,
-        ));
-    }
     let mut source = String::new();
     let mut module_hashes = Vec::with_capacity(modules.len());
     for (module, path, captured) in modules {
@@ -912,23 +850,14 @@ fn module_sources(
             hash_source_bytes(captured.as_bytes()),
         ));
     }
-    if let Some(legacy) = legacy {
-        source.push_str(&format!(
-            "#[path = {:?}]\npub mod legacy_bridge;\n",
-            legacy.to_str().context("non-UTF8 bridge path")?
-        ));
-    }
     source.push_str("pub mod bridge {\n#[allow(unused_imports, reason = \"Native type adapters share the bridge namespace\")] use crate::bridge;\n");
-    if legacy.is_some() {
-        source.push_str("pub use crate::legacy_bridge::*;\n");
-    }
     source.push_str(&adapters);
     source.push_str("}\n");
     // Generated names contain absolute-path hashes solely for ABI disambiguation.
     // A source review uses project-relative paths and a native adapter schema so
-    // moving the checkout does not invalidate a mixed legacy nonblocking review.
+    // moving the checkout does not invalidate the source identity.
     let fingerprint = hash(&serde_json::to_vec(&("native-modules-v1", module_hashes))?);
-    Ok((source, Some(fingerprint)))
+    Ok((source, fingerprint))
 }
 
 #[cfg(test)]
@@ -1154,11 +1083,6 @@ fn canonical_output_path(path: &Path) -> Result<PathBuf> {
     Ok(resolved)
 }
 
-fn hash_source_file(path: &Path) -> Result<String> {
-    let bytes = std::fs::read(path)?;
-    Ok(hash_source_bytes(&bytes))
-}
-
 fn hash_source_bytes(bytes: &[u8]) -> String {
     let mut digest = Sha256::new();
     let mut rest = bytes;
@@ -1234,31 +1158,95 @@ mod tests {
                 "pub use crate::second::value as second_value;",
             ),
         ];
-        let legacy = directory.join("absent-legacy.rs");
-        let (source, fingerprint) = module_sources(&directory, Some(&legacy), &symbols).unwrap();
+        let (source, fingerprint) = module_sources(&directory, &symbols).unwrap();
         assert_eq!(source.matches("pub mod first;").count(), 1);
         assert_eq!(source.matches("pub mod second;").count(), 1);
-        assert!(source.contains("pub use crate::legacy_bridge::*;"));
         assert!(source.contains("another_value;"));
         assert!(source.contains("/source-must-not-be-read.rs"));
         assert!(!directory.join("src/first.rs").exists());
         symbols[0].native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 1 }\r\n".into());
-        assert_eq!(
-            module_sources(&directory, Some(&legacy), &symbols)
-                .unwrap()
-                .1,
-            fingerprint
-        );
+        assert_eq!(module_sources(&directory, &symbols).unwrap().1, fingerprint);
         symbols[0].native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 3 }\n".into());
-        assert_ne!(
-            module_sources(&directory, Some(&legacy), &symbols)
-                .unwrap()
-                .1,
-            fingerprint
-        );
+        assert_ne!(module_sources(&directory, &symbols).unwrap().1, fingerprint);
         symbols[0].native.as_mut().unwrap().source = None;
-        assert!(module_sources(&directory, None, &symbols).is_err());
+        assert!(module_sources(&directory, &symbols).is_err());
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn native_metadata_without_exports_generates_an_empty_bridge() {
+        let root = Path::new("/unused-metadata-project");
+        let (source, _) = generated_bridge_source(root, root, &[]).unwrap();
+        assert!(source.contains("pub mod bridge {"));
+        assert!(!source.contains("#[path"));
+        assert!(!source.contains("extern"));
+        assert!(!source.contains("willow_bridge_abi"));
+    }
+
+    #[test]
+    fn native_review_policy_applies_only_when_claimed_or_recorded() {
+        let root = std::env::temp_dir().join(format!(
+            "willow-native-review-policy-{}",
+            std::process::id()
+        ));
+        assert!(!root.exists());
+        fs::create_dir_all(&root).unwrap();
+        let mut options = BridgeOptions::new(BuildMode::Debug).unwrap();
+        options.symbols.push(native_symbol(
+            "native",
+            Some("macro_rules! value { () => { 42 }; } pub fn value() -> i64 { value!() }"),
+            "",
+        ));
+        let mut lock = crate::package::lock::RustLock {
+            modules: true,
+            cargo_lock_hash: "lock".into(),
+            bridge_input_hash: "inputs".into(),
+            dependencies: Default::default(),
+        };
+        // Invalid metadata proves the dependency review scanner is not invoked
+        // without a claim. The captured private macro remains ordinary Rust.
+        let inspect =
+            |options: &BridgeOptions, lock: &crate::package::lock::RustLock, source: &str| {
+                bridge_reviews(
+                    &root,
+                    options,
+                    BridgeAction::Metadata,
+                    source.into(),
+                    lock,
+                    &Value::Null,
+                )
+            };
+        let initial = inspect(&options, &lock, "source").unwrap().1;
+        assert_eq!(inspect(&options, &lock, "source").unwrap().1, initial);
+        assert_ne!(
+            inspect(&options, &lock, "changed source").unwrap().1,
+            initial
+        );
+        lock.cargo_lock_hash.push_str(" changed");
+        assert_ne!(inspect(&options, &lock, "source").unwrap().1, initial);
+        lock.cargo_lock_hash = "lock".into();
+        lock.bridge_input_hash.push_str(" changed");
+        assert_ne!(inspect(&options, &lock, "source").unwrap().1, initial);
+        options.symbols[0].no_io = true;
+        assert!(
+            inspect(&options, &lock, "source")
+                .unwrap_err()
+                .to_string()
+                .contains("rust_review_source_layout")
+        );
+        options.symbols[0].no_io = false;
+        fs::write(
+            root.join(review::RECORD),
+            format!("fingerprint='{}'", "0".repeat(64)),
+        )
+        .unwrap();
+        assert!(
+            inspect(&options, &lock, "source")
+                .unwrap_err()
+                .to_string()
+                .contains("rust_review_source_layout")
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -1302,17 +1290,15 @@ mod tests {
         native.module = "native_second".into();
         native.source_path = second_root.join("src/native.rs");
         native.adapter = native.adapter.replace("native_first", "native_second");
-        let first_hash = module_sources(first_root, None, &[first]).unwrap().1;
+        let first_hash = module_sources(first_root, &[first]).unwrap().1;
         assert_eq!(
             first_hash,
-            module_sources(second_root, None, &[second.clone()])
-                .unwrap()
-                .1
+            module_sources(second_root, &[second.clone()]).unwrap().1
         );
         second.native.as_mut().unwrap().source = Some("pub fn value() -> i64 { 43 }".into());
         assert_ne!(
             first_hash,
-            module_sources(second_root, None, &[second]).unwrap().1
+            module_sources(second_root, &[second]).unwrap().1
         );
     }
 

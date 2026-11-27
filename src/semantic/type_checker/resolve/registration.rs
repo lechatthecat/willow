@@ -669,9 +669,10 @@ impl TypeChecker {
                         pi.ty = qualify(&pi.ty);
                     }
                     let identity = FunctionId::free(&f.name).in_namespace(canonical);
-                    if identity.module().is_some() {
-                        functions.scope().declare(&f.name, identity);
-                    }
+                    // Function values retain the declaring namespace even when
+                    // the module has no interned SymbolModule identity yet.
+                    // The backend declares this same canonical callable.
+                    functions.scope().declare(&f.name, identity);
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {

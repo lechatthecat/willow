@@ -1508,11 +1508,12 @@ fn semantic_diff_first_rust_bridge_retries_and_matches_cold() {
         fs::copy(fixture.join(file), target).unwrap();
     }
     fs::write(
-        scratch.0.join("bridge.rs"),
+        scratch.0.join("native.rs"),
         "pub fn foreign() -> i64 { willow_bridge_native::answer() as i64 }",
     )
     .unwrap();
     fs::create_dir(scratch.0.join("src")).unwrap();
+    fs::rename(scratch.0.join("native.rs"), scratch.0.join("src/native.rs")).unwrap();
     fs::write(
         scratch.0.join("src/helper.wi"),
         "pub fn untouched() -> i64 { return 7; }",
@@ -1540,7 +1541,7 @@ fn semantic_diff_first_rust_bridge_retries_and_matches_cold() {
         )
         .unwrap();
         let base = analyze(&options, &scratch, &mut revision, entry).unwrap();
-        fs::write(&path, format!("import helper; extern rust {{ fn foreign() -> i64; }} fn same() {{}} {extra} fn main() {{ println(foreign() + helper::untouched()); }}")).unwrap();
+        fs::write(&path, format!("import helper; import native::foreign; fn same() {{}} {extra} fn main() {{ println(foreign() + helper::untouched()); }}")).unwrap();
         let session = crate::CompilerSession::new(
             path.to_str().unwrap(),
             "",

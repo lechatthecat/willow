@@ -7,9 +7,7 @@ mod dependency;
 pub mod init;
 mod rust;
 pub use dependency::{CanonicalGitUrl, DependencySource, GitSelector};
-pub use rust::{
-    RustDependency, RustDependencySource, RustDependencySpec, RustGitSelector, RustSection,
-};
+pub use rust::{RustDependency, RustDependencySource, RustDependencySpec, RustGitSelector};
 
 use anyhow::Result;
 use serde::Deserialize;
@@ -32,7 +30,6 @@ pub struct ProjectManifest {
     /// `[dependencies]`: these never reach the Willow package resolver.
     #[serde(rename = "rust-dependencies", default)]
     pub rust_dependencies: BTreeMap<String, RustDependencySpec>,
-    pub rust: Option<RustSection>,
     #[serde(default)]
     pub native: Option<crate::toolchain::native::NativeManifest>,
 }
@@ -53,8 +50,6 @@ pub enum ManifestError {
     UnsupportedVersion { found: u64, supported: u64 },
     #[error("error[{code}]: rust_dependency_invalid: {0}", code = crate::diagnostics::ErrorCode::E2015.as_str())]
     RustDependencyInvalid(String),
-    #[error("error[{code}]: rust_bridge_missing: {0}", code = crate::diagnostics::ErrorCode::E2016.as_str())]
-    RustBridgeMissing(String),
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,13 +71,20 @@ impl ProjectManifest {
         let text = std::fs::read_to_string(manifest_path).map_err(|e| {
             ManifestError::Invalid(format!("cannot read {}: {e}", manifest_path.display()))
         })?;
-        let manifest: Self = toml::from_str(&text)
+        let value: toml::Value = toml::from_str(&text)
+            .map_err(|e| ManifestError::Invalid(format!("{}: {e}", manifest_path.display())))?;
+        // Reject the removed configuration before interpreting its value or
+        // touching its path. Empty, malformed and missing paths share the same
+        // migration advice as an otherwise usable bridge.
+        if value.get("rust").is_some() {
+            return Err(ManifestError::RustDependencyInvalid(
+                "rust_bridge_removed: `[rust] bridge` has been removed; move the Rust source to `src/<name>.rs`, use `import <name>;` in Willow, and remove the `[rust]` section. Keep Cargo dependencies in `[rust-dependencies]`.".into(),
+            ).into());
+        }
+        let manifest: Self = value
+            .try_into()
             .map_err(|e| ManifestError::Invalid(format!("{}: {e}", manifest_path.display())))?;
         manifest.validate()?;
-        // Bridge existence is the only rule that needs the project root.
-        if let Some(rust) = &manifest.rust {
-            rust.resolve_bridge(root)?;
-        }
         Ok(manifest)
     }
 
@@ -132,9 +134,6 @@ impl ProjectManifest {
         }
         for (alias, spec) in &self.rust_dependencies {
             spec.normalize(alias)?;
-        }
-        if let Some(rust) = &self.rust {
-            rust.relative_bridge()?;
         }
         if is_reserved_package_name(&self.project.name) {
             anyhow::bail!(
@@ -627,60 +626,55 @@ mod rust_manifest_tests {
     }
 
     #[test]
-    fn bridge_resolves_against_the_project_root() {
-        let project = Project::new();
-        std::fs::create_dir_all(project.0.join("rust")).unwrap();
-        std::fs::write(project.0.join("rust/bridge.rs"), "pub fn f() {}\n").unwrap();
-        let manifest = project
-            .load("[rust]\nbridge = \"rust/bridge.rs\"\n\n[rust-dependencies]\nregex = \"1.12\"\n")
-            .unwrap();
-        let rust = manifest.rust.as_ref().unwrap();
-        assert_eq!(rust.relative_bridge().unwrap(), Path::new("rust/bridge.rs"));
-        assert_eq!(
-            rust.resolve_bridge(&project.0).unwrap(),
-            project.0.join("rust/bridge.rs")
-        );
-    }
-
-    #[test]
-    fn bridge_paths_escaping_the_project_root_are_rejected() {
-        let absolute = if cfg!(windows) {
-            "C:\\\\tmp\\\\bridge.rs"
-        } else {
-            "/tmp/bridge.rs"
-        };
-        for bridge in ["../bridge.rs", "rust/../../bridge.rs", absolute, "", "."] {
-            let error = rejection(&format!("[rust]\nbridge = \"{bridge}\"\n"));
-            assert!(
-                error.contains("error[E2015]") && error.contains("rust_dependency_invalid"),
-                "{bridge}: {error}"
-            );
+    fn removed_bridge_key_reports_module_migration_for_every_value() {
+        for extra in [
+            "[rust]\nbridge = 'bridge.rs'",
+            "[rust]\nbridge = 'missing.rs'",
+            "[rust]\nbridge = '../outside.rs'",
+            "[rust]\nbridge = '/tmp/outside.rs'",
+            "[rust]\nbridge = ''",
+            "[rust]\nbridge = '.'",
+            "[rust]\nbridge = 42",
+            "[rust]\nbridge = false",
+            "[rust]\nbridge = ['bridge.rs']",
+            "[rust]\nbridge = { path = 'bridge.rs' }",
+            "[rust]\nbridge = 'bridge.rs'\nextra = 1",
+            "[rust]",
+            "rust = { bridge = 'bridge.rs' }\n[project]\nname='demo'\nversion='1.2.3'",
+        ] {
+            // The last spelling starts at the document root; the fixture's
+            // project section would otherwise make it a project-local key.
+            let error = if extra.starts_with("rust =") {
+                let path = tests::temp_manifest(extra);
+                let error = ProjectManifest::load(&path).unwrap_err().to_string();
+                std::fs::remove_file(path).unwrap();
+                error
+            } else {
+                rejection(extra)
+            };
+            for expected in [
+                "error[E2015]",
+                "rust_bridge_removed",
+                "src/<name>.rs",
+                "import <name>;",
+                "remove the `[rust]` section",
+                "[rust-dependencies]",
+            ] {
+                assert!(error.contains(expected), "{extra}: {error}");
+            }
         }
     }
 
     #[test]
-    fn missing_bridge_file_is_its_own_diagnostic() {
+    fn removed_bridge_rejects_existing_files_without_loading_them() {
         let project = Project::new();
-        let error = project
-            .load("[rust]\nbridge = \"rust/bridge.rs\"\n")
-            .expect_err("missing bridge should fail")
-            .to_string();
-        assert!(error.contains("error[E2016]"), "{error}");
-        assert!(error.contains("rust_bridge_missing"), "{error}");
-
-        // A directory at the bridge path is missing, not a usable bridge.
-        std::fs::create_dir_all(project.0.join("rust/bridge.rs")).unwrap();
-        let error = project
-            .load("[rust]\nbridge = \"rust/bridge.rs\"\n")
-            .expect_err("directory bridge should fail")
-            .to_string();
-        assert!(error.contains("rust_bridge_missing"), "{error}");
-    }
-
-    #[test]
-    fn unknown_keys_in_the_rust_section_are_rejected() {
-        assert!(!rejection("[rust]\nbridge = 'rust/b.rs'\nextra = 1\n").is_empty());
-        assert!(!rejection("[rust]\n").is_empty());
+        std::fs::write(project.0.join("bridge.rs"), "pub fn f() {}\n").unwrap();
+        let error = project.load("[rust]\nbridge = 'bridge.rs'").unwrap_err();
+        assert!(error.to_string().contains("rust_bridge_removed"), "{error}");
+        assert_eq!(
+            std::fs::read_to_string(project.0.join("bridge.rs")).unwrap(),
+            "pub fn f() {}\n"
+        );
     }
 
     #[test]
@@ -693,8 +687,8 @@ mod rust_manifest_tests {
             .unwrap();
         assert_eq!(manifest.dependencies.len(), 1);
         assert_eq!(manifest.rust_dependencies.len(), 1);
-        // A manifest without Rust configuration keeps both fields empty.
+        // A manifest without Rust dependencies keeps that table empty.
         let plain = project.load("").unwrap();
-        assert!(plain.rust_dependencies.is_empty() && plain.rust.is_none());
+        assert!(plain.rust_dependencies.is_empty());
     }
 }

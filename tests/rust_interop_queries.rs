@@ -27,7 +27,7 @@ impl Fixture {
         let root = temp.join("project with spaces");
         fs::create_dir_all(root.join("src")).unwrap();
         fs::create_dir_all(root.join("native/src")).unwrap();
-        fs::write(root.join("project.toml"), "[project]\nname='r6'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n[rust-dependencies]\nregex={path='native'}\n[rust]\nbridge='bridge.rs'\n").unwrap();
+        fs::write(root.join("project.toml"), "[project]\nname='r6'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n[rust-dependencies]\nregex={path='native'}\n").unwrap();
         fs::write(
             root.join("native/Cargo.toml"),
             "[package]\nname='regex'\nversion='1.2.3'\nedition='2024'\n",
@@ -39,11 +39,11 @@ impl Fixture {
         )
         .unwrap();
         fs::write(
-            root.join("bridge.rs"),
+            root.join("src/native.rs"),
             "pub fn regex_is_match(v:i64)->bool {regex::is_match(v)}\n",
         )
         .unwrap();
-        fs::write(root.join("src/main.wi"), "extern rust { fn regex_is_match(v:i64)->bool; }\nclass App { pub static fn validate(v:i64)->bool { return regex_is_match(v); } }\nfn main(){println(App::validate(42));}\n").unwrap();
+        fs::write(root.join("src/main.wi"), "import native;\nclass App { pub static fn validate(v:i64)->bool { return native::regex_is_match(v); } }\nfn main(){println(App::validate(42));}\n").unwrap();
         Self { temp, root }
     }
     fn run(&self, args: &[&str]) -> (bool, Value) {
@@ -97,17 +97,39 @@ impl Drop for Fixture {
 #[test]
 fn rust_bridge_json_schema_package_identity_and_unknown_selector() {
     let f = Fixture::new();
+    let fresh = f.files();
+    let (ok, unresolved) = f.run(&["query", "rust-bridge"]);
+    assert!(ok, "{unresolved}");
+    assert!(unresolved["bridges"][0]["crate"]["version"].is_null());
+    assert_eq!(f.files(), fresh);
+    let (ok, metadata) = f.run(&["rust", "metadata"]);
+    assert!(ok, "{metadata}");
     let before = f.files();
-    let (ok, v) = f.run(&["query", "rust-bridge", "regex_is_match"]);
+    let (ok, v) = f.run(&["query", "rust-bridge"]);
     assert!(ok, "{v}");
     assert_eq!(v["schema"], 2);
     assert_eq!(v["status"], "ok");
     let b = &v["bridges"][0];
-    assert_eq!(b["symbol"], "regex_is_match");
+    assert!(
+        b["symbol"]
+            .as_str()
+            .unwrap()
+            .ends_with("::native::regex_is_match")
+    );
     assert_eq!(b["kind"], "rust-bridge");
     assert_eq!(b["crate"]["name"], "regex");
     assert_eq!(b["crate"]["version"], "1.2.3");
-    assert_eq!(b["rust_adapter"], "bridge.rs");
+    assert_eq!(
+        Path::new(b["declaration"][0]["path"].as_str().unwrap()),
+        f.root.join("src/native.rs")
+    );
+    assert!(
+        b["declaration_text"]
+            .as_str()
+            .unwrap()
+            .contains("fn regex_is_match")
+    );
+    let function = b["function"].as_str().unwrap().to_owned();
     assert!(
         b["abi_symbol"]
             .as_str()
@@ -117,10 +139,16 @@ fn rust_bridge_json_schema_package_identity_and_unknown_selector() {
     assert_eq!(b["signature"], json!({"inputs":["I64"],"output":"Bool"}));
     assert!(
         b.get("records").is_none(),
-        "legacy signatures keep the existing response shape"
+        "scalar signatures have no record definitions"
     );
     assert_eq!(b["identity"]["package"]["name"], "r6");
     assert_eq!(b["identity"]["symbol"], "regex_is_match");
+    assert_eq!(b["identity"]["module"], "native");
+    let selector = b["symbol"].as_str().unwrap();
+    let (ok, selected) = f.run(&["query", "rust-bridge", selector]);
+    assert!(ok, "{selected}");
+    assert_eq!(selected["bridges"].as_array().unwrap().len(), 1);
+    assert_eq!(selected["bridges"][0]["function"], function);
     assert_eq!(f.files(), before);
     let (ok, v) = f.run(&["query", "rust-bridge", "absent"]);
     assert!(ok);
@@ -129,10 +157,8 @@ fn rust_bridge_json_schema_package_identity_and_unknown_selector() {
     let rev = snapshot.revision.clone();
     let mut session = QuerySession::new(snapshot).unwrap();
     let v = session.query(
-        serde_json::from_value(
-            json!({"kind":"rust-bridge","revision":rev,"symbol":"regex_is_match"}),
-        )
-        .unwrap(),
+        serde_json::from_value(json!({"kind":"rust-bridge","revision":rev,"symbol":function}))
+            .unwrap(),
     );
     assert_eq!(
         v["result"]["bridges"][0]["identity"]["package"]["name"],
@@ -171,7 +197,12 @@ fn app_validate_impact_stops_at_regex_boundary() {
     assert_eq!(b["kind"], "rust");
     assert_eq!(b["crate"]["name"], "regex");
     assert_eq!(b["crate"]["version"], "1.2.3");
-    assert_eq!(b["bridge"], "regex_is_match");
+    assert!(
+        b["bridge"]
+            .as_str()
+            .unwrap()
+            .ends_with("::native::regex_is_match")
+    );
     assert!(impact.nodes.iter().any(|n| n.id == b["function"]));
 }
 
@@ -223,14 +254,22 @@ fn update_dry_run_preserves_all_project_files_fresh_and_locked() {
 fn bridge_compile_failure_bundles_cargo_declarations_and_callers() {
     let f = Fixture::new();
     fs::write(
-        f.root.join("bridge.rs"),
-        "pub fn regex_is_match(v:i64)->i64 {v}\n",
+        f.root.join("src/native.rs"),
+        "pub fn regex_is_match(v:i64)->bool {v}\n",
     )
     .unwrap();
     let (ok, v) = f.run(&["rust", "check"]);
     assert!(!ok, "{v}");
     let text = v.to_string();
-    assert!(text.contains("rust_bridge_signature_mismatch"), "{v}");
+    assert_eq!(v["error"]["kind"], "rust_bridge_compile_error", "{v}");
+    assert_eq!(
+        Path::new(
+            v["error"]["bridge_declarations"]["bridges"][0]["declaration"][0]["path"]
+                .as_str()
+                .unwrap()
+        ),
+        f.root.join("src/native.rs")
+    );
     assert!(text.contains("E0308"), "{v}");
     assert!(text.contains("bridge_declarations"), "{v}");
     assert!(text.contains("regex_is_match"), "{v}");
@@ -242,7 +281,12 @@ fn namespaced_and_imported_bridges_keep_distinct_function_ids() {
     let f = Fixture::new();
     fs::write(f.root.join("src/main.wi"),"import first as a; import second as b; fn main(){println(a::answer()); println(b::answer());}").unwrap();
     for name in ["first", "second"] {
-        fs::write(f.root.join(format!("src/{name}.wi")),"extern rust native { fn regex_is_match(v:i64)->bool; } pub fn answer()->bool {return native::regex_is_match(42);}").unwrap();
+        fs::write(f.root.join(format!("src/{name}.wi")), format!("import {name}_native as native; pub fn answer()->bool {{return native::regex_is_match(42);}}")).unwrap();
+        fs::write(
+            f.root.join(format!("src/{name}_native.rs")),
+            "pub fn regex_is_match(v:i64)->bool {regex::is_match(v)}",
+        )
+        .unwrap();
     }
     let (ok, v) = f.run(&["query", "rust-bridge"]);
     assert!(ok, "{v}");
@@ -255,6 +299,12 @@ fn namespaced_and_imported_bridges_keep_distinct_function_ids() {
     );
     assert_ne!(bridges[0]["abi_symbol"], bridges[1]["abi_symbol"]);
     for b in bridges {
+        let module = b["identity"]["module"].as_str().unwrap();
+        assert!(matches!(module, "first_native" | "second_native"));
+        assert_eq!(
+            Path::new(b["declaration"][0]["path"].as_str().unwrap()),
+            f.root.join(format!("src/{module}.rs"))
+        );
         assert!(
             b["declaration_text"]
                 .as_str()
@@ -292,7 +342,7 @@ fn multiple_crates_are_conservative_and_unused_bridges_have_no_callers() {
     .unwrap();
     fs::write(
         f.root.join("src/main.wi"),
-        "extern rust { fn regex_is_match(v:i64)->bool; } fn main() {println(42);}",
+        "import native; fn main() {println(42);}",
     )
     .unwrap();
     let (ok, v) = f.run(&["query", "rust-bridge"]);

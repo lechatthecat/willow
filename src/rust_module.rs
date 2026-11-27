@@ -27,6 +27,7 @@ pub struct NativeBridge {
 #[cfg(test)]
 thread_local! {
     static CONVERSION_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INTERFACE_NAME_VISITS: std::cell::Cell<[usize; 2]> = const { std::cell::Cell::new([0; 2]) };
 }
 
 #[derive(Clone)]
@@ -508,7 +509,7 @@ impl Deriver<'_> {
             }
             // Native claims are bound to the single project review at validation.
             if no_block {
-                symbol.declare_nonblocking(String::new());
+                symbol.declare_no_block();
             }
             symbol.no_io = no_io;
             symbol.assumption_span = Some(span);
@@ -938,7 +939,22 @@ pub(crate) fn parse(path: &Path, source: &str, file: FileId) -> (Program, Vec<Di
         if let syn::Item::Struct(s) = item
             && matches!(s.vis, syn::Visibility::Public(_))
         {
-            d.structs.insert(ident(&s.ident), s);
+            #[cfg(test)]
+            INTERFACE_NAME_VISITS.with(|visits| {
+                let mut counts = visits.get();
+                counts[0] += 1;
+                visits.set(counts);
+            });
+            let name = ident(&s.ident);
+            if d.structs.insert(name.clone(), s).is_some() {
+                return (
+                    program,
+                    vec![d.error(
+                        s.ident.span(),
+                        format!("duplicate exported struct `{name}`"),
+                    )],
+                );
+            }
             for field in &s.fields {
                 if matches!(field.vis, syn::Visibility::Public(_)) {
                     HandleUses(&mut d.opaque).visit_type(&field.ty);
@@ -1214,7 +1230,7 @@ impl RecordInterfaces {
         symbol.native_receiver = true;
         if let Some((no_block, no_io, span)) = assumed {
             if no_block {
-                symbol.declare_nonblocking(String::new());
+                symbol.declare_no_block();
             }
             symbol.no_io = no_io;
             symbol.assumption_span = Some(span);
@@ -1278,6 +1294,7 @@ impl RecordInterfaces {
             return Err(d.error(s.fields.span(), "records require named public fields"));
         }
         let mut fields = Vec::new();
+        let mut field_names = HashSet::new();
         let mut bridge_fields = Vec::new();
         let mut input_fields = String::new();
         let mut output_fields = String::new();
@@ -1291,6 +1308,18 @@ impl RecordInterfaces {
                 ));
             }
             let n = d.export_name(f.ident.as_ref().unwrap())?;
+            #[cfg(test)]
+            INTERFACE_NAME_VISITS.with(|visits| {
+                let mut counts = visits.get();
+                counts[1] += 1;
+                visits.set(counts);
+            });
+            if !field_names.insert(n.clone()) {
+                return Err(d.error(
+                    f.ident.as_ref().unwrap().span(),
+                    format!("duplicate record field `{n}` in `{name}`"),
+                ));
+            }
             let ty = d.ty(&f.ty, false)?;
             if matches!(ty, NativeType::Value(Scalar::Void)) {
                 return Err(d.error(f.ty.span(), "record fields require supported value types"));
@@ -1540,3 +1569,77 @@ mod tests;
 
 #[cfg(test)]
 mod shadow_tests;
+
+#[cfg(test)]
+mod interface_name_tests {
+    use super::*;
+
+    #[test]
+    fn duplicate_exported_structs_and_record_fields_are_rejected() {
+        for (source, message, duplicate) in [
+            (
+                "pub struct A; pub struct A;",
+                "duplicate exported struct `A`",
+                "A;",
+            ),
+            (
+                "pub struct A; pub struct r#A;",
+                "duplicate exported struct `A`",
+                "r#A;",
+            ),
+            (
+                "pub struct A(i64); pub fn make()->Box<A> {todo!()} pub struct A(bool);",
+                "duplicate exported struct `A`",
+                "A(bool)",
+            ),
+            (
+                "pub struct R { pub x:i64, pub x:bool } pub fn echo(v:R)->R {v}",
+                "duplicate record field `x` in `R`",
+                "x:bool",
+            ),
+            (
+                "pub struct R { pub x:i64, pub r#x:i64 }",
+                "duplicate record field `x` in `R`",
+                "r#x:i64",
+            ),
+        ] {
+            let (_, errors) = parse(Path::new("src/native.rs"), source, FileId(7));
+            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+            assert!(errors[0].message.contains(message), "{errors:?}");
+            let span = errors[0].labels[0].span;
+            assert_eq!(span.file_id, FileId(7));
+            assert_eq!(span.start, source.rfind(duplicate).unwrap());
+        }
+    }
+
+    #[test]
+    fn exported_name_validation_visits_each_struct_and_field_once() {
+        for records in [1, 16, 64] {
+            for fields in [1, 16, 64] {
+                let mut source = String::new();
+                for record in 0..records {
+                    write!(source, "pub struct Record{record} {{").unwrap();
+                    for field in 0..fields {
+                        write!(source, "pub field{field}: i64,").unwrap();
+                    }
+                    source.push_str("}\n");
+                }
+                INTERFACE_NAME_VISITS.with(|visits| visits.set([0; 2]));
+                let (program, errors) = parse(Path::new("src/native.rs"), &source, FileId(7));
+                assert!(errors.is_empty(), "{errors:?}");
+                assert_eq!(
+                    INTERFACE_NAME_VISITS.with(std::cell::Cell::get),
+                    [records, records * fields]
+                );
+                assert_eq!(
+                    program
+                        .items
+                        .iter()
+                        .filter(|item| matches!(item, Item::Class(_)))
+                        .count(),
+                    records
+                );
+            }
+        }
+    }
+}

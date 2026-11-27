@@ -26,6 +26,12 @@ write this file. Changes to Rust sources (including attributes and unimported
 modules), Cargo resolution or Rust manifest settings require another review.
 The diagnostic supplies the current fingerprint and these manual review steps.
 Run `willow run . --offline` to print `42` twice, from a task and a lexical lock.
+The included `project.lock` and `.willow/rust/Cargo.lock` pin the resolved inputs;
+both are reproducible dependency records. Run `willow run . --offline --locked`
+to require those inputs. The regression test copies the shipped sources,
+manifest, both locks and review into a temporary project and verifies that a
+fresh locked run and a normal run preserve them; it never regenerates the review
+record.
 
 The compiler injects its bundled no-op `willow_assume` procedural macro under
 the reserved dependency alias `willow`. For standalone Cargo, use the explicit
@@ -41,5 +47,5 @@ submodules or independent `.rs` modules imported by Willow. Out-of-line Rust
 `mod name;` declarations (including `#[path]` and conditional forms), `include!`,
 `include_str!`, `include_bytes!`, their imports/aliases and file-loading declarations
 inside macro bodies are rejected before issuing or accepting a native review.
-This also applies to unimported Rust sources and a mixed legacy bridge when a
+This also applies to unimported Rust sources when a
 native assertion is reviewed. Inline modules and ordinary macros remain usable.

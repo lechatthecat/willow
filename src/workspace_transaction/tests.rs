@@ -156,15 +156,6 @@ fn package_process_death_recovers_before_locked_offline_resolution() {
 }
 
 fn rust_fixture(f: &Fixture) {
-    fs::write(
-        f.root().join("bridge.rs"),
-        "// intentionally empty bridge\n",
-    )
-    .unwrap();
-    let path = f.root().join("project.toml");
-    let mut manifest = fs::read_to_string(&path).unwrap();
-    manifest.push_str("[rust]\nbridge = 'bridge.rs'\n");
-    fs::write(path, manifest).unwrap();
     let dep = f.0.join("rust-dep");
     fs::create_dir_all(dep.join("src")).unwrap();
     fs::write(

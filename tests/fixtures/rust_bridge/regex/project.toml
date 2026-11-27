@@ -3,5 +3,3 @@ name = "rust_regex_fixture"
 version = "0.1.0"
 [rust-dependencies]
 regex = "1"
-[rust]
-bridge = "bridge.rs"

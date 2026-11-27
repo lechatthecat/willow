@@ -12,6 +12,7 @@ impl Fixture {
         ));
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("main.wi"), source).unwrap();
+        fs::write(root.join("native.rs"), "pub fn foreign() {}\n").unwrap();
         Self(root)
     }
     fn command(&self, command: &str) -> std::process::Output {
@@ -249,14 +250,14 @@ fn purity_driver_templates_and_foreign() {
             "E2620",
         ),
         (
-            "extern rust { fn foreign(); } @pure fn f() { foreign(); } fn main() {}",
+            "import native::foreign; @pure fn f() { foreign(); } fn main() {}",
             false,
             "E2620",
         ),
         (
             "extern rust { @pure fn foreign(); } fn main() {}",
             false,
-            "E0105",
+            "E0102",
         ),
         (
             "interface I { @pure fn f(self); } class C implements I { pub fn f(self) { println(1); } } fn main() {}",
@@ -485,7 +486,7 @@ fn effect_contract_polymorphic_module_revisions() {
             Some("E2610"),
         ),
         (
-            "extern rust { fn foreign(); } pub fn run(c: BlockingCell<i64>) { foreign(); }",
+            "import native::foreign; pub fn run(c: BlockingCell<i64>) { foreign(); }",
             Some("E2612"),
         ),
         ("pub fn run(c: BlockingCell<i64>) {}", None),
@@ -559,7 +560,7 @@ fn effect_contract_polymorphic_generics_and_defaults() {
         ),
         (
             "extern rust { @effects(no_wait) fn foreign(); } @effects(no_wait) fn guard() { foreign(); } fn main() {}",
-            Some("E0105"),
+            Some("E0102"),
         ),
     ] {
         let fixture = Fixture::new(source);

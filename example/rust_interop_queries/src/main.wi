@@ -1,3 +1,4 @@
-extern rust { fn regex_is_match(v:i64)->bool; }
+import native::regex_is_match;
+
 class App { pub static fn validate(v:i64)->bool { return regex_is_match(v); } }
 fn main(){println(App::validate(42));}

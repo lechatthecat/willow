@@ -6,7 +6,7 @@ edition = "2024"
 publish = false
 [workspace]
 [lib]
-path = "bridge.rs"
+path = "src/native.rs"
 [dependencies]
 rustls = { version = "=0.23.45", default-features = false, features = ["std", "ring", "tls12"] }
 httparse = "=1.10.1"

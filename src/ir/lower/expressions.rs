@@ -1123,6 +1123,27 @@ fn lower_static_field_expr(
             s.span,
         ));
     }
+    if ctx
+        .tables
+        .symbols
+        .is_some_and(|symbols| symbols.lookup_module_func(&s.class, &s.field).is_some())
+        && let Some(ty @ Type::Fn(..)) = checked_type.as_ref()
+    {
+        return Ok(lit(
+            HirExprKind::FnRef(
+                ctx.tables
+                    .symbols
+                    .unwrap()
+                    .lookup_module(&s.class)
+                    .unwrap()
+                    .functions
+                    .scope()
+                    .lookup_id(&s.field),
+            ),
+            ctx.normalize(ty),
+            s.span,
+        ));
+    }
     // `Enum::Variant` (fieldless) parses like a static property read.
     let resolved = ctx.tables.static_call_class(&s.id, &s.class);
     let class = if resolved == "Self" {

@@ -1,0 +1,21 @@
+lock-version = 1
+
+[root]
+package = "path:."
+
+[[package]]
+id = "path:."
+name = "rust_assume"
+version = "0.1.0"
+dependencies = []
+
+[package.source]
+kind = "path"
+path = "."
+
+[rust]
+modules = true
+cargo-lock-hash = "5919f2c509ecc30a74173b18152c9896f9626a0207cf91343cdd958861c8dac5"
+bridge-input-hash = "efe1f90761f5ca889853a633a9733c0e0e5a703f0ecaf4f21a8e7749868f2c2c"
+
+[rust.dependencies]

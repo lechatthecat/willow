@@ -30,7 +30,8 @@ impl Fixture {
                 .join(name);
             for file in [
                 "project.toml",
-                "bridge.rs",
+                "src/main.wi",
+                "src/native.rs",
                 "native/Cargo.toml",
                 "native/src/lib.rs",
             ] {
@@ -95,7 +96,7 @@ fn hyphenated_manifest_alias_survives_metadata_check_and_lock() {
                 format!("{contents}\n[lib]\nname = \"different_crate_name\"\n"),
             )
             .unwrap();
-            let bridge = f.root.join("bridge.rs");
+            let bridge = f.root.join("src/native.rs");
             let contents = fs::read_to_string(&bridge)
                 .unwrap()
                 .replace("willow_bridge_native", "different_crate_name");
@@ -186,7 +187,11 @@ fn path_check_metadata_and_frozen_output() {
 #[test]
 fn metadata_resolves_without_compiling_invalid_bridge() {
     let f = Fixture::new("path");
-    fs::write(f.root.join("bridge.rs"), "invalid Rust syntax!").unwrap();
+    fs::write(
+        f.root.join("src/native.rs"),
+        "pub fn invalid() { missing_function(); }",
+    )
+    .unwrap();
     let metadata = success(&f.run(&["rust", "metadata", "--offline", "--format=json"]));
     let manifest = PathBuf::from(metadata["bridge"]["manifest"].as_str().unwrap());
     assert!(!manifest.parent().unwrap().join("target").exists());
@@ -213,6 +218,8 @@ fn check_does_not_invoke_native_linker() {
 #[test]
 fn locked_resolution_and_missing_bridge_fail_before_cargo_check() {
     let f = Fixture::new("path");
+    // Establish only the Willow graph, so --frozen reaches the missing Rust lock.
+    willow_compiler::package::fetch_packages(&f.root, false, true).unwrap();
     let output = f.run(&["rust", "check", "--frozen", "--format=json"]);
     assert!(!output.status.success());
     assert!(
@@ -221,7 +228,7 @@ fn locked_resolution_and_missing_bridge_fail_before_cargo_check() {
             .unwrap()
             .contains("rust_lockfile_stale")
     );
-    fs::remove_file(f.root.join("bridge.rs")).unwrap();
+    fs::remove_file(f.root.join("src/native.rs")).unwrap();
     let output = f.run(&["rust", "check", "--format=json"]);
     assert!(!output.status.success());
     assert_ne!(json(&output)["error"]["kind"], "rust_bridge_compile_error");
@@ -231,13 +238,20 @@ fn locked_resolution_and_missing_bridge_fail_before_cargo_check() {
 fn successful_check_keeps_warning_diagnostics_inside_json() {
     let f = Fixture::new("path");
     fs::write(
-        f.root.join("bridge.rs"),
+        f.root.join("src/native.rs"),
         "pub fn valid() { let unused = 1; }\n",
     )
     .unwrap();
     let output = f.run(&["rust", "check", "--offline", "--format=json"]);
     let value = success(&output);
     assert!(output.stderr.is_empty());
+    assert!(
+        value["willow_diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["code"] == "W2003")
+    );
     assert!(
         value["diagnostics"]
             .as_array()
@@ -251,7 +265,7 @@ fn successful_check_keeps_warning_diagnostics_inside_json() {
 fn compile_error_has_lossless_structured_diagnostics_and_source_position() {
     let f = Fixture::new("path");
     fs::write(
-        f.root.join("bridge.rs"),
+        f.root.join("src/native.rs"),
         "pub fn bad() { missing_function(); }\n",
     )
     .unwrap();
@@ -260,6 +274,13 @@ fn compile_error_has_lossless_structured_diagnostics_and_source_position() {
         assert!(!output.status.success());
         assert!(output.stderr.is_empty(), "{output:?}");
         let error = json(&output);
+        assert!(
+            error["error"]["willow_diagnostics"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|d| d["code"] == "W2003")
+        );
         assert_eq!(error["kind"], "rust.error");
         assert_eq!(error["error"]["kind"], "rust_bridge_compile_error");
         let diagnostic = error["error"]["diagnostics"]
@@ -276,7 +297,7 @@ fn compile_error_has_lossless_structured_diagnostics_and_source_position() {
                 .contains("missing_function")
         );
         let span = &diagnostic["message"]["spans"][0];
-        assert!(span["file_name"].as_str().unwrap().ends_with("bridge.rs"));
+        assert!(span["file_name"].as_str().unwrap().ends_with("native.rs"));
         assert_eq!(span["line_start"], 1);
         assert!(span["column_start"].as_u64().unwrap() > 0);
         assert!(error["error"]["cargo_stderr"].is_string());
@@ -284,7 +305,36 @@ fn compile_error_has_lossless_structured_diagnostics_and_source_position() {
     let human = f.run(&["rust", "check", "--offline"]);
     assert!(!human.status.success());
     let stderr = String::from_utf8(human.stderr).unwrap();
-    assert!(stderr.contains("bridge.rs:1:") && stderr.contains("E0425"));
+    assert!(stderr.contains("native.rs:1:") && stderr.contains("E0425"));
+}
+
+#[test]
+fn frontend_errors_keep_structured_locations_without_stderr_leaks() {
+    let f = Fixture::new("path");
+    fs::write(
+        f.root.join("src/main.wi"),
+        "import native; fn main() { missing(); }\n",
+    )
+    .unwrap();
+    for format in ["json", "ndjson"] {
+        for operation in ["check", "metadata"] {
+            let output = f.run(&["rust", operation, "--offline", "--format", format]);
+            assert!(!output.status.success());
+            assert!(output.stderr.is_empty(), "{output:?}");
+            let value = json(&output);
+            let diagnostics = value["error"]["willow_diagnostics"].as_array().unwrap();
+            let error = diagnostics
+                .iter()
+                .find(|d| d["severity"] == "error")
+                .unwrap();
+            assert!(error["code"].as_str().unwrap().starts_with('E'));
+            assert!(error["message"].as_str().unwrap().contains("missing"));
+            assert_eq!(
+                Path::new(error["labels"][0]["path"].as_str().unwrap()),
+                f.root.join("src/main.wi")
+            );
+        }
+    }
 }
 
 #[test]
@@ -415,8 +465,18 @@ fn regex_check_and_resolved_metadata() {
 }
 
 fn empty_bridge(f: &Fixture) {
-    fs::write(f.root.join("project.toml"), "# keep header\n[project]\nname = \"mutation\" # keep name\nversion = \"0.1.0\"\n[rust]\nbridge = \"bridge.rs\" # keep bridge\n").unwrap();
-    fs::write(f.root.join("bridge.rs"), "pub fn answer() -> i32 { 42 }\n").unwrap();
+    fs::create_dir_all(f.root.join("src")).unwrap();
+    fs::write(
+        f.root.join("src/main.wi"),
+        "import native; fn main() { println(native::answer()); }\n",
+    )
+    .unwrap();
+    fs::write(f.root.join("project.toml"), "# keep header\n[project]\nname = \"mutation\" # keep name\nversion = \"0.1.0\" # keep version\n").unwrap();
+    fs::write(
+        f.root.join("src/native.rs"),
+        "pub fn answer() -> i32 { 42 }\n",
+    )
+    .unwrap();
 }
 fn native_command(f: &Fixture, args: &[&str]) -> Command {
     let original_home = std::env::var_os("HOME")
@@ -449,7 +509,11 @@ fn native_command(f: &Fixture, args: &[&str]) -> Command {
 }
 fn build_mutation(f: &Fixture) {
     fs::create_dir_all(f.root.join("src")).unwrap();
-    fs::write(f.root.join("src/main.wi"), "fn main() { println(42); }\n").unwrap();
+    fs::write(
+        f.root.join("src/main.wi"),
+        "import native; fn main() { println(native::answer()); }\n",
+    )
+    .unwrap();
     let mut command = native_command(f, &["build", "--offline", "-o"]);
     command.arg(f.temp.join("app"));
     let output = command.output().unwrap();
@@ -470,7 +534,7 @@ fn assert_removed(f: &Fixture, name: &str, added: &Value) {
     );
     assert_eq!(removed["diagnostics"][0]["dependency"], name);
     let text = fs::read_to_string(f.root.join("project.toml")).unwrap();
-    for comment in ["# keep header", "# keep name", "# keep bridge"] {
+    for comment in ["# keep header", "# keep name", "# keep version"] {
         assert!(text.contains(comment));
     }
     let manifest: toml::Value = toml::from_str(&text).unwrap();
@@ -482,7 +546,7 @@ fn assert_removed(f: &Fixture, name: &str, added: &Value) {
         toml::from_str(&fs::read_to_string(f.root.join(".willow/rust/Cargo.lock")).unwrap())
             .unwrap();
     assert_eq!(cargo["package"].as_array().unwrap().len(), 1);
-    let lock: toml::Value =
+    let mut lock: toml::Value =
         toml::from_str(&fs::read_to_string(f.root.join("project.lock")).unwrap()).unwrap();
     let paths = ["project.lock", ".willow/rust/Cargo.lock"];
     let saved: Vec<_> = paths
@@ -502,7 +566,9 @@ fn assert_removed(f: &Fixture, name: &str, added: &Value) {
     for (path, bytes) in paths.iter().zip(saved) {
         assert_eq!(fs::read(f.root.join(path)).unwrap(), bytes);
     }
-    assert!(lock.get("rust").is_none());
+    assert_eq!(lock["rust"]["modules"].as_bool(), Some(true));
+    assert!(lock["rust"]["dependencies"].as_table().unwrap().is_empty());
+    lock.as_table_mut().unwrap().remove("rust");
     assert_eq!(lock, willow_lock);
 }
 #[test]

@@ -1406,8 +1406,35 @@ impl TypeChecker {
 
 #[cfg(test)]
 mod tests {
-    use super::super::check::check_source;
     use super::*;
+
+    fn check_source(source: &str) -> Vec<Diagnostic> {
+        let assumed = source.contains("import assumed::foreign;");
+        if !assumed && !source.contains("import native::foreign;") {
+            return super::super::check::check_source(source);
+        }
+        let source = source
+            .replace("import assumed::foreign;", "")
+            .replace("import native::foreign;", "");
+        let tokens = crate::lexer::Lexer::new(&source).tokenize().unwrap();
+        let (mut program, errors) = crate::parser::Parser::new(tokens).parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let native = if assumed {
+            "#[willow::assume(no_io)] pub fn foreign() {}"
+        } else {
+            "pub fn foreign() {}"
+        };
+        let (native, errors) = crate::rust_module::parse(
+            std::path::Path::new("native.rs"),
+            native,
+            crate::diagnostics::FileId(1),
+        );
+        assert!(errors.is_empty(), "{errors:?}");
+        program.items.extend(native.items);
+        let mut checker = TypeChecker::new();
+        checker.check_program(&program);
+        checker.errors
+    }
 
     fn contract_errors(source: &str) -> Vec<Diagnostic> {
         check_source(source)
@@ -1889,17 +1916,17 @@ mod tests {
             ),
             (
                 "foreign panic",
-                "extern rust { fn foreign(); } @effects(no_panic) fn f() { foreign(); }",
+                "import native::foreign; @effects(no_panic) fn f() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "foreign allocation",
-                "extern rust { fn foreign(); } @effects(no_alloc) fn f() { foreign(); }",
+                "import native::foreign; @effects(no_alloc) fn f() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "foreign io promise",
-                "extern rust { @effects(no_io) fn foreign(); } @effects(no_alloc) fn f() { foreign(); }",
+                "import assumed::foreign; @effects(no_alloc) fn f() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
@@ -2136,27 +2163,27 @@ mod tests {
             ),
             (
                 "unknown foreign",
-                "extern rust { fn foreign(); } @effects(no_io) fn f() { foreign(); }",
+                "import native::foreign; @effects(no_io) fn f() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "declared foreign",
-                "extern rust { @effects(no_io) fn foreign(); } @effects(no_io) fn f() { foreign(); }",
+                "import assumed::foreign; @effects(no_io) fn f() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "foreign relay",
-                "extern rust { fn foreign(); } fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
+                "import native::foreign; fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "declared relay",
-                "extern rust { @effects(no_io) fn foreign(); } fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
+                "import assumed::foreign; fn relay() { foreign(); } @effects(no_io) fn f() { relay(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "unused foreign",
-                "extern rust { fn foreign(); } @effects(no_io) fn f() {}",
+                "import native::foreign; @effects(no_io) fn f() {}",
                 None,
             ),
             (
@@ -2414,17 +2441,17 @@ mod tests {
             ),
             (
                 "unverified ffi",
-                "extern rust { fn foreign(); } @effects(no_wait) fn guard() { foreign(); }",
+                "import native::foreign; @effects(no_wait) fn guard() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "ffi cannot prove no suspend",
-                "extern rust { fn foreign(); } @effects(no_suspend) fn guard() { foreign(); }",
+                "import native::foreign; @effects(no_suspend) fn guard() { foreign(); }",
                 Some(ErrorCode::E2612),
             ),
             (
                 "ffi transitive",
-                "extern rust { fn foreign(); } fn relay() { foreign(); } @effects(no_block) fn guard() { relay(); }",
+                "import native::foreign; fn relay() { foreign(); } @effects(no_block) fn guard() { relay(); }",
                 None,
             ),
             (
@@ -2439,7 +2466,7 @@ mod tests {
             ),
             (
                 "unannotated ffi unaffected",
-                "extern rust { fn foreign(); } fn guard() { foreign(); }",
+                "import native::foreign; fn guard() { foreign(); }",
                 None,
             ),
         ];

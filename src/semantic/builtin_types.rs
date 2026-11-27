@@ -280,50 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn bridge_builtin_ids_preserve_shapes_and_opaque_precedence() {
-        use crate::rust_bridge_ir::Scalar;
-        let array = BuiltinTypeId::Array.apply(vec![Type::U8]);
-        assert_eq!(Scalar::from_type(&array), Some(Scalar::Bytes));
-        assert_eq!(
-            Scalar::from_type(&Type::Array(Box::new(Type::U8))),
-            Some(Scalar::Bytes)
-        );
-        assert_eq!(
-            Scalar::from_type(&BuiltinTypeId::Array.apply(vec![Type::I64])),
-            Some(Scalar::Array(Box::new(Scalar::I64)))
-        );
-        let result = BuiltinTypeId::Result.apply(vec![array, Type::String]);
-        assert_eq!(
-            Scalar::from_type(&result),
-            Some(Scalar::Result(
-                Box::new(Scalar::Bytes),
-                Box::new(Scalar::String)
-            ))
-        );
-        assert_eq!(
-            Scalar::from_type(&BuiltinTypeId::Array.apply(vec![Type::Bool])),
-            Some(Scalar::Array(Box::new(Scalar::Bool)))
-        );
-        for (id, args) in [
-            (BuiltinTypeId::Option, vec![]),
-            (BuiltinTypeId::Option, vec![Type::I64, Type::I64]),
-            (BuiltinTypeId::Result, vec![Type::I64]),
-            (BuiltinTypeId::Mutex, vec![Type::I64]),
-        ] {
-            assert_eq!(Scalar::from_type(&id.apply(args)), None);
-        }
-        assert_eq!(
-            Scalar::from_type(&Type::Generic("user::Option".into(), vec![Type::I64])),
-            None
-        );
-        let names = std::collections::HashSet::from(["Option".to_owned()]);
-        assert_eq!(
-            Scalar::from_type_with_opaque(&Type::Named("Option".into()), &names),
-            Some(Scalar::Opaque("Option".into()))
-        );
-    }
-
-    #[test]
     fn builtin_head_resolution_does_not_visit_payloads() {
         use std::cell::Cell;
         struct Counted<'a>(&'a Cell<usize>);

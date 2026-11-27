@@ -1099,12 +1099,22 @@ fn effect_contract_imported_proofs_require_current_verification() {
     use crate::diagnostics::ErrorCode;
     for mode in ["missing", "current", "stale", "waiting", "callback", "ffi"] {
         let dependency = crate::module::ModuleId(7);
-        let worker = program(match mode {
+        let mut worker = program(match mode {
             "waiting" => "pub fn run(c: BlockingCell<i64>) { c.get(); }",
             "callback" => "pub fn run(f: fn()) { f(); }",
-            "ffi" => "extern rust { fn foreign(); } pub fn run() { foreign(); }",
+            "ffi" => "pub fn foreign() {} pub fn run() { foreign(); }",
             _ => "pub fn run() {}",
         });
+        if mode == "ffi" {
+            let crate::parser::ast::Item::Function(f) = &mut worker.items[0] else {
+                panic!()
+            };
+            f.rust_bridge = Some(Box::new(crate::rust_bridge_ir::RustBridgeSymbol::new(
+                "foreign".into(),
+                vec![],
+                crate::rust_bridge_ir::Scalar::Void,
+            )));
+        }
         let mut queries = EffectQueries::default();
         queries.names.insert("dependency".into(), dependency);
         let mut queries = std::rc::Rc::new(queries);

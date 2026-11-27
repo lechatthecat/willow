@@ -373,6 +373,9 @@ impl TypeChecker {
             std::rc::Rc::clone(&self.resolution),
             self.symbols.fork_body_scope(),
         );
+        // Carried nominal aliases are declaration metadata too. Share their
+        // normalization identities without copying them for every body.
+        body.generics.nominal_aliases = std::rc::Rc::clone(&self.generics.nominal_aliases);
         body.capture_call_sites = self.capture_call_sites;
         body.effect_queries = self.effect_queries.clone();
         body.invalid_type_names = self.invalid_type_names.clone();

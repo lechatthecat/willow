@@ -1166,7 +1166,8 @@ pub(super) fn expand_prechecked_unit(
         let mut metadata = ai::generics::Source::capture(&source);
         metadata.class_templates = checker.generics.class_template_spans();
         metadata.logical_types = checker.generics.logical_types.raw().clone();
-        metadata.nominal_aliases = std::mem::take(&mut checker.generics.nominal_aliases);
+        let aliases = std::rc::Rc::make_mut(&mut checker.generics.nominal_aliases);
+        metadata.nominal_aliases = std::mem::take(aliases);
         metadata
             .symbols
             .extend(std::mem::take(&mut checker.generics.source_symbols));

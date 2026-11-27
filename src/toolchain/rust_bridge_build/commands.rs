@@ -276,7 +276,6 @@ pub fn mutate(root: &Path, options: &BridgeOptions, mutation: Mutation) -> Resul
     // macros and generated code preclude proving unused declarations textually.
     let diagnostics = if operation == "remove" {
         json!([{"kind":"rust_bridge_unused_declaration_candidate", "dependency":name,
-            "source":original.rust.as_ref().map(|r| &r.bridge),
             "message":"Review bridge declarations after removing this dependency; declarations may now be unused or refer to the removed crate."}])
     } else {
         json!([])

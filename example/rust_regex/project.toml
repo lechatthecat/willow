@@ -2,8 +2,6 @@
 name = "rust_regex"
 version = "0.1.0"
 
-[rust]
-bridge = "rust/bridge.rs"
 
 [rust-dependencies]
 regex = "1"

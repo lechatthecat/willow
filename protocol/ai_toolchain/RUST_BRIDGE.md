@@ -12,12 +12,13 @@ Rust function bodies or implement a second Rust resolver.
 ## Inspect a bridge
 
 ```sh
-willow query rust-bridge regex_is_match --project-dir example/rust_interop_queries --format json
+willow query rust-bridge --project-dir example/rust_interop_queries --format json
 ```
 
-Omit the selector for all bridges, or pass the returned `function` ID to distinguish
-same-named declarations. Each record contains `schema`, `kind`, `symbol`, `crate`,
-`rust_adapter`, `abi_symbol`, `signature`, `identity`, declaration spans, and the
+Omit the selector for all bridges, or copy a returned `function` ID or exact
+`symbol` value to select one boundary. Native symbol values include their package
+and module qualifiers; a bare function name is not a selector. Each record contains `schema`, `kind`, `symbol`, `crate`,
+`abi_symbol`, `signature`, `identity`, declaration spans, and the
 original `declaration_text`. The response schema is
 [`rust-bridge-v2.schema.json`](rust-bridge-v2.schema.json).
 Boundary signatures encode scalar types as strings, `Array` with its element type,
@@ -51,14 +52,16 @@ use the projected crate identities instead.
 Existing query batches also accept:
 
 ```json
-[{"kind":"rust-bridge","symbol":"regex_is_match"}]
+[{"kind":"rust-bridge","symbol":null}]
 ```
 
-Batches use the immutable snapshot and never invoke Cargo per query. A missing
+Use `null` to select all boundaries, or a `function` ID returned by the query
+for one boundary. Batches use the immutable snapshot and never invoke Cargo per query. A missing
 revision binds to the CLI invocation; a mismatched revision returns `stale`.
 Recorded Rust versions are included only when manifest/adapter configuration fingerprints and
-the persisted Cargo.lock checksum match; otherwise versions are null. Standalone
-`query rust-bridge` consults Cargo metadata for resolved versions. It leaves the
+the persisted Cargo.lock checksum match; otherwise versions are null. A native query derives interfaces without Cargo when there are no review claims.
+Use `willow rust metadata` to resolve dependency versions explicitly. Reviewed
+queries consult Cargo metadata to validate the review. It leaves the
 project untouched but can populate the external Cargo/Willow caches. Use
 `--offline` to forbid network resolution and `--cache-dir` to select the cache.
 
@@ -100,12 +103,15 @@ is covered by the acceptance test.
 ## Generate or repair an adapter
 
 1. Inspect declarations using the query above and inspect the returned Willow
-   caller identities. Generate/edit the explicit Rust adapter and Willow
-   declarations as ordinary reviewed source changes.
+   caller identities. Generate/edit the explicit Rust adapter and Rust module interfaces as ordinary reviewed source changes.
 2. Run `willow rust check --project-dir DIR --format json`. A Cargo bridge failure
    returns one structured error containing Cargo `diagnostics`, `cargo_stderr`,
    `bridge_declarations` (original declaration text, ABI and signatures), and
-   `willow_callers` (caller identities and coverage).
+   `willow_callers` (caller identities and coverage). Frontend warnings and errors
+   are retained in `willow_diagnostics`, with codes, severity, notes, help, labels
+   and fix suggestions carrying source paths. Successful machine responses place
+   this array at the top level; failures place it inside `error`. JSON and NDJSON
+   keep these diagnostics in the response without writing human text to stderr.
 3. Fix the reported adapter symbol/type error against that evidence. Repeat the
    check, then run the affected Willow tests and application normally.
 
@@ -121,12 +127,11 @@ existing build paths.
 | Class | Declaration and effects | Execution path |
 | --- | --- | --- |
 | Unknown / Blocking | Ordinary synchronous declaration; `MAY_SUSPEND`, no `MAY_BLOCK` | In a task, owned native work runs on the bounded Rust pool and the caller parks. Outside a task, the calling thread runs it synchronously in a GC idle region. |
-| NonBlocking | Current reviewed `nonblocking` / `no_block` assertion; no waiting effects | Direct execution on the caller, including a task worker, in a GC idle region. No pool submission or transport allocation. |
+| NonBlocking | Current reviewed `#[willow::assume(no_block)]` assertion; no waiting effects | Direct execution on the caller, including a task worker, in a GC idle region. No pool submission or transport allocation. |
 
-The same policy applies to native Rust modules, legacy `extern rust`, and
-generated opaque close. `no_block` describes scheduler-worker blocking and is
+The same policy applies to native Rust modules and generated opaque close. `no_block` describes scheduler-worker blocking and is
 satisfied by the default pool path; `no_wait`, `no_suspend`, and lexical locks
-reject that path. Diagnostics identify the need for a reviewed `nonblocking`
+reject that path. Diagnostics identify the need for a reviewed `#[willow::assume(no_block)]`
 assertion. Stale assertions remain build errors. All calls retain conservative
 allocation, panic and I/O effects unless an applicable reviewed I/O claim exists.
 
@@ -160,13 +165,14 @@ boundary. No Rust unwind crosses the C ABI.
 Pool calls do not preserve thread/TLS affinity. Non-`Send` or non-`Sync` opaque
 types are build errors. For a thread-affine library, keep its state on an
 adapter-owned dedicated thread and expose a `Send + Sync` proxy exchanging owned
-messages. Keep waiting proxy operations unreviewed. A `nonblocking` assertion
-does not establish affinity between separate task invocations.
+messages. Keep waiting proxy operations unreviewed. A reviewed
+`#[willow::assume(no_block)]` assertion does not establish affinity between
+separate task invocations.
 
 Parallel calls use ordinary eager task creation: wrap a synchronous Rust call in
 an `async fn`, call it several times, then await the returned tasks. Willow has
-no separate `spawn` keyword or blocking declaration syntax. Use `defer` for
-explicit handle close. See [rust_blocking_pool](../../example/rust_blocking_pool).
+no separate `spawn` keyword or blocking declaration syntax. Bind owned handles
+with `use` to close them on scope exit, including errors and cancellation. See [rust_blocking_pool](../../example/rust_blocking_pool).
 
 ### When a direct-call review is worthwhile
 
@@ -183,20 +189,19 @@ measured hot sequence of short calls (for example small TLS state-machine steps)
 whose own work is comparable to or below the pool handoff cost. Batch small
 operations when possible. Keep socket waits, contended locks, arbitrary callbacks
 and unbounded destructors on the pool even if the common case looks fast.
-A successful benchmark cannot justify `nonblocking`; bounded behavior of the
+A successful benchmark cannot justify `#[willow::assume(no_block)]`; bounded behavior of the
 whole call still needs review. Re-measure the actual workload on its target.
 
 ## Bounded synchronous calls from tasks
 
-A function can declare `nonblocking("<legacy_review_fingerprint>")` before `fn` inside
-`extern rust`. Obtain the current fingerprint with `willow query rust-bridge`.
-Review the adapter and its resolved dependencies before copying
-`legacy_review_fingerprint` into each function declaration. Write the distinct
-shared `review_fingerprint` into `rust-review.toml`; it also binds the canonical
-legacy claim identities and effect names. Adding, removing or changing a claim
-requires a new shared review, without changing the inline digest encoding. `check`, `build`, and `run` reject stale reviews.
-The fingerprint binds the resolved Cargo.lock (including crate versions), root
-bridge source, and Rust manifest configuration. Dependency updates require a new
+Use `#[willow::assume(no_block)]` on a Rust function or inherent method.
+Review the complete adapter and resolved dependencies, then obtain the shared
+`review_fingerprint` from `willow query rust-bridge --format json` and write
+`fingerprint = "<value>"` in `rust-review.toml`. Claims live only in Rust source;
+Willow imports carry no signatures or fingerprints. `check`, `build`, and `run`
+reject stale reviews.
+The fingerprint binds the resolved Cargo.lock (including crate versions), native
+module sources, and Rust manifest configuration. Dependency updates require a new
 review. Mutable Cargo path-dependency trees are included in the shared
 fingerprint, even without version changes. Mutable path packages support normal
 in-tree Rust modules and unqualified literal `include_bytes!`/`include_str!`
@@ -237,11 +242,10 @@ The declaration removes the default wait/suspend effect, permitting `no_wait`,
 `no_suspend` and lock contexts, while retaining MAY_ALLOCATE, MAY_PANIC and
 FOREIGN_CALL. It never establishes purity. Generated opaque close runs through
 the pool unless separately reviewed:
-place `nonblocking("<legacy_review_fingerprint>")` before the `opaque` declaration to
-review its generated close function. Reviewing another function does not review
-close; arbitrary native Drop implementations can block.
+place `#[willow::assume(no_block)]` on its Rust struct to cover generated
+close and `Drop`. Reviewing another function does not review close.
 
-Records expose `effects`, `execution`, `nonblocking`, `trust`, and
+Records expose `effects`, `execution`, `trust`, and
 `official_verified`. `execution` is `blocking_pool_in_task`, `direct`, or
 `async_executor`; the first executes directly outside task context.
 `trust` distinguishes `undeclared`, `developer_declared`, and the reserved
@@ -253,7 +257,7 @@ do not claim that a review matches the current dependency resolution.
 `example/rust_task_bridge` runs the crates.io regex implementation from two Tasks
 with a fixed pattern and a 64-byte input limit. Run `willow run
 example/rust_task_bridge`. If dependency resolution has changed, inspect the
-query, review the new resolved graph and refresh the declaration before running.
+query and review the resolved graph before updating any review record.
 
 ## Remaining interop directions
 
@@ -276,9 +280,7 @@ external I/O. Async functions may assert `no_io`, but not `no_block`.
 Unknown names, duplicates, and other effects are errors. `no_panic` and
 `no_alloc` cannot be asserted because adapters may panic or allocate.
 
-Every claim requires the same current `rust-review.toml` fingerprint, including
-legacy `nonblocking("...")` and extern `@effects(no_io)` declarations. Legacy
-inline fingerprints must also remain current during migration. A missing or
+Every claim requires the same current `rust-review.toml` fingerprint. A missing or
 stale record disables every claim; dependent contracts fail closed. Querying
 `rust-bridge` can still produce the review fingerprint when contracts fail.
 Review sources and resolved dependencies before explicitly updating the record;

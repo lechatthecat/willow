@@ -926,7 +926,7 @@ fn byte_api_migration_diagnostics_and_literal_ranges() {
     ] {
         let source = format!(
             "import std::bytes::ByteBuffer; import std::net; import std::collections::Array;
-             extern rust {{ fn accept(a: Array<u8>); }}
+             fn accept(a: Array<u8>) {{}}
              fn write(a: Array<u8>) {{}}
              fn probe(s: TcpStream) {{ {body} }} fn main() {{}}"
         );

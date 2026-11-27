@@ -1,20 +1,13 @@
 import std::collections::Array;
-extern rust {
-    class Packet {
-        pub body: Array<u8>;
-        pub labels: Array<String>;
-        pub ratio: f64;
-        pub active: bool;
-        pub code: Option<i64>;
-    }
-    fn packet(value: Packet) -> Packet;
-    fn optional(value: Option<Packet>) -> Option<Packet>;
-    fn result(value: Result<Packet, Array<String>>) -> Result<Packet, Array<String>>;
-    fn labels(value: Array<String>) -> Array<String>;
-    fn flags(value: Array<bool>) -> Array<bool>;
-    fn ratios(value: Array<f64>) -> Array<f64>;
-    fn maybe_labels(value: Option<Array<String>>) -> Option<Array<String>>;
-}
+import native::Packet;
+import native::packet;
+import native::optional;
+import native::result;
+import native::labels;
+import native::flags;
+import native::ratios;
+import native::maybe_labels;
+
 fn main() {
     let p = new Packet([0, 128, 255], ["", "日本語🙂"], -2.5, true, Some(-42));
     let q = packet(p);

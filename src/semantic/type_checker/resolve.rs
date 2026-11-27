@@ -2104,28 +2104,42 @@ impl TypeChecker {
         field: &str,
         span: Span,
     ) -> Type {
-        // `config::LIMIT`: a module-qualified `const`. A
-        // module's constants take precedence over a same-named class, exactly
-        // as HIR lowering resolves the read.
-        if let Some(info) = self
-            .symbols
-            .lookup_module_func(class_name, field)
-            .filter(|info| info.constant.is_some())
-            .cloned()
-        {
+        // Module values take precedence over same-named classes, as in calls.
+        if let Some(info) = self.symbols.lookup_module_func(class_name, field).cloned() {
             self.record_method_use(field, "function", span, info.declaration_span, &[]);
             if !info.public {
-                self.push(
-                    Diagnostic::new(
-                        Severity::Error,
-                        ErrorCode::E0402,
-                        format!("constant `{class_name}::{field}` is private"),
-                    )
-                    .with_label(Label::primary(span, "private constant"))
-                    .with_help(format!("make it public with `pub const {field}`")),
+                self.push_private_module_function(field, &info, span);
+            }
+            if info.constant.is_some() {
+                return info.return_type;
+            }
+            let result = if info.is_async {
+                self.push(Diagnostic::new(Severity::Error, ErrorCode::E1012,
+                    format!("`{class_name}::{field}` is an async function and cannot be used as a function value"))
+                    .with_label(Label::primary(span, "named here as a value"))
+                    .with_help("wrap the call in a lambda instead"));
+                Type::Generic("Task".into(), vec![info.return_type])
+            } else {
+                info.return_type
+            };
+            let arity = info.params.len();
+            let ty = Type::Fn(info.params, Box::new(result));
+            if !info.is_async {
+                self.record_function_value(
+                    Some(
+                        self.symbols
+                            .lookup_module(class_name)
+                            .unwrap()
+                            .functions
+                            .scope()
+                            .lookup_id(field),
+                    ),
+                    arity,
+                    span,
+                    &ty,
                 );
             }
-            return info.return_type;
+            return ty;
         }
         let Some(resolved) = self.resolve_static_call_class_name(class_name, span) else {
             return Type::Void;

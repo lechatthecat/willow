@@ -233,12 +233,10 @@ impl<'a> CompilerSession<'a> {
             .files
             .iter()
             .any(|file| file.path.extension().is_some_and(|ext| ext == "rs"));
-        let has_legacy_symbols = bound.iter().any(|(_, symbol)| symbol.native.is_none());
         // Derived interfaces are checked entirely by the frontend. Cargo is
-        // reserved for an explicit native build, review or legacy adapter validation.
+        // reserved for an explicit native build, review.
         if !build
             && has_native_sources
-            && !has_legacy_symbols
             && !self.project_root.as_ref().is_some_and(|root| {
                 toolchain::rust_bridge_build::review::required(root, bound.iter().map(|(_, s)| s))
             })
@@ -247,13 +245,7 @@ impl<'a> CompilerSession<'a> {
         }
         let rust_bridge = if let Some(project_root) = &self.project_root {
             let manifest = project::ProjectManifest::load(&project_root.join("project.toml"))?;
-            if (manifest.rust_dependencies.is_empty() && !has_native_modules)
-                || (has_native_sources && bound.is_empty() && manifest.rust.is_none())
-            {
-                anyhow::ensure!(
-                    bound.is_empty(),
-                    "rust_bridge_missing: extern rust requires Rust dependencies and [rust] bridge"
-                );
+            if !has_native_modules {
                 None
             } else {
                 let mut options =
@@ -261,14 +253,6 @@ impl<'a> CompilerSession<'a> {
                 options.locked = self.opts.locked;
                 options.offline = self.opts.offline;
                 options.symbols = bound.iter().map(|(_, symbol)| symbol.clone()).collect();
-                if build && !bound.is_empty() && !has_native_modules {
-                    drop(toolchain::rust_bridge_build::build_bridge(
-                        &manifest,
-                        project_root,
-                        &options,
-                        true,
-                    )?);
-                }
                 toolchain::rust_bridge_build::build_bridge(
                     &manifest,
                     project_root,
@@ -279,7 +263,7 @@ impl<'a> CompilerSession<'a> {
         } else {
             anyhow::ensure!(
                 bound.is_empty(),
-                "rust_bridge_missing: extern rust requires a project"
+                "rust_bridge_missing: Rust modules require a project"
             );
             None
         };

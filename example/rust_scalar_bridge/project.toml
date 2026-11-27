@@ -3,5 +3,3 @@ name = "rust_scalar_bridge"
 version = "0.1.0"
 [rust-dependencies]
 scalar_native = { path = "native" }
-[rust]
-bridge = "bridge.rs"

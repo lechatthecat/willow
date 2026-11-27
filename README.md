@@ -21,7 +21,7 @@ assumptions, not proofs about arbitrary native code.
 | Check | Guarantee for accepted code | Main limit or assumption |
 | --- | --- | --- |
 | [E2402 / E2408](#e2402-async-calls-capture-only-shareable-or-exclusively-lent-values) | Async captures are shareable or exclusively lent; transferred values cannot be used through old aliases. Non-`Sync` immutable statics are rejected in task-reachable code. | Conservative reachability and ownership rules can reject safe code; native shared memory is not analyzed. |
-| [E2604](#e2604-a-lock-body-never-waits) | A lexical `lock` body contains no operation classified as waiting, including through calls; missing effect evidence is rejected. | Console output is allowed and can stall. Reviewed `nonblocking` foreign declarations are trusted. Computation time is unbounded. |
+| [E2604](#e2604-a-lock-body-never-waits) | A lexical `lock` body contains no operation classified as waiting, including through calls; missing effect evidence is rejected. | Console output is allowed and can stall. Reviewed Rust `#[willow::assume(no_block)]` attributes are trusted. Computation time is unbounded. |
 | [E2605](#e2605-nested-locks-follow-one-acyclic-order) | Nested lexical locks follow one acyclic acquisition order without reacquiring a held lock. | Locks the analysis cannot distinguish cannot be nested; use a [group lock](#acquiring-multiple-locks), whose acquisition is not fair. |
 | [`@effects(...)`](#effect-contracts-declare-the-property-on-any-function) | An annotated function excludes the declared effects within the effect model, including transitive calls; unknown effects are rejected. | Native declarations are reviewed assumptions. `no_alloc` covers managed language allocation, not all native allocation or runtime bookkeeping. |
 
@@ -200,17 +200,25 @@ for collections, classes, enums, error handling and I/O.
 
 ### Rust interop
 
+Place Rust code in `src/native.rs` and write `import native;` in Willow.
+Public functions and structs define the interface directly; inherent Rust
+methods become Willow methods. For example, `pub fn add(a: i64, b: i64) -> i64
+{ a + b }` is called as `native::add(20, 22)`. Declare external Cargo crates in
+`[rust-dependencies]`. Bind owned opaque resources with `use resource =
+native::Resource::new();` to close them on scope exit, including errors and
+cancellation. See the [native module example](example/rust_modules).
+
 Rust crates require concrete, handwritten adapters and Cargo/Rust. Willow generates
 ABI wrappers, but does not analyze native bodies. Ordinary synchronous foreign
 calls from tasks run on a bounded Rust blocking pool; the task waits while its
 scheduler worker runs other tasks. Generated opaque close uses the same path.
-These calls satisfy `no_block`, but require a current reviewed `nonblocking`
+These calls satisfy `no_block`, but require a current reviewed `#[willow::assume(no_block)]`
 assertion in `no_wait`, `no_suspend`, or lexical lock contexts. See the
 [parallel example](example/rust_blocking_pool) and [execution policy](protocol/ai_toolchain/RUST_BRIDGE.md#synchronous-foreign-execution-paths).
 
-- <a id="boundary-types"></a>**Boundary types:** scalars, strings, supported arrays, records, opaque handles and composed Option/Result values. Arbitrary classes, closures and raw pointers are not boundary types. See the [record mapping](example/rust_record_bridge/README.md), [declaration parser](src/parser/rust_declarations.rs) and [type mapping](src/rust_bridge_ir.rs).
+- <a id="boundary-types"></a>**Boundary types:** scalars, strings, supported arrays, records, opaque handles and composed Option/Result values. Arbitrary classes, closures and raw pointers are not boundary types. See the [record mapping](example/rust_record_bridge/README.md), [module interface extraction](src/rust_module.rs) and [type mapping](src/rust_bridge_ir.rs).
 - <a id="async-calls-willow-task-awaits-rust-future"></a>**Async direction:** Willow can await an adapter's Rust Future; this does not enable Rust-to-Willow callbacks. Inputs are owned, and the Future must be `Send + 'static`. Adapters must arrange native runtime services. See the [async example](example/rust_async_pull) and [interop directions](protocol/ai_toolchain/RUST_BRIDGE.md#remaining-interop-directions).
-- <a id="where-the-guarantees-stop"></a>**Trust boundary:** reviewed `nonblocking` and `no_io` declarations are developer assertions, including conversions and destructors. A current review fingerprint is required; native behavior is not proved. See [bounded calls](protocol/ai_toolchain/RUST_BRIDGE.md#bounded-synchronous-calls-from-tasks) and [reviewed assumptions](protocol/ai_toolchain/RUST_BRIDGE.md#reviewed-effect-assumptions).
+- <a id="where-the-guarantees-stop"></a>**Trust boundary:** reviewed `#[willow::assume(no_block)]` and `no_io` declarations are developer assertions, including conversions and destructors. A current review fingerprint is required; native behavior is not proved. See [bounded calls](protocol/ai_toolchain/RUST_BRIDGE.md#bounded-synchronous-calls-from-tasks) and [reviewed assumptions](protocol/ai_toolchain/RUST_BRIDGE.md#reviewed-effect-assumptions).
 
 ### Concurrency details
 

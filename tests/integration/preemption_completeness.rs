@@ -448,15 +448,15 @@ fn task_preemption_virtual_override_hazard_uses_union_span() {
         &[
             (
                 "api.wi",
-                "pub open class Base { pub open fn get(self)->i64{return 1;} }",
+                "pub open class Base { pub open fn get(self,f:fn(i64)->i64)->i64{return 1;} }",
             ),
             (
                 "impls.wi",
-                "import api; extern rust {fn foreign()->i64;} pub class Box extends api::Base { pub override fn get(self)->i64{return foreign();} } pub fn touch(){let b=new Box();}",
+                "import api; pub class Box extends api::Base { pub override fn get(self,f:fn(i64)->i64)->i64{return f(41);} } pub fn touch(){let b=new Box();}",
             ),
             (
                 "main.wi",
-                "import api; import impls::touch;\nasync fn run(b:api::Base)->i64 {\n    return b.get();\n}\nfn main(){touch();}",
+                "import api; import impls::touch;\nasync fn run(b:api::Base,f:fn(i64)->i64)->i64 {\n    return b.get(f);\n}\nfn main(){touch();}",
             ),
         ],
     );
@@ -464,6 +464,50 @@ fn task_preemption_virtual_override_hazard_uses_union_span() {
         let error = String::from_utf8_lossy(&output.stderr);
         assert!(!output.status.success(), "{error}");
         assert!(error.contains("error[E0810]"), "{error}");
+        assert!(error.contains("unresolved call target"), "{error}");
         assert!(error.contains("main.wi:3:"), "{error}");
     }
+}
+
+#[test]
+fn task_preemption_native_pool_override_executes_through_base() {
+    let project = TestProject::new(
+        "virtual_native_pool_override",
+        &[
+            (
+                "project.toml",
+                "[project]\nname='native-pool-override'\nversion='0.1.0'\n[willow]\nmanifest-version=1\n",
+            ),
+            ("src/native.rs", "pub fn foreign() -> i64 { 42 }"),
+            (
+                "src/api.wi",
+                "pub open class Base { pub open fn get(self)->i64{return 1;} }",
+            ),
+            (
+                "src/impls.wi",
+                "import api; import native::foreign; pub class Box extends api::Base { pub override fn get(self)->i64{return foreign();} }",
+            ),
+            (
+                "src/main.wi",
+                "import api; import impls; async fn main(){let b:api::Base=new impls::Box();println(b.get());}",
+            ),
+        ],
+    );
+    for output in [
+        project.package_command("check"),
+        project.package_command("build"),
+    ] {
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let run = project.run_with_env_timeout(&[], std::time::Duration::from_secs(10));
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "42\n");
 }

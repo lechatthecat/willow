@@ -41,11 +41,11 @@
         "null"
       ]
     },
-    "legacy_review_fingerprint": {
-      "type": [
-        "string",
-        "null"
-      ]
+    "willow_diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/willow_diagnostic"
+      }
     }
   },
   "$defs": {
@@ -79,7 +79,6 @@
         "function",
         "identity",
         "crate",
-        "rust_adapter",
         "abi_symbol",
         "signature",
         "declaration",
@@ -88,7 +87,8 @@
         "assumptions",
         "review_current",
         "evidence_kind",
-        "assumption_location"
+        "assumption_location",
+        "execution"
       ],
       "additionalProperties": false,
       "properties": {
@@ -118,12 +118,6 @@
             {
               "type": "null"
             }
-          ]
-        },
-        "rust_adapter": {
-          "type": [
-            "string",
-            "null"
           ]
         },
         "abi_symbol": {
@@ -190,12 +184,6 @@
           "minimum": 0,
           "maximum": 255
         },
-        "nonblocking": {
-          "type": [
-            "string",
-            "null"
-          ]
-        },
         "trust": {
           "enum": [
             "undeclared",
@@ -259,6 +247,13 @@
               "type": "integer"
             }
           }
+        },
+        "execution": {
+          "enum": [
+            "async_executor",
+            "blocking_pool_in_task",
+            "direct"
+          ]
         }
       }
     },
@@ -388,6 +383,147 @@
               }
             ],
             "items": false
+          }
+        }
+      }
+    },
+    "willow_span": {
+      "type": "object",
+      "required": [
+        "file_id",
+        "start",
+        "end",
+        "line",
+        "col"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "file_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "end": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "col": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "willow_label": {
+      "type": "object",
+      "required": [
+        "span",
+        "message",
+        "kind",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "span": {
+          "$ref": "#/$defs/willow_span"
+        },
+        "message": {
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "Primary",
+            "Secondary"
+          ]
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "willow_fix": {
+      "type": "object",
+      "required": [
+        "span",
+        "replacement",
+        "message",
+        "path"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "span": {
+          "$ref": "#/$defs/willow_span"
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "path": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      }
+    },
+    "willow_diagnostic": {
+      "type": "object",
+      "required": [
+        "severity",
+        "code",
+        "message",
+        "labels",
+        "notes",
+        "helps",
+        "fix_suggestions"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "severity": {
+          "enum": [
+            "error",
+            "warning"
+          ]
+        },
+        "code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "labels": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/willow_label"
+          }
+        },
+        "notes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "helps": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "fix_suggestions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/willow_fix"
           }
         }
       }

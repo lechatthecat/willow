@@ -30,12 +30,10 @@ HTTP/2 or persistent/pipelined connections. Duplicate Content-Length and any
 Transfer-Encoding are rejected. Certificate validation and hostname validation
 remain enabled. Numeric socket addresses avoid synchronous DNS resolution.
 
-`nonblocking("<review fingerprint>") opaque Tls;` explicitly covers the generated
-close operation and destructor. Ordinary unannotated opaque declarations retain
-their conservative effects. The same source/dependency review fingerprint
-validation applies to close and the other bridge functions. After reviewing
-bridge changes, obtain the current fingerprint with
-`willow query rust-bridge --project-dir example/https_api` and update declarations.
+`src/native.rs` supplies the imported Rust types and inherent methods. `use`
+bindings release handles on success, error and cancellation. Calls use the default
+bounded Rust blocking pool; these examples require no direct-call assertions or
+review fingerprints in Willow source.
 
 Focused standalone bridge tests:
 

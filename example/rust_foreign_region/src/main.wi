@@ -1,8 +1,7 @@
-extern rust {
-    fn remember_thread();
-    fn unknown(text: String) -> String;
-    fn blocking(text: String) -> String;
-}
+import native::remember_thread;
+import native::unknown;
+import native::blocking;
+
 
 async fn progress() {
     gc_minor_collect();

@@ -126,7 +126,7 @@ fn asynchronous_interfaces_keep_conservative_effects() {
         symbol.effects & willow_abi::RuntimeEffects::MAY_SUSPEND.bits(),
         0
     );
-    assert!(symbol.nonblocking.is_none());
+    assert!(!symbol.no_block);
 }
 
 #[test]
@@ -394,8 +394,8 @@ fn assume_no_block_attribute_validation_perspectives() {
     // 1-9: valid free function, method, opaque close, independent claims,
     // retained allocation/panic/foreign effects, async rejection, no pure claim.
     let program = interface("#[willow::assume(no_block)] pub fn f() {} pub fn g() {}");
-    assert!(function(&program, "f").nonblocking.is_some());
-    assert!(function(&program, "g").nonblocking.is_none());
+    assert!(function(&program, "f").no_block);
+    assert!(!function(&program, "g").no_block);
     let consuming = interface("pub struct Handle(i64); impl Handle { pub fn f(self) {} }");
     assert_eq!(function(&consuming, "Handle_f").consume_inputs, vec![0]);
     let mutable = interface(
@@ -490,7 +490,7 @@ fn assume_no_block_methods_preserve_private_helpers_and_raw_owners() {
     let program = interface(
         "#[willow::assume(no_block)] pub struct r#struct(i64); impl r#struct { #[willow::assume(no_block)] pub fn read(&self) -> i64 { self.0 } }",
     );
-    assert!(function(&program, "struct_read").nonblocking.is_some());
+    assert!(function(&program, "struct_read").no_block);
 }
 
 #[test]
@@ -521,7 +521,7 @@ fn unified_assumption_attributes_and_review_states() {
         ] {
             let program = interface(&source);
             let mut symbol = function(&program, function_name).clone();
-            assert_eq!(symbol.nonblocking.is_some(), block);
+            assert_eq!(symbol.no_block, block);
             assert_eq!(symbol.no_io, io);
             assert!(symbol.assumption_span.is_some());
             for reviewed in [false, true, false] {

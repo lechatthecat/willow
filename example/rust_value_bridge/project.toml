@@ -3,5 +3,3 @@ name = "rust_value_bridge"
 version = "0.1.0"
 [rust-dependencies]
 value_native = { path = "native" }
-[rust]
-bridge = "bridge.rs"

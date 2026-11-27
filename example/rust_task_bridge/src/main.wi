@@ -1,6 +1,5 @@
-extern rust {
-    nonblocking("87eaed58aeac71f2d95c4376f0dbdf2ecb5a99824939552006b010677c076eb0") fn is_identifier(text:String)->bool;
-}
+import native::is_identifier;
+
 async fn validate(text:String)->bool { return is_identifier(text); }
 async fn main() {
     let first = validate("hello_42");

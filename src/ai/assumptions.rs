@@ -196,7 +196,7 @@ mod tests {
     fn seed(snapshot: &mut Snapshot, function: usize, block: bool, io: bool, current: bool) {
         let mut symbol = RustBridgeSymbol::new(format!("f{function}"), vec![], Scalar::Void);
         if block {
-            symbol.declare_nonblocking(String::new());
+            symbol.declare_no_block();
         }
         symbol.no_io = io;
         symbol.apply_review(current);

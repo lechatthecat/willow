@@ -11,8 +11,7 @@ Willow
 
 `import native;` loads `src/native.rs`. `import math::value as answer;` imports
 one function. No Willow declarations, `[rust]` section, or Cargo dependency are
-needed. Rust dependencies can still be declared in `[rust-dependencies]`; legacy
-`extern rust` and `[rust] bridge` declarations can coexist with native modules.
+needed. Declare external Rust crates in `[rust-dependencies]`.
 All reachable Rust modules are compiled into one project bridge crate and share
 its lock and fingerprint. `willow check` derives native-only interfaces without
 starting Cargo; `willow query rust-bridge --project-dir .` reports those signatures.
@@ -20,8 +19,7 @@ A native build still requires Cargo and rustc. Checking does not validate Rust
 function bodies or resolve Rust dependency types.
 
 Only unrestricted `pub fn`, `pub async fn`, and `pub struct` form the interface.
-Use private visibility or `pub(crate)` for implementation details. Methods and
-macro expansion are not imported as Willow functions. Generics, explicit
+Use private visibility or `pub(crate)` for implementation details. Inherent methods become Willow methods; macro expansion is not inspected. Generics, explicit
 lifetimes, `impl Trait`, unsupported types, and conditional interface attributes
 produce diagnostics at their Rust source location. A Willow module and a Rust
 module with the same name is an error. Exported names must also be valid Willow identifiers.
@@ -54,7 +52,7 @@ cannot consume an owned handle; pass the handle as a separate `&T` argument.
 
 Unreviewed synchronous calls copy inputs into owned native values and run on a
 bounded Rust pool when called from tasks. Generated close follows the same rule;
-use `defer native::Handle_close(handle);` for cleanup. Reviewed
+use `use handle = native::Handle::new();` for lexical cleanup. Reviewed
 `#[willow::assume(no_block)]` calls retain the direct borrowed path. Both paths
 require shared opaque handles to be `Send + Sync + 'static`. Async functions
 still return tasks and require owned inputs for their Rust futures.

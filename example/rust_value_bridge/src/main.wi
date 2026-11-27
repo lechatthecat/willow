@@ -1,18 +1,17 @@
 import std::collections::Array;
-extern rust {
-    fn text(value: String) -> String;
-    fn bytes(value: Array<u8>) -> Array<u8>;
-    fn maybe(value: Option<i64>) -> Option<i64>;
-    fn maybe_text(value: Option<String>) -> Option<String>;
-    fn maybe_bytes(value: Option<Array<u8>>) -> Option<Array<u8>>;
-    fn checked(value: bool) -> Result<bool, String>;
-    fn checked_bytes(value: Array<u8>) -> Result<Array<u8>, String>;
-    fn nested(value: Option<Option<i64>>) -> Option<Option<i64>>;
-    fn nested_text(value: Option<Option<String>>) -> Option<Option<String>>;
-    fn scalar_result(value: Result<f64, bool>) -> Result<f64, bool>;
-    fn result_input(value: Result<Array<u8>, String>) -> Result<Array<u8>, String>;
-    fn concurrent(value: String) -> String;
-}
+import native::text;
+import native::bytes;
+import native::maybe;
+import native::maybe_text;
+import native::maybe_bytes;
+import native::checked;
+import native::checked_bytes;
+import native::nested;
+import native::nested_text;
+import native::scalar_result;
+import native::result_input;
+import native::concurrent;
+
 fn main() {
     println(text("") == "");
     println(text("日本語🙂") == "日本語🙂");
