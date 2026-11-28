@@ -846,6 +846,166 @@ fn imported_interface_defaults_and_overrides_keep_the_selected_wait_effect() {
 }
 
 #[test]
+fn default_method_source_projection_round_trips_all_output_names() {
+    for imported in [false, true] {
+        for generic in [false, true] {
+            let f = Fixture::new();
+            let params = if generic { "<T>" } else { "" };
+            let args = if generic { "<i64>" } else { "" };
+            let child = if generic {
+                "pub class Child<T> implements Shape<T> {}"
+            } else {
+                "pub class Child extends Sq {}"
+            };
+            let declarations = format!(
+                "pub interface Shape{params} {{ fn flat(self, callback: fn() -> bool) -> bool {{ return callback(); }} }}
+                 pub open class Sq{params} implements Shape{params} {{}}
+                 pub class Pt{params} implements Shape{params} {{}}
+                 {child}
+                 pub class Ln{params} implements Shape{params} {{ pub fn flat(self, callback: fn() -> bool) -> bool {{ return false; }} }}"
+            );
+            let (prefix, imports, local) = if imported {
+                fs::write(f.0.join("src/shapes.wi"), &declarations).unwrap();
+                ("shapes", "import shapes;", "")
+            } else {
+                ("main", "", declarations.as_str())
+            };
+            let qualifier = if imported { "shapes::" } else { "" };
+            fs::write(f.0.join("src/main.wi"), format!(
+                "{imports} {local}
+                 fn concrete(s: {qualifier}Sq{args}, f: fn() -> bool) -> bool {{ return s.flat(f); }}
+                 fn dispatch(s: {qualifier}Shape{args}, f: fn() -> bool) -> bool {{ return s.flat(f); }}
+                 fn yes() -> bool {{ return true; }}
+                 fn main() {{ let s = new {qualifier}Sq{args}(); concrete(s, yes); dispatch(s, yes); }}"
+            )).unwrap();
+            if imported && generic {
+                let output = f.run(&["run", "."]);
+                assert!(output.status.success(), "{output:?}");
+            }
+            let default = format!("{prefix}::Shape::flat");
+            let override_name = format!("{prefix}::Ln::flat");
+            let mut selectors = std::collections::BTreeSet::new();
+            for format in ["human", "json", "ndjson"] {
+                for (command, selector) in [
+                    ("impact", default.as_str()),
+                    ("effects", "main::concrete"),
+                    ("effects", default.as_str()),
+                ] {
+                    let output =
+                        f.run(&[command, selector, "--format", format, "--all", "--explain"]);
+                    let text = String::from_utf8_lossy(&output.stdout);
+                    assert!(
+                        matches!(output.status.code(), Some(0 | 1)),
+                        "{text} {output:?}"
+                    );
+                    assert!(
+                        !text.contains("$default$")
+                            && !text.contains("$pkg")
+                            && !text.contains("$mono"),
+                        "{imported} {generic} {command} {format}: {text}"
+                    );
+                    for owner in ["Sq", "Pt", "Child"] {
+                        assert!(
+                            !text.contains(&format!("{prefix}::{owner}::flat")),
+                            "{text}"
+                        );
+                    }
+                    if format == "human" {
+                        if selector == default {
+                            assert!(
+                                text.contains("(default)"),
+                                "{imported} {generic}: {text} {}",
+                                String::from_utf8_lossy(&output.stderr)
+                            );
+                            assert!(text.contains("inherited"), "{text}");
+                        }
+                        continue;
+                    }
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    if command == "impact" {
+                        let nodes = value["result"]["impact"]["nodes"].as_array().unwrap();
+                        let definitions: Vec<_> = nodes
+                            .iter()
+                            .filter(|n| n["relation"] == "definition")
+                            .collect();
+                        assert_eq!(definitions.len(), 2, "{text}");
+                        assert!(
+                            definitions
+                                .iter()
+                                .any(|n| n["selector"] == default && n["kind"] == "default-method"),
+                            "{text}"
+                        );
+                        assert!(
+                            definitions.iter().any(|n| n["selector"] == override_name),
+                            "{text}"
+                        );
+                        for node in nodes {
+                            selectors.insert(node["selector"].as_str().unwrap().to_owned());
+                        }
+                    } else {
+                        for cause in value["result"]["unknown_causes"].as_array().unwrap() {
+                            selectors.insert(cause["name"].as_str().unwrap().to_owned());
+                        }
+                    }
+                }
+                let output = f.run(&["overview", ".", "--depth", "1", "--all", "--format", format]);
+                assert!(output.status.success(), "{output:?}");
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(!text.contains('$'), "{text}");
+                for owner in ["Sq", "Pt", "Child"] {
+                    assert!(
+                        !text.contains(&format!("{prefix}::{owner}::flat")),
+                        "{text}"
+                    );
+                }
+                if format == "human" {
+                    assert!(text.contains("(default)"), "{text}");
+                    assert!(text.contains("inherited"), "{text}");
+                } else {
+                    let value: Value = serde_json::from_str(&text).unwrap();
+                    let method = value["files"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .flat_map(|f| f["symbols"].as_array().unwrap())
+                        .flat_map(|s| s["members"].as_array().into_iter().flatten())
+                        .find(|m| m["selector"] == default)
+                        .unwrap();
+                    assert_eq!(method["is_default"], true, "{text}");
+                }
+            }
+            for selector in selectors {
+                for command in ["symbol", "effects", "refs"] {
+                    let output = f.run(&[command, &selector, "--format", "json"]);
+                    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+                    assert!(
+                        value["result"]["selected"].is_object(),
+                        "{command} {selector}: {value}"
+                    );
+                    if command != "effects" {
+                        assert_ne!(value["result"]["status"], "unknown", "{value}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn default_method_imported_conformance_keeps_generic_arguments_distinct() {
+    let f = Fixture::new();
+    fs::write(f.0.join("src/shapes.wi"), "pub interface Shape<T> { fn flat(self) -> bool { return true; } } pub class Sq<T> implements Shape<T> {}").unwrap();
+    fs::write(f.0.join("src/main.wi"), "import shapes; fn dispatch(s: shapes::Shape<bool>) -> bool { return s.flat(); } fn main() { dispatch(new shapes::Sq<i64>()); }").unwrap();
+    let output = f.run(&["check", "."]);
+    assert!(!output.status.success());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("E0201") && error.contains("Shape<bool>") && error.contains("Sq<i64>"),
+        "{error}"
+    );
+}
+
+#[test]
 fn default_method_effects_cover_twenty_body_and_call_perspectives() {
     // Five bodies through four entry points: declaration, interface dispatch,
     // concrete inherited method, and transitive wrapper of a deep subclass.
@@ -899,6 +1059,27 @@ fn default_method_effects_cover_twenty_body_and_call_perspectives() {
                 assert_eq!(result["no_panic"]["status"], "PROVEN", "{value}");
             }
             if expected == "unknown" {
+                let causes = result["unknown_causes"].as_array().unwrap();
+                assert!(!causes.is_empty(), "{value}");
+                for cause in causes {
+                    let name = cause["name"].as_str().unwrap();
+                    assert!(!name.contains('$'), "{value}");
+                    assert!(
+                        !["Base", "Middle", "Child", "Other"]
+                            .iter()
+                            .any(|owner| name == format!("main::{owner}::probe")),
+                        "{value}"
+                    );
+                    for command in ["symbol", "refs"] {
+                        let output = f.run(&[command, name, "--format", "json"]);
+                        let resolved: Value = serde_json::from_slice(&output.stdout).unwrap();
+                        assert!(
+                            resolved["result"]["selected"].is_object(),
+                            "{command} {name}: {cause} {resolved}"
+                        );
+                    }
+                }
+
                 let output = f.run(&["effects", &selector]);
                 let text = String::from_utf8(output.stdout).unwrap();
                 assert!(

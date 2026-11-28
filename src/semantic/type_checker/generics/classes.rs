@@ -297,6 +297,11 @@ impl TypeChecker {
                 renames.insert(written, qualified.clone());
             }
         }
+        // Conformance types are part of the imported signature too. A
+        // template's local `Shape<T>` must name the provider's interface.
+        for (written, qualified) in template.implements.iter().zip(&info.implements) {
+            collect_spellings(written, qualified, &mut renames);
+        }
         for field in &template.fields {
             let qualified = info.fields.get(&field.name).map(|field| &field.ty);
             if let Some(qualified) = qualified {

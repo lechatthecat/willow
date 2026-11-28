@@ -23,6 +23,7 @@ impl Default for Limits {
 #[serde(rename_all = "kebab-case")]
 pub enum ImpactKind {
     Lambda,
+    DefaultMethod,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]

@@ -24,6 +24,8 @@ pub const KINDS: &[&str] = &[
 ];
 #[derive(Clone, Serialize)]
 pub struct Entry {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
     pub name: String,
     pub kind: SymbolKind,
     pub selector: String,
@@ -382,6 +384,7 @@ fn entry(session: &DirectSession, symbol: &Symbol) -> Entry {
             .render(ty, symbol.identity.as_ref().map(|i| i.module.as_str()))
     };
     Entry {
+        is_default: session.is_default_method(&symbol.id),
         name: QualifiedName::new(&symbol.name).last_segment().into(),
         kind: symbol.kind.clone(),
         selector: session.selector(symbol),
@@ -414,6 +417,9 @@ fn human_entry(out: &mut impl Write, s: &Entry, indent: &str) -> io::Result<()> 
         }
     }
     write!(out, " [{}]", s.selector)?;
+    if s.is_default {
+        write!(out, " (default) [inherited copies use this declaration]")?;
+    }
     if let Some(ty) = &s.type_display {
         write!(out, ": {ty}")?;
     }

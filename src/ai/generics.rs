@@ -7,6 +7,7 @@ use crate::semantic::analysis_symbols::{Declaration, Facts};
 
 #[derive(Default)]
 pub(crate) struct Source {
+    rename_relations: std::sync::Arc<rename::Relations>,
     /// Declaration span of each generic class template this unit can name,
     /// by its spelling here (`Box`, imported `Bag`, aliased `w::Bag`), as the
     /// checker resolved it before expansion removed the templates.
@@ -55,7 +56,10 @@ impl Source {
                 .cloned()
                 .collect()
         }
-        let mut selected = Self::default();
+        let mut selected = Self {
+            rename_relations: self.rename_relations.clone(),
+            ..Self::default()
+        };
         for name in names {
             if let Some(ty) = self.logical_types.get(name) {
                 selected.logical_types.insert(name.clone(), ty.clone());
@@ -146,7 +150,7 @@ impl Source {
         Some(selected)
     }
 
-    pub fn capture(program: &Program) -> Self {
+    pub fn capture(program: &Program, checked: &crate::semantic::symbols::SymbolTable) -> Self {
         let items: Vec<_> = program
             .items
             .iter()
@@ -251,6 +255,10 @@ impl Source {
             }
         }
         Self {
+            rename_relations: std::sync::Arc::new(rename::relations_of(
+                items.iter().copied(),
+                checked,
+            )),
             class_templates: HashMap::new(),
             imports: program.imports.clone(),
             logical_types: HashMap::new(),
@@ -360,6 +368,10 @@ pub(super) fn restore(
     let owners: HashMap<_, _> = sources.values().flat_map(|s| &s.owners).cloned().collect();
     for (&unit, capture) in captures.iter_mut() {
         if let Some(source) = sources.get(&unit) {
+            capture
+                .semantic
+                .rename_relations
+                .extend_missing(&source.rename_relations);
             // Template facts go first: a template-body declaration then keeps
             // its source type (`T`) instead of whichever instance registered
             // first, since instances of one template may disagree.
@@ -981,7 +993,7 @@ mod tests {
         .unwrap();
         let (program, diagnostics) = crate::parser::Parser::new(tokens).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let source = Source::capture(&program);
+        let source = Source::capture(&program, &Default::default());
         (program, source)
     }
 

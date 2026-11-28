@@ -22,6 +22,20 @@ object; `--format ndjson` writes that same object on one line. Exit codes are
 0 for success, 1 for resolution/analysis failures and 2 for invalid arguments.
 This direct-command envelope is separate from the event-stream protocol below.
 
+Inherited method copies are not listed under implementing classes in `impact`
+or `overview`, whether or not a class is instantiated. They use the source
+method's selector instead; explicit overrides keep their own selectors. Default
+interface bodies are marked `(default)` with an inherited-copy note. `effects`
+and `overview` expose `is_default: true` for a selected/default declaration;
+`impact` marks its canonical node with `kind: "default-method"`. Impact combines
+reached copies into one source node, retaining the shortest caller distance and
+the union of their effect states. Effects selected directly on the interface
+method describe its default body, not the union of overrides.
+
+Names and selectors in these listings can be reused with `symbol`, `effects`
+and `refs`. JSON evidence continues to use opaque function IDs for graph links;
+these IDs and unresolved operation descriptions are not symbol selectors.
+
 Rename uses compiler-owned structured edits, checks its source/configuration
 revision, validates a candidate, and applies under the existing workspace lock.
 `--dry-run` only returns the prospective diff. Failed direct apply rolls back

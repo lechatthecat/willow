@@ -627,6 +627,11 @@ fn human_items(value: &CommandOutput, options: &Options) -> Vec<String> {
             .as_deref()
             .unwrap_or(&selected.selector);
         lines.push(format!("Symbol: {name} ({})", selected.kind));
+        if result.is_default {
+            lines.push(format!(
+                "Body: {name} (default) [inherited copies use this declaration]"
+            ));
+        }
         if selected.location.is_some() {
             lines.push(selected_location(selected.location.as_ref()));
         }
@@ -705,13 +710,18 @@ fn human_items(value: &CommandOutput, options: &Options) -> Vec<String> {
                 ));
             }
             lines.push(format!(
-                "  {}{}{}",
+                "  {}{}{}{}",
                 if node.kind == Some(ImpactKind::Lambda) {
                     "lambda "
                 } else {
                     ""
                 },
                 node.selector.as_deref().unwrap_or("unknown symbol"),
+                if node.kind == Some(ImpactKind::DefaultMethod) {
+                    " (default) [inherited copies use this declaration]"
+                } else {
+                    ""
+                },
                 if group(node) == Some(2) {
                     format!(" (distance {})", node.distance)
                 } else {

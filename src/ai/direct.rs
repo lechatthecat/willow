@@ -98,6 +98,8 @@ pub enum Resolution {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct DirectQueryResult {
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub is_default: bool,
     pub status: super::query_result::Status,
     #[serde(flatten)]
     pub data: DirectQueryData,
@@ -138,6 +140,7 @@ pub enum DirectQueryData {
 impl DirectQueryResult {
     pub fn new(status: super::query_result::Status, data: DirectQueryData) -> Self {
         Self {
+            is_default: false,
             status,
             data,
             selected: None,
@@ -326,6 +329,9 @@ pub struct DirectSession {
     pub session: QuerySession,
     sources: HashMap<String, SourceIndex>,
     function_names: HashMap<String, String>,
+    source_methods: HashMap<String, usize>,
+    function_origins: HashMap<String, HashMap<(usize, usize), String>>,
+    default_methods: std::collections::HashSet<String>,
     lambda_symbols: HashMap<String, symbols::Symbol>,
     constructor_bodies: HashMap<String, String>,
 }
@@ -386,7 +392,9 @@ impl DirectSession {
                 .as_ref()
                 .map(|i| i.module.clone())
                 .unwrap_or_else(|| source_module(&f.module, &snapshot.workspace));
-            function_names.insert(f.id.clone(), QualifiedName::join(&module, &f.name));
+            if !f.synthetic {
+                function_names.insert(f.id.clone(), QualifiedName::join(&module, &f.name));
+            }
         }
         let constructor_bodies = snapshot
             .semantic
@@ -405,52 +413,76 @@ impl DirectSession {
             session: QuerySession::new(snapshot)?,
             sources: HashMap::new(),
             function_names,
+            source_methods: HashMap::new(),
+            function_origins: HashMap::new(),
+            default_methods: Default::default(),
             lambda_symbols,
             constructor_bodies,
         };
-        let names: Vec<_> = session
-            .snapshot()
-            .semantic
-            .symbols
-            .iter()
-            .filter(|s| s.kind == SymbolKind::Method && session.function_names.contains_key(&s.id))
-            .map(|s| (s.id.clone(), session.selector(s)))
-            .collect();
-        session.function_names.extend(names);
-        // Copies keep their source declaration's range, including imported
-        // defaults. Display an addressable source selector for each copy.
-        let methods: HashMap<_, _> = session
-            .snapshot()
-            .semantic
-            .symbols
-            .iter()
-            .filter(|s| s.kind == SymbolKind::Method)
-            .map(|s| (s.id.as_str(), session.selector(s)))
-            .collect();
-        let declarations: HashMap<_, _> = session
-            .snapshot()
-            .functions
-            .iter()
-            .filter_map(|f| methods.get(f.id.as_str()).map(|name| (f, name)))
-            .flat_map(|(f, name)| {
-                f.locations
-                    .iter()
-                    .map(move |l| ((l.path.as_str(), l.start, l.end), name))
-            })
-            .collect();
-        let copies: Vec<_> = session
-            .snapshot()
-            .functions
-            .iter()
-            .filter_map(|f| {
-                f.locations
-                    .iter()
-                    .find_map(|l| declarations.get(&(l.path.as_str(), l.start, l.end)))
-                    .map(|name| (f.id.clone(), (*name).clone()))
-            })
-            .collect();
-        session.function_names.extend(copies);
+        session.index_source_methods();
         Ok(session)
+    }
+    fn index_source_methods(&mut self) {
+        // Index source declarations once. Lowered inherited bodies keep their
+        // declaration's range; never invent a class method selector for a copy.
+        let methods: HashMap<_, _> = self
+            .snapshot()
+            .semantic
+            .symbols
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.kind == SymbolKind::Method)
+            .map(|(i, s)| (s.id.as_str(), (i, self.selector(s))))
+            .collect();
+        let declarations: HashMap<_, _> = self
+            .snapshot()
+            .functions
+            .iter()
+            .filter(|f| methods.contains_key(f.id.as_str()))
+            .flat_map(|f| {
+                f.locations
+                    .iter()
+                    .map(move |l| ((l.path.as_str(), l.start, l.end), f.id.as_str()))
+            })
+            .collect();
+        let mut source_methods = HashMap::new();
+        let mut names = HashMap::new();
+        let mut defaults = std::collections::HashSet::new();
+        for f in &self.snapshot().functions {
+            let source = methods
+                .get(f.id.as_str())
+                .map(|_| f.id.as_str())
+                .or_else(|| {
+                    f.locations.iter().find_map(|l| {
+                        declarations
+                            .get(&(l.path.as_str(), l.start, l.end))
+                            .copied()
+                    })
+                });
+            if let Some(source) = source {
+                names.insert(f.id.clone(), methods[source].1.clone());
+                source_methods.insert(f.id.clone(), methods[source].0);
+                if f.synthetic_kind == crate::qualified_name::SyntheticKind::InterfaceDefault {
+                    defaults.insert(source.to_owned());
+                }
+            }
+        }
+        self.function_names.extend(names);
+        self.source_methods = source_methods;
+        self.default_methods = defaults;
+        for f in &self.session.snapshot.functions {
+            if self.function_names.contains_key(&f.id) {
+                for location in &f.locations {
+                    self.function_origins
+                        .entry(location.path.clone())
+                        .or_default()
+                        .insert((location.start, location.end), f.id.clone());
+                }
+            }
+        }
+    }
+    pub(super) fn is_default_method(&self, id: &str) -> bool {
+        self.default_methods.contains(id)
     }
     pub fn workspace(&self) -> &str {
         &self.session.snapshot.workspace
@@ -1247,10 +1279,13 @@ impl DirectSession {
                 Limits::default(),
                 Some(&revision),
             )?;
+            self.project_method_nodes(&mut impact.nodes);
             for node in &mut impact.nodes {
                 node.selector = self.function_names.get(&node.id).cloned();
                 if self.lambda_symbols.contains_key(&node.id) {
                     node.kind = Some(super::graph::ImpactKind::Lambda);
+                } else if self.is_default_method(&node.id) {
+                    node.kind = Some(super::graph::ImpactKind::DefaultMethod);
                 }
                 node.relation = Some(match node.distance {
                     0 => super::graph::ImpactRelation::Definition,
@@ -1319,6 +1354,7 @@ impl DirectSession {
         }
         let mut result: DirectQueryResult = queried.into();
         result.type_display = type_display;
+        result.is_default = self.is_default_method(&symbol.id);
         result.selected = Some(symbol);
         if let DirectQueryData::Semantic(QueryData::References { references, .. }) =
             &mut result.data
@@ -1337,6 +1373,60 @@ impl DirectSession {
         }
         Ok(result)
     }
+    /// Source declarations are the presentation unit, including inherited
+    /// copies that were materialized only after a concrete call. Keep the
+    /// shortest distance and the union of observed effects, without changing
+    /// the graph used to discover callers. Work is linear in emitted nodes:
+    /// effect and reason-code counts are fixed by the effect schema.
+    fn project_method_nodes(&self, nodes: &mut Vec<super::graph::ImpactNode>) -> usize {
+        let mut visits = 0;
+        let mut positions = HashMap::new();
+        let mut projected: Vec<super::graph::ImpactNode> = Vec::with_capacity(nodes.len());
+        for mut node in std::mem::take(nodes) {
+            visits += 1;
+            if let Some(source) = self.source_methods.get(&node.id) {
+                let source = &self.snapshot().semantic.symbols[*source];
+                node.id.clone_from(&source.id);
+                // A lowered copy's identity can contain internal names. The
+                // selector below is the source-facing identity of this node.
+                node.identity.clone_from(&source.identity);
+            }
+            if let Some(&position) = positions.get(&node.id) {
+                let prior: &mut super::graph::ImpactNode = &mut projected[position];
+                prior.distance = prior.distance.min(node.distance);
+                prior.graph_distance = prior.graph_distance.min(node.graph_distance);
+                prior.level = (prior.distance + 1).min(3);
+                for (old, mut new) in prior.effects.iter_mut().zip(node.effects) {
+                    visits += 1;
+                    use super::effect_states::State;
+                    let rank = |state| match state {
+                        State::None => 0,
+                        State::Unknown => 1,
+                        State::May => 2,
+                    };
+                    let mut reasons = std::mem::take(&mut old.unknown_reasons);
+                    for reason in std::mem::take(&mut new.unknown_reasons) {
+                        if !reasons.iter().any(|r| r.code == reason.code) {
+                            reasons.push(reason);
+                        }
+                    }
+                    if rank(new.state) > rank(old.state)
+                        || old.state == State::None && new.assumption.is_some()
+                    {
+                        // Absence remains conditional if any copy needed a contract.
+                        *old = new;
+                    }
+                    old.unknown_reasons = reasons;
+                }
+            } else {
+                positions.insert(node.id.clone(), projected.len());
+                projected.push(node);
+            }
+        }
+        *nodes = projected;
+        visits
+    }
+
     /// Name each acquired lock by its operand's source text, so evidence reads
     /// `locked=table: Mutex<..>` without a source lookup. Whitespace collapses
     /// and long operands are shortened; the location keeps the exact range.
@@ -1449,31 +1539,22 @@ impl DirectSession {
         }
         let name = |id: &str| labels.get(id).or_else(|| self.function_names.get(id));
         if let Some(effects) = result.effects_mut() {
-            for cause in effects.unknown_causes.iter_mut().flatten() {
-                if let Some(name) = name(&cause.function) {
-                    cause.name.clone_from(name);
-                }
-            }
             for fact in effects
                 .effect_evidence
                 .iter_mut()
                 .flatten()
                 .chain(effects.compiler_witnesses.iter_mut().flatten().flatten())
             {
-                for step in fact.call_chain.iter_mut().flatten() {
-                    if let Some(label) = name(step) {
-                        step.clone_from(label);
-                    }
+                if let Some(chain) = &mut fact.call_chain {
+                    *chain = chain
+                        .iter()
+                        .filter_map(|step| name(step).cloned())
+                        .collect();
+                    chain.dedup();
                 }
-                if let Some(via) = &mut fact.via_function
-                    && let Some(label) = name(via)
-                {
-                    via.clone_from(label);
-                }
-                if let Some(owner) = fact.witness.as_mut().and_then(|w| w.owner.as_mut())
-                    && let Some(label) = name(owner)
-                {
-                    owner.clone_from(label);
+                fact.via_function = fact.via_function.as_deref().and_then(&name).cloned();
+                if let Some(witness) = &mut fact.witness {
+                    witness.owner = witness.owner.as_deref().and_then(&name).cloned();
                 }
             }
         }
@@ -1647,6 +1728,26 @@ impl DirectSession {
             }
         }
         for cause in effects.unknown_causes.iter_mut().flatten() {
+            let origin = cause.caller_location.as_ref().and_then(|location| {
+                self.function_origins
+                    .get(&location.path)?
+                    .get(&(location.start, location.end))
+            });
+            let id = if self.function_names.contains_key(&cause.function) {
+                Some(&cause.function)
+            } else {
+                origin
+            };
+            let lambda = id
+                .and_then(|id| self.lambda_symbols.get(id))
+                .and_then(|symbol| symbol.location.clone());
+            cause.name = if let Some(location) = lambda {
+                self.source_label(&location.path, location.start)?
+            } else {
+                id.and_then(|id| self.function_names.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "unresolved call".into())
+            };
             self.display_path(&mut cause.module, absolute);
             for location in &mut cause.locations {
                 self.display_location(location, absolute)?;
@@ -1826,6 +1927,131 @@ impl DirectSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn default_method_projection_is_linear_and_unions_copy_evidence() {
+        use super::super::effect_states::{
+            EffectState, EvidenceKind, State, UnknownReason, UnknownReasonCode,
+        };
+        for n in [16, 64, 256, 1024] {
+            let location = Location {
+                display: None,
+                path: "/virtual/main.wi".into(),
+                start: 0,
+                end: 8,
+            };
+            let mut snapshot = Snapshot {
+                edit_context: None,
+                version: 1,
+                compiler: storage::compiler_stamp(),
+                compatibility: String::new(),
+                workspace: "/virtual".into(),
+                revision: String::new(),
+                sources: BTreeMap::from([(location.path.clone(), hash("flatxxxx"))]),
+                semantic: Default::default(),
+                functions: (0..n)
+                    .map(|i| Function {
+                        synthetic_kind: if i == 0 {
+                            crate::qualified_name::SyntheticKind::InterfaceDefault
+                        } else {
+                            crate::qualified_name::SyntheticKind::Source
+                        },
+                        identity: None,
+                        source_name: None,
+                        body_id: None,
+                        body_location: None,
+                        rename_calls: vec![],
+                        rename_imports: vec![],
+                        id: format!("f{i}"),
+                        module: location.path.clone(),
+                        name: if i == 0 {
+                            "Shape::$default$flat".into()
+                        } else {
+                            format!("Copy{i}::flat")
+                        },
+                        locations: vec![location.clone()],
+                        synthetic: false,
+                        fingerprint: String::new(),
+                        body_fingerprint: String::new(),
+                        callees: vec![],
+                        runtime_effects: 0,
+                        unknown: false,
+                        unresolved: vec![],
+                    })
+                    .collect(),
+            };
+            snapshot.semantic.symbols.push(symbols::Symbol {
+                origin: Default::default(),
+                identity: None,
+                id: "f0".into(),
+                name: "flat".into(),
+                source_name: Some("Shape::flat".into()),
+                details: Default::default(),
+                kind: SymbolKind::Method,
+                location: Some(location),
+                ty: None,
+            });
+            snapshot.revision = snapshot.digest().unwrap();
+            let digest = snapshot.revision.clone();
+            let session = DirectSession::new(snapshot).unwrap();
+            assert_eq!(session.source_methods.len(), n);
+            assert_eq!(session.default_methods.len(), 1);
+            for reverse in [false, true] {
+                let mut nodes: Vec<_> = (0..n)
+                    .map(|i| super::super::graph::ImpactNode {
+                        identity: None,
+                        id: format!("f{i}"),
+                        level: 3,
+                        distance: n - i,
+                        graph_distance: n - i,
+                        effects: [1, 2]
+                            .into_iter()
+                            .map(|effect| EffectState {
+                                assumption: None,
+                                effect,
+                                evidence_kind: EvidenceKind::Unknown,
+                                state: if effect == 1 && i == n - 1 {
+                                    State::May
+                                } else {
+                                    State::Unknown
+                                },
+                                unknown_reasons: vec![UnknownReason {
+                                    code: if i % 2 == 0 {
+                                        UnknownReasonCode::IndirectCall
+                                    } else {
+                                        UnknownReasonCode::MissingBody
+                                    },
+                                    callee: None,
+                                    location: None,
+                                }],
+                                witness: None,
+                            })
+                            .collect(),
+                        selector: None,
+                        kind: None,
+                        relation: None,
+                    })
+                    .collect();
+                if reverse {
+                    nodes.reverse();
+                }
+                let visits = session.project_method_nodes(&mut nodes);
+                assert_eq!(visits, n + 2 * (n - 1));
+                assert_eq!(nodes.len(), 1);
+                assert_eq!(nodes[0].id, "f0");
+                assert_eq!(nodes[0].distance, 1);
+                assert_eq!(nodes[0].level, 2);
+                assert_eq!(nodes[0].effects[0].state, State::May);
+                assert_eq!(nodes[0].effects[1].state, State::Unknown);
+                assert_eq!(nodes[0].effects[1].unknown_reasons.len(), 2);
+                println!(
+                    "default-projection copies={n} reverse={reverse} visits={visits} emitted={}",
+                    nodes.len()
+                );
+            }
+            assert_eq!(session.snapshot().digest().unwrap(), digest);
+        }
+    }
+
     #[test]
     fn type_parameter_position_miss_never_mislabels_identifiers() {
         let text = "T fn (  // 型\n";

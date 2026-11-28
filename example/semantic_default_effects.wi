@@ -1,12 +1,15 @@
 // Default bodies retain their own effects; interface calls also reach overrides.
 // willow effects semantic_default_effects::Shape::flat --source example/semantic_default_effects.wi
 // willow effects semantic_default_effects::inherited --source example/semantic_default_effects.wi
+// willow impact semantic_default_effects::Shape::flat --source example/semantic_default_effects.wi
+// Default body appears once; inherited copies use Shape::flat, including Unused.
 // Expected output: true, true, false (one per line).
 interface Shape {
     fn flat(self) -> bool { return true; }
 }
 open class Point implements Shape {}
 class Child extends Point {}
+class Unused implements Shape {}
 class Curve implements Shape {
     pub fn flat(self) -> bool { return false; }
 }

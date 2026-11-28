@@ -32,6 +32,7 @@ pub(super) struct Relations {
     classes: Vec<Class>,
     interfaces: Vec<(Declaration, Declaration)>,
 }
+#[derive(Clone)]
 struct Class {
     span: Span,
     base: Option<Span>,
@@ -40,21 +41,52 @@ struct Class {
     contracts: Vec<(String, Span)>,
 }
 
+impl Relations {
+    /// Expansion can remove never-instantiated classes. Retain their checked
+    /// source relationships without duplicating classes captured after expansion.
+    pub(super) fn extend_missing(&mut self, source: &Self) {
+        let mut present: HashSet<_> = self.classes.iter().map(|c| c.span).collect();
+        self.classes.extend(
+            source
+                .classes
+                .iter()
+                .filter(|c| present.insert(c.span))
+                .cloned(),
+        );
+        self.interfaces.extend(source.interfaces.iter().cloned());
+    }
+}
+
 pub(super) fn relations(program: &Program, checked: &SymbolTable) -> Relations {
+    relations_of(program.items.iter(), checked)
+}
+
+pub(super) fn relations_of<'a>(
+    items: impl Iterator<Item = &'a Item>,
+    checked: &SymbolTable,
+) -> Relations {
     let mut result = Relations::default();
-    for item in &program.items {
+    for item in items {
         match item {
             Item::Class(c) => {
-                let Some(info) = checked.lookup_class(&c.name) else {
-                    continue;
-                };
-                let base = info
-                    .base_class
-                    .as_ref()
+                let info = checked.lookup_class(&c.name);
+                // Generic templates are prechecked without registering a concrete
+                // ClassInfo. Resolve their declared contracts through the same
+                // checked interface table before expansion removes the template.
+                let base_name = info
+                    .and_then(|info| info.base_class.as_deref())
+                    .map(std::borrow::Cow::Borrowed)
+                    .or_else(|| {
+                        c.base_class
+                            .as_ref()
+                            .map(|base| std::borrow::Cow::Owned(base.spelling()))
+                    });
+                let base = base_name
+                    .as_deref()
                     .and_then(|base| checked.lookup_class(base))
                     .map(|base| base.declaration_span);
                 let mut contracts = Vec::new();
-                for implemented in &info.implements {
+                for implemented in info.map_or(c.implements.as_slice(), |info| &info.implements) {
                     let (Type::Named(name) | Type::Generic(name, _)) = implemented else {
                         continue;
                     };

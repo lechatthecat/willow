@@ -1173,7 +1173,7 @@ pub(super) fn expand_prechecked_unit(
     generic_sources: Option<&mut std::collections::HashMap<module::UnitId, ai::generics::Source>>,
 ) -> Result<parser::ast::Program> {
     if let Some(sources) = generic_sources {
-        let mut metadata = ai::generics::Source::capture(&source);
+        let mut metadata = ai::generics::Source::capture(&source, &checker.symbols);
         metadata.class_templates = checker.generics.class_template_spans();
         metadata.logical_types = checker.generics.logical_types.raw().clone();
         let aliases = std::rc::Rc::make_mut(&mut checker.generics.nominal_aliases);
