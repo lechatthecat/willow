@@ -137,7 +137,8 @@ Windows synchronizes file contents before replacement, but does not synchronize
 directory entries, so power-loss durability is not promised there. Process-kill
 recovery uses the same journal on both platforms. Deterministic process-kill tests
 cover journal boundaries, every prefix of a multi-file apply, commit, and repeated
-recovery on Linux; these simulate interruption, not physical power loss.
+recovery on Linux; these simulate interruption, not physical power loss. The tool
+never runs Git.
 
 The initial edit surface uses debug/default compiler options and workspace-local,
 regular, non-symlink source files. `--project` selects project mode. External

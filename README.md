@@ -239,8 +239,8 @@ and lock-order rules, with executable models and differential tests.
 
 **Captures and transfers (E2402/E2408).** `Send` and `Sync` are inferred from a
 type's structure. Mutable arrays and maps aren't `Sync`. A fresh local value
-with `Send` contents can be lent to one task until that task is awaited in the
-same block. Values that loop or escape follow stricter rules. Tasks can't reach
+with `Send` contents can be lent to one task until that task is awaited
+unconditionally in the same block. Values that loop or escape follow stricter rules. Tasks can't reach
 non-`Sync` statics, even through helpers. See [loans](example/owned_task_loans.wi),
 [ownership transfer](example/ownership_transfer.wi),
 [capture tests](tests/integration/concurrency/capture_checking.rs) and
@@ -254,7 +254,8 @@ The diagnostic names the boundary or alias involved.
 To share mutable state, use `Mutex<T>`, `RwLock<T>` or atomics, or share frozen
 data. Sending a non-`Sync` object through a channel transfers it: the sender
 and its aliases can't use it afterwards. A fresh local object can be lent to one
-task and used again after that task is awaited. See the
+task and used again after that task is awaited unconditionally in the block
+that lent it. See the
 [shared-object example](example/shared_object_safety.wi).
 
 To fix rejected code, create the object inside the task, wrap it in a mutex and
@@ -379,8 +380,8 @@ The CLI provides `effects`, `impact`, `refs`, `type`, `symbol`, `rename` and
 [AI toolchain protocol](protocol/ai_toolchain/README.md).
 
 - <a id="exact-rename-change-a-symbol-preserve-unrelated-names"></a>**Rename** edits every resolved occurrence in the project and checks the result. Strings and code outside the project are untouched. Preview with `willow rename SELECTOR NEW_NAME --dry-run --diff`. See [rename tests](tests/semantic_rename.rs).
-- <a id="what-an-agent-can-trust"></a>**Effect states:** `MAY` comes with a witness. `UNKNOWN` means the analysis couldn't decide and treats the effect as possible. `NONE` means the effect can't happen. See the [effect-state example](example/effect_states.wi).
-- <a id="compare-scalar-contracts-across-an-edit"></a>**Contract comparison** checks whether an edit keeps a function's contracts; it doesn't prove the old and new code behave the same. Approving a change needs `--protected-base COMMIT`, `--approval-evidence FILE` and `--approval-verifier EXECUTABLE`. Use a verifier outside the editable checkout. It must check the evidence and request binding, finish within 10 seconds, and print exactly `{"schema":"willow.contract-approval.v1","approved":true,"binding":<request binding>}`. See [comparison](example/contract_comparison.wi), [repair](example/contract_repair.wi) and [tests](tests/contract_comparison_cli.rs).
+- <a id="what-an-agent-can-trust"></a>**Effect states:** `MAY` comes with a witness. `UNKNOWN` means the analysis couldn't decide and treats the effect as possible. `NONE` means the analysis found no way for the effect to happen (native declarations are trusted). See the [effect-state example](example/effect_states.wi).
+- <a id="compare-scalar-contracts-across-an-edit"></a>**Contract comparison** checks whether an edit keeps a function's contracts; it doesn't prove the old and new code behave the same. Approving a change needs `--protected-base COMMIT`, `--approval-evidence FILE` and `--approval-verifier EXECUTABLE`. Use a verifier outside the editable checkout; being outside it doesn't make a verifier trusted, so choose one you trust. It must check the evidence and request binding, finish within 10 seconds, and print exactly `{"schema":"willow.contract-approval.v1","approved":true,"binding":<request binding>}`. See [comparison](example/contract_comparison.wi), [repair](example/contract_repair.wi) and [tests](tests/contract_comparison_cli.rs).
 
 ### Type parameter queries and rename
 
