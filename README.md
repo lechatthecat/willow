@@ -432,8 +432,8 @@ the whole process, so their Java numbers include JVM startup.
 | string_build | 2,000,000 built strings | 61.2 | 80.3 | 85.2 | Willow 1.31x | Willow 1.39x |
 
 100,000 parked tasks use 757 bytes of memory each in Willow (Go 2,743, Java
-1,348). Willow's CPU time includes a driver thread that busy-spins. See the
-[benchmark harness](benches/go_vs_willow/README.md) to run the cases yourself.
+1,348). See the [benchmark harness](benches/go_vs_willow/README.md) to run the
+cases yourself.
 
 <a id="current-boundaries"></a>
 
