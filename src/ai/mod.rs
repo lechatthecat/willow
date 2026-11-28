@@ -628,7 +628,7 @@ impl CaptureExpressionContext<'_> {
             builtin_aliases,
         } = *self;
         match e {
-            Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
+            Expr::String(..) | Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
                 RuntimeEffects::MAY_ALLOCATE.bits()
             }
             // Async select parks via SuspendOp::SelectWait. Its case
@@ -727,7 +727,16 @@ impl CaptureExpressionContext<'_> {
                     .lookup_func(&c.callee)
                     .is_none_or(|f| f.declaration_span.end == 0) =>
             {
-                crate::semantic::intrinsics::builtin_call_runtime_name(&c.callee)
+                // Source panic lowers to the recoverable raising helper, not
+                // the fatal legacy entry point. Include its payload allocation.
+                let runtime = if c.callee == "panic"
+                    && calls.get(&c.id) == Some(&Some(FunctionId::free("panic")))
+                {
+                    Some("willow_panic_raise")
+                } else {
+                    crate::semantic::intrinsics::builtin_call_runtime_name(&c.callee)
+                };
+                runtime
                     .and_then(willow_abi::runtime_symbol)
                     .map_or(0, |s| s.effects().intersection(RuntimeEffects::ALL).bits())
             }
@@ -796,12 +805,6 @@ impl CaptureExpressionContext<'_> {
                 intrinsic == Intrinsic::StringByteAt,
             );
         }
-        if matches!(e, Expr::String(..)) {
-            // Literal slots can allocate on first use, but a static
-            // literal is not evidence of a per-evaluation allocation.
-            // Keep the bound without displacing actual allocation sites.
-            *bits |= RuntimeEffects::MAY_ALLOCATE.bits();
-        }
         // A resolved enum variant has no callable body. Keep its
         // allocation bound tied to the construction site rather
         // than exposing a propagated bit without any witness.
@@ -837,6 +840,7 @@ impl CaptureExpressionContext<'_> {
             }
         }
         let operation = match e {
+            Expr::String(..) => "string-literal-allocation",
             Expr::New(_) => "object-allocation",
             Expr::ArrayLiteral(..) => "array-allocation",
             Expr::ObjectLiteral(_) => "object-literal-allocation",

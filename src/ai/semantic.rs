@@ -207,6 +207,9 @@ impl Captured {
             {
                 witness.reason = Some("conservative await bound for the checked operand type: waiting may park or block depending on the selected lowering; this summary does not establish which path executes".into());
             }
+            if operation == CapabilityOperation::StringLiteralAllocation {
+                witness.reason = Some("The literal slot allocates and permanently roots its string on first use; subsequent uses load the cached object without allocating. This capability includes cold initialization, not an allocation on every evaluation.".into());
+            }
             if operation == CapabilityOperation::ArrayLengthNullPanic {
                 witness.reason = Some("Normal Array.len()/FrozenArray.len() reads the length without allocating. Only a null receiver (or a malformed negative length) reaches willow_array_len's panic path, which may allocate the panic payload; receiver non-nullness is not proven by this summary.".into());
                 if effect == RuntimeEffects::MAY_ALLOCATE.bits() {

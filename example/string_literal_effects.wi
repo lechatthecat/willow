@@ -1,0 +1,42 @@
+// Literal slots allocate once on cold initialization and are reused afterward.
+// `willow effects literal --source example/string_literal_effects.wi --explain`
+// reports the allocation capability with its literal source location.
+fn literal() -> String { return "hello"; }
+fn empty() -> String { return ""; }
+fn unicode() -> String { return "日本語"; }
+fn escaped() -> String { return "a\nb"; }
+fn local() -> String { let s = "local"; return s; }
+fn branch(b: bool) -> String { if b { return "yes"; } return "no"; }
+fn identity(s: String) -> String { return s; }
+fn argument() -> String { return identity("argument"); }
+fn nested_argument() -> String { return identity(identity("nested")); }
+fn relay() -> String { return literal(); }
+fn repeated() -> String { identity("same"); return identity("same"); }
+fn generic<T>(value: T) -> String { return "generic"; }
+fn generic_call() -> String { return generic(1); }
+interface Named { fn name(self) -> String; }
+open class Label implements Named {
+    pub fn name(self) -> String { return "label"; }
+    pub fn argument(self) -> String { return identity("method"); }
+    pub fn relay(self) -> String { return self.name(); }
+}
+class GenericLabel<T> { pub fn name(self) -> String { return "generic label"; } }
+class Child extends Label {}
+fn method(value: Label) -> String { return value.name(); }
+fn method_argument(value: Label) -> String { return value.argument(); }
+fn inherited(value: Child) -> String { return value.name(); }
+fn dispatch(value: Named) -> String { return value.name(); }
+fn concat(value: String) -> String { return value + " suffix"; }
+fn literal_concat() -> String { return "left" + "right"; }
+fn integer() -> i64 { return 1; }
+fn main() {
+    let label = new Label();
+    println(literal());
+    println(literal());
+    println(argument());
+    println(label.name());
+    let generic_label = new GenericLabel<i64>();
+    println(generic_label.name());
+    println(concat("hello"));
+    println(literal_concat());
+}

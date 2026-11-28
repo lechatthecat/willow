@@ -49,6 +49,7 @@ spellings!(CapabilityOperation {
     ExternalCall => "external-call", ArrayAllocation => "array-allocation",
     EnumAllocation => "enum-allocation", ObjectAllocation => "object-allocation",
     ObjectLiteralAllocation => "object-literal-allocation",
+    StringLiteralAllocation => "string-literal-allocation",
     StringConcatenation => "string-concatenation", LambdaEnvironment => "lambda-environment",
     ArrayLengthNullPanic => "array-length-null-panic",
     PanicPayloadAllocation => "panic-payload-allocation", PanicGuard => "panic-guard",
@@ -58,6 +59,8 @@ spellings!(CapabilityOperation {
     BuiltinMethodCall => "builtin-method-call", BuiltinCall => "builtin-call",
 });
 impl CapabilityOperation {
+    // First-use literal initialization stays below per-evaluation allocations
+    // when choosing one representative witness. It still has concrete evidence.
     pub fn explicit_allocation(&self) -> bool {
         matches!(
             self,

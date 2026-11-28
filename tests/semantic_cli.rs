@@ -3624,6 +3624,235 @@ fn indirect_reference_candidates_include_imported_static_methods() {
 }
 
 #[test]
+fn literal_effect_capture_respects_shadowed_panic_callable() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+fn identity(s: String) -> String { return s; }
+fn invoke(panic: fn(String) -> String, message: String) -> String { return panic(message); }
+fn ordinary(f: fn(String) -> String, message: String) -> String { return f(message); }
+fn main() { println(invoke(identity, "x")); println(ordinary(identity, "x")); }
+"#,
+    )
+    .unwrap();
+    let normal = f.json(&["effects", "ordinary"], 0);
+    let shadowed = f.json(&["effects", "invoke", "--explain"], 0);
+    assert_eq!(
+        shadowed["result"]["bounds"], normal["result"]["bounds"],
+        "{shadowed}"
+    );
+    assert_eq!(
+        shadowed["result"]["bounds"]["runtime"].as_u64().unwrap()
+            & u64::from(E::MAY_ALLOCATE.bits()),
+        0,
+        "{shadowed}"
+    );
+    assert!(
+        shadowed["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|e| e["witness"]["cause"]["operation"] != "builtin-call"),
+        "{shadowed}"
+    );
+}
+
+#[test]
+fn explicit_panic_effects_locate_raise_and_payload_allocation() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+fn raise(message: String) { panic(message); }
+async fn async_raise(message: String) { panic(message); }
+fn relay(message: String) { raise(message); }
+fn literal_first(message: String) { let label = "cold"; panic(message); }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    for name in ["raise", "async_raise", "relay", "literal_first"] {
+        let value = f.json(&["effects", name, "--explain"], 0);
+        assert_eq!(value["result"]["status"], "ok", "{value}");
+        assert_eq!(
+            value["result"]["bounds"]["runtime"],
+            E::MAY_ALLOCATE.union(E::MAY_PANIC).bits(),
+            "{value}"
+        );
+        for effect in [E::MAY_ALLOCATE, E::MAY_PANIC] {
+            let evidence = value["result"]["effect_evidence"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|e| e["effect"] == effect.bits())
+                .unwrap();
+            assert_eq!(evidence["status"], "conservative-bound", "{value}");
+            assert!(
+                evidence["witness"]["cause"]["location"]["line"].is_number(),
+                "{value}"
+            );
+            if name != "literal_first" || effect == E::MAY_PANIC {
+                assert_eq!(
+                    evidence["witness"]["cause"]["operation"], "builtin-call",
+                    "{value}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn string_literal_witness_does_not_hide_unknown_call_capabilities() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/main.wi"),
+        r#"
+fn apply(f: fn(i64) -> i64) -> i64 { let label = "cold"; return f(1); }
+fn relay(f: fn(i64) -> i64) -> i64 { return apply(f); }
+fn main() {}
+"#,
+    )
+    .unwrap();
+    for name in ["apply", "relay"] {
+        let value = f.json(&["effects", name, "--explain"], 1);
+        assert_eq!(value["result"]["status"], "unknown", "{value}");
+        let evidence = value["result"]["effect_evidence"].as_array().unwrap();
+        let allocation = evidence
+            .iter()
+            .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+            .unwrap();
+        assert_eq!(
+            allocation["witness"]["cause"]["operation"], "string-literal-allocation",
+            "{value}"
+        );
+        assert!(
+            evidence.iter().any(|e| e["status"] == "missing-witness"),
+            "{value}"
+        );
+        assert!(
+            !value["result"]["unknown_causes"]
+                .as_array()
+                .unwrap()
+                .is_empty(),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn string_literal_effects_have_cold_allocation_witnesses() {
+    use willow_compiler::semantic::effects::RuntimeEffects as E;
+    let f = Fixture::new();
+    let source = include_str!("../example/string_literal_effects.wi");
+    fs::write(f.0.join("src/main.wi"), source).unwrap();
+    for selector in [
+        "literal",
+        "empty",
+        "unicode",
+        "escaped",
+        "local",
+        "branch",
+        "argument",
+        "nested_argument",
+        "relay",
+        "repeated",
+        "generic",
+        "generic_call",
+        "Label::name",
+        "Label::argument",
+        "Label::relay",
+        "GenericLabel::name",
+        "method",
+        "method_argument",
+        "inherited",
+        "dispatch",
+    ] {
+        let qualified = format!("main::{selector}");
+        for source_mode in [false, true] {
+            let mut args = vec!["effects", &qualified, "--explain"];
+            if source_mode {
+                args.extend(["--source", "src/main.wi"]);
+            }
+            let value = f.json(&args, 0);
+            assert_eq!(value["status"], "ok", "{selector}: {value}");
+            let result = &value["result"];
+            assert_eq!(result["status"], "ok", "{selector}: {value}");
+            assert_eq!(
+                result["bounds"]["runtime"],
+                E::MAY_ALLOCATE.bits(),
+                "{selector}: {value}"
+            );
+            assert_eq!(result["unknown_causes"], serde_json::json!([]), "{value}");
+            let evidence = result["effect_evidence"].as_array().unwrap();
+            assert_eq!(evidence.len(), 1, "{value}");
+            let allocation = &evidence[0];
+            assert_eq!(allocation["effect"], E::MAY_ALLOCATE.bits(), "{value}");
+            assert_eq!(allocation["status"], "conservative-bound", "{value}");
+            let witness = &allocation["witness"];
+            assert_eq!(
+                witness["cause"]["operation"], "string-literal-allocation",
+                "{value}"
+            );
+            let location = &witness["cause"]["location"];
+            assert_eq!(
+                location["path"],
+                if source_mode {
+                    "main.wi"
+                } else {
+                    "src/main.wi"
+                },
+                "{value}"
+            );
+            let start = location["start"].as_u64().unwrap() as usize;
+            let end = location["end"].as_u64().unwrap() as usize;
+            assert!(source[start..end].starts_with('"'), "{value}");
+            assert!(source[start..end].ends_with('"'), "{value}");
+            let reason = witness["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("first use") && reason.contains("without allocating"),
+                "{value}"
+            );
+        }
+    }
+    for selector in ["identity", "integer"] {
+        let value = f.json(&["effects", selector], 0);
+        assert_eq!(value["result"]["bounds"]["runtime"], 0, "{value}");
+        assert_eq!(
+            value["result"]["effect_evidence"],
+            serde_json::json!([]),
+            "{value}"
+        );
+    }
+    for selector in ["concat", "literal_concat"] {
+        let value = f.json(&["effects", selector, "--explain"], 0);
+        let allocation = value["result"]["effect_evidence"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
+            .unwrap();
+        assert_eq!(
+            allocation["witness"]["cause"]["operation"], "string-concatenation",
+            "{value}"
+        );
+    }
+    let output = f.run(&["effects", "literal", "--explain"]);
+    assert!(output.status.success());
+    let text = String::from_utf8(output.stdout).unwrap();
+    assert!(text.contains("effects literal: ok"), "{text}");
+    assert!(text.contains("may-allocate: may"), "{text}");
+    assert!(
+        text.contains("operation=string-literal-allocation"),
+        "{text}"
+    );
+    assert!(!text.contains("missing-witness"), "{text}");
+}
+
+#[test]
 fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
     use willow_compiler::semantic::effects::RuntimeEffects as E;
     let f = Fixture::new();
@@ -3633,7 +3862,7 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
     )
     .unwrap();
     for name in ["literal", "literal_relay"] {
-        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 1);
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
         assert_ne!(
             value["result"]["bounds"]["runtime"].as_u64().unwrap()
                 & u64::from(E::MAY_ALLOCATE.bits()),
@@ -3646,8 +3875,16 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
             .iter()
             .find(|e| e["effect"] == E::MAY_ALLOCATE.bits())
             .unwrap();
-        assert_eq!(allocation["status"], "missing-witness", "{value}");
-        assert!(allocation.get("witness").is_none(), "{value}");
+        assert_eq!(value["result"]["status"], "ok", "{value}");
+        assert_eq!(allocation["status"], "conservative-bound", "{value}");
+        assert_eq!(
+            allocation["witness"]["cause"]["operation"], "string-literal-allocation",
+            "{value}"
+        );
+        assert_eq!(
+            allocation["witness"]["cause"]["location"]["line"], 3,
+            "{value}"
+        );
     }
     for name in [
         "panic_message",
@@ -3656,10 +3893,7 @@ fn effect_witness_precision_literals_scheduler_and_unknown_origins() {
         "allocate_relay",
         "concat",
     ] {
-        let value = f.json(
-            &["effects", &format!("main::{name}"), "--explain"],
-            if name == "panic_message" { 1 } else { 0 },
-        );
+        let value = f.json(&["effects", &format!("main::{name}"), "--explain"], 0);
         assert!(!value.to_string().contains("string-allocation"), "{value}");
         if name.starts_with("allocate") || name == "concat" {
             let allocation = value["result"]["effect_evidence"]

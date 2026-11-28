@@ -247,6 +247,38 @@ fn task_effect_evidence_scales_with_sites_and_reachable_edges() {
 }
 
 #[test]
+fn literal_allocation_capture_keeps_one_witness_and_roundtrips() {
+    for n in [1, 8, 64, 512] {
+        let mut captured = Captured::default();
+        let function = FunctionId::free("literal_user");
+        for _ in 0..n {
+            captured.capability(
+                function,
+                RuntimeEffects::MAY_ALLOCATE.bits(),
+                Span::dummy(),
+                "string-literal-allocation",
+            );
+        }
+        let witnesses = &captured.witnesses[&function];
+        assert_eq!(witnesses.len(), 1);
+        let fact: EffectFact =
+            serde_json::from_value(serde_json::to_value(&witnesses[0]).unwrap()).unwrap();
+        assert_eq!(fact.effect, RuntimeEffects::MAY_ALLOCATE.bits());
+        assert_eq!(
+            fact.witness.operation(),
+            Some(&CapabilityOperation::StringLiteralAllocation)
+        );
+        assert!(!fact.witness.operation().unwrap().explicit_allocation());
+        assert!(fact.witness.reason.as_ref().unwrap().contains("first use"));
+        println!(
+            "literal sites={n}, stored witnesses={}, scan bound={}",
+            witnesses.len(),
+            RuntimeEffects::BIT_COUNT
+        );
+    }
+}
+
+#[test]
 fn await_capture_keeps_summary_scans_bounded() {
     for n in [1, 8, 64, 512] {
         let mut captured = Captured::default();
