@@ -150,11 +150,15 @@ fn async_local_occurrences_survive_shared_spans() {
 
 #[test]
 fn synchronous_lambda_send_does_not_add_outer_async_locals() {
+    // Function values are Send now; an interface that does not extend
+    // `Send` is a channel element that is still rejected.
     let source = r#"
+interface Shape { fn area(self) -> i64; }
+class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side; } }
 async fn run() {
     (|| {
-        let ch = Channel<fn(i64) -> i64>::new();
-        ch.send(|x| x);
+        let ch = Channel<Shape>::new();
+        ch.send(new Square(2));
     });
 }
 "#;
@@ -166,7 +170,11 @@ async fn run() {
     checker.check_program(&program);
     // The invalid channel element still has its own E2403 diagnostic;
     // it must not manufacture an unrelated outer task-frame error.
-    assert!(checker.errors.iter().any(|e| e.code == ErrorCode::E2403));
+    assert!(
+        checker.errors.iter().any(|e| e.code == ErrorCode::E2403),
+        "{:?}",
+        checker.errors
+    );
     assert!(
         !checker.errors.iter().any(|e| e.code == ErrorCode::E2402),
         "{:?}",

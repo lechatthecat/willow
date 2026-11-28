@@ -912,7 +912,6 @@ mod tests {
                 "ObjectLiteral",
                 "Await",
                 "Select",
-                "Print",
                 "Ternary",
                 "Range",
                 "Lambda",

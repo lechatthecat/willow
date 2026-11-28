@@ -228,7 +228,7 @@ struct FunctionName {
     namespace: Option<Arc<str>>,
     owner: Option<Arc<str>>,
     name: Arc<str>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "SyntheticKind::is_source")]
     kind: SyntheticKind,
 }
 #[derive(Default)]

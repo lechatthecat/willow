@@ -985,35 +985,43 @@ impl Baseline {
                     }
                 }
             }
-            known.insert(key.clone(), bits);
-            if bits != 0 {
-                queue.push_back(key.clone());
-            }
+            let fact = facts.entry(key.clone()).or_insert_with(|| Fact {
+                signature: None,
+                effects: None,
+                body: String::new(),
+                callees: vec![],
+            });
+            // Synthetic candidate sets of one call type share a stable key.
+            // The key summarizes their union, not whichever set came last.
+            let merged = fact.effects.take();
             let mut callees: Vec<_> = f.callees.iter().map(|id| ids[id].clone()).collect();
+            let mut unknown = if f.unknown {
+                RuntimeEffects::ALL.bits()
+            } else {
+                0
+            };
+            let previous_bits = merged.as_ref().map_or(0, |previous| previous.may);
+            if let Some(previous) = merged {
+                bits |= previous.may;
+                unknown |= previous.unknown;
+                callees.append(&mut fact.callees);
+            }
             callees.sort();
             callees.dedup();
+            known.insert(key.clone(), bits);
+            if bits != 0 && previous_bits == 0 {
+                queue.push_back(key.clone());
+            }
             for callee in &callees {
                 callers
                     .entry(callee.clone())
                     .or_default()
                     .insert(key.clone());
             }
-            let fact = facts.entry(key).or_insert_with(|| Fact {
-                signature: None,
-                effects: None,
-                body: String::new(),
-                callees: vec![],
-            });
+            let fact = facts.get_mut(&key).expect("function fact");
             fact.body = f.body_fingerprint.clone();
             fact.callees = callees;
-            fact.effects = Some(EffectState {
-                may: bits,
-                unknown: if f.unknown {
-                    RuntimeEffects::ALL.bits()
-                } else {
-                    0
-                },
-            });
+            fact.effects = Some(EffectState { may: bits, unknown });
         }
         // Attribute resolved type/member references to their innermost callable
         // with one ordered sweep per source, rather than scanning all functions

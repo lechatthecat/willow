@@ -254,7 +254,7 @@ fn closure_field_call_help_perspectives() {
                 error
                     .helps
                     .iter()
-                    .any(|h| h.contains("let callback = receiver.f; callback(...)")),
+                    .any(|h| h.contains("let f = self.f; f(x)")),
                 "{source}: {errors:?}"
             );
             assert!(
@@ -290,7 +290,12 @@ fn closure_field_help_inherited_declaration() {
         .find(|l| l.message == "callable field declared here")
         .unwrap();
     assert_eq!(&source[label.span.start..label.span.end], "f");
-    assert!(error.helps.iter().any(|h| h.contains("receiver.f")));
+    assert!(
+        error
+            .helps
+            .iter()
+            .any(|h| h.contains("let f = self.f; f(1)"))
+    );
 }
 
 #[test]

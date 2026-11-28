@@ -172,14 +172,7 @@ impl TypeChecker {
             self.check_discarded_builtin_args(&m.args);
             return Self::error_type();
         }
-        if !matches!(
-            crate::semantic::intrinsics::MethodName::classify(spelling),
-            crate::semantic::intrinsics::MethodName::AbiConcat
-                | crate::semantic::intrinsics::MethodName::AbiCopy
-                | crate::semantic::intrinsics::MethodName::AbiDebug
-                | crate::semantic::intrinsics::MethodName::AbiLen
-                | crate::semantic::intrinsics::MethodName::AbiResize
-        ) {
+        if !m.method.kind().is_abi_storage() {
             let bundled = "$std::collections::Array";
             let template = self
                 .generics

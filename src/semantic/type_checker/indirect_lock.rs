@@ -21,7 +21,7 @@ impl TypeChecker {
         program: &crate::parser::ast::Program,
         graph: &mut CallGraph,
     ) {
-        crate::semantic::function_flow::resolve(
+        let cross_owner = crate::semantic::function_flow::resolve(
             program,
             &self.expr_types,
             &self.analysis_calls,
@@ -32,7 +32,7 @@ impl TypeChecker {
             *complete.entry(call.caller).or_insert(true) &= call.targets.is_some();
         }
         let mut refined = CallGraph::default();
-        refined.flow_sensitive = !self.indirect_lock.calls.is_empty();
+        refined.flow_sensitive = cross_owner;
         for (&id, sites) in graph.iter() {
             let mut sites = sites.clone();
             if complete.get(&id) == Some(&true) {

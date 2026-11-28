@@ -641,14 +641,8 @@ impl TypeChecker {
         method: &str,
     ) -> Vec<FunctionId> {
         if matches!(obj_ty, Type::Array(_) | Type::FixedArray(..))
-            && !matches!(
-                crate::semantic::intrinsics::MethodName::classify(method),
-                crate::semantic::intrinsics::MethodName::AbiConcat
-                    | crate::semantic::intrinsics::MethodName::AbiCopy
-                    | crate::semantic::intrinsics::MethodName::AbiDebug
-                    | crate::semantic::intrinsics::MethodName::AbiLen
-                    | crate::semantic::intrinsics::MethodName::AbiResize
-            )
+            && !(method.starts_with("__abi_")
+                && crate::semantic::intrinsics::MethodName::classify(method).is_abi_storage())
             && let Some(owner) = self.array_storage_method_class(obj_ty)
         {
             return vec![FunctionId::method(TypeId::from_source_name(owner), method)];

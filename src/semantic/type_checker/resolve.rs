@@ -552,14 +552,8 @@ impl TypeChecker {
             crate::semantic::builtin_types::BuiltinTypeId::Option,
         ) {
             // A missing Option member can still be available on its payload.
-            let payload_has_method = !matches!(
-                crate::semantic::intrinsics::MethodName::classify(method_name),
-                crate::semantic::intrinsics::MethodName::AbiConcat
-                    | crate::semantic::intrinsics::MethodName::AbiCopy
-                    | crate::semantic::intrinsics::MethodName::AbiDebug
-                    | crate::semantic::intrinsics::MethodName::AbiLen
-                    | crate::semantic::intrinsics::MethodName::AbiResize
-            ) && method_name != "init"
+            let payload_has_method = !classified.unwrap_or(call.method.kind()).is_abi_storage()
+                && method_name != "init"
                 && {
                     let name = classified.unwrap_or(call.method.kind());
                     name.has_method_on(inner) || self.type_declares_method(inner, method_name)

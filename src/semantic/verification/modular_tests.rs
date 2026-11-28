@@ -253,7 +253,9 @@ fn modular_proof_import_and_contract_perspectives() {
             assert!(
                 diagnostics
                     .iter()
-                    .any(|d| matches!(d.code, ErrorCode::E2631 | ErrorCode::E2632)),
+                    // An impure contract callee leaves the caller's implied purity UNKNOWN.
+                    .any(|d| matches!(d.code, ErrorCode::E2631 | ErrorCode::E2632)
+                        || (d.code == ErrorCode::E2620 && d.message.contains("UNKNOWN"))),
                 "{label}: {diagnostics:?}"
             );
         }

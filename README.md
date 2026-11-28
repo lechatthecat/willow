@@ -404,10 +404,44 @@ owner. See the [type parameter example](example/semantic_type_parameters.wi).
 
 <a id="runtime-performance-strengths-and-gaps"></a>
 
-The [Willow/Go comparison](benches/go_vs_willow/MEASUREMENT_2026-10-25.md)
-gives per-workload results, method and raw data; results vary by workload. The
-[benchmark harness](benches/go_vs_willow/README.md) explains how to reproduce
-them.
+Latest Willow, Go and Java comparison, measured on 2026-11-28 at commit
+`e0e602a7`: AMD Ryzen 7 7800X3D, Linux x86_64, release builds, Go 1.27.0,
+OpenJDK 26.0.2, 8 workers in every runtime, median of 5 trials. Scheduler
+cases time marked phases; synchronous cases time the whole process (Java rows
+include JVM startup and JIT warm-up) except `*_only` and the GC, map, dispatch,
+closure and string cases, which time a marked phase. Results vary by workload.
+
+| Case | Work | Willow (ms) | Go (ms) | Java (ms) | vs Go | vs Java |
+|---|---|---:|---:|---:|---|---|
+| idle_spawn | 100,000 parked tasks | 59.0 | 121.4 | 84.3 | Willow 2.06x | Willow 1.43x |
+| wake_fanout | 100,000 tasks, one send each | 71.6 | 13.0 | 179.5 | Go 5.49x | Willow 2.51x |
+| yield_switch | 100,000 tasks × 100 yields | 343.6 | 1,417.7 | 548.9 | Willow 4.13x | Willow 1.60x |
+| ping_pong | 1,000,000 channel round trips | 721.1 | 166.4 | 778.0 | Go 4.33x | Willow 1.08x |
+| gc_scheduler | 10,000 tasks × 100 alloc/yield rounds | 63.0 | 133.7 | 140.0 | Willow 2.12x | Willow 2.22x |
+| channel_select_fan_in | 1,000,000 select receives | 881.4 | 231.7 | 535.9 | Go 3.80x | Java 1.64x |
+| spawn_join_tree | 111,110 spawn + join | 33.6 | 16.0 | 99.2 | Go 2.10x | Willow 2.95x |
+| server_sim_c1000 | 1,000 connections × 1,000 requests | 205.4 | 79.9 | 323.8 | Go 2.57x | Willow 1.58x |
+| general_pow | 20,480,000 `pow` calls | 582.3 | 603.6 | 199.5 | Willow 1.04x | Java 2.92x |
+| leibniz_reduced | 100,000,001 terms | 108.6 | 99.4 | 263.8 | Go 1.09x | Willow 2.43x |
+| fibonacci | naive fib(40) | 173.1 | 386.9 | 230.6 | Willow 2.23x | Willow 1.33x |
+| array_sum | append + sum 5,000,000 i64 | 60.6 | 52.9 | 88.7 | Go 1.15x | Willow 1.46x |
+| linked_list | build + traverse 1,000,000 nodes | 32.3 | 25.9 | 47.1 | Go 1.24x | Willow 1.46x |
+| array_read_sum_only | index-read 5,000,000 values | 4.1 | 2.2 | 5.0 | Go 1.91x | Willow 1.21x |
+| array_write_only | index-write 5,000,000 values | 4.9 | 3.2 | 7.3 | Go 1.55x | Willow 1.48x |
+| object_churn | 10,000,000 short-lived objects | 69.8 | 56.4 | 71.2 | Go 1.24x | Willow 1.02x |
+| map_lookup_insert | 1,000,000 inserts + 2,000,000 gets | 89.4 | 84.3 | 201.3 | Go 1.06x | Willow 2.25x |
+| virtual_dispatch | 20,000,000 interface calls | 65.6 | 40.4 | 58.4 | Go 1.62x | Java 1.12x |
+| closure_call | 20,480,000 closure calls | 52.6 | 25.9 | 16.7 | Go 2.03x | Java 3.15x |
+| string_build | 2,000,000 built strings | 61.2 | 80.3 | 85.2 | Willow 1.31x | Willow 1.39x |
+
+Willow's 100,000 parked tasks take 757 bytes of RSS each (Go 2,743, Java
+1,348). Willow's scheduler CPU time includes a busy-spinning driver thread.
+Compared with the previous measurement on the same machine, Willow array index
+reads became 13 to 19% faster and writes 9 to 14% faster; no Willow case
+regressed. The [benchmark harness](benches/go_vs_willow/README.md) runs every
+case and explains how to reproduce the numbers; the
+[2026-10-25 report](benches/go_vs_willow/MEASUREMENT_2026-10-25.md) shows the
+full report format with raw data.
 
 <a id="current-boundaries"></a>
 

@@ -403,10 +403,13 @@ mod tests {
                 _ => None,
             })
             .expect("fn f");
-        let Some(Stmt::Expr(stmt)) = f.body.stmts.first() else {
-            panic!("f starts with a match statement");
+        // A trailing `match` without `;` is the function's tail expression.
+        let expr = match f.body.stmts.first() {
+            Some(Stmt::Expr(stmt)) => &stmt.expr,
+            Some(Stmt::Return(ret)) => ret.value.as_ref().expect("tail match"),
+            _ => panic!("f starts with a match statement"),
         };
-        let Expr::Match(m) = &stmt.expr else {
+        let Expr::Match(m) = expr else {
             panic!("f starts with a match");
         };
         &m.arms[0].pattern
