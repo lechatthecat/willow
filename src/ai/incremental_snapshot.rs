@@ -859,7 +859,6 @@ pub(crate) fn capture_incremental(
             selected_indirect,
             selected_types,
             selected_calls,
-            selected_constructors,
             selected_patterns,
         }) => {
             let mut captured = capture(
@@ -869,7 +868,6 @@ pub(crate) fn capture_incremental(
                     indirect: &selected_indirect,
                     types: &selected_types,
                     calls: &selected_calls,
-                    constructors: &selected_constructors,
                     patterns: &selected_patterns,
                     symbols: &selected_symbols,
                 },
@@ -920,7 +918,6 @@ struct CaptureSelection {
     selected_indirect: crate::semantic::indirect_lock::IndirectInputs,
     selected_types: HashMap<ExprId, Type>,
     selected_calls: HashMap<ExprId, Option<FunctionId>>,
-    selected_constructors: std::collections::HashSet<ExprId>,
     selected_patterns: HashMap<PatternId, Pattern>,
 }
 
@@ -1103,7 +1100,6 @@ fn select_capture(
     let mut selected_graph = CallGraph::default();
     let mut selected_types = HashMap::new();
     let mut selected_calls = HashMap::new();
-    let mut selected_constructors = std::collections::HashSet::new();
     let mut selected_patterns = HashMap::new();
     let mut constructor_items = HashMap::<usize, usize>::new();
     let mut selected_symbols = crate::semantic::analysis_symbols::Facts::default();
@@ -1178,7 +1174,6 @@ fn select_capture(
                 typed.snapshot_tables(
                     &mut selected_types,
                     &mut selected_calls,
-                    &mut selected_constructors,
                     &mut selected_patterns,
                 );
                 selected_indirect.extend(
@@ -1202,7 +1197,6 @@ fn select_capture(
                     typed.snapshot_tables(
                         &mut selected_types,
                         &mut selected_calls,
-                        &mut selected_constructors,
                         &mut selected_patterns,
                     );
                 }
@@ -1216,9 +1210,6 @@ fn select_capture(
                 let id = expression.id();
                 if let Some(value) = inputs.types.get(&id) {
                     selected_types.insert(id, value.clone());
-                }
-                if inputs.constructors.contains(&id) {
-                    selected_constructors.insert(id);
                 }
                 if let Some(value) = inputs.calls.get(&id) {
                     selected_calls.insert(id, *value);
@@ -1268,7 +1259,6 @@ fn select_capture(
         selected_indirect,
         selected_types,
         selected_calls,
-        selected_constructors,
         selected_patterns,
     })
 }

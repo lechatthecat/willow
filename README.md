@@ -108,15 +108,17 @@ fn score(user: User) -> i64 {
 }
 
 fn main() {
-    let user = User(2);
+    let user = new User(2);
     println(score(user));
     println(2.0); // 2.0
 }
 ```
 
-`User(args...)` and `new User(args...)` call the same constructor; both forms
-are supported. A local callable or function with the same name as a class takes
-precedence.
+Objects are created only with `new User(args...)`. Writing `User(args...)` is
+error E0843, and its fix keeps the qualifier and type arguments you wrote, such
+as `new model::Box<i64>(...)`. Calls to enum variants, static factories,
+functions and callable values are unchanged; a function or local callable
+named like a class is still an ordinary call.
 
 `print` and `println` are ordinary functions from `std::io`, available without
 an import. They can be imported, aliased, shadowed or called as

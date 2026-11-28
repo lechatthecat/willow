@@ -851,7 +851,7 @@ impl TypeChecker {
             .flatten()
             .filter(|id| {
                 id.is_method_of("$output")
-                    || self.constructor_calls.contains(&expr.id())
+                    || matches!(expr, Expr::New(_))
                     || self
                         .symbols
                         .native_function(&id.to_string())
@@ -1102,7 +1102,6 @@ impl TypeChecker {
         expr: &'e Expr,
     ) -> Option<(&'e String, &'e Vec<Type>)> {
         match expr {
-            Expr::New(n) => Some((&n.class_name, &n.type_args)),
             Expr::StaticCall(c)
                 if c.type_args.is_empty() && self.enclosing_static_receiver(&c.class).is_some() =>
             {
@@ -1120,7 +1119,6 @@ impl TypeChecker {
         checked: bool,
     ) -> Type {
         let result = self.check_new(n, class, checked);
-        self.constructor_calls.insert(n.id);
         if let Type::Named(owner) = &result {
             self.static_call_classes
                 .insert(n.id, TypeId::from_source_name(owner));
@@ -1169,6 +1167,9 @@ impl TypeChecker {
         if let Some(construction) = self.construction(expr) {
             return self.check_constructor_call(&construction);
         }
+        if let Some((name, type_args, args)) = self.call_form_class(expr) {
+            return self.reject_call_form_construction(expr, &name, type_args, args);
+        }
         let generic_class = self.generic_class_site(expr);
         if let Some((name, args)) = generic_class
             && let Some(ty) = self.instantiate_class(name, args, expr.span())
@@ -1187,15 +1188,6 @@ impl TypeChecker {
                 _ => unreachable!(),
             }
             return self.check_expr_inner(&concrete);
-        }
-        if let Some((name, args)) = generic_class
-            && !args.is_empty()
-            && matches!(expr, Expr::New(_))
-        {
-            self.generic_error(
-                expr.span(),
-                format!("class `{name}` is not generic and does not accept type arguments"),
-            );
         }
 
         match expr {

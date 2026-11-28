@@ -448,3 +448,5 @@ mod static_task_sharing;
 
 #[path = "integration/concise_surface.rs"]
 mod concise_surface;
+#[path = "integration/new_only_construction.rs"]
+mod new_only_construction;

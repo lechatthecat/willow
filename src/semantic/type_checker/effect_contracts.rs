@@ -483,7 +483,6 @@ impl TypeChecker {
                 };
                 let enum_type = self.expr_types.get(&expr.id());
                 let allocates = match expr {
-                    _ if self.is_constructor_call(expr) => true,
                     Expr::String(..)
                     | Expr::ArrayLiteral(..)
                     | Expr::ObjectLiteral(_)

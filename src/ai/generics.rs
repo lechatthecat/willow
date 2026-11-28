@@ -150,11 +150,7 @@ impl Source {
         Some(selected)
     }
 
-    pub fn capture(
-        program: &Program,
-        checked: &crate::semantic::symbols::SymbolTable,
-        constructors: &std::collections::HashSet<ExprId>,
-    ) -> Self {
+    pub fn capture(program: &Program, checked: &crate::semantic::symbols::SymbolTable) -> Self {
         let items: Vec<_> = program
             .items
             .iter()
@@ -194,12 +190,6 @@ impl Source {
                 }
                 AstEvent::Expr(Expr::New(c)) => {
                     written.insert((c.span.file_id.0, c.span.start), c.class_name.clone());
-                }
-                AstEvent::Expr(Expr::StaticCall(c)) if constructors.contains(&c.id) => {
-                    written.insert(
-                        (c.span.file_id.0, c.span.start),
-                        format!("{}::{}", c.class, c.method),
-                    );
                 }
                 _ => {}
             }
@@ -1002,7 +992,7 @@ mod tests {
         .unwrap();
         let (program, diagnostics) = crate::parser::Parser::new(tokens).parse();
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
-        let source = Source::capture(&program, &Default::default(), &Default::default());
+        let source = Source::capture(&program, &Default::default());
         (program, source)
     }
 

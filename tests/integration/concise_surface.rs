@@ -23,7 +23,7 @@ class C {
         self.x = 4;
     }
 }
-fn main() { println(C().x); }
+fn main() { println(new C().x); }
 "#;
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
@@ -32,7 +32,7 @@ fn main() { println(C().x); }
 
 #[test]
 fn concise_surface_constructors_and_tails() {
-    // Memberwise, explicit, generic/inferred/contextual, legacy construction;
+    // Memberwise, explicit, generic/inferred/contextual construction with `new`;
     // function/method/default/closure/async tails, early return, cleanup, tuples.
     let source = r#"
 import std::collections;
@@ -48,19 +48,19 @@ fn tuple() -> i64 { let (a, b) = (2, 3); a + b }
 fn generic<T>(v: T) -> T { v }
 async fn task() -> i64 { 6 }
 async fn main() {
-    println(Box(3).value);
-    println(Box<i64>(4).value);
-    let empty: Empty<i64> = Empty();
-    println(Counter(4).n);
+    println(new Box(3).value);
+    println(new Box<i64>(4).value);
+    let empty: Empty<i64> = new Empty();
+    println(new Counter(4).n);
     println(new Counter(5).n);
-    println(Default().value());
+    println(new Default().value());
     println(early(0)); println(early(2));
     println(cleanup()); println(tuple()); println(generic(8));
     println(await task());
     let f = || -> i64 { if true { 9 } else { 10 } };
     println(f());
     let xs = [1];
-    let holder = Holder(|value: i64| value + xs[0]);
+    let holder = new Holder(|value: i64| value + xs[0]);
     let callback = holder.callback;
     println(callback(2));
 }
@@ -84,7 +84,7 @@ class Printer { pub fn print(self) -> i64 { 8 } }
 fn main() {
     line(println(2));
     let print = |x: i64| x * 2;
-    line(print(3)); line(apply(print)); line(Printer().print());
+    line(print(3)); line(apply(print)); line(new Printer().print());
     output::print("ok"); std::io::println(true);
     line(2.0); line([1.0, 2.0].to_string());
 }
@@ -113,10 +113,14 @@ fn concise_surface_migration_diagnostics() {
         ("fn main() { print(1, 2); }", "argument"),
         ("fn main() { let n = 1; println(&n); }", "remove `&`"),
         (
-            "class C { pub n: i64; } fn main() { println(C(1)); }",
+            "class C { pub n: i64; } fn main() { println(new C(1)); }",
             "cannot println",
         ),
-        ("class C { pub n: i64; } fn main() { C(); }", "constructor"),
+        (
+            "class C { pub n: i64; } fn main() { new C(); }",
+            "constructor",
+        ),
+        ("class C { pub n: i64; } fn main() { C(1); }", "E0843"),
     ] {
         let error = compile_error_stderr(source);
         assert!(error.contains(expected), "{source}: {error}");
@@ -150,10 +154,10 @@ import model;
 import model::User as Person;
 import model::Box as Container;
 fn main() {
-    println(model::User(1).score);
-    println(Person(2).score);
-    println(model::Box<i64>(3).value);
-    println(Container(4).value);
+    println(new model::User(1).score);
+    println(new Person(2).score);
+    println(new model::Box<i64>(3).value);
+    println(new Container(4).value);
 }
 "#,
         ),
@@ -186,7 +190,7 @@ fn concise_surface_constructor_effects_and_statement_compatibility() {
     let source = r#"
 class Holder { pub callback: fn() -> void; }
 fn output() { println(1); }
-@effects(no_io) fn store() -> Holder { Holder(output) }
+@effects(no_io) fn store() -> Holder { new Holder(output) }
 fn init() -> i64 { 3 }
 fn main() {
     println(init());
@@ -202,17 +206,17 @@ fn main() {
     assert_eq!(out, "3\n8\n9\n5\n");
     for (source, expected) in [
         (
-            "class C {} @effects(no_alloc) fn f() { C(); } fn main() {}",
+            "class C {} @effects(no_alloc) fn f() { new C(); } fn main() {}",
             "E2610",
         ),
-        ("class C {} @pure fn f() { C(); } fn main() {}", "pure"),
+        ("class C {} @pure fn f() { new C(); } fn main() {}", "pure"),
         (
             "@effects(no_io) fn f() { println(1); } fn main() {}",
             "E2610",
         ),
-        ("class C {} fn main() { defer C(); }", "E0905"),
+        ("class C {} fn main() { defer C(); }", "E0843"),
         (
-            "class C { pub init(self, m: Mutex<i64>) { lock m as v { println(v); } } } fn main() { let m = Mutex<i64>::new(1); lock m as held { C(m); } }",
+            "class C { pub init(self, m: Mutex<i64>) { lock m as v { println(v); } } } fn main() { let m = Mutex<i64>::new(1); lock m as held { new C(m); } }",
             "E2605",
         ),
     ] {
@@ -248,7 +252,7 @@ fn main() {
     println(model::G<i64>(5)); println(m::G<i64>(6)); println(Generic<i64>(7));
     let inferred: i64 = m::G(8); println(inferred);
     println(new model::C(9).n); println(new m::Box<i64>(10).n);
-    println(model::Only(11).n); println(m::Only(12).n);
+    println(new model::Only(11).n); println(new m::Only(12).n);
 }
 "#,
         ),

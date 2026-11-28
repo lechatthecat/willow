@@ -504,21 +504,6 @@ impl TypeChecker {
             }
             return;
         }
-        if self.constructor_calls.contains(&expr.id())
-            && let Some(ty) = self.expr_types.get(&expr.id()).cloned()
-        {
-            match expr {
-                Expr::New(call) => self.record_type_use(&call.class_name, &ty, call.span),
-                Expr::Call(call) => self.record_type_use(&call.callee, &ty, call.span),
-                Expr::StaticCall(call) => self.record_type_use(
-                    &format!("{}::{}", call.class, call.method),
-                    &ty,
-                    call.span,
-                ),
-                _ => {}
-            }
-            return;
-        }
         match expr {
             Expr::Var(name, span, _) => {
                 self.record_binding_use(name, *span, "read");

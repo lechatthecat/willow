@@ -779,19 +779,6 @@ impl TypeChecker {
             }
             DeferBody::Expr(expr) => {
                 self.check_expr(expr);
-                if matches!(expr, Expr::Call(_) | Expr::StaticCall(_))
-                    && self.is_constructor_call(expr)
-                {
-                    self.push(
-                        Self::error_at(
-                            ErrorCode::E0905,
-                            "`defer` expects a call, match expression, or block",
-                            expr.span(),
-                            "constructors must be placed inside a deferred block",
-                        )
-                        .with_help("write `defer { Class(args); }` to construct at scope exit"),
-                    );
-                }
             }
             DeferBody::Block(block) => self.check_block(block),
         }

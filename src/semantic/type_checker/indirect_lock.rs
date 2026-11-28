@@ -129,7 +129,7 @@ impl TypeChecker {
         if self.enum_variant_resolutions.contains_key(&expr.id()) {
             return;
         }
-        if (matches!(expr, Expr::New(_)) || self.is_constructor_call(expr))
+        if matches!(expr, Expr::New(_))
             && self
                 .expr_types
                 .get(&expr.id())

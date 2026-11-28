@@ -340,39 +340,39 @@ fn resolution_work_is_linear() {
 }
 
 #[test]
-fn concise_constructor_scan_preserves_capture_slots() {
-    for prefix in ["", "new "] {
-        for declaration in [
-            "class Holder { pub callback: fn(i64) -> i64; }",
-            "class Holder { pub callback: fn(i64) -> i64; pub init(self, f: fn(i64) -> i64) { self.callback = f; } }",
-        ] {
-            let source = format!(
-                "{declaration} fn main() {{ let xs = [1]; let h = {prefix}Holder(|x: i64| x + xs[0]); let callback = h.callback; println(callback(2)); }}"
-            );
-            let program = parse(&source);
-            assert!(
-                !shareable(&class(&program, "Holder").fields[0].ty),
-                "{source}"
-            );
-            let mut checker = crate::semantic::TypeChecker::new();
-            checker.check_program(&program);
-            assert!(checker.errors.is_empty(), "{source}: {:?}", checker.errors);
-        }
+fn new_construction_scan_preserves_capture_slots() {
+    for declaration in [
+        "class Holder { pub callback: fn(i64) -> i64; }",
+        "class Holder { pub callback: fn(i64) -> i64; pub init(self, f: fn(i64) -> i64) { self.callback = f; } }",
+    ] {
         let source = format!(
-            "class Box<T> {{ pub f: fn(T) -> T; pub value: T; }} fn main() {{ let xs = [1]; let b = {prefix}Box<i64>(|x: i64| x + xs[0], 1); }}"
+            "{declaration} fn main() {{ let xs = [1]; let h = new Holder(|x: i64| x + xs[0]); let callback = h.callback; println(callback(2)); }}"
         );
-        assert!(!field(&source, "Box", "f"));
-        let source = format!(
-            "{STAGE} class Other {{ pub run: fn(i64) -> i64; }} fn main() {{ let s = {prefix}Stage(inc); let alias = s; let xs = [1]; alias.run = |x: i64| x + xs[0]; }}"
+        let program = parse(&source);
+        assert!(
+            !shareable(&class(&program, "Holder").fields[0].ty),
+            "{source}"
         );
-        assert!(!field(&source, "Stage", "run"));
-        assert!(field(&source, "Other", "run"));
+        let mut checker = crate::semantic::TypeChecker::new();
+        checker.check_program(&program);
+        assert!(checker.errors.is_empty(), "{source}: {:?}", checker.errors);
     }
+    let source = "class Box<T> { pub f: fn(T) -> T; pub value: T; } fn main() { let xs = [1]; let b = new Box<i64>(|x: i64| x + xs[0], 1); }";
+    assert!(!field(source, "Box", "f"));
+    let source = format!(
+        "{STAGE} class Other {{ pub run: fn(i64) -> i64; }} fn main() {{ let s = new Stage(inc); let alias = s; let xs = [1]; alias.run = |x: i64| x + xs[0]; }}"
+    );
+    assert!(!field(&source, "Stage", "run"));
+    assert!(field(&source, "Other", "run"));
 }
 
 #[test]
-fn concise_constructor_scan_respects_function_and_local_shadowing() {
+fn call_scan_never_treats_a_call_as_construction() {
+    // Only `new` constructs: a call spelled like the class (rejected by the
+    // checker), a function or a local binding with that name stores nothing
+    // into the class's constructor slots.
     for (declaration, binding) in [
+        ("", ""),
         ("fn Stage(f: fn(i64) -> i64) -> i64 { 0 }", ""),
         ("", "let Stage = |f: fn(i64) -> i64| 0;"),
     ] {
@@ -384,39 +384,37 @@ fn concise_constructor_scan_respects_function_and_local_shadowing() {
 }
 
 #[test]
-fn concise_constructor_scan_resolves_imports_and_scales() {
-    for prefix in ["", "new "] {
-        for call in ["model::Holder", "m::Holder", "Container"] {
-            let mut model = parse("pub class Holder { pub callback: fn(i64) -> i64; }");
-            let source = format!(
-                "import model; import model as m; import model::Holder as Container; fn main() {{ let xs = [1]; let h = {prefix}{call}(|x: i64| x + xs[0]); }}"
-            );
-            let (mut main, errors) = crate::parser::Parser::new(
-                crate::lexer::Lexer::with_file_id(&source, FileId(1))
-                    .tokenize()
-                    .unwrap(),
-            )
-            .parse();
-            assert!(errors.is_empty(), "{errors:?}");
-            let mut stores = program_stores(&model);
-            stores.extend(program_stores(&main));
-            apply_build(
-                &mut [("model", &mut model), ("main", &mut main)],
-                None,
-                &stores,
-            );
-            assert!(
-                !shareable(&class(&model, "Holder").fields[0].ty),
-                "{source}"
-            );
-        }
+fn new_construction_scan_resolves_imports_and_scales() {
+    for call in ["model::Holder", "m::Holder", "Container"] {
+        let mut model = parse("pub class Holder { pub callback: fn(i64) -> i64; }");
+        let source = format!(
+            "import model; import model as m; import model::Holder as Container; fn main() {{ let xs = [1]; let h = new {call}(|x: i64| x + xs[0]); }}"
+        );
+        let (mut main, errors) = crate::parser::Parser::new(
+            crate::lexer::Lexer::with_file_id(&source, FileId(1))
+                .tokenize()
+                .unwrap(),
+        )
+        .parse();
+        assert!(errors.is_empty(), "{errors:?}");
+        let mut stores = program_stores(&model);
+        stores.extend(program_stores(&main));
+        apply_build(
+            &mut [("model", &mut model), ("main", &mut main)],
+            None,
+            &stores,
+        );
+        assert!(
+            !shareable(&class(&model, "Holder").fields[0].ty),
+            "{source}"
+        );
     }
     for count in [8, 32, 128] {
         let declarations = (0..count)
             .map(|i| format!("class Holder{i} {{ pub f: fn(i64) -> i64; }}"))
             .collect::<String>();
         let calls = (0..count)
-            .map(|i| format!("Holder{i}(|x: i64| x + xs[0]);"))
+            .map(|i| format!("new Holder{i}(|x: i64| x + xs[0]);"))
             .collect::<String>();
         let mut program = parse(&format!(
             "{declarations} fn main() {{ let xs = [1]; {calls} }}"
@@ -427,14 +425,14 @@ fn concise_constructor_scan_resolves_imports_and_scales() {
         assert_eq!(stats.stores, count);
         assert_eq!(stats.visits, count);
         eprintln!(
-            "concise constructor classes={count} stores={} visits={}",
+            "new construction classes={count} stores={} visits={}",
             stats.stores, stats.visits
         );
     }
 }
 
 #[test]
-fn concise_constructor_scan_indexes_qualified_variants_once() {
+fn call_scan_indexes_qualified_variants_once() {
     for count in [8, 32, 128] {
         let variants = (0..count)
             .map(|i| format!("V{i}(fn(i64) -> i64),"))
@@ -458,7 +456,7 @@ fn concise_constructor_scan_indexes_qualified_variants_once() {
 }
 
 #[test]
-fn concise_constructor_scan_indexes_arity_and_shared_inherited_layouts() {
+fn construction_scan_indexes_arity_and_shared_inherited_layouts() {
     for count in [8, 32, 128] {
         let chain = (1..=count)
             .map(|i| {

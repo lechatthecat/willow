@@ -1,4 +1,5 @@
-//! Both constructor spellings share borrowed arguments and one checking path.
+//! Objects are constructed only with `new`; the call form `Class(args)` is
+//! rejected with a fix that keeps the written qualifier and type arguments.
 use super::*;
 
 pub(super) struct Construction<'a> {
@@ -11,17 +12,28 @@ pub(super) struct Construction<'a> {
 
 #[willow_continuations::checker]
 impl TypeChecker {
-    pub(super) fn is_constructor_call(&self, expr: &Expr) -> bool {
-        self.constructor_calls.contains(&expr.id())
+    pub(super) fn construction<'a>(&self, expr: &'a Expr) -> Option<Construction<'a>> {
+        let Expr::New(n) = expr else {
+            return None;
+        };
+        Some(Construction {
+            class_name: n.class_name.clone(),
+            type_args: &n.type_args,
+            args: &n.args,
+            id: n.id,
+            span: n.span,
+        })
     }
 
-    pub(super) fn construction<'a>(&self, expr: &'a Expr) -> Option<Construction<'a>> {
-        let (class_name, type_args, args) = match expr {
-            Expr::New(n) => (
-                n.class_name.clone(),
-                n.type_args.as_slice(),
-                n.args.as_slice(),
-            ),
+    /// A call spelled like a constructor without `new` (`User(x)`,
+    /// `model::User(x)`, `Box<i64>(x)`). Variables, functions and generic
+    /// functions keep precedence, exactly as for ordinary calls, so only a
+    /// callee that resolves to nothing but a class is reported.
+    pub(super) fn call_form_class<'a>(
+        &self,
+        expr: &'a Expr,
+    ) -> Option<(String, &'a [Type], &'a [CallArg])> {
+        let (name, type_args, args) = match expr {
             Expr::Call(c)
                 if self.symbols.lookup_var(&c.callee).is_none()
                     && self.symbols.lookup_func(&c.callee).is_none()
@@ -31,9 +43,6 @@ impl TypeChecker {
             }
             Expr::StaticCall(c) if !c.is_bare_member() => {
                 let name = QualifiedName::join(&c.class, &c.method);
-                // Use the same module/alias and generic indexes as ordinary
-                // static calls. A function keeps precedence even when a class
-                // shares its spelling, or its arguments will be diagnosed.
                 if self
                     .symbols
                     .lookup_module_func(&c.class, &c.method)
@@ -46,21 +55,54 @@ impl TypeChecker {
             }
             _ => return None,
         };
-        if !matches!(expr, Expr::New(_))
-            && !self.generics.classes.contains_key(&class_name)
-            && self
-                .resolve_static_call_class_quiet(&class_name)
-                .is_none_or(|name| self.symbols.lookup_class(&name).is_none())
-        {
-            return None;
-        }
-        Some(Construction {
-            class_name,
+        let class = self.generics.classes.contains_key(&name)
+            || self
+                .resolve_static_call_class_quiet(&name)
+                .is_some_and(|resolved| self.symbols.lookup_class(&resolved).is_some());
+        class.then_some((name, type_args, args))
+    }
+
+    /// Reject `Class(args)`: objects are constructed only with `new`. The
+    /// arguments still go through the constructor check, so their own errors
+    /// (arity, types, lambda parameter context) surface exactly as they would
+    /// with `new`; the result is the error type so the missing `new` does not
+    /// cascade into later uses.
+    pub(super) fn reject_call_form_construction(
+        &mut self,
+        expr: &Expr,
+        name: &str,
+        type_args: &[Type],
+        args: &[CallArg],
+    ) -> Type {
+        self.check_constructor_call(&Construction {
+            class_name: name.to_owned(),
             type_args,
             args,
             id: expr.id(),
             span: expr.span(),
-        })
+        });
+        let written = if type_args.is_empty() {
+            name.to_owned()
+        } else {
+            format!(
+                "{name}<{}>",
+                type_args
+                    .iter()
+                    .map(|ty| self.diagnostic_type_name(ty))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        };
+        self.push(
+            Self::error_at(
+                ErrorCode::E0843,
+                format!("class `{name}` can only be constructed with `new`"),
+                expr.span(),
+                "`new` is missing",
+            )
+            .with_help(format!("write `new {written}(...)` instead")),
+        );
+        Self::error_type()
     }
 
     pub(super) fn check_constructor_call(&mut self, n: &Construction<'_>) -> Type {
@@ -118,23 +160,25 @@ mod tests {
             let name = QualifiedName::join(owner, "C");
             let class = checker.generics.registry.borrow_mut().intern_class(class);
             checker.generics.classes.insert(name.clone(), class);
-            assert!(checker.construction(&statement.expr).is_some());
+            assert!(checker.call_form_class(&statement.expr).is_some());
             let function = checker
                 .generics
                 .registry
                 .borrow_mut()
                 .intern_function(function);
             checker.generics.functions.insert(name, function);
-            assert!(checker.construction(&statement.expr).is_none());
+            assert!(checker.call_form_class(&statement.expr).is_none());
         }
     }
 
     #[test]
-    fn concise_constructor_inference_is_linear_and_shared() {
-        for legacy in [false, true] {
+    fn constructor_inference_is_linear_and_shared() {
+        // Valid `new` sites and rejected call-form sites share one inference
+        // path; neither grows faster than the number of sites.
+        for call_form in [false, true] {
             let mut previous = None;
             for count in [8, 32, 128] {
-                let prefix = if legacy { "new " } else { "" };
+                let prefix = if call_form { "" } else { "new " };
                 let source = format!(
                     "class Box<T> {{ pub value: T; }} fn main() {{ {} }}",
                     (0..count)
@@ -149,14 +193,20 @@ mod tests {
                 super::super::generics::GENERIC_NEW_INFERENCES.with(|n| n.set(0));
                 let mut checker = TypeChecker::new();
                 checker.check_program(&program);
-                assert!(checker.errors.is_empty(), "{:?}", checker.errors);
+                let rejected = checker
+                    .errors
+                    .iter()
+                    .filter(|e| e.code == ErrorCode::E0843)
+                    .count();
+                assert_eq!(rejected, if call_form { 2 * count } else { 0 });
+                assert_eq!(checker.errors.len(), rejected, "{:?}", checker.errors);
                 let work = super::super::generics::GENERIC_NEW_INFERENCES.with(|n| n.get());
                 if let Some((old_count, old_work)) = previous {
                     assert_eq!(work * old_count, old_work * count);
                 }
                 assert!(work >= count);
                 eprintln!(
-                    "legacy={legacy} sites={} inference_checks={work}",
+                    "call_form={call_form} sites={} inference_checks={work}",
                     count * 2
                 );
                 previous = Some((count, work));

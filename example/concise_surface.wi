@@ -1,4 +1,4 @@
-// Tail values, optional new, ordinary output names and typed float display.
+// Tail values, `new` construction, ordinary output names and typed float display.
 import std::io::{print, println};
 
 class User {
@@ -15,7 +15,7 @@ fn choose(value: bool) -> i64 {
 }
 
 fn main() {
-    let user = User(2);
+    let user = new User(2);
     print("score=");
     println(score(user));
     println(user.doubled());

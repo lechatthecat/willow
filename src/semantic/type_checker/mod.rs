@@ -271,7 +271,6 @@ pub struct TypeChecker {
     static_sync: HashMap<(TypeId, Span), bool>,
     static_markers: send_sync::MarkerCache,
     pub(crate) analysis_calls: HashMap<ExprId, Option<FunctionId>>,
-    pub(crate) constructor_calls: std::collections::HashSet<ExprId>,
     /// Constructor bodies whose call-agnostic flow reported a missing field;
     /// `finish_effect_analysis` decides their E0842 with panic facts.
     pending_constructor_flow: Vec<crate::parser::ast::BodyId>,
@@ -474,7 +473,6 @@ impl TypeChecker {
             static_sync: HashMap::new(),
             static_markers: Default::default(),
             analysis_calls: HashMap::new(),
-            constructor_calls: Default::default(),
             pending_constructor_flow: Vec::new(),
             analysis_symbols: Default::default(),
             member_uses: HashMap::new(),

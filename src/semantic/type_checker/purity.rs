@@ -724,7 +724,6 @@ impl TypeChecker {
                 AstEvent::Bind(name) => references.insert(name.to_owned(), false),
                 AstEvent::Expr(expr) => {
                     let bit = match expr {
-                        _ if self.is_constructor_call(expr) => Some(PuritySummary::UNKNOWN),
                         // Allocation is outside the supported purity subset.
                         // Literal allocations have no resolved call edge, and
                         // a constructor's body alone cannot prove allocation pure.

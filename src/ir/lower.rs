@@ -64,7 +64,6 @@ use crate::semantic::intrinsics::{BuiltinMethod, Intrinsic};
 /// borrow one checked unit; no fact maps are cloned at this boundary.
 pub struct SemanticFacts<'a> {
     pub analysis_calls: &'a HashMap<ExprId, Option<crate::semantic::ids::FunctionId>>,
-    pub constructor_calls: &'a HashSet<ExprId>,
     pub symbols: &'a symbols::SymbolTable,
     pub expr_types: &'a HashMap<ExprId, Type>,
     pub enum_variant_resolutions: &'a HashMap<ExprId, String>,
@@ -80,7 +79,6 @@ impl<'a> SemanticFacts<'a> {
     pub fn from_checker(checker: &'a crate::semantic::TypeChecker) -> Self {
         Self {
             analysis_calls: &checker.analysis_calls,
-            constructor_calls: &checker.constructor_calls,
             symbols: &checker.symbols,
             expr_types: &checker.expr_types,
             enum_variant_resolutions: &checker.enum_variant_resolutions,
@@ -96,7 +94,6 @@ impl<'a> SemanticFacts<'a> {
     fn lowering(&self) -> PartialCheckerTables<'a> {
         PartialCheckerTables {
             analysis_calls: Some(self.analysis_calls),
-            constructor_calls: Some(self.constructor_calls),
             checked: true,
             mutable_capture_declarations: Default::default(),
             symbols: Some(self.symbols),
@@ -167,7 +164,6 @@ pub(crate) fn lower_resolution(
 #[derive(Default)]
 pub struct PartialCheckerTables<'a> {
     pub analysis_calls: Option<&'a HashMap<ExprId, Option<crate::semantic::ids::FunctionId>>>,
-    pub constructor_calls: Option<&'a HashSet<ExprId>>,
     pub(crate) checked: bool,
     /// One unit-wide index, shared by all lowered functions and nested lambdas.
     pub mutable_capture_declarations: std::sync::OnceLock<std::collections::HashSet<Span>>,

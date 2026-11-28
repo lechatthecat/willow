@@ -2109,26 +2109,7 @@ impl TypeChecker {
                         }
                     }
                     if let Some(name) = self.generics.objects.get(&expr.id()) {
-                        let constructor = self.constructor_calls.contains(&expr.id());
                         match expr {
-                            Expr::Call(c) => {
-                                *expr = Expr::New(Box::new(NewExpr {
-                                    id: c.id,
-                                    class_name: name.clone(),
-                                    type_args: Vec::new(),
-                                    args: std::mem::take(&mut c.args),
-                                    span: c.span,
-                                }));
-                            }
-                            Expr::StaticCall(c) if constructor => {
-                                *expr = Expr::New(Box::new(NewExpr {
-                                    id: c.id,
-                                    class_name: name.clone(),
-                                    type_args: Vec::new(),
-                                    args: std::mem::take(&mut c.args),
-                                    span: c.span,
-                                }));
-                            }
                             Expr::ObjectLiteral(c) => {
                                 c.class = name.clone();
                                 c.type_args.clear();

@@ -370,6 +370,11 @@ impl TypeChecker {
                 checked,
             );
         }
+        if let Some((name, type_args, args)) = self.call_form_class(expr) {
+            let generation = self.error_generation;
+            let ty = self.reject_call_form_construction(expr, &name, type_args, args);
+            return self.finish_checked_expr(expr, ty, generation);
+        }
         if let Some(n) = self.construction(expr) {
             let generation = self.error_generation;
             if let Some(ty) = self.contextual_new_type(&n, expected) {

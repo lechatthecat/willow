@@ -987,13 +987,8 @@ impl TypeChecker {
                 state.graph.alias(result, &ternary.then_expr);
                 state.graph.alias(result, &ternary.else_expr);
             }
-            _ if matches!(expr, Expr::New(_)) || self.is_constructor_call(expr) => {
-                let (written, args) = match expr {
-                    Expr::New(c) => (c.class_name.as_str(), c.args.as_slice()),
-                    Expr::Call(c) => (c.callee.as_str(), c.args.as_slice()),
-                    Expr::StaticCall(c) => (c.class.as_str(), c.args.as_slice()),
-                    _ => unreachable!(),
-                };
+            Expr::New(c) => {
+                let (written, args) = (c.class_name.as_str(), c.args.as_slice());
                 let class = match self.expr_types.get(&expr.id()) {
                     Some(Type::Named(class)) => class.as_str(),
                     _ => written,

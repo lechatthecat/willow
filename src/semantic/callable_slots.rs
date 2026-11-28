@@ -34,7 +34,7 @@ use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::qualified_name::QualifiedName;
-use crate::semantic::field_writes::{BodyRef, DeclNames, ReceiverName};
+use crate::semantic::field_writes::{BodyRef, DeclNames};
 use crate::semantic::scopes::Scopes;
 
 /// Where a body sits, which decides what `self`, parameters and a
@@ -55,7 +55,7 @@ pub(crate) struct StoreContext<'a> {
 pub(crate) enum StoreTarget {
     /// `recv.field = v` / object literal; `None`: unresolved receiver.
     Field {
-        class: Option<ReceiverName>,
+        class: Option<String>,
         field: String,
     },
     /// An instance-field initializer.
@@ -72,13 +72,9 @@ pub(crate) enum StoreTarget {
         arity: usize,
         index: usize,
     },
-    /// An unresolved ordinary call: constructor or enum variant after names
-    /// are indexed, unless a function declaration shadows its spelling.
-    Call {
-        name: String,
-        arity: usize,
-        index: usize,
-    },
+    /// Payload `index` of a call that may name an enum variant (`V(…)` or
+    /// `E::V(…)`), unless a function declaration shadows its spelling.
+    Variant { name: String, index: usize },
 }
 
 /// A stored value that is not known to be shareable.
@@ -89,7 +85,7 @@ pub(crate) enum StoredValue {
     Function(String),
     /// A field read: the field's slot kind.
     Field {
-        class: Option<ReceiverName>,
+        class: Option<String>,
         field: String,
     },
     /// The current constructor's parameter declared at this span.
@@ -112,7 +108,7 @@ struct Binding {
     values: Vec<StoredValue>,
     /// Capturing it keeps a lambda shareable.
     capture_ok: bool,
-    class: Option<ReceiverName>,
+    class: Option<String>,
     /// Lambda nesting depth of the binding.
     depth: usize,
 }
@@ -158,7 +154,7 @@ struct PendingLet<'a> {
     init: &'a Expr,
     values: Vec<StoredValue>,
     literal_ok: bool,
-    class: Option<ReceiverName>,
+    class: Option<String>,
 }
 
 struct Collector<'a> {
@@ -236,32 +232,23 @@ impl<'a> BodyRef<'a> {
 }
 
 impl<'a> Collector<'a> {
-    fn nominal(&self, ty: &Type) -> Option<ReceiverName> {
+    fn nominal(&self, ty: &Type) -> Option<String> {
         match ty {
             Type::Named(name) | Type::Generic(name, _)
                 if !self.type_params.contains(name.as_str()) =>
             {
-                Some(ReceiverName::Declared(name.clone()))
+                Some(name.clone())
             }
             _ => None,
         }
     }
 
-    fn receiver(&self, expr: &Expr) -> Option<ReceiverName> {
+    fn receiver(&self, expr: &Expr) -> Option<String> {
         match expr {
-            Expr::Var(name, ..) if name == "self" => self.context.class.map(ReceiverName::from),
+            Expr::Var(name, ..) if name == "self" => self.context.class.map(str::to_owned),
             Expr::New(call) if !self.type_params.contains(call.class_name.as_str()) => {
-                Some(ReceiverName::Declared(call.class_name.clone()))
+                Some(call.class_name.clone())
             }
-            Expr::Call(call)
-                if self.bindings.get(&call.callee).is_none()
-                    && !self.type_params.contains(call.callee.as_str()) =>
-            {
-                Some(ReceiverName::Call(call.callee.clone()))
-            }
-            Expr::StaticCall(call) if !call.is_bare_member() => Some(ReceiverName::Call(
-                QualifiedName::join(&call.class, &call.method),
-            )),
             Expr::Var(name, ..) => self.bindings.get(name).and_then(|b| b.class.clone()),
             _ => None,
         }
@@ -504,7 +491,7 @@ impl<'a> Collector<'a> {
             Expr::ObjectLiteral(literal) if !self.type_params.contains(literal.class.as_str()) => {
                 for field in &literal.fields {
                     let target = StoreTarget::Field {
-                        class: Some(ReceiverName::Declared(literal.class.clone())),
+                        class: Some(literal.class.clone()),
                         field: field.name.clone(),
                     };
                     self.record(target, &field.value);
@@ -514,17 +501,15 @@ impl<'a> Collector<'a> {
                 if self.bindings.get(&call.callee).is_none()
                     && !self.type_params.contains(call.callee.as_str()) =>
             {
-                self.record_args(&call.args, |index| StoreTarget::Call {
+                self.record_args(&call.args, |index| StoreTarget::Variant {
                     name: call.callee.clone(),
-                    arity: call.args.len(),
                     index,
                 });
             }
             Expr::StaticCall(call) if !call.is_bare_member() => {
                 let name = QualifiedName::join(&call.class, &call.method);
-                self.record_args(&call.args, |index| StoreTarget::Call {
+                self.record_args(&call.args, |index| StoreTarget::Variant {
                     name: name.clone(),
-                    arity: call.args.len(),
                     index,
                 });
             }
@@ -1107,11 +1092,11 @@ impl<'a> Index<'a> {
         self.class_names.lookup(file, name)
     }
 
-    fn field_node(&mut self, file: FileId, class: &Option<ReceiverName>, field: &str) -> FieldNode {
+    fn field_node(&mut self, file: FileId, class: &Option<String>, field: &str) -> FieldNode {
         let Some(class) = class else {
             return FieldNode::ByName;
         };
-        match class.resolve(file, &self.class_names, &self.function_names) {
+        match self.class(file, class) {
             None => FieldNode::ByName,
             Some(id) => match self.field(id, field) {
                 Some(span) => self
@@ -1147,12 +1132,9 @@ impl<'a> Index<'a> {
                 let base = self.bases[self.class(file, class)?]?;
                 self.constructor_slot(base, *arity, *index)
             }
-            StoreTarget::Call { name, arity, index } => {
+            StoreTarget::Variant { name, index } => {
                 if self.function_names.lookup(file, name).is_some() {
                     return None;
-                }
-                if let Some(class) = self.class(file, name) {
-                    return self.constructor_slot(class, *arity, *index);
                 }
                 if let Some((enum_name, name)) = QualifiedName::new(name).split_last() {
                     let id = self.enum_names.lookup(file, enum_name)?;

@@ -197,7 +197,6 @@ pub(super) struct BodyOutputs {
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
-    constructor_calls: std::collections::HashSet<ExprId>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     lock_direct: HashMap<FunctionId, DirectLockEffects>,
@@ -233,7 +232,6 @@ pub(crate) struct TypedBody {
     static_reads: HashMap<FunctionId, HashSet<FunctionId>>,
     unsafe_static_accesses: Vec<(FunctionId, Diagnostic)>,
     analysis_calls: HashMap<ExprId, Option<FunctionId>>,
-    constructor_calls: std::collections::HashSet<ExprId>,
     analysis_symbols: crate::semantic::analysis_symbols::Facts,
     task_method_calls: Vec<crate::compiler_db::effects::TaskMethodCall>,
     #[serde(with = "crate::compiler_db::map_entries")]
@@ -276,7 +274,6 @@ impl TypedBody {
             static_reads: outputs.static_reads,
             unsafe_static_accesses: outputs.unsafe_static_accesses,
             analysis_calls: outputs.analysis_calls,
-            constructor_calls: outputs.constructor_calls,
             analysis_symbols: outputs.analysis_symbols,
             task_method_calls: outputs.task_method_calls,
             lock_direct: outputs.lock_direct,
@@ -303,12 +300,10 @@ impl TypedBody {
         self,
         types: &mut HashMap<ExprId, Type>,
         calls: &mut HashMap<ExprId, Option<FunctionId>>,
-        constructors: &mut std::collections::HashSet<ExprId>,
         patterns: &mut HashMap<PatternId, Pattern>,
     ) {
         types.extend(self.expr_types);
         calls.extend(self.analysis_calls);
-        constructors.extend(self.constructor_calls);
         patterns.extend(self.pattern_resolutions);
     }
 
@@ -325,7 +320,6 @@ impl TypedBody {
             .extend(self.enum_variant_resolutions);
         unit.pattern_resolutions.extend(self.pattern_resolutions);
         unit.analysis_calls.extend(self.analysis_calls);
-        unit.constructor_calls.extend(self.constructor_calls);
         unit.arm_leaves.extend(self.arm_leaves);
         unit.static_call_classes.extend(self.static_call_classes);
         unit.builtin_calls.extend(self.builtin_calls);
@@ -514,7 +508,6 @@ impl TypeChecker {
         }
         self.expr_types.extend(body.expr_types);
         self.analysis_calls.extend(body.analysis_calls);
-        self.constructor_calls.extend(body.constructor_calls);
         self.analysis_symbols.extend(match queries {
             Some(queries) => queries.resolved_references(body.id, &body.analysis_symbols)?,
             None => body.analysis_symbols,
@@ -609,7 +602,6 @@ impl TypeChecker {
             &mut outputs.unsafe_static_accesses,
         );
         swap(&mut self.analysis_calls, &mut outputs.analysis_calls);
-        swap(&mut self.constructor_calls, &mut outputs.constructor_calls);
         swap(&mut self.analysis_symbols, &mut outputs.analysis_symbols);
         swap(&mut self.task_method_calls, &mut outputs.task_method_calls);
         swap(&mut self.effect_inputs.direct, &mut outputs.lock_direct);

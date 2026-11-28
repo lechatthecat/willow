@@ -210,7 +210,6 @@ pub(crate) struct CaptureInputs<'a> {
     pub indirect: &'a crate::semantic::indirect_lock::IndirectInputs,
     pub types: &'a HashMap<ExprId, Type>,
     pub calls: &'a HashMap<ExprId, Option<FunctionId>>,
-    pub constructors: &'a std::collections::HashSet<ExprId>,
     pub patterns: &'a HashMap<PatternId, Pattern>,
     pub symbols: &'a crate::semantic::analysis_symbols::Facts,
 }
@@ -232,7 +231,6 @@ pub(crate) fn capture(
         indirect,
         types,
         calls,
-        constructors,
         patterns,
         symbols: symbol_facts,
     } = inputs;
@@ -314,7 +312,6 @@ pub(crate) fn capture(
                         is_async,
                         types,
                         calls,
-                        constructors,
                         symbols,
                         builtin_aliases: &builtin_aliases,
                     }
@@ -615,7 +612,6 @@ struct CaptureExpressionContext<'a> {
     is_async: bool,
     types: &'a HashMap<ExprId, Type>,
     calls: &'a HashMap<ExprId, Option<FunctionId>>,
-    constructors: &'a std::collections::HashSet<ExprId>,
     symbols: &'a crate::semantic::symbols::SymbolTable,
     builtin_aliases: &'a HashMap<String, String>,
 }
@@ -627,14 +623,10 @@ impl CaptureExpressionContext<'_> {
             is_async,
             types,
             calls,
-            constructors,
             symbols,
             builtin_aliases,
         } = *self;
         match e {
-            Expr::Call(_) | Expr::StaticCall(_) if constructors.contains(&e.id()) => {
-                RuntimeEffects::MAY_ALLOCATE.bits()
-            }
             Expr::String(..) | Expr::New(_) | Expr::ArrayLiteral(..) | Expr::ObjectLiteral(_) => {
                 RuntimeEffects::MAY_ALLOCATE.bits()
             }
@@ -762,7 +754,6 @@ impl CaptureExpressionContext<'_> {
             is_async: _,
             types,
             calls,
-            constructors,
             symbols,
             builtin_aliases,
         } = *self;
@@ -867,9 +858,6 @@ impl CaptureExpressionContext<'_> {
             }
         }
         let operation = match e {
-            Expr::Call(_) | Expr::StaticCall(_) if constructors.contains(&e.id()) => {
-                "object-allocation"
-            }
             Expr::String(..) => "string-literal-allocation",
             Expr::New(_) => "object-allocation",
             Expr::ArrayLiteral(..) => "array-allocation",

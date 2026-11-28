@@ -1451,7 +1451,7 @@ fn type_parameter_constraints_interfaces_and_explicit_arguments() {
 }
 
 #[test]
-fn concise_qualified_constructor_references_preserve_module_and_alias_tokens() {
+fn qualified_new_constructor_references_preserve_module_and_alias_tokens() {
     for (import, call, token, declaration) in [
         (
             "import model;",
@@ -1484,7 +1484,7 @@ fn concise_qualified_constructor_references_preserve_module_and_alias_tokens() {
             "pub class User { pub score: i64; }",
         ),
     ] {
-        let source = format!("{import} fn main() {{ println({call}.score); }}");
+        let source = format!("{import} fn main() {{ println(new {call}.score); }}");
         let f = Fixture::new(&source);
         f.write("model.wi", declaration);
         let result = f.run(&["refs", "model::User"], 0);

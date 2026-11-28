@@ -73,33 +73,8 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
             ctx,
         );
     }
-    if matches!(expr, Expr::Call(_) | Expr::StaticCall(_))
-        && ctx
-            .tables
-            .constructor_calls
-            .is_some_and(|calls| calls.contains(&expr.id()))
-    {
-        let args = match expr {
-            Expr::Call(c) => &c.args,
-            Expr::StaticCall(c) => &c.args,
-            _ => unreachable!(),
-        };
-        let args = lower_value_args(args, ctx)?;
-        let Type::Named(name) = checked_type
-            .as_ref()
-            .ok_or_else(|| missing_fact(expr.span(), "constructor type"))?
-        else {
-            return Err(missing_fact(expr.span(), "nominal constructor type"));
-        };
-        let (class, ty) = allocation_type(name, checked_type.clone(), ctx);
-        return Ok(HirExpr {
-            kind: HirExprKind::New { class, args },
-            ty,
-            span: expr.span(),
-        });
-    }
     // The public standalone lowering API has no checker facts. Respect its
-    // lexical/function scopes before recognizing prelude output or classes.
+    // lexical/function scopes before recognizing prelude output.
     if !ctx.tables.checked {
         let site = match expr {
             Expr::Call(c)
@@ -112,29 +87,20 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
             }
             _ => None,
         };
-        if let Some((name, args)) = site {
-            if matches!(
+        if let Some((name, args)) = site
+            && matches!(
                 name.as_str(),
                 "print" | "println" | "std::io::print" | "std::io::println"
-            ) && args.len() == 1
-            {
-                return lower_print_expr(
-                    &args[0].expr,
-                    name.ends_with("println"),
-                    expr.span(),
-                    checked_type,
-                    ctx,
-                );
-            }
-            if ctx.classes.map.contains_key(&name) {
-                let args = lower_value_args(args, ctx)?;
-                let (class, ty) = allocation_type(&name, checked_type, ctx);
-                return Ok(HirExpr {
-                    kind: HirExprKind::New { class, args },
-                    ty,
-                    span: expr.span(),
-                });
-            }
+            )
+            && args.len() == 1
+        {
+            return lower_print_expr(
+                &args[0].expr,
+                name.ends_with("println"),
+                expr.span(),
+                checked_type,
+                ctx,
+            );
         }
     }
     lower_expr_inner(expr, checked_type, ctx)
