@@ -76,8 +76,7 @@ stack. See `parallel_tasks.wi`, `task_sync_preemption.wi`,
 E0810 still rejects calls whose preemptibility cannot be proven (for example,
 unresolved callbacks or foreign functions without a preemption contract).
 Targets without native sync-stack support also reject synchronous loops and
-recursion from tasks. Making a known looping helper async is a remedy for that
-target limitation; it does not prove an unknown foreign call safe.
+recursion from tasks; making the looping helper async fixes this.
 
 ## Optional values
 

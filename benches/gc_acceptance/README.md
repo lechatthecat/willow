@@ -139,6 +139,5 @@ CycleWait and HeapLock event kinds, and independent runtime loss flags/drop coun
 Binary and evaluator-source identity must remain unchanged throughout diagnostics.
 Failed trial summaries and raw identities are retained; they are never retried.
 
-Measurement reports are local artifacts and are not committed.
-Linux execution never establishes native Windows/macOS results; unexecuted
-platforms remain unverified. No CI polling is needed to interpret local evidence.
+Measurement reports stay local and are not committed. Results apply only to the
+platform they were measured on.

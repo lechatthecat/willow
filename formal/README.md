@@ -1,17 +1,14 @@
 # A small concurrency core
 
-This is an executable-model formalization, not a proof of the Willow compiler
-or runtime. The models live in
+This document defines the core rules behind Willow's concurrency checks and
+checks them with executable models. The models live in
 [`core_models.rs`](../src/semantic/type_checker/core_models.rs), compiled only
-under `cfg(test)`. Run `cargo test --lib core_model_`. No solver, generated
-program execution, network, or additional dependency is needed for these tests.
+under `cfg(test)`. Run `cargo test --lib core_model_`; the tests need no
+solver, network or extra dependency.
 
-The statements below separate a mathematical core, a bounded machine check,
-and the assumptions needed to connect it to Willow. Acceptance by the compiler
-is evidence for its implemented restrictions; it is not a universal data-race,
-termination, or deadlock theorem. The models intentionally retain independent
-representations and algorithms so a shared implementation bug is less likely
-to pass as agreement.
+Each section gives the rules, a bounded machine check, and the assumptions that
+connect the model to the compiler. The models use their own representations and
+algorithms, so a bug in the compiler is unlikely to be repeated in the model.
 
 ## Types, sharing and loans
 

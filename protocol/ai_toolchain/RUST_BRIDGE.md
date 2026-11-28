@@ -165,9 +165,8 @@ boundary. No Rust unwind crosses the C ABI.
 Pool calls do not preserve thread/TLS affinity. Non-`Send` or non-`Sync` opaque
 types are build errors. For a thread-affine library, keep its state on an
 adapter-owned dedicated thread and expose a `Send + Sync` proxy exchanging owned
-messages. Keep waiting proxy operations unreviewed. A reviewed
-`#[willow::assume(no_block)]` assertion does not establish affinity between
-separate task invocations.
+messages. Keep waiting proxy operations unreviewed. `#[willow::assume(no_block)]`
+doesn't keep separate calls on the same thread.
 
 Parallel calls use ordinary eager task creation: wrap a synchronous Rust call in
 an `async fn`, call it several times, then await the returned tasks. Willow has
@@ -264,11 +263,9 @@ query and review the resolved graph before updating any review record.
 The current [async bridge](../../README.md#async-calls-willow-task-awaits-rust-future)
 supports Willow Tasks awaiting Rust Futures through explicit adapters. Reverse
 Rust-to-Willow callbacks, Rust awaiting Willow Tasks, and automatic bindings for
-arbitrary generic or trait APIs remain unsupported. Callback integration and a
-restricted auto-binding subset are future directions, not available features or
-a delivery commitment. Keep using concrete handwritten adapters and the current
-boundary types; one-way Future support does not imply general bidirectional
-runtime integration.
+arbitrary generic or trait APIs are not supported. Callbacks and a limited form
+of automatic bindings may come later; for now, write concrete adapters using the
+current boundary types.
 
 ## Reviewed effect assumptions
 

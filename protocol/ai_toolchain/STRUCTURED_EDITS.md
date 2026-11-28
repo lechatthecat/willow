@@ -73,8 +73,7 @@ contract. Omitting `--manifest` retains exhaustive transaction integrity checks.
 
 Verification preserves source, cache and transaction bytes and does not validate
 or apply the edit. `validate` and `apply` retain their exhaustive checks. The
-independent semantic-difference report remains version 1. Manifest attestation
-alone makes no claim about the amount of semantic reanalysis or cache work.
+independent semantic-difference report remains version 1.
 
 ## Visibility, concurrency, and recovery contract
 
@@ -138,8 +137,7 @@ Windows synchronizes file contents before replacement, but does not synchronize
 directory entries, so power-loss durability is not promised there. Process-kill
 recovery uses the same journal on both platforms. Deterministic process-kill tests
 cover journal boundaries, every prefix of a multi-file apply, commit, and repeated
-recovery on Linux; these simulate interruption, not physical power loss. Foreign
-native execution is unverified. No Git operation is performed.
+recovery on Linux; these simulate interruption, not physical power loss.
 
 The initial edit surface uses debug/default compiler options and workspace-local,
 regular, non-symlink source files. `--project` selects project mode. External
