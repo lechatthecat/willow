@@ -1624,7 +1624,9 @@ fn attach_retained_panic_evidence(
     for (&unit, capture) in captured {
         for (&id, evidence) in &capture.semantic.panic_evidence {
             let (owner, local) = resolve(unit, id);
-            if !captured.contains_key(&owner) || !paths.contains_key(&owner) {
+            // Only the owning unit's evidence is a proof; an importing
+            // unit's view must not win by map iteration order.
+            if owner != unit || !paths.contains_key(&owner) {
                 continue;
             }
             let (module, name) = node_name(captured, paths, owner, local);

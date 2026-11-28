@@ -21,7 +21,7 @@ fn main() {
     if !(i64::clamp(2, -3, 4) == 2) { panic("inside clamp"); }
     if !(i64::clamp(9, 2, 2) == 2) { panic("equal bounds"); }
     if !(f64::abs(-3.5) == 3.5) { panic("float abs"); }
-    if !(f64::to_string(f64::abs(-0.0)) == "0") { panic("abs signed zero"); }
+    if !(f64::to_string(f64::abs(-0.0)) == "0.0") { panic("abs signed zero"); }
     if !(f64::min(-1.5, 2.0) == -1.5) { panic("float min"); }
     if !(f64::max(-1.5, 2.0) == 2.0) { panic("float max"); }
     if !(f64::clamp(-3.0, -2.0, 2.0) == -2.0) { panic("float lower"); }
@@ -42,8 +42,8 @@ fn main() {
     if !(f64::to_string(f64::min(nan, nan)) == "NaN") { panic("two NaN"); }
     if !(f64::to_string(f64::clamp(nan, 0.0, 1.0)) == "NaN") { panic("clamp NaN value"); }
     if !(f64::sqrt(inf) == inf && f64::round(inf) == inf) { panic("infinity"); }
-    if !(f64::to_string(f64::sqrt(-0.0)) == "-0") { panic("sqrt signed zero"); }
-    if !(f64::to_string(f64::ceil(-0.2)) == "-0") { panic("ceil signed zero"); }
+    if !(f64::to_string(f64::sqrt(-0.0)) == "-0.0") { panic("sqrt signed zero"); }
+    if !(f64::to_string(f64::ceil(-0.2)) == "-0.0") { panic("ceil signed zero"); }
     if !(f64::sqrt(1e-300) > 0.0) { panic("small magnitude"); }
     println("math helpers ok");
 }

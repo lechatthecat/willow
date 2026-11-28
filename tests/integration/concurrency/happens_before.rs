@@ -3,8 +3,8 @@ use super::*;
 // ── Happens-before guarantees + Channel item Send ────────────
 // Perspectives: 1 channel send->recv value visible; 2 channel order preserved;
 // 3 Mutex counter no lost updates; 4 AtomicI64 counter no lost updates; 5 await
-// makes a task's result visible; 6 Channel<Fn> send rejected under the check
-// (E2403); 7 low worker overrides still reject it; 8 Channel<i64> is accepted.
+// makes a task's result visible; 6 a non-Send channel item is rejected under
+// the check (E2403); 7 it is also rejected by default; 8 Channel<i64> is accepted.
 #[test]
 fn test_dgwo6_channel_send_recv_value_and_order() {
     let (out, ok) = compile_and_run(
@@ -95,13 +95,17 @@ async fn main() {
 }
 
 #[test]
-fn test_dgwo6_channel_item_must_be_send_e2403() {
+fn channel_item_must_be_send_e2403() {
+    // Function values without task-local captures are Send; an interface
+    // that does not extend `Send` is not.
     let (ok, stderr) = compile_with_data_race_check(
         r#"
+interface Shape { fn area(self) -> i64; }
+class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side; } }
 fn main() {
-    let ch = Channel<fn(i64) -> i64>::new();
-    let f: fn(i64) -> i64 = |x| x * 2;
-    ch.send(f);
+    let ch = Channel<Shape>::new();
+    let s: Shape = new Square(2);
+    ch.send(s);
 }
 "#,
     );
@@ -111,14 +115,15 @@ fn main() {
 }
 
 #[test]
-fn test_dgwo6_channel_fn_send_rejected_by_default() {
+fn channel_non_send_item_rejected_by_default() {
     let (ok, stderr) = compile_with_compiler_env(
         r#"
+interface Shape { fn area(self) -> i64; }
+class Square implements Shape { pub side: i64; pub fn area(self) -> i64 { return self.side; } }
 fn main() {
-    let ch = Channel<fn(i64) -> i64>::new();
-    ch.send(|x| x * 2);
-    let g = ch.recv();
-    println(g(21));   // 42
+    let ch = Channel<Shape>::new();
+    ch.send(new Square(21));
+    println(ch.recv().area());
 }
 "#,
         &[],

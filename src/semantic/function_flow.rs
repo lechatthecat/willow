@@ -103,11 +103,15 @@ impl Builder<'_> {
         false
     }
     fn field(&mut self, name: &str) -> usize {
-        *self.fields.entry(name.into()).or_insert_with(|| {
-            let node = self.solver.node();
-            self.solver.storage_slot(node);
-            node
-        })
+        if let Some(&node) = self.fields.get(name) {
+            return node;
+        }
+        let owner = std::mem::replace(&mut self.solver.owner, SHARED);
+        let node = self.solver.node();
+        self.solver.owner = owner;
+        self.solver.storage_slot(node);
+        self.fields.insert(name.into(), node);
+        node
     }
     fn signature(&mut self, id: FunctionId, n: usize) -> Signature {
         if let Some(mut sig) = self.solver.signatures.get(&id).cloned() {
@@ -474,14 +478,17 @@ impl Builder<'_> {
     }
 }
 
+/// Resolves indirect-call targets. Returns whether any call's resolution can
+/// depend on syntax outside the root body containing it; only then can an edit
+/// elsewhere change an unchanged caller's targets.
 pub(crate) fn resolve(
     program: &Program,
     types: &HashMap<ExprId, Type>,
     calls: &HashMap<ExprId, Option<FunctionId>>,
     inputs: &mut IndirectInputs,
-) {
+) -> bool {
     if inputs.calls.is_empty() {
-        return;
+        return false;
     }
     let mut b = Builder {
         solver: Solver::default(),
@@ -499,6 +506,7 @@ pub(crate) fn resolve(
         super_calls: inputs.super_calls.iter().copied().collect(),
         escape: 0,
     };
+    b.solver.owner = SHARED;
     b.escape = b.solver.node();
     for (span, names) in &inputs.memberwise {
         let fields: std::sync::Arc<[usize]> = names.iter().map(|name| b.field(name)).collect();
@@ -540,7 +548,8 @@ pub(crate) fn resolve(
             _ => {}
         }
     }
-    for &(id, params, _, _) in &roots {
+    for (owner, &(id, params, _, _)) in (0u32..).zip(&roots) {
+        b.solver.owner = owner;
         b.signature(id, params.len());
         for (p, reference) in params
             .iter()
@@ -557,13 +566,18 @@ pub(crate) fn resolve(
             b.storage_escape = true;
         }
     }
+    let mut owner = 0u32;
     for (id, params, root, public) in roots {
+        b.solver.owner = owner;
+        owner += 1;
         b.root(id, params, root, public);
     }
     for item in &program.items {
         if let Item::Class(c) = item {
             for field in &c.fields {
                 if let Some(init) = &field.initializer {
+                    b.solver.owner = owner;
+                    owner += 1;
                     let id = FunctionId::method(
                         TypeId::local(&c.name),
                         format!("$flow-field:{}", field.name),
@@ -581,7 +595,13 @@ pub(crate) fn resolve(
     }
     b.solver.escape(b.escape);
     b.solver.solve();
+    let foreign = b.solver.foreign_nodes();
+    let mut cross_owner = false;
     for call in &mut inputs.calls {
+        cross_owner |= [b.forwarded.get(&call.span), b.calls.get(&call.span)]
+            .into_iter()
+            .flatten()
+            .any(|&node| foreign[node]);
         if let Some(&callee) = b.forwarded.get(&call.span) {
             let node = &b.solver.nodes[callee];
             if node.unknown == 0
@@ -609,4 +629,5 @@ pub(crate) fn resolve(
             None
         };
     }
+    cross_owner
 }

@@ -451,8 +451,13 @@ pub(super) fn finish(
                     });
             }
         }
+        // An importing unit's view of a callee is not its proof: only the
+        // owning unit records evidence, independently of unit order.
         for (&id, evidence) in &captures[&unit].semantic.panic_evidence {
-            if let Some(function) = functions.get(&resolve(unit, id)) {
+            let owner = resolve(unit, id);
+            if owner.0 == unit
+                && let Some(function) = functions.get(&owner)
+            {
                 result
                     .panic_evidence
                     .insert(function.id.clone(), evidence.clone());

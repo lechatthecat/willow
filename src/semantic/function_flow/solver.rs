@@ -10,6 +10,8 @@ pub(super) const STORAGE: u8 = 2;
 pub(super) const CAPACITY: u8 = 4;
 pub(super) const TOO_DEEP: u8 = 8;
 pub(super) const UNRESOLVED: u8 = 16;
+/// Owner of nodes no single root body writes, such as heap slots.
+pub(super) const SHARED: u32 = u32::MAX;
 
 #[derive(Default)]
 pub(super) struct Node {
@@ -18,6 +20,8 @@ pub(super) struct Node {
     pub reference: bool,
     pub targets: HashMap<FunctionId, u16>,
     pub unknown: u8,
+    /// Root body whose syntax created this node, or [`SHARED`].
+    pub owner: u32,
     edges: Vec<usize>,
     edge_set: HashSet<usize>,
     calls: Vec<usize>,
@@ -42,6 +46,8 @@ enum Event {
 #[derive(Default)]
 pub(super) struct Solver {
     pub nodes: Vec<Node>,
+    /// Owner stamped on nodes created next.
+    pub owner: u32,
     pub signatures: HashMap<FunctionId, Signature>,
     calls: Vec<Call>,
     queue: VecDeque<(usize, Event)>,
@@ -61,7 +67,10 @@ pub(super) struct Solver {
 impl Solver {
     pub fn node(&mut self) -> usize {
         let id = self.nodes.len();
-        self.nodes.push(Node::default());
+        self.nodes.push(Node {
+            owner: self.owner,
+            ..Node::default()
+        });
         id
     }
     pub fn unknown(&mut self, node: usize, reason: u8) {
@@ -269,6 +278,48 @@ impl Solver {
                 }
             }
         }
+    }
+}
+
+impl Solver {
+    /// Whether each node's value can depend on syntax outside its own root.
+    ///
+    /// A node is foreign when an edge from another owner reaches its root, or
+    /// when a signature parameter reaches it: parameters are fed by callers
+    /// and escapes elsewhere, which may have changed even if no such edge
+    /// exists now. Every other node depends only on its own root's syntax.
+    /// One pass over the edges plus one multi-source search: O(nodes + edges).
+    pub fn foreign_nodes(&self) -> Vec<bool> {
+        let mut fed_owners = HashSet::new();
+        for node in &self.nodes {
+            for &next in &node.edges {
+                if self.nodes[next].owner != node.owner {
+                    fed_owners.insert(self.nodes[next].owner);
+                }
+            }
+        }
+        let mut foreign: Vec<bool> = self
+            .nodes
+            .iter()
+            .map(|node| node.owner == SHARED || fed_owners.contains(&node.owner))
+            .collect();
+        let mut work: Vec<usize> = self
+            .signatures
+            .values()
+            .flat_map(|sig| sig.params.iter().copied())
+            .collect();
+        for &param in &work {
+            foreign[param] = true;
+        }
+        while let Some(node) = work.pop() {
+            for &next in &self.nodes[node].edges {
+                if !foreign[next] {
+                    foreign[next] = true;
+                    work.push(next);
+                }
+            }
+        }
+        foreign
     }
 }
 

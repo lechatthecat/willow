@@ -1431,8 +1431,9 @@ mod tests {
     }
 
     /// Without body queries an expression-bodied lambda has no stable
-    /// BodyId to scan, but every lambda is reached only through an unknown
-    /// indirect or callback edge, so the contract stays fail-closed.
+    /// BodyId to scan. An allocating lambda or one reached through a callback
+    /// edge stays fail-closed; a direct call whose bounded function-value flow
+    /// has one non-allocating candidate is proven.
     #[test]
     fn no_alloc_expression_lambda_without_body_queries_fails_closed() {
         for lambda in [
@@ -1448,6 +1449,12 @@ mod tests {
                     "import std::collections::Array; enum Option<T> {{ Some(T), None }} @effects(no_alloc) fn f(h: fn(i64) -> i64) -> i64 {{ {body} }} fn main() {{ let g = {lambda}; f(g); }}"
                 );
                 let errors = contract_errors(&source);
+                if lambda == "|x: i64| x + 1" && body == "return h(1);" {
+                    // Bounded function-value flow resolves `h` to its only
+                    // candidate, which does not allocate.
+                    assert!(errors.is_empty(), "{lambda} {body}: {errors:?}");
+                    continue;
+                }
                 assert!(
                     !errors.is_empty()
                         && errors

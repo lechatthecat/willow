@@ -784,7 +784,7 @@ mod tests {
                 "injected interface default method",
             ),
             (
-                "fn seed() -> i64 { return 42; } fn call(f: fn() -> i64) -> i64 { return f(); } pub fn start() -> i64 { return call(seed); }",
+                "fn seed() -> i64 { return 42; } pub fn call(f: fn() -> i64) -> i64 { return f(); } pub fn start() -> i64 { return call(seed); }",
                 "indirect call through a function value",
             ),
         ] {

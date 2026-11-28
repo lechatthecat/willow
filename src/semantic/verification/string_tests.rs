@@ -312,9 +312,10 @@ fn verified_string_encoding_scales_with_occurrences_and_literal_bytes() {
             let summary =
                 encode(0, &[f], &HashMap::from([("f", 0)]), &DataTypes::default()).unwrap();
             // Every literal appears once in each of the constant number of
-            // shared summary definitions, never multiplied by callers or exits.
+            // shared summary definitions (value, safe, failure_safe, assume,
+            // post, post_safe), never multiplied by callers or exits.
             let escaped_bytes = summary.definitions.matches("\\u{78}").count();
-            assert_eq!(escaped_bytes, bytes * count * 5);
+            assert_eq!(escaped_bytes, bytes * count * 6);
             assert!(summary.nodes <= count + 8);
             eprintln!(
                 "bytes={bytes} occurrences={count} escapes={escaped_bytes} nodes={} smt_bytes={}",

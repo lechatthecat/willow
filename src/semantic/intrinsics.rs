@@ -1079,6 +1079,14 @@ impl MethodName {
         matches!(self, Self::Join | Self::TryJoin)
     }
 
+    /// Private storage operations the compiler lowers itself.
+    pub(crate) fn is_abi_storage(self) -> bool {
+        matches!(
+            self,
+            Self::AbiConcat | Self::AbiCopy | Self::AbiDebug | Self::AbiLen | Self::AbiResize
+        )
+    }
+
     fn scalar_operation(self) -> Option<(Intrinsic, ScalarTarget)> {
         Some(match self {
             Self::Parse(target) => (Intrinsic::ScalarParse, target),

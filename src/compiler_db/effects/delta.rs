@@ -81,6 +81,7 @@ pub(super) fn solve_unit_delta<N: std::fmt::Display>(
         .filter(|target| !previous.preemption_bodies.contains(target))
         .collect();
     changed.extend(inherited_changed);
+    delta.mark_value_bounds(&solution, &mut changed);
     let mut seeds = DeltaSeeds {
         external: delta.propagate_dirty_sources(&result, &changed, &mut changed_copies),
         ..DeltaSeeds::default()
@@ -894,6 +895,42 @@ impl DeltaSolve<'_> {
         updates.extend(removed.iter().map(|&id| (id, None)));
         solution.apply_delta(updates);
         compared
+    }
+
+    /// Function-value bound vertices are owned by no body: their targets come
+    /// from every value of the unit. Recompute each current one, and retire the
+    /// old ones the changed bodies reached that the new graph no longer has.
+    /// The graph scan is linear in vertices, like the graph construction itself.
+    pub(super) fn mark_value_bounds(
+        &self,
+        solution: &crate::semantic::effects::EffectSolution<EffectWitness>,
+        changed: &mut HashSet<FunctionId>,
+    ) {
+        let bound = |id: &FunctionId| {
+            matches!(
+                id.synthetic_kind(),
+                crate::qualified_name::SyntheticKind::Indirect { .. }
+            )
+        };
+        let mut pending: Vec<_> = changed
+            .iter()
+            .filter_map(|&id| solution.equation(id))
+            .flat_map(|equation| equation.edges.iter().map(|(target, _)| *target))
+            .filter(bound)
+            .collect();
+        pending.extend(self.graph.iter().map(|(id, _)| *id).filter(bound));
+        while let Some(id) = pending.pop() {
+            if !changed.insert(id) {
+                continue;
+            }
+            pending.extend(
+                solution
+                    .equation(id)
+                    .into_iter()
+                    .flat_map(|equation| equation.edges.iter().map(|(target, _)| *target))
+                    .filter(bound),
+            );
+        }
     }
 
     /// Applies changed IO equations. Returns the number compared.

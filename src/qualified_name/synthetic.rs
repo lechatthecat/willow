@@ -40,6 +40,13 @@ pub enum SyntheticKind {
     StdNamespace,
 }
 
+impl SyntheticKind {
+    /// Source names are the serialized default, so artifacts omit the field.
+    pub fn is_source(&self) -> bool {
+        matches!(self, Self::Source)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SyntheticName {
     pub(crate) kind: SyntheticKind,
