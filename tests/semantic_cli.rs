@@ -2031,6 +2031,249 @@ fn mismatch_diagnostics_keep_dependency_type_names_distinct() {
 }
 
 #[test]
+fn semantic_outputs_present_awaited_nominal_types_in_every_format() {
+    let f = Fixture::new();
+    fs::write(
+        f.0.join("src/model.wi"),
+        "module model; pub class Item {}\n\
+         pub async fn make() -> Result<Item, String> { return Ok(new Item()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import model;\n\
+         async fn relay() -> Result<model::Item, String> { return await model::make(); }\n\
+         async fn main() { let task = relay(); let item = await task; }\n",
+    )
+    .unwrap();
+    for project in [false, true] {
+        for format in ["human", "json", "ndjson"] {
+            for (command, selector) in [
+                ("effects", "main::main"),
+                ("effects", "main::relay"),
+                ("type", "main::main::task"),
+                ("type", "model::Item"),
+                ("symbol", "model::make"),
+                ("refs", "model::Item"),
+                ("impact", "model::make"),
+            ] {
+                let mut args = vec![command, selector, "--format", format, "--all"];
+                if command == "effects" {
+                    args.push("--explain");
+                }
+                if !project {
+                    args.extend(["--source", "src/main.wi"]);
+                }
+                let out = f.run(&args);
+                let text = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(out.status.success(), "{args:?}: {text}");
+                for internal in ["$pkg", "$local", "$mono$", "$Tuple", "$receiver"] {
+                    assert!(!text.contains(internal), "{args:?}: {text}");
+                }
+                if command == "effects" {
+                    assert!(
+                        text.contains("await of Task<Result<model::Item, String>>"),
+                        "{args:?}: {text}"
+                    );
+                }
+                if command == "type" && selector.ends_with("task") {
+                    assert!(text.contains("Task<Result<model::Item, String>>"), "{text}");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_outputs_keep_dependency_await_types_distinct() {
+    let f = Fixture::new();
+    fs::create_dir_all(f.0.join("ledger/src")).unwrap();
+    fs::write(
+        f.0.join("ledger/project.toml"),
+        "[willow]\nmanifest-version=1\n[project]\nname='ledger'\nversion='1.0.0'\n",
+    )
+    .unwrap();
+    let model = "module model; pub class Item {}\n\
+                 pub async fn make() -> Result<Item, String> { return Ok(new Item()); }\n";
+    fs::write(f.0.join("ledger/src/model.wi"), model).unwrap();
+    fs::write(f.0.join("src/model.wi"), model).unwrap();
+    let manifest = fs::read_to_string(f.0.join("project.toml")).unwrap();
+    fs::write(
+        f.0.join("project.toml"),
+        format!("{manifest}\n[dependencies]\nexternal={{path='ledger'}}\n"),
+    )
+    .unwrap();
+    fs::write(
+        f.0.join("src/main.wi"),
+        "import model; import external::model as other;\n\
+         fn same<T>(x: T) -> T { return x; }\n\
+         async fn main() {\n\
+             let local = model::make(); let remote = other::make();\n\
+             let a = await local; let b = await remote;\n\
+             let c = await other::make().result();\n\
+             println(same(1));\n\
+         }\n",
+    )
+    .unwrap();
+    for format in ["human", "json", "ndjson"] {
+        for (command, selector, expected) in [
+            (
+                "effects",
+                "main::main",
+                "Task<Result<ledger::model::Item, String>>",
+            ),
+            (
+                "type",
+                "main::main::local",
+                "Task<Result<model::Item, String>>",
+            ),
+            (
+                "type",
+                "main::main::remote",
+                "Task<Result<ledger::model::Item, String>>",
+            ),
+            ("symbol", "main::main::b", "ledger::model::Item"),
+            ("impact", "main::main", "main::main"),
+        ] {
+            let mut args = vec![command, selector, "--format", format, "--all"];
+            if command == "effects" {
+                args.push("--explain");
+            }
+            let out = f.run(&args);
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert!(out.status.success(), "{args:?}: {text}");
+            for internal in ["$pkg", "$local", "$mono$", "$Tuple", "$receiver"] {
+                assert!(!text.contains(internal), "{args:?}: {text}");
+            }
+            assert!(text.contains(expected), "{args:?}: {text}");
+            if command == "effects" {
+                for ty in [
+                    "Task<Result<model::Item, String>>",
+                    "TaskResult<Result<ledger::model::Item, String>>",
+                ] {
+                    assert!(text.contains(&format!("await of {ty}")), "{text}");
+                }
+                if format == "json" {
+                    let value: Value = serde_json::from_slice(&out.stdout).unwrap();
+                    for evidence in ["effect_evidence", "compiler_witnesses"] {
+                        let rows = value["result"][evidence].as_array().unwrap();
+                        assert!(
+                            rows.iter()
+                                .any(|row| row["witness"]["awaited_type"] == expected),
+                            "{text}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn semantic_await_witness_types_match_type_queries() {
+    for (argument, value, expected) in [
+        ("", "", "Task<main::Item>"),
+        ("i64", "42", "Task<model::Box<i64>>"),
+        (
+            "Result<Item, String>",
+            "Ok(new Item())",
+            "Task<model::Box<Result<model::Item, String>>>",
+        ),
+        ("(i64, bool)", "(42, true)", "Task<model::Box<(i64, bool)>>"),
+    ] {
+        let f = Fixture::new();
+        let (prefix, declaration, item, value) = if !argument.is_empty() {
+            fs::write(
+                f.0.join("src/model.wi"),
+                format!("module model; pub class Item {{}} pub class Box<T> {{ pub value: T; }}\n\
+                 pub async fn make() -> Box<{argument}> {{ return new Box<{argument}>({value}); }}\n"),
+            )
+            .unwrap();
+            (
+                "import model;",
+                "",
+                expected
+                    .strip_prefix("Task<")
+                    .unwrap()
+                    .strip_suffix('>')
+                    .unwrap(),
+                "model::make()",
+            )
+        } else {
+            (
+                "",
+                "class Item {} async fn make() -> Item { return new Item(); }",
+                "Item",
+                "make()",
+            )
+        };
+        fs::write(
+            f.0.join("src/main.wi"),
+            format!("{prefix}\n{declaration}\nasync fn relay() -> {item} {{ let task = {value}; return await task; }}\nasync fn main() {{ let task = relay(); let item = await task; }}\n"),
+        ).unwrap();
+        for owner in ["main", "relay"] {
+            let binding = format!("main::{owner}::task");
+            let ty = f.json(&["type", &binding], 0);
+            let display = ty["result"]["type_display"].as_str().unwrap();
+            assert_eq!(display, expected, "{ty}");
+            for format in ["human", "json", "ndjson"] {
+                let output = f.run(&[
+                    "effects",
+                    &format!("main::{owner}"),
+                    "--format",
+                    format,
+                    "--explain",
+                    "--all",
+                ]);
+                let text = String::from_utf8(output.stdout).unwrap();
+                assert!(
+                    output.status.success(),
+                    "{text}\n{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                for internal in ["$pkg", "$local", "$mono$", "$Tuple", "$receiver"] {
+                    assert!(!text.contains(internal), "{text}");
+                }
+                assert!(
+                    text.contains(&format!("await of {display} lowers")),
+                    "{text}"
+                );
+                if format != "human" {
+                    assert!(
+                        text.contains(&format!(
+                            "\"awaited_type\":{}",
+                            serde_json::to_string(display).unwrap()
+                        )),
+                        "{text}"
+                    );
+                }
+                if format == "json" {
+                    let result: Value = serde_json::from_str(&text).unwrap();
+                    for field in ["effect_evidence", "compiler_witnesses"] {
+                        let witnesses: Vec<_> = result["result"][field]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|fact| fact["witness"]["awaited_type"].as_str())
+                            .collect();
+                        assert!(!witnesses.is_empty(), "{text}");
+                        assert!(witnesses.iter().all(|&ty| ty == display), "{text}");
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn await_block_bounds_explain_lowering_without_blaming_locks() {
     use willow_compiler::semantic::effects::RuntimeEffects;
     for (mode, ty) in [
@@ -4073,9 +4316,21 @@ fn generic_closure_value_calls_keep_queries_available() {
         );
         let name = selector.split_once("::").unwrap().1;
         let function = snapshot.functions.iter().find(|f| f.name == name).unwrap();
-        assert_eq!(
-            snapshot.semantic.unresolved_calls[&function.id].len(),
-            sites,
+        let calls = &snapshot.semantic.effect_calls[&function.id];
+        // Specializations can select different candidate buckets at one source
+        // site. Count source sites, retaining every resolved target in the graph.
+        let locations: std::collections::HashSet<_> = calls
+            .iter()
+            .filter(|call| call.indirect.is_some())
+            .map(|call| (&call.location.path, call.location.start, call.location.end))
+            .collect();
+        assert_eq!(locations.len(), sites, "{selector}: {calls:?}");
+        assert!(
+            snapshot
+                .semantic
+                .unresolved_calls
+                .get(&function.id)
+                .is_none_or(Vec::is_empty),
             "{selector}"
         );
         assert!(!text.contains("$mono$"), "{selector}: {text}");

@@ -324,11 +324,10 @@ pub(crate) fn capture(
                 if effects != 0 {
                     result.semantic.capability(id, effects, span, reason);
                     if let AstEvent::Expr(Expr::Await(a)) = event {
-                        let operand = types.get(&a.expr.id()).map(awaited_type_name);
                         result.semantic.await_type(
                             id,
                             span,
-                            operand.as_deref(),
+                            types.get(&a.expr.id()),
                             effects & RuntimeEffects::MAY_BLOCK.bits() == 0,
                         );
                     }
@@ -889,21 +888,6 @@ impl CaptureExpressionContext<'_> {
     }
 }
 
-/// Spell an awaited operand type for AI output. A task with no value is
-/// written `Task<()>` (likewise `JoinHandle<()>`/`TaskResult<()>`), the unit
-/// spelling users annotate, instead of the checker's internal `void` payload.
-fn awaited_type_name(ty: &Type) -> String {
-    match ty {
-        Type::Generic(name, args)
-            if matches!(args.as_slice(), [Type::Void])
-                && crate::semantic::type_checker::awaitable_task_type(ty).is_some() =>
-        {
-            format!("{name}<()>")
-        }
-        _ => crate::semantic::type_checker::type_name(ty),
-    }
-}
-
 pub(crate) fn snapshot(
     frontend: &crate::Frontend,
     entry: &Path,
@@ -1220,8 +1204,22 @@ fn snapshot_with_boundary(
         functions,
         semantic,
     };
-    if regenerates_generics && has_workspace_generics(frontend, generic_sources) {
-        generics::present_types(&mut snapshot);
+    let present_generics =
+        regenerates_generics && has_workspace_generics(frontend, generic_sources);
+    let present_awaits = snapshot
+        .semantic
+        .witnesses
+        .values()
+        .flatten()
+        .any(|fact| fact.witness.awaited.is_some());
+    if present_generics || present_awaits {
+        let names = display::TypeNames::new(&snapshot);
+        if present_generics {
+            generics::present_types(&mut snapshot, &names);
+        }
+        if present_awaits {
+            display::present_witness_types(&mut snapshot, &names);
+        }
     }
     snapshot.revision = snapshot.digest()?;
     Ok(snapshot)

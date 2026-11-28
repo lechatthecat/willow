@@ -192,6 +192,13 @@ impl Cause {
     }
 }
 
+/// Live capture data, restored with other source types before presentation.
+#[derive(Debug, Clone)]
+pub(crate) struct AwaitType {
+    pub operand: Option<Type>,
+    pub parks: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Witness {
     pub kind: WitnessKind,
@@ -215,6 +222,8 @@ pub struct Witness {
         deserialize_with = "present_nullable"
     )]
     pub awaited_type: Option<Option<String>>,
+    #[serde(skip)]
+    pub(crate) awaited: Option<AwaitType>,
 }
 impl Witness {
     pub fn new(kind: WitnessKind) -> Self {
@@ -228,6 +237,7 @@ impl Witness {
             certainty: None,
             reason: None,
             awaited_type: None,
+            awaited: None,
         }
     }
     pub fn operation(&self) -> Option<&CapabilityOperation> {

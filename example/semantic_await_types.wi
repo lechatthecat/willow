@@ -1,0 +1,26 @@
+// Inspect this program with `willow effects semantic_await_types::main --source
+// example/semantic_await_types.wi --explain` to see readable nested await types.
+class Item {
+    pub value: i64;
+}
+
+class Box<T> {
+    pub value: T;
+}
+
+async fn make() -> Result<Box<Item>, String> {
+    return Ok(new Box<Item>(new Item(42)));
+}
+
+async fn relay() -> Result<Box<Item>, String> {
+    return await make();
+}
+
+async fn main() {
+    let task = relay();
+    let result = await task;
+    match result {
+        Ok(item) => { println(item.value.value); },
+        Err(message) => { println(message); },
+    }
+}

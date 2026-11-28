@@ -16,17 +16,54 @@ pub(super) struct TypeNames {
     local: HashMap<(String, String), String>,
 }
 
+fn package_names(snapshot: &Snapshot) -> HashMap<String, Option<String>> {
+    let mut packages = HashMap::new();
+    for (i, module) in snapshot.semantic.modules.iter().enumerate() {
+        let package = &module.identity.package;
+        // The entry module (index 0) belongs to the root package.
+        let name = (i != 0).then(|| package.name.clone());
+        packages
+            .entry(crate::semantic::ids::package_namespace(package))
+            .or_insert(name);
+    }
+    packages
+}
+
+/// Render restored source types after package attachment, using each witness's
+/// origin (not the querying caller). Consume live-only types before storage.
+pub(super) fn present_witness_types(snapshot: &mut Snapshot, names: &TypeNames) {
+    let modules: HashMap<_, _> = snapshot
+        .semantic
+        .modules
+        .iter()
+        .map(|module| (module.path.as_str(), module.identity.module.as_str()))
+        .collect();
+    for fact in snapshot.semantic.witnesses.values_mut().flatten() {
+        let witness = &mut fact.witness;
+        let Some(awaited) = witness.awaited.take() else {
+            continue;
+        };
+        let module = witness
+            .location()
+            .and_then(|location| modules.get(location.path.as_str()).copied());
+        let operand = awaited.operand.as_ref().map(|ty| names.awaited(ty, module));
+        let operand_name = operand.as_deref().unwrap_or("an unresolved operand type");
+        witness.reason = Some(if awaited.parks {
+            format!(
+                "In an async function, await of {operand_name} lowers to a scheduler suspension: the task parks until the awaited operation completes; no OS thread blocks."
+            )
+        } else {
+            format!(
+                "Conservative await bound for {operand_name}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes."
+            )
+        });
+        witness.awaited_type = Some(operand);
+    }
+}
+
 impl TypeNames {
     pub(super) fn new(snapshot: &Snapshot) -> Self {
-        let mut packages = HashMap::new();
-        for (i, module) in snapshot.semantic.modules.iter().enumerate() {
-            let package = &module.identity.package;
-            // The entry module (index 0) belongs to the root package.
-            let name = (i != 0).then(|| package.name.clone());
-            packages
-                .entry(crate::semantic::ids::package_namespace(package))
-                .or_insert(name);
-        }
+        let packages = package_names(snapshot);
         let root = snapshot
             .semantic
             .modules
@@ -217,6 +254,20 @@ impl TypeNames {
         out
     }
 
+    /// Keep the source unit spelling for task payloads; Future<void> retains
+    /// its existing spelling. All other nodes use the canonical type renderer.
+    fn awaited(&self, ty: &Type, module: Option<&str>) -> String {
+        match ty {
+            Type::Generic(name, args)
+                if matches!(args.as_slice(), [Type::Void])
+                    && crate::semantic::type_checker::awaitable_task_type(ty).is_some() =>
+            {
+                format!("{}<()>", self.name(name, module))
+            }
+            _ => self.render(ty, module),
+        }
+    }
+
     /// Generic binders belong to declarations, not to callable value types.
     /// Keep instantiated receiver/call types on the ordinary render path.
     pub(super) fn declaration(&self, symbol: &symbols::Symbol, ty: &Type) -> String {
@@ -285,6 +336,105 @@ thread_local! { static TYPE_VISITS: std::cell::Cell<usize> = const { std::cell::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn witness_type_projection_preserves_nullable_fields_and_storage() {
+        use super::super::evidence::{AwaitType, EffectFact, Witness, WitnessKind};
+        for count in [1, 16, 256, 1024] {
+            let operand = Type::Generic(
+                "Task".into(),
+                vec![Type::Generic(
+                    "Result".into(),
+                    vec![
+                        Type::Generic("$local::model::Box".into(), vec![Type::I64]),
+                        Type::String,
+                    ],
+                )],
+            );
+            let mut witness = Witness::new(WitnessKind::RuntimeCapability);
+            witness.awaited = Some(AwaitType {
+                operand: Some(operand),
+                parks: true,
+            });
+            let fact = EffectFact {
+                effect: 1,
+                witness,
+                paths: None,
+            };
+            let mut snapshot = Snapshot {
+                edit_context: None,
+                version: 1,
+                compiler: String::new(),
+                compatibility: String::new(),
+                workspace: String::new(),
+                revision: String::new(),
+                sources: BTreeMap::new(),
+                functions: vec![],
+                semantic: Default::default(),
+            };
+            let facts = snapshot
+                .semantic
+                .witnesses
+                .entry("unchanged-id".into())
+                .or_default();
+            facts.extend(std::iter::repeat_n(fact, count));
+            let mut unresolved = Witness::new(WitnessKind::RuntimeCapability);
+            unresolved.awaited = Some(AwaitType {
+                operand: None,
+                parks: false,
+            });
+            facts.push(EffectFact {
+                effect: 2,
+                witness: unresolved,
+                paths: None,
+            });
+            facts.push(EffectFact {
+                effect: 4,
+                witness: Witness::new(WitnessKind::Unavailable),
+                paths: None,
+            });
+            TYPE_VISITS.with(|visits| visits.set(0));
+            present_witness_types(&mut snapshot, &names());
+            assert_eq!(TYPE_VISITS.with(|visits| visits.get()), 5 * count);
+            let facts = &snapshot.semantic.witnesses["unchanged-id"];
+            assert_eq!(facts.len(), count + 2);
+            for fact in &facts[..count] {
+                assert_eq!(
+                    fact.witness.awaited_type.as_ref().unwrap().as_deref(),
+                    Some("Task<Result<model::Box<i64>, String>>")
+                );
+                assert_eq!(
+                    fact.witness.reason.as_deref(),
+                    Some(
+                        "In an async function, await of Task<Result<model::Box<i64>, String>> lowers to a scheduler suspension: the task parks until the awaited operation completes; no OS thread blocks."
+                    )
+                );
+                assert_eq!(fact.effect, 1);
+                assert!(fact.witness.awaited.is_none());
+            }
+            assert_eq!(facts[count].witness.awaited_type, Some(None));
+            assert_eq!(facts[count + 1].witness.awaited_type, None);
+            assert!(
+                facts[count]
+                    .witness
+                    .reason
+                    .as_deref()
+                    .unwrap()
+                    .starts_with("Conservative await bound for an unresolved operand type;")
+            );
+            let stored = serde_json::to_vec(&snapshot).unwrap();
+            let mut restored: Snapshot = serde_json::from_slice(&stored).unwrap();
+            present_witness_types(&mut restored, &names());
+            assert_eq!(TYPE_VISITS.with(|visits| visits.get()), 5 * count);
+            assert_eq!(stored, serde_json::to_vec(&restored).unwrap());
+            println!(
+                "witnesses={} rendered_type_nodes={} stored_bytes={}",
+                count + 2,
+                count * 5,
+                stored.len()
+            );
+        }
+    }
 
     fn names() -> TypeNames {
         let mut namespaces = crate::qualified_name::NameMetadata::default();

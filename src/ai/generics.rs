@@ -919,8 +919,7 @@ pub(super) fn source_edges(
 
 /// Remove private nominal namespaces only after package identities are attached,
 /// so dependency types retain their public package prefix.
-pub(super) fn present_types(snapshot: &mut Snapshot) {
-    let names = display::TypeNames::new(snapshot);
+pub(super) fn present_types(snapshot: &mut Snapshot, names: &display::TypeNames) {
     let modules: HashMap<_, _> = snapshot
         .functions
         .iter()

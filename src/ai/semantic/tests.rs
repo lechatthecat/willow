@@ -285,16 +285,43 @@ fn await_capture_keeps_summary_scans_bounded() {
         let function = FunctionId::free("worker");
         for _ in 0..n {
             captured.capability(function, RuntimeEffects::ALL.bits(), Span::dummy(), "await");
-            captured.await_type(function, Span::dummy(), Some("Future<void>"), true);
+            captured.await_type(
+                function,
+                Span::dummy(),
+                Some(&Type::Generic("Future".into(), vec![Type::Void])),
+                true,
+            );
         }
         assert_eq!(captured.suspension_sites[&function].len(), n);
         assert_eq!(
             captured.witnesses[&function].len(),
             RuntimeEffects::BIT_COUNT as usize
         );
+        let visits = std::cell::Cell::new(0);
+        captured.map_types(|_| {
+            visits.set(visits.get() + 1);
+            Type::Generic(
+                "Task".into(),
+                vec![Type::Generic("model::Box".into(), vec![Type::I64])],
+            )
+        });
+        assert_eq!(visits.get(), n + RuntimeEffects::BIT_COUNT as usize);
+        for fact in captured.witnesses[&function]
+            .iter()
+            .chain(&captured.suspension_sites[&function])
+        {
+            assert_eq!(
+                fact.witness.awaited.as_ref().unwrap().operand,
+                Some(Type::Generic(
+                    "Task".into(),
+                    vec![Type::Generic("model::Box".into(), vec![Type::I64])]
+                ))
+            );
+        }
         println!(
-            "awaits={n}, stored sites={n}, summary scan bound={}",
-            RuntimeEffects::BIT_COUNT
+            "awaits={n}, stored sites={n}, summary scan bound={}, restored_types={}",
+            RuntimeEffects::BIT_COUNT,
+            visits.get()
         );
     }
 }

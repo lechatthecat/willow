@@ -139,6 +139,21 @@ impl Captured {
                 }
             }
         }
+        for fact in self
+            .witnesses
+            .values_mut()
+            .flatten()
+            .chain(self.suspension_sites.values_mut().flatten())
+        {
+            if let Some(operand) = fact
+                .witness
+                .awaited
+                .as_mut()
+                .and_then(|awaited| awaited.operand.as_mut())
+            {
+                *operand = normalize(operand);
+            }
+        }
     }
     pub fn builtin_effect_paths(
         &mut self,
@@ -241,26 +256,19 @@ impl Captured {
         &mut self,
         function: FunctionId,
         span: Span,
-        operand: Option<&str>,
+        operand: Option<&Type>,
         parks: bool,
     ) {
-        let operand_name = operand.unwrap_or("an unresolved operand type");
-        let reason = if parks {
-            format!(
-                "In an async function, await of {operand_name} lowers to a scheduler suspension: the task parks until the awaited operation completes; no OS thread blocks."
-            )
-        } else {
-            format!(
-                "Conservative await bound for {operand_name}; waiting may park or block depending on the selected lowering. This summary does not establish which path executes."
-            )
+        let awaited = AwaitType {
+            operand: operand.cloned(),
+            parks,
         };
         // Summary witnesses retain one representative per effect. Preserve each
         // await independently, including when a lock already owns that bit.
         let mut witness = Witness::new(WitnessKind::RuntimeCapability);
         witness.certainty = Some(Certainty::ConservativeBound);
         witness.cause = Some(Cause::captured(span, CapabilityOperation::Await));
-        witness.awaited_type = Some(operand.map(str::to_owned));
-        witness.reason = Some(reason.clone());
+        witness.awaited = Some(awaited.clone());
         self.suspension_sites
             .entry(function)
             .or_default()
@@ -276,8 +284,7 @@ impl Captured {
                     matches!(cause.source, CauseSource::Captured { span: site }
                     if (site.file_id, site.start, site.end) == (span.file_id, span.start, span.end))
                 }) {
-                    witness.awaited_type = Some(operand.map(str::to_owned));
-                    witness.reason = Some(reason.clone());
+                    witness.awaited = Some(awaited.clone());
                 }
             }
         }
