@@ -61,6 +61,9 @@ jobs:
       - name: Willow lib tests
         if: always()
         run: cargo test --locked -p willow --lib
+      - name: Integration tests
+        if: always()
+        run: cargo test --locked --test integration --no-fail-fast -- --skip runtime::examples::test_runnable_example_files_compile_and_run
       - name: Runnable example audit
         if: always()
         run: cargo test --locked --test integration runtime::examples::test_runnable_example_files_compile_and_run -- --exact --nocapture
