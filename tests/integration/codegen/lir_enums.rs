@@ -139,7 +139,7 @@ fn main() {
     println(to_f(Val::Nothing));
 }
 "#,
-        "3.5\n4.25\n-1\n",
+        "3.5\n4.25\n-1.0\n",
     );
 }
 

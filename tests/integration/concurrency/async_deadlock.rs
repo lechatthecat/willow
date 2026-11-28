@@ -169,6 +169,36 @@ fn permanent_wait_compile_witnesses() {
 }
 
 #[test]
+fn permanent_wait_output_aliases_keep_cached_witnesses() {
+    for (imports, output) in [
+        ("", "print"),
+        ("", "std::io::print"),
+        ("", "std::io::println"),
+        ("import std::io as out;", "out::print"),
+        ("import std::io as out;", "out::println"),
+        ("import std::io::print as write;", "write"),
+        ("import std::io::println as line;", "line"),
+    ] {
+        let source =
+            format!("{imports} fn main() {{ let ch = Channel<i64>::new(); {output}(ch.recv()); }}");
+        let project = TestProject::new("output_wait_witness", &[("main.wi", &source)]);
+        for _ in 0..2 {
+            let result = project.compile("main.wi");
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            assert!(!result.status.success(), "{source}");
+            assert!(
+                stderr.contains("E2607") && stderr.contains("witness"),
+                "{source}: {stderr}"
+            );
+            assert!(
+                !stderr.contains("E2402") && !stderr.contains("E2403"),
+                "{stderr}"
+            );
+        }
+    }
+}
+
+#[test]
 fn permanent_wait_valid_example() {
     let project = TestProject::new(
         "permanent_wait_escapes",

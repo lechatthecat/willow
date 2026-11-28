@@ -968,7 +968,7 @@ impl TypeChecker {
     /// argument types computed here instead of walking the arguments again.
     pub(in crate::semantic::type_checker) fn check_inferred_generic_new(
         &mut self,
-        n: &NewExpr,
+        n: &Construction<'_>,
     ) -> Option<Type> {
         // No argument can fix a type parameter; the explicit-arguments
         // diagnostic says what to write.
@@ -984,7 +984,7 @@ impl TypeChecker {
         #[cfg(test)]
         GENERIC_NEW_INFERENCES.with(|count| count.set(count.get() + 1));
         if params.len() != n.args.len() {
-            for arg in &n.args {
+            for arg in n.args {
                 self.check_expr(&arg.expr);
             }
             self.push(
@@ -1039,7 +1039,7 @@ impl TypeChecker {
             GenericCallSite {
                 callee: "",
                 type_args: &[],
-                call_args: &n.args,
+                call_args: n.args,
                 span: n.span,
                 context: CallContext {
                     expected: None,
@@ -1049,7 +1049,7 @@ impl TypeChecker {
         );
         let Some(checked) = self.infer_generic_call_arguments(
             &signature,
-            &n.args,
+            n.args,
             n.span,
             &parameter_names,
             arguments,

@@ -29,7 +29,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
-    assert_eq!(out.trim(), "10");
+    assert_eq!(out.trim(), "10.0");
 }
 
 #[test]

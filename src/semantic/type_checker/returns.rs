@@ -1,11 +1,7 @@
 //! Every path out of a value-returning body must be a `return`.
 //!
-//! Willow has no implicit tail expression: a body produces its value only
-//! through a `return` statement. Nothing used to check that one was reached, so
-//! a function declared `-> i64` whose body ran off the bottom compiled clean and
-//! handed the caller the zero value of the return type. The failure surfaced far
-//! from its cause as a plausible wrong answer — a missing `return match s {...}`
-//! reads exactly like a downcast that never matched.
+//! Callable tail expressions are lowered to returns by the parser. Explicit
+//! semicolons discard values; a declared result still needs a return on every path.
 //!
 //! The analysis here asks the opposite question of a data-flow one: not "is a
 //! value assigned" but "can control reach the closing brace at all". A body is
@@ -137,8 +133,7 @@ impl TypeChecker {
                 },
             ))
             .with_help(
-                "end every path with `return <value>;` — Willow has no implicit tail \
-                 expression, so a trailing `match` or `if` needs its own `return`",
+                "end every path with `return <value>;` or a tail expression without `;`; remove the final `;` to return its value",
             ),
         );
     }

@@ -370,12 +370,12 @@ impl TypeChecker {
                 checked,
             );
         }
-        if let Expr::New(n) = expr {
+        if let Some(n) = self.construction(expr) {
             let generation = self.error_generation;
-            if let Some(ty) = self.contextual_new_type(n, expected) {
+            if let Some(ty) = self.contextual_new_type(&n, expected) {
                 let ty = if let Type::Named(name) = &ty {
                     self.generics.objects.insert(n.id, name.clone());
-                    self.check_new_with_effects(n, name, checked)
+                    self.check_new_with_effects(&n, name, checked)
                 } else {
                     ty
                 };

@@ -445,3 +445,6 @@ mod scalar_widths;
 
 #[path = "integration/static_task_sharing.rs"]
 mod static_task_sharing;
+
+#[path = "integration/concise_surface.rs"]
+mod concise_surface;

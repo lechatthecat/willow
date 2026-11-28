@@ -744,8 +744,6 @@ impl<'a> Lexer<'a> {
             "for" => TokenKind::For,
             "in" => TokenKind::In,
             "return" => TokenKind::Return,
-            "print" => TokenKind::Print,
-            "println" => TokenKind::Println,
             "true" => TokenKind::True,
             "false" => TokenKind::False,
             "nil" => TokenKind::Nil,

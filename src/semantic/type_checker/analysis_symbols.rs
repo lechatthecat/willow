@@ -480,6 +480,45 @@ impl TypeChecker {
         if !self.capture_call_sites {
             return;
         }
+        if let Some(newline) = self.output_function(expr) {
+            let (local, written, args) = match expr {
+                Expr::Call(c) => (c.callee.as_str(), c.callee.as_str(), c.args.as_slice()),
+                Expr::StaticCall(c) => (c.class.as_str(), c.method.as_str(), c.args.as_slice()),
+                _ => unreachable!(),
+            };
+            self.record_import_use(local, expr.span());
+            let name = if newline { "println" } else { "print" };
+            self.analysis_symbols.reference(
+                expr.span(),
+                written,
+                Declaration::new(name, "builtin-function", Span::dummy(), None),
+                "call",
+                false,
+            );
+            if let Some(ty) = args
+                .first()
+                .and_then(|arg| self.expr_types.get(&arg.expr.id()))
+            {
+                self.analysis_symbols.references.last_mut().unwrap().ty =
+                    Some(Type::Fn(vec![ty.clone()], Box::new(Type::Void)));
+            }
+            return;
+        }
+        if self.constructor_calls.contains(&expr.id())
+            && let Some(ty) = self.expr_types.get(&expr.id()).cloned()
+        {
+            match expr {
+                Expr::New(call) => self.record_type_use(&call.class_name, &ty, call.span),
+                Expr::Call(call) => self.record_type_use(&call.callee, &ty, call.span),
+                Expr::StaticCall(call) => self.record_type_use(
+                    &format!("{}::{}", call.class, call.method),
+                    &ty,
+                    call.span,
+                ),
+                _ => {}
+            }
+            return;
+        }
         match expr {
             Expr::Var(name, span, _) => {
                 self.record_binding_use(name, *span, "read");

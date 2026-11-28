@@ -1014,9 +1014,6 @@ fn interface_generic_two_type_params() {
 
 #[test]
 fn interface_02_pub_interface() {
-    // NB: `print`/`println` are builtin keywords and cannot be method names
-    // (a pre-existing limitation that also applies to class methods), so the
-    // method here is `render`.
     let p = parse_ok("pub interface Printable { fn render(self); }");
     let i = first_interface(&p);
     assert!(i.public);
@@ -1335,8 +1332,6 @@ fn classify_after_question(kind: &TokenKind) -> AfterQuestion {
             | TokenKind::Match
             | TokenKind::Await
             | TokenKind::Select
-            | TokenKind::Print
-            | TokenKind::Println
             | TokenKind::I8 | TokenKind::I16 | TokenKind::I32 | TokenKind::U16 | TokenKind::U32 | TokenKind::U64 | TokenKind::Char
             | TokenKind::U8 | TokenKind::I64
             | TokenKind::F64 => AfterQuestion::Ternary,
@@ -1437,8 +1432,6 @@ fn all_token_kinds() -> Vec<TokenKind> {
         TokenKind::For,
         TokenKind::In,
         TokenKind::Return,
-        TokenKind::Print,
-        TokenKind::Println,
         TokenKind::True,
         TokenKind::False,
         TokenKind::Nil,

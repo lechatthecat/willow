@@ -229,16 +229,24 @@ fn match_arm_valid_and_context_boundaries() {
     }
     for source in [
         "fn main() { 1 }",
-        "fn main() { match true { _ => { let y = 1 } } }",
-        "fn main() { match true { _ => { while true { 1 } } } }",
         "fn main() { match true { _ => {} } 1 }",
         "fn main() { match true { _ => { match false { _ => {} } } } 1 }",
     ] {
+        assert!(errors(source).is_empty(), "{source}: {:?}", errors(source));
+    }
+    for (source, expected) in [
+        (
+            "fn main() { match true { _ => { let y = 1 } } }",
+            "expected `;` after statement",
+        ),
+        (
+            "fn main() { match true { _ => { while true { 1 } } } }",
+            "tail position",
+        ),
+    ] {
         let diagnostics = errors(source);
         assert!(
-            diagnostics
-                .iter()
-                .any(|e| e.message == "expected `;` after statement"),
+            diagnostics.iter().any(|e| e.message.contains(expected)),
             "{source}: {diagnostics:?}"
         );
         assert!(
@@ -389,15 +397,16 @@ fn block_arm_control_conditional_context_restores_on_failure() {
     assert!(parser.parse_if().is_err());
     assert_eq!(parser.match_arm_block_depth, Some(0));
     assert_eq!(parser.match_arm_conditional_depth, Some(42));
+    assert!(errors("fn main() { if true { 1 } else { 2 } }").is_empty());
     for source in [
-        "fn main() { if true { 1 } else { 2 } }",
+        "fn main() { if true { 1 } else { 2 } println(3); }",
         "fn main() { match true { _ => { while true { if true { 1 } } } } }",
     ] {
         let diagnostics = errors(source);
         assert!(
             diagnostics
                 .iter()
-                .any(|d| d.message == "expected `;` after statement")
+                .any(|d| d.message.contains("tail position"))
         );
         assert!(
             diagnostics

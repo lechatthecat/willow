@@ -298,7 +298,7 @@ fn native_sync_stack_boundary_value_shapes() {
         ),
         (
             "fn plus(x: f64) -> f64 { return x + 0.5; } async fn main() { println(plus(1.5)); }",
-            "2\n",
+            "2.0\n",
         ),
         (
             "fn suffix(x: String) -> String { return x + \"!\"; } async fn main() { println(suffix(\"hello\")); }",

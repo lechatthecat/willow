@@ -7,7 +7,7 @@ use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::builtin_types::{self, BuiltinTypeId as B};
-use crate::semantic::ids::TypeId;
+use crate::semantic::ids::{FunctionId, TypeId};
 use crate::semantic::intrinsics::{BuiltinCalls, Intrinsic};
 
 #[derive(Default, Debug)]
@@ -93,6 +93,7 @@ fn summarize(
     types: &HashMap<ExprId, Type>,
     owners: &HashMap<ExprId, TypeId>,
     builtin_calls: &BuiltinCalls,
+    resolved_calls: &HashMap<ExprId, Option<FunctionId>>,
     counts: &mut Counts,
 ) -> Option<Summary> {
     if !f.type_params.is_empty()
@@ -170,6 +171,26 @@ fn summarize(
                 };
                 match e {
                     Expr::Var(name, ..) => out = *names.get(name.as_str())?,
+                    Expr::Call(_) | Expr::StaticCall(_)
+                        if resolved_calls.get(&e.id()).copied().flatten().is_some_and(
+                            |target| {
+                                target.is_method_of("$output")
+                                    && matches!(target.name().as_ref(), "print" | "println")
+                            },
+                        ) =>
+                    {
+                        // The postorder walk already summarized the argument,
+                        // including any receive/call. Output itself neither
+                        // invalidates the region nor makes this a non-leaf body.
+                        let value = match e {
+                            Expr::Call(c) => &c.args.first()?.expr,
+                            Expr::StaticCall(c) => &c.args.first()?.expr,
+                            _ => unreachable!(),
+                        };
+                        if tracked(value, types) {
+                            summary.ops.push(Op::Escape(*values.get(&value.id())?));
+                        }
+                    }
                     Expr::StaticCall(c)
                         if builtin(e, B::Channel)
                             && owners.get(&c.id).is_some_and(|owner| {
@@ -501,6 +522,7 @@ pub(crate) fn check(
     types: &HashMap<ExprId, Type>,
     owners: &HashMap<ExprId, TypeId>,
     builtin_calls: &BuiltinCalls,
+    resolved_calls: &HashMap<ExprId, Option<FunctionId>>,
 ) -> Analysis {
     let mut result = Analysis::default();
     let functions: Vec<_> = program
@@ -521,7 +543,17 @@ pub(crate) fn check(
         .collect();
     let summaries: Vec<_> = functions
         .iter()
-        .map(|f| summarize(f, &index, types, owners, builtin_calls, &mut result.counts))
+        .map(|f| {
+            summarize(
+                f,
+                &index,
+                types,
+                owners,
+                builtin_calls,
+                resolved_calls,
+                &mut result.counts,
+            )
+        })
         .collect();
     // A helper may be detached, cancelled or bounded by its caller's select.
     // Only the actual entry's reachable wait chain establishes a program wait.

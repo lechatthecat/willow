@@ -782,6 +782,7 @@ impl TypeChecker {
                         &self.expr_types,
                         &|name| self.declaration_name_key(name),
                         &graph,
+                        &self.analysis_calls,
                     ),
                     std::sync::Arc::clone(&imports),
                 ),
@@ -792,6 +793,7 @@ impl TypeChecker {
                 &self.expr_types,
                 &|name| self.declaration_name_key(name),
                 &graph,
+                &self.analysis_calls,
             );
             for diagnostic in diagnostics {
                 self.push(diagnostic);
@@ -880,6 +882,7 @@ impl TypeChecker {
                         indirect: &self.indirect_lock,
                         types: &self.expr_types,
                         calls: &self.analysis_calls,
+                        constructors: &self.constructor_calls,
                         patterns: &self.pattern_resolutions,
                         symbols: &self.analysis_symbols,
                     },

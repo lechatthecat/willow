@@ -89,7 +89,7 @@ impl TypeChecker {
     /// Inspect the outer logical type; do not traverse or clone the expression tree.
     pub(in crate::semantic::type_checker) fn contextual_new_type(
         &mut self,
-        n: &NewExpr,
+        n: &Construction<'_>,
         expected: &Type,
     ) -> Option<Type> {
         if !n.type_args.is_empty() || !self.generics.classes.contains_key(&n.class_name) {

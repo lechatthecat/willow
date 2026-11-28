@@ -310,5 +310,5 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(source);
     assert!(ok, "{out}");
-    assert_eq!(out, "-1\n0\n3\ntrue\ntrue\nfalse\n");
+    assert_eq!(out, "-1.0\n0.0\n3.0\ntrue\ntrue\nfalse\n");
 }

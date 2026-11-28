@@ -129,7 +129,7 @@ fn main() { run(new A()); run(new B()); }
 "#;
     let (out, ok) = compile_and_run_release(source);
     assert!(ok, "{out}");
-    assert_eq!(out, "12\n2\n13\n3\n");
+    assert_eq!(out, "12\n2.0\n13\n3.0\n");
 }
 
 #[test]

@@ -1,7 +1,7 @@
 use super::*;
 use crate::lexer::Lexer;
 
-const KEYWORDS: &str = "fn let mut if else while break continue defer for in return print println true false nil class pub prot override static new extends interface implements self import module as async await select match enum const i64 f64 bool";
+const KEYWORDS: &str = "fn let mut if else while break continue defer for in return true false nil class pub prot override static new extends interface implements self import module as async await select match enum const i64 f64 bool";
 
 #[test]
 fn keyword_identifier_diagnostics_all_spellings() {
@@ -126,9 +126,16 @@ fn keyword_diagnostics_in_declarations_members_locals_and_fields() {
 }
 
 #[test]
-fn builtin_method_names_recover_without_receiver_cascades() {
+fn output_function_names_are_ordinary_identifiers() {
     for keyword in ["print", "println"] {
+        let tokens = Lexer::new(keyword).tokenize().unwrap();
+        assert_eq!(tokens[0].kind, TokenKind::Ident(keyword.into()));
+        assert_eq!(tokens[0].kind.keyword_name(), None);
         for source in [
+            format!("fn {keyword}(v: i64) -> i64 {{ return v; }} fn after() {{}}"),
+            format!("fn f({keyword}: i64) {{ let value = {keyword}; }} fn after() {{}}"),
+            format!("fn f() {{ let {keyword} = |v: i64| v; {keyword}(1); }} fn after() {{}}"),
+            format!("class C {{ pub {keyword}: i64; }} fn after() {{}}"),
             format!(
                 "interface Printer {{ fn {keyword}(self, v: Json) -> String; fn name(self) -> String; }} fn after() {{}}"
             ),
@@ -143,12 +150,7 @@ fn builtin_method_names_recover_without_receiver_cascades() {
         ] {
             let tokens = Lexer::new(&source).tokenize().unwrap();
             let (program, errors) = Parser::new(tokens).parse();
-            assert_eq!(errors.len(), 1, "{source}: {errors:?}");
-            assert!(errors[0].message.contains("builtin function name"));
-            assert_eq!(
-                errors[0].primary_span().unwrap().start,
-                source.find(keyword).unwrap()
-            );
+            assert!(errors.is_empty(), "{source}: {errors:?}");
             assert!(
                 program
                     .items
@@ -158,7 +160,9 @@ fn builtin_method_names_recover_without_receiver_cascades() {
             for item in &program.items {
                 match item {
                     ast::Item::Interface(i) => assert_eq!(i.methods[1].name, "name"),
-                    ast::Item::Class(c) => assert_eq!(c.methods[1].name, "name"),
+                    ast::Item::Class(c) if !c.methods.is_empty() => {
+                        assert_eq!(c.methods[1].name, "name");
+                    }
                     _ => {}
                 }
             }
@@ -167,7 +171,7 @@ fn builtin_method_names_recover_without_receiver_cascades() {
 }
 
 #[test]
-fn builtin_method_recovery_token_reads_scale_linearly() {
+fn output_method_token_reads_scale_linearly() {
     let mut samples = Vec::new();
     for n in [8, 16, 32, 64] {
         let source = format!(
@@ -175,14 +179,14 @@ fn builtin_method_recovery_token_reads_scale_linearly() {
             "fn print(self);".repeat(n)
         );
         PARSER_TOKEN_READS.with(|count| count.set(0));
-        assert_eq!(parse_errors(&source).len(), n);
+        parse_ok(&source);
         samples.push((n, PARSER_TOKEN_READS.with(|count| count.get())));
     }
     let slope = (samples[1].1 - samples[0].1) / 8;
     for pair in samples.windows(2) {
         assert_eq!(pair[1].1 - pair[0].1, slope * (pair[1].0 - pair[0].0));
     }
-    eprintln!("builtin recovery token reads: {samples:?}");
+    eprintln!("ordinary output method token reads: {samples:?}");
 }
 
 #[test]

@@ -862,7 +862,7 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
         ),
         ("fn main() { let old = 1; println(old); }", "old"),
     ] {
-        for keyword in ["if", "class", "return", "i64", "print", "println"] {
+        for keyword in ["if", "class", "return", "i64"] {
             let f = Fixture::new(source);
             let result = f.run(&["rename", selector, keyword], 1);
             assert!(
@@ -872,15 +872,37 @@ fn rename_keywords_name_the_reserved_word_for_all_target_kinds() {
                     .contains(&format!("'{keyword}' is a reserved keyword")),
                 "{result}"
             );
-            if matches!(keyword, "print" | "println") {
-                assert!(
-                    result["message"]
-                        .as_str()
-                        .unwrap()
-                        .contains("builtin function name")
-                );
-            }
             assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        }
+    }
+}
+
+#[test]
+fn rename_to_output_function_names_for_all_target_kinds() {
+    for (source, selector) in [
+        ("fn old() {} fn main() { old(); }", "old"),
+        (
+            "class A { pub old: i64; } fn main() { let a = new A(1); std::io::println(a.old); }",
+            "main::A::old",
+        ),
+        (
+            "class A { pub fn old(self) {} } fn main() { new A().old(); }",
+            "main::A::old",
+        ),
+        ("fn main() { let old = 1; std::io::println(old); }", "old"),
+        (
+            "fn main() { let old = |v: i64| v; std::io::println(old(1)); }",
+            "old",
+        ),
+    ] {
+        for name in ["print", "println"] {
+            let f = Fixture::new(source);
+            let result = f.run(&["rename", selector, name], 0);
+            assert_eq!(result["result"]["validation"], "passed", "{result}");
+            assert_eq!(
+                fs::read_to_string(f.0.join("main.wi")).unwrap(),
+                source.replace("old", name),
+            );
         }
     }
 }
@@ -1426,4 +1448,68 @@ fn type_parameter_constraints_interfaces_and_explicit_arguments() {
     assert!(changed.contains("where Element: i64 | f64"));
     assert!(changed.contains("identity<Element>(value)"));
     assert!(changed.contains("fn identity<T>"));
+}
+
+#[test]
+fn concise_qualified_constructor_references_preserve_module_and_alias_tokens() {
+    for (import, call, token, declaration) in [
+        (
+            "import model;",
+            "model::User(1)",
+            "User",
+            "pub class User { pub score: i64; }",
+        ),
+        (
+            "import model;",
+            "model::User<i64>(1)",
+            "User",
+            "pub class User<T> { pub score: T; }",
+        ),
+        (
+            "import model as m;",
+            "m::User<i64>(1)",
+            "User",
+            "pub class User<T> { pub score: T; }",
+        ),
+        (
+            "import model as m;",
+            "m::User(1)",
+            "User",
+            "pub class User { pub score: i64; }",
+        ),
+        (
+            "import model::User as U;",
+            "U(1)",
+            "U",
+            "pub class User { pub score: i64; }",
+        ),
+    ] {
+        let source = format!("{import} fn main() {{ println({call}.score); }}");
+        let f = Fixture::new(&source);
+        f.write("model.wi", declaration);
+        let result = f.run(&["refs", "model::User"], 0);
+        let expected_start = source.find(call).unwrap() + call.find(token).unwrap();
+        let references = result["result"]["references"].as_array().unwrap();
+        assert!(
+            references
+                .iter()
+                .any(|r| r["location"]["start"] == expected_start),
+            "{source}: {result}"
+        );
+        // Class rename is deliberately unsupported by the existing CLI. It
+        // must reject without modifying either spelling or the module token.
+        let result = f.run(&["rename", "model::User", "Person"], 1);
+        assert!(
+            result["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported rename target")
+        );
+        assert_eq!(fs::read_to_string(f.0.join("main.wi")).unwrap(), source);
+        assert!(
+            fs::read_to_string(f.0.join("model.wi"))
+                .unwrap()
+                .contains("class User")
+        );
+    }
 }

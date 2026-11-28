@@ -65,7 +65,7 @@ fn clo_03_a_string_capture_is_a_gc_reference() {
 fn clo_04_an_f64_capture_keeps_its_representation() {
     assert_program_output(
         "fn main() { let r = 1.5; let f = |x: f64| x * r; println(f(4.0)); }",
-        "6\n",
+        "6.0\n",
     );
 }
 
@@ -509,7 +509,7 @@ fn mutable_capture_bool() {
 fn mutable_capture_float() {
     assert_program_output(
         r#"fn main() { let mut v = 1.5; let f = || { v = v + 0.5; }; f(); println(v); }"#,
-        "2\n",
+        "2.0\n",
     );
 }
 

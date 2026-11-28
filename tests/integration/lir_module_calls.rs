@@ -448,7 +448,7 @@ fn main() {
 "#,
         ),
     ];
-    assert_module_call(&files, "6\n", &["main"]);
+    assert_module_call(&files, "6.0\n", &["main"]);
 }
 
 #[test]

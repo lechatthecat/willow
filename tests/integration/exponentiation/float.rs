@@ -15,7 +15,7 @@ fn main() {
 "#,
     );
     assert!(ok, "native f64 power should compile: {out}");
-    assert_eq!(out, "8\n1.414213562373095\n");
+    assert_eq!(out, "8.0\n1.414213562373095\n");
 
     let mixed_stderr = compile_error_stderr(
         r#"
@@ -155,8 +155,8 @@ fn main() {
     assert!(ok, "special matrix failed: {out}");
     assert_eq!(
         out,
-        "1\n1\n1\n1\ntrue\n-0\n0\n-Infinity\n0\nInfinity\n-Infinity\n\
-         Infinity\nInfinity\n0\n-Infinity\nInfinity\n"
+        "1.0\n1.0\n1.0\n1.0\ntrue\n-0.0\n0.0\n-Infinity\n0.0\nInfinity\n-Infinity\n\
+         Infinity\nInfinity\n0.0\n-Infinity\nInfinity\n"
     );
 }
 
@@ -275,7 +275,7 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(
         out,
-        "1.414213562373095\n-128\n2.7182818284590446\n9.513656920021768\n"
+        "1.414213562373095\n-128.0\n2.7182818284590446\n9.513656920021768\n"
     );
 }
 
@@ -291,7 +291,7 @@ fn main() { println(compatibility(9.0, 0.5)); }
         &[],
     );
     assert!(ok, "LIR compatibility calls failed: {out}");
-    assert_eq!(out, "6\n");
+    assert_eq!(out, "6.0\n");
 }
 
 #[test]

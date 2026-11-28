@@ -373,7 +373,7 @@ fn main() {
 ",
             ),
         ],
-        "main\n3\nfalse\n4\nmain\n",
+        "main\n3.0\nfalse\n4\nmain\n",
     );
 }
 

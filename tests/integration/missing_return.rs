@@ -1,12 +1,8 @@
 //! E0205: a body that owes its caller a value must not run off the end.
 //!
 //!
-//! Willow has no implicit tail expression — a body produces its value only
-//! through `return` — and nothing used to check that one was reached. A
-//! function declared `-> i64` whose body just ended compiled clean and handed
-//! the caller the zero of the return type, so a missing `return match s { ... }`
-//! read exactly like a downcast that never matched and sent debugging in the
-//! wrong direction.
+//! Callable tail expressions return values. An explicit semicolon discards
+//! the expression; such a body still needs an explicit return on every path.
 //!
 //! The check is a reachability question, not a data-flow one: can control get to
 //! the closing brace? Three things stop it — a `return`, a call declared to
@@ -110,8 +106,7 @@ fn main() { println(g(0 - 1)); }
 }
 
 // 3. The shape that motivated the bug report: a trailing `match` written as if
-//    it were a tail expression. Every arm produces the right type and the whole
-//    thing still returns 0.
+//    it were a tail expression, but the semicolon explicitly discards it.
 #[test]
 fn missing_return_03_a_trailing_statement_match() {
     assert_missing_return(
@@ -120,7 +115,7 @@ fn which(s: Shape) -> i64 {
     match s {
         Square(sq) => sq,
         _ => 0 - 1,
-    }
+    };
 }
 fn main() { println(which(Shape::Square(4))); }
 ",

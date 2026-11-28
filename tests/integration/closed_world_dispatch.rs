@@ -85,7 +85,7 @@ fn closed_world_singleton_abis_and_allocations() {
     let source = include_str!("../../tests/regressions/closed_world_dispatch.wi");
     let (output, ok) = compile_and_run_release(source);
     assert!(ok, "{output}");
-    assert_eq!(output, "12\n2\nitem!\n7\n");
+    assert_eq!(output, "12\n2.0\nitem!\n7\n");
 }
 
 #[test]
@@ -165,7 +165,10 @@ fn closed_world_singleton_release_gc_and_debug_control() {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(String::from_utf8_lossy(&output.stdout), "12\n2\nitem!\n7\n");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "12\n2.0\nitem!\n7\n"
+        );
     }
 }
 

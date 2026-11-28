@@ -101,7 +101,7 @@ fn main() {
 "#,
     );
     assert!(ok);
-    assert_eq!(out, "4\n");
+    assert_eq!(out, "4.0\n");
 }
 
 // pop then push reuses the array correctly.

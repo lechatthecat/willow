@@ -667,22 +667,6 @@ impl Parser {
                 self.advance();
                 Ok(Expr::String(value, span, ExprId::fresh()))
             }
-            TokenKind::Print => {
-                let span = self.current_span();
-                self.advance();
-                self.expect(TokenKind::LParen)?;
-                let arg = self.parse_expr()?;
-                self.expect(TokenKind::RParen)?;
-                Ok(Expr::Print(Box::new(arg), false, span, ExprId::fresh()))
-            }
-            TokenKind::Println => {
-                let span = self.current_span();
-                self.advance();
-                self.expect(TokenKind::LParen)?;
-                let arg = self.parse_expr()?;
-                self.expect(TokenKind::RParen)?;
-                Ok(Expr::Print(Box::new(arg), true, span, ExprId::fresh()))
-            }
             TokenKind::SelfKw => {
                 let span = self.current_span();
                 self.advance();
@@ -933,30 +917,6 @@ impl Parser {
         let method_span = self.previous_span();
         if self.eat(TokenKind::LParen) {
             let args = self.parse_call_args_after_lparen()?;
-            if parts.as_slice() == ["std", "io", "print"]
-                || parts.as_slice() == ["std", "io", "println"]
-            {
-                let newline = parts.last().is_some_and(|name| name == "println");
-                if args.len() != 1 {
-                    return Ok(Expr::StaticCall(Box::new(StaticCallExpr {
-                        class: "std::io".to_string(),
-                        type_args: vec![],
-                        method: parts.last().cloned().unwrap_or_default(),
-                        args,
-                        span: span.to(self.previous_span()),
-                        id: ExprId::fresh(),
-                        method_span,
-                    })));
-                }
-                let mut args = args;
-                return Ok(Expr::Print(
-                    Box::new(args.remove(0).expr),
-                    newline,
-                    span,
-                    ExprId::fresh(),
-                ));
-            }
-
             let Some(method) = parts.pop() else {
                 return Err(self.err(ErrorCode::E0102, "expected std item path"));
             };
@@ -1396,7 +1356,7 @@ impl Parser {
         }
         // Body: `{ block }` or expression
         let body = if self.check(TokenKind::LBrace) {
-            LambdaBody::Block(self.parse_block()?)
+            LambdaBody::Block(self.parse_callable_block()?)
         } else {
             LambdaBody::Expr(Box::new(self.parse_expr()?))
         };

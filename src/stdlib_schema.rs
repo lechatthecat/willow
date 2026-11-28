@@ -288,7 +288,7 @@ pub const STDLIB_SCHEMA: &[StdModuleSchema] = &[
 
 /// Builtin modules whose items are runtime functions called as
 /// `module::function(...)`. Console output (`io`) is excluded: its functions
-/// are overloaded syntax rather than namespace calls.
+/// use polymorphic argument checking and typed output intrinsics.
 pub const FUNCTION_MODULES: &[&str] = &["time", "env", "fs", "net", "parallel", "text", "path"];
 
 pub fn is_function_module(name: &str) -> bool {

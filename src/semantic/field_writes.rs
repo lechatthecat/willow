@@ -36,12 +36,43 @@ use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::scopes::Scopes;
 
+/// A syntactic receiver keeps call spelling until build-wide declarations are
+/// available. Function declarations take precedence over concise constructors.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum ReceiverName {
+    Declared(String),
+    Call(String),
+}
+
+impl From<&str> for ReceiverName {
+    fn from(name: &str) -> Self {
+        Self::Declared(name.to_owned())
+    }
+}
+
+impl ReceiverName {
+    pub(crate) fn resolve(
+        &self,
+        file: FileId,
+        classes: &DeclNames<'_>,
+        functions: &DeclNames<'_>,
+    ) -> Option<usize> {
+        match self {
+            Self::Declared(name) => classes.lookup(file, name),
+            Self::Call(name) if functions.lookup(file, name).is_none() => {
+                classes.lookup(file, name)
+            }
+            Self::Call(_) => None,
+        }
+    }
+}
+
 /// One syntactic field write. `self_class` is the receiver's nominal type
 /// spelling in `file` (also used for `self`); `None` means unresolved.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct RawFieldWrite {
     pub(crate) file: FileId,
-    pub(crate) self_class: Option<String>,
+    pub(crate) self_class: Option<ReceiverName>,
     pub(crate) field: String,
     pub(crate) kind: WriteKind,
 }
@@ -106,6 +137,13 @@ impl FieldWrites {
         let programs: Vec<_> = programs.into_iter().collect();
         let mut resolver = Resolver::new(programs.iter().flat_map(|(_, p)| classes(p)));
         resolver.names.dependencies = dependencies;
+        resolver.functions = DeclNames::new(programs.iter().flat_map(|(_, program)| {
+            program.items.iter().filter_map(|item| match item {
+                Item::Function(function) => Some((function.span.file_id, function.name.as_str())),
+                _ => None,
+            })
+        }));
+        resolver.functions.dependencies = dependencies;
         for (namespace, program) in programs {
             for class in classes(program) {
                 let id = resolver
@@ -114,7 +152,17 @@ impl FieldWrites {
                     .expect("indexed class");
                 resolver.names.qualify(namespace, &class.name, id);
             }
+            for item in &program.items {
+                if let Item::Function(function) = item {
+                    let id = resolver
+                        .functions
+                        .local(function.span.file_id, &function.name)
+                        .expect("indexed function");
+                    resolver.functions.qualify(namespace, &function.name, id);
+                }
+            }
             resolver.names.add_imports(program);
+            resolver.functions.add_imports(program);
         }
         resolver.resolve(writes).0
     }
@@ -228,6 +276,7 @@ impl<'a> DeclNames<'a> {
 struct Resolver<'a> {
     classes: Vec<&'a ClassDecl>,
     names: DeclNames<'a>,
+    functions: DeclNames<'a>,
     fields: Vec<HashMap<&'a str, Span>>,
     bases: Vec<Option<Result<usize, ()>>>,
     escaping: HashSet<usize>,
@@ -251,6 +300,7 @@ impl<'a> Resolver<'a> {
         Self {
             classes,
             names,
+            functions: DeclNames::new([]),
             fields,
             bases: Vec::new(),
             escaping: HashSet::new(),
@@ -280,8 +330,8 @@ impl<'a> Resolver<'a> {
             if write.kind == WriteKind::InitEscapes
                 && let Some(id) = write
                     .self_class
-                    .as_deref()
-                    .and_then(|name| self.class(write.file, name))
+                    .as_ref()
+                    .and_then(|name| name.resolve(write.file, &self.names, &self.functions))
             {
                 self.escaping.insert(id);
             }
@@ -305,8 +355,8 @@ impl<'a> Resolver<'a> {
             }
             let owner = write
                 .self_class
-                .as_deref()
-                .and_then(|name| self.class(write.file, name));
+                .as_ref()
+                .and_then(|name| name.resolve(write.file, &self.names, &self.functions));
             let Some(id) = owner else {
                 summary.by_name.insert(write.field.clone());
                 continue;
@@ -507,13 +557,13 @@ pub(crate) fn for_each_body<'a>(
 
 struct Collector<'a> {
     context: WriteContext<'a>,
-    bindings: Scopes<Option<String>>,
+    bindings: Scopes<Option<ReceiverName>>,
     type_params: HashSet<&'a str>,
     lambda_depth: usize,
     /// One entry per open walker scope: whether it is a lambda's scope.
     scope_kinds: Vec<bool>,
     /// Receiver types of the `let`s whose initializer is being walked.
-    let_types: Vec<Option<String>>,
+    let_types: Vec<Option<ReceiverName>>,
     /// In a constructor: `self` may already be visible outside `init`.
     self_escaped: bool,
     /// In a constructor: the base constructor has already run.
@@ -530,22 +580,31 @@ fn is_super(expr: &Expr) -> bool {
 }
 
 impl Collector<'_> {
-    fn nominal(&self, ty: &Type) -> Option<String> {
+    fn nominal(&self, ty: &Type) -> Option<ReceiverName> {
         match ty {
             Type::Named(name) | Type::Generic(name, _)
                 if !self.type_params.contains(name.as_str()) =>
             {
-                Some(name.clone())
+                Some(ReceiverName::Declared(name.clone()))
             }
             _ => None,
         }
     }
 
-    fn receiver(&self, expr: &Expr) -> Option<String> {
+    fn receiver(&self, expr: &Expr) -> Option<ReceiverName> {
         match expr {
             Expr::New(call) if !self.type_params.contains(call.class_name.as_str()) => {
-                Some(call.class_name.clone())
+                Some(ReceiverName::Declared(call.class_name.clone()))
             }
+            Expr::Call(call)
+                if self.bindings.get(&call.callee).is_none()
+                    && !self.type_params.contains(call.callee.as_str()) =>
+            {
+                Some(ReceiverName::Call(call.callee.clone()))
+            }
+            Expr::StaticCall(call) if !call.is_bare_member() => Some(ReceiverName::Call(
+                QualifiedName::join(&call.class, &call.method),
+            )),
             Expr::Var(name, ..) => self.bindings.get(name).cloned().flatten(),
             _ => None,
         }
@@ -568,7 +627,7 @@ impl Collector<'_> {
         {
             self.writes.insert(RawFieldWrite {
                 file: block.span.file_id,
-                self_class: Some(class.to_string()),
+                self_class: Some(ReceiverName::Declared(class.to_string())),
                 field: String::new(),
                 kind: WriteKind::InitEscapes,
             });
@@ -592,10 +651,10 @@ impl Collector<'_> {
                     return;
                 }
                 kind = WriteKind::AfterBaseInit;
-                Some(class.to_string())
+                Some(ReceiverName::Declared(class.to_string()))
             }
             WriteContext::Method(class) | WriteContext::Constructor(class) if is_self => {
-                Some(class.to_string())
+                Some(ReceiverName::Declared(class.to_string()))
             }
             _ => self.receiver(object),
         };
@@ -735,6 +794,63 @@ mod tests {
             .and_then(|c| c.fields.iter().find(|f| f.name == field))
             .expect("field");
         summary.is_reassigned(&decl.name, decl.span)
+    }
+
+    #[test]
+    fn concise_constructor_scan_resolves_imported_receivers() {
+        for prefix in ["", "new "] {
+            for name in ["model::A", "m::A", "Container"] {
+                let model = parse("pub class A { pub n: i64; } pub class B { pub n: i64; }");
+                let source = format!(
+                    "import model; import model as m; import model::A as Container; fn main() {{ let a = {prefix}{name}(1); let alias = a; alias.n = 2; }}"
+                );
+                let (main, errors) = crate::parser::Parser::new(
+                    crate::lexer::Lexer::with_file_id(&source, FileId(1))
+                        .tokenize()
+                        .unwrap(),
+                )
+                .parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let mut writes = HashSet::new();
+                for_each_body(&main, |body, context, params, type_params| {
+                    writes.extend(body.collect_with_bindings(context, params, type_params))
+                });
+                let result = FieldWrites::resolve_programs(
+                    [("model", &model), ("main", &main)],
+                    None,
+                    &writes,
+                );
+                for class in classes(&model) {
+                    assert_eq!(
+                        result.is_reassigned("n", class.fields[0].span),
+                        class.name == "A",
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn concise_constructor_scan_preserves_receiver_identity() {
+        for prefix in ["", "new "] {
+            let source = format!(
+                "class A {{ pub n: i64; }} class B {{ pub n: i64; }} fn main() {{ let a = {prefix}A(1); let alias = a; alias.n = 2; }}"
+            );
+            assert!(reassigned(&source, "A", "n"));
+            assert!(!reassigned(&source, "B", "n"));
+        }
+        for (declaration, binding) in [
+            ("fn A(n: i64) -> B { new B(n) }", ""),
+            ("", "let A = |n: i64| new B(n);"),
+        ] {
+            let source = format!(
+                "class A {{ pub n: i64; }} class B {{ pub n: i64; }} {declaration} fn main() {{ {binding} let a = A(1); a.n = 2; }}"
+            );
+            // Unknown function return receivers conservatively cover every n;
+            // they must never be mistaken for the class with the same name.
+            assert!(reassigned(&source, "B", "n"), "{source}");
+        }
     }
 
     #[test]

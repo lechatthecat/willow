@@ -1424,6 +1424,131 @@ fn io_propagates_through_cycles_and_unknown_calls() {
 }
 
 #[test]
+fn output_capabilities_preserve_resolution_and_panic_independence() {
+    use std::rc::Rc;
+    let dependency = crate::module::ModuleId(7);
+    for (imports, output) in [
+        ("", "print"),
+        ("", "println"),
+        ("", "std::io::print"),
+        ("", "std::io::println"),
+        ("import std::io as out;", "out::print"),
+        ("import std::io as out;", "out::println"),
+        ("import std::io::print as write;", "write"),
+        ("import std::io::println as line;", "line"),
+    ] {
+        let source = program(&format!(
+            "{imports} pub fn emit(n: i64) {{ {output}(n); }} pub fn relay() {{ emit(1); }}"
+        ));
+        let mut queries = EffectQueries::default();
+        queries.names.insert("provider".into(), dependency);
+        let queries = Rc::new(queries);
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.set_effect_queries(queries.clone(), dependency);
+        checker.check_program(&source);
+        assert!(checker.errors.is_empty(), "{output}: {:?}", checker.errors);
+        for name in ["emit", "relay"] {
+            let local = queries
+                .effect_capabilities(dependency, FunctionId::free(name))
+                .unwrap();
+            assert!(local.may_io, "{output}: {name}");
+            assert!(!local.runtime.intersects(ANY_PANIC), "{output}: {name}");
+            let imported = queries.external_capabilities(
+                UnitId::ENTRY,
+                &FunctionId::method(TypeId::local("alias"), name),
+                &HashMap::from([("alias".into(), "provider".into())]),
+            );
+            assert_eq!(*local, imported, "{output}: imported {name}");
+        }
+    }
+    for (source, may_io, panics) in [
+        ("fn print(n: i64) {} fn emit() { print(1); }", false, false),
+        (
+            "fn println(n: i64) {} fn emit() { println(1); }",
+            false,
+            false,
+        ),
+        (
+            "import std::io::println as line; fn output() { line(2); } fn emit(line: fn(i64)) { line(1); }",
+            true,
+            true,
+        ),
+        (
+            "class Printer { pub static fn println(n: i64) {} } fn emit() { Printer::println(1); }",
+            false,
+            false,
+        ),
+        (
+            "fn println(n: i64) { panic(\"user\"); } fn emit() { println(1); }",
+            false,
+            true,
+        ),
+        ("fn emit(println: fn(i64)) { println(1); }", true, true),
+        ("fn emit(n: i64) { std::io::println(1 / n); }", true, true),
+    ] {
+        let queries = Rc::new(EffectQueries::default());
+        let mut checker = crate::semantic::TypeChecker::new();
+        crate::register_prelude(&mut checker).unwrap();
+        checker.set_effect_queries(queries.clone(), UnitId::ENTRY);
+        checker.check_program(&program(source));
+        assert!(checker.errors.is_empty(), "{source}: {:?}", checker.errors);
+        let capabilities = queries
+            .effect_capabilities(UnitId::ENTRY, FunctionId::free("emit"))
+            .unwrap();
+        assert_eq!(capabilities.may_io, may_io, "{source}");
+        assert_eq!(
+            capabilities.runtime.intersects(ANY_PANIC),
+            panics,
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn output_capability_shared_target_classification_is_bounded() {
+    use crate::query_stats::{Counter, Session, count};
+    for size in [8, 32, 128] {
+        let source = program(&format!(
+            "import std::io::println as line; fn emit() {{ {} }} fn relay() {{ {} }}",
+            "line(1);".repeat(size),
+            "emit();".repeat(size)
+        ));
+        let graph = crate::semantic::TypeChecker::resolved_effect_graph(&source);
+        let classifications = std::cell::Cell::new(0);
+        let _session = Session::start(true, false);
+        let effects = solve_unit(
+            &source,
+            &graph,
+            &HashMap::<ExprId, Type>::new(),
+            None,
+            &HashMap::new(),
+            &HashMap::new(),
+            |target| {
+                classifications.set(classifications.get() + 1);
+                intrinsic_effects(target).unwrap_or(PANIC)
+            },
+        );
+        assert_eq!(classifications.get(), 1);
+        assert_eq!(count(Counter::EffectSolve), 1);
+        assert_eq!(count(Counter::EffectIoSolve), 0);
+        // Inventory and propagation revisit the two unique edges a bounded
+        // number of times, independent of the number of source call sites.
+        assert!(count(Counter::EffectEdges) <= 6);
+        assert!(count(Counter::EffectInventory) <= 20 * size + 20);
+        for name in ["emit", "relay"] {
+            assert!(effects.may_io.contains(&FunctionId::free(name)), "{name}");
+        }
+        eprintln!(
+            "output sites={size}, helper calls={size}: inventory={}, edges={}, classifications={}",
+            count(Counter::EffectInventory),
+            count(Counter::EffectEdges),
+            classifications.get()
+        );
+    }
+}
+
+#[test]
 fn unified_query_reuses_all_facts_and_isolates_units() {
     let queries = EffectQueries::default();
     let source = program("fn first() { first(); }");

@@ -170,7 +170,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
-    assert_eq!(out, "4\ntrue\nfalse\n");
+    assert_eq!(out, "4.0\ntrue\nfalse\n");
 }
 
 #[test]

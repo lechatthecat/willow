@@ -8,6 +8,7 @@ use std::sync::Arc;
 use crate::diagnostics::Span;
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
+use crate::semantic::ids::FunctionId;
 use crate::semantic::intrinsics::{BuiltinCalls, Intrinsic};
 
 use super::LambdaCapture;
@@ -204,6 +205,7 @@ struct Graph<'a> {
     summarizing: bool,
     types: &'a HashMap<ExprId, Type>,
     builtin_calls: &'a BuiltinCalls,
+    resolved_calls: &'a HashMap<ExprId, Option<FunctionId>>,
     exhaustive_matches: &'a HashSet<ExprId>,
     patterns: &'a HashMap<PatternId, Pattern>,
     nodes: Vec<Node>,
@@ -235,6 +237,7 @@ pub(super) fn analyze(
     captures: &HashMap<ExprId, Vec<LambdaCapture>>,
     types: &HashMap<ExprId, Type>,
     builtin_calls: &BuiltinCalls,
+    resolved_calls: &HashMap<ExprId, Option<FunctionId>>,
     exhaustive_matches: &HashSet<ExprId>,
     patterns: &HashMap<PatternId, Pattern>,
 ) -> Retention {
@@ -243,6 +246,7 @@ pub(super) fn analyze(
         summarizing: false,
         types,
         builtin_calls,
+        resolved_calls,
         exhaustive_matches,
         patterns,
         nodes: terminals(),
@@ -340,20 +344,29 @@ impl<'a> Graph<'a> {
     // Match the constructor flow analysis' conservative exceptional-operation
     // classification. Children get their own edges at their evaluation point.
     fn may_panic(&self, expr: &Expr) -> bool {
-        match expr {
-            Expr::Call(c) => c.callee != "recover",
-            Expr::MethodCall(_)
-            | Expr::StaticCall(_)
-            | Expr::New(_)
-            | Expr::Index(..)
-            | Expr::Unary(_)
-            | Expr::FieldAccess(..)
-            | Expr::ArrayLiteral(..)
-            | Expr::ObjectLiteral(_)
-            | Expr::Await(_)
-            | Expr::Select(_) => true,
-            Expr::Binary(b) => !matches!(b.op, BinOp::And | BinOp::Or),
-            Expr::Print(value, ..) => !matches!(
+        let output = match expr {
+            Expr::Print(value, ..) => Some(value.as_ref()),
+            Expr::Call(_) | Expr::StaticCall(_)
+                if self
+                    .resolved_calls
+                    .get(&expr.id())
+                    .copied()
+                    .flatten()
+                    .is_some_and(|target| {
+                        target.is_method_of("$output")
+                            && matches!(target.name().as_ref(), "print" | "println")
+                    }) =>
+            {
+                match expr {
+                    Expr::Call(call) => call.args.first().map(|arg| &arg.expr),
+                    Expr::StaticCall(call) => call.args.first().map(|arg| &arg.expr),
+                    _ => unreachable!(),
+                }
+            }
+            _ => None,
+        };
+        if let Some(value) = output {
+            return !matches!(
                 self.types.get(&value.id()),
                 Some(
                     Type::I8
@@ -369,7 +382,21 @@ impl<'a> Graph<'a> {
                         | Type::Bool
                         | Type::String
                 )
-            ),
+            );
+        }
+        match expr {
+            Expr::Call(c) => c.callee != "recover",
+            Expr::MethodCall(_)
+            | Expr::StaticCall(_)
+            | Expr::New(_)
+            | Expr::Index(..)
+            | Expr::Unary(_)
+            | Expr::FieldAccess(..)
+            | Expr::ArrayLiteral(..)
+            | Expr::ObjectLiteral(_)
+            | Expr::Await(_)
+            | Expr::Select(_) => true,
+            Expr::Binary(b) => !matches!(b.op, BinOp::And | BinOp::Or),
             _ => false,
         }
     }
@@ -1779,6 +1806,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                     &checker.lambda_captures,
                     &checker.expr_types,
                     &checker.builtin_calls,
+                    &checker.analysis_calls,
                     &checker.local.exhaustive_matches,
                     &checker.pattern_resolutions,
                 );
@@ -1791,6 +1819,68 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                     result.nodes, result.facts, result.edge_visits
                 );
             }
+        }
+    }
+
+    #[test]
+    fn async_retention_resolved_scalar_output_preserves_cleanup_kills() {
+        let cases = [
+            ("", "println(1)", false),
+            ("", "print(1)", false),
+            ("", "std::io::println(2.0)", false),
+            ("", "std::io::print(true)", false),
+            ("import std::io as out;", "out::println(1)", false),
+            ("import std::io as out;", "out::print(1)", false),
+            ("import std::io::println as line;", "line(1)", false),
+            ("import std::io::print as write;", "write(1)", false),
+            ("", "println(\"text\")", false),
+            (
+                "",
+                "let println = |n: i64| { panic(\"stop\"); }; println(1)",
+                true,
+            ),
+            ("", "println(1 / zero)", true),
+            ("", "std::io::println(1 / zero)", true),
+            ("import std::io::println as line;", "line(1 / zero)", true),
+            (
+                "fn value() -> i64 { panic(\"stop\"); }",
+                "println(value())",
+                true,
+            ),
+            (
+                "fn println(n: i64) { panic(\"stop\"); }",
+                "println(1)",
+                true,
+            ),
+            ("fn print(n: i64) { panic(\"stop\"); }", "print(1)", true),
+            (
+                "import std::io::println as line;",
+                "let line = |n: i64| { panic(\"stop\"); }; line(1)",
+                true,
+            ),
+        ];
+        for (declarations, call, bad) in cases {
+            let source = format!(
+                "{declarations} async fn work(zero: i64) {{ let mut op: fn(i64) -> i64 = |x| x; defer {{ std::io::println(op(1)); }} defer {{ {call}; op = |x| x + 1; }} await sleep(0); }}"
+            );
+            let program = parse(&source);
+            let mut checker = TypeChecker::new();
+            checker.set_enforce_send_sync(true);
+            checker.check_program(&program);
+            let errors: Vec<_> = checker
+                .errors
+                .iter()
+                .filter(|e| e.severity == Severity::Error)
+                .collect();
+            assert_eq!(
+                errors.iter().any(|e| e.code == ErrorCode::E2402),
+                bad,
+                "{source}: {errors:?}"
+            );
+            assert!(
+                errors.iter().all(|e| e.code == ErrorCode::E2402),
+                "{source}: {errors:?}"
+            );
         }
     }
 
@@ -1962,6 +2052,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                 &checker.lambda_captures,
                 &checker.expr_types,
                 &checker.builtin_calls,
+                &checker.analysis_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2249,6 +2340,7 @@ async fn check(flag: bool) {{ let mut op: fn(i64) -> i64 = |x| x; {body} }}
                         &checker.lambda_captures,
                         &checker.expr_types,
                         &checker.builtin_calls,
+                        &checker.analysis_calls,
                         &exhaustive,
                         &checker.pattern_resolutions,
                     );
@@ -2491,6 +2583,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &checker.lambda_captures,
                 &checker.expr_types,
                 &checker.builtin_calls,
+                &checker.analysis_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2527,6 +2620,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                     &HashMap::new(),
                     &HashMap::new(),
                     &Default::default(),
+                    &HashMap::new(),
                     &HashSet::new(),
                     &HashMap::new(),
                 );
@@ -2562,6 +2656,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                     &HashMap::new(),
                     &HashMap::new(),
                     &Default::default(),
+                    &HashMap::new(),
                     &HashSet::new(),
                     &HashMap::new(),
                 );
@@ -2761,6 +2856,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &checker.lambda_captures,
                 &checker.expr_types,
                 &checker.builtin_calls,
+                &checker.analysis_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2808,6 +2904,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &checker.lambda_captures,
                 &checker.expr_types,
                 &checker.builtin_calls,
+                &checker.analysis_calls,
                 &checker.local.exhaustive_matches,
                 &checker.pattern_resolutions,
             );
@@ -2940,6 +3037,7 @@ async fn work() {{ let op: fn(i64) -> i64 = |x| x; {body} }}
                 &HashMap::new(),
                 &HashMap::new(),
                 &Default::default(),
+                &HashMap::new(),
                 &HashSet::new(),
                 &HashMap::new(),
             );

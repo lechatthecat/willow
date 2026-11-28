@@ -196,6 +196,66 @@ inside synchronous helpers. The console output above is an explicit exception.
 See the [standard library](std/README.md) and [runnable examples](example/README.md)
 for collections, classes, enums, error handling and I/O.
 
+## Language essentials
+
+A function, method, or block lambda returns its final expression when there is
+no trailing semicolon. A terminal `if` / `else` can return a value from each
+branch. Explicit `return value;` remains available for early returns. A
+semicolon discards the expression's value; a non-void function that can reach
+its end without a value reports E0205, with migration help to remove the final
+semicolon or add a return. Loop and defer bodies do not implicitly return from
+the enclosing function. Match expression arms can be used directly as a tail:
+
+```willow
+class User { pub score: i64; }
+
+fn score(user: User) -> i64 {
+    match user.score { 0 => 10, n => n }
+}
+
+fn main() {
+    let user = User(2);
+    println(score(user));
+    println(2.0); // 2.0
+}
+```
+
+`User(args...)` calls the same memberwise or declared `init` constructor as
+`new User(args...)`. Both spellings support generic arguments, inference,
+visibility checks and module-qualified class names. `new` remains supported;
+existing construction code needs no migration. A local callable or declared
+function takes precedence over a class with the same call spelling, including
+module-qualified calls and module aliases.
+
+`print` and `println` are ordinary standard-library function names, available
+without an import for compatibility. They can also be imported from `std::io`,
+aliased, or called as `std::io::println(value)`. Variables, parameters, functions
+and methods may use these names. Local values and user functions take precedence;
+use the fully qualified standard name to bypass shadowing. Both functions take
+one printable value and return `void`; wrong arity, reference arguments and
+unsupported values produce type diagnostics. To pass a polymorphic output
+function as a callback, give it a concrete signature with a lambda, for example
+`|value: i64| println(value)`.
+
+Scalar output retains its I/O capability but is non-panicking in the language's
+effect model, including through helper functions. It therefore adds no recovery
+exit before constructor fields are initialized. Panicking arguments and
+user-defined functions with the same names keep their own effects.
+
+Default `f64` display preserves a decimal point for integral values in fixed
+notation: `2.0`, `0.0`, `-0.0`. This applies to output, `.to_string()`, `format`
+placeholders and array stringification. Scientific notation remains compact
+outside `1e-6 <= abs(x) < 1e21` (for example `1e30`); finite values round-trip
+without losing bits. Explicit precision formats keep their own rules. When
+migrating, update textual snapshots that expected `2` for an `f64`; integer
+output remains `2`.
+
+JSON numbers retain their validated source spelling: parsing `2` and writing it
+again yields `2`. Constructing a JSON number from `(2.0).to_string()` yields
+`2.0`. JSON rejects non-finite numbers; display still uses `NaN`, `Infinity` and
+`-Infinity`. See [the runnable language example](example/concise_surface.wi) and
+[float display examples](example/f64_integral_display.wi).
+
 ## Details and evidence
 
 ### Rust interop

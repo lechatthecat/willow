@@ -1898,7 +1898,10 @@ impl TypeChecker {
         if exhaustive {
             self.local.exhaustive_matches.insert(m.id);
         }
-        let result = result_type.unwrap_or(Type::Void);
+        // With no errors, a nonempty exhaustive match with no surviving
+        // value arms consists entirely of diverging arms. Preserve Never
+        // when the match flows into a return value (including a callable tail).
+        let result = result_type.unwrap_or(if exhaustive { Type::Never } else { Type::Void });
         self.resolve_empty_array_values(&m.arms, &result);
         self.resolve_generic_values(
             m.arms.iter().filter_map(|arm| match &arm.body {

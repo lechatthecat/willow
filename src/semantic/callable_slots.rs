@@ -34,7 +34,7 @@ use crate::diagnostics::{FileId, Span};
 use crate::parser::ast::*;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::qualified_name::QualifiedName;
-use crate::semantic::field_writes::{BodyRef, DeclNames};
+use crate::semantic::field_writes::{BodyRef, DeclNames, ReceiverName};
 use crate::semantic::scopes::Scopes;
 
 /// Where a body sits, which decides what `self`, parameters and a
@@ -55,7 +55,7 @@ pub(crate) struct StoreContext<'a> {
 pub(crate) enum StoreTarget {
     /// `recv.field = v` / object literal; `None`: unresolved receiver.
     Field {
-        class: Option<String>,
+        class: Option<ReceiverName>,
         field: String,
     },
     /// An instance-field initializer.
@@ -72,10 +72,11 @@ pub(crate) enum StoreTarget {
         arity: usize,
         index: usize,
     },
-    /// `E::V(…)` (`enum_name` given) or `V(…)` payload `index`.
-    Variant {
-        enum_name: Option<String>,
+    /// An unresolved ordinary call: constructor or enum variant after names
+    /// are indexed, unless a function declaration shadows its spelling.
+    Call {
         name: String,
+        arity: usize,
         index: usize,
     },
 }
@@ -88,7 +89,7 @@ pub(crate) enum StoredValue {
     Function(String),
     /// A field read: the field's slot kind.
     Field {
-        class: Option<String>,
+        class: Option<ReceiverName>,
         field: String,
     },
     /// The current constructor's parameter declared at this span.
@@ -111,7 +112,7 @@ struct Binding {
     values: Vec<StoredValue>,
     /// Capturing it keeps a lambda shareable.
     capture_ok: bool,
-    class: Option<String>,
+    class: Option<ReceiverName>,
     /// Lambda nesting depth of the binding.
     depth: usize,
 }
@@ -157,7 +158,7 @@ struct PendingLet<'a> {
     init: &'a Expr,
     values: Vec<StoredValue>,
     literal_ok: bool,
-    class: Option<String>,
+    class: Option<ReceiverName>,
 }
 
 struct Collector<'a> {
@@ -235,23 +236,32 @@ impl<'a> BodyRef<'a> {
 }
 
 impl<'a> Collector<'a> {
-    fn nominal(&self, ty: &Type) -> Option<String> {
+    fn nominal(&self, ty: &Type) -> Option<ReceiverName> {
         match ty {
             Type::Named(name) | Type::Generic(name, _)
                 if !self.type_params.contains(name.as_str()) =>
             {
-                Some(name.clone())
+                Some(ReceiverName::Declared(name.clone()))
             }
             _ => None,
         }
     }
 
-    fn receiver(&self, expr: &Expr) -> Option<String> {
+    fn receiver(&self, expr: &Expr) -> Option<ReceiverName> {
         match expr {
-            Expr::Var(name, ..) if name == "self" => self.context.class.map(str::to_owned),
+            Expr::Var(name, ..) if name == "self" => self.context.class.map(ReceiverName::from),
             Expr::New(call) if !self.type_params.contains(call.class_name.as_str()) => {
-                Some(call.class_name.clone())
+                Some(ReceiverName::Declared(call.class_name.clone()))
             }
+            Expr::Call(call)
+                if self.bindings.get(&call.callee).is_none()
+                    && !self.type_params.contains(call.callee.as_str()) =>
+            {
+                Some(ReceiverName::Call(call.callee.clone()))
+            }
+            Expr::StaticCall(call) if !call.is_bare_member() => Some(ReceiverName::Call(
+                QualifiedName::join(&call.class, &call.method),
+            )),
             Expr::Var(name, ..) => self.bindings.get(name).and_then(|b| b.class.clone()),
             _ => None,
         }
@@ -494,28 +504,27 @@ impl<'a> Collector<'a> {
             Expr::ObjectLiteral(literal) if !self.type_params.contains(literal.class.as_str()) => {
                 for field in &literal.fields {
                     let target = StoreTarget::Field {
-                        class: Some(literal.class.clone()),
+                        class: Some(ReceiverName::Declared(literal.class.clone())),
                         field: field.name.clone(),
                     };
                     self.record(target, &field.value);
                 }
             }
-            Expr::Call(call) => {
-                let name = QualifiedName::new(&call.callee).last_segment();
-                if is_variant_name(name) {
-                    let name = name.to_owned();
-                    self.record_args(&call.args, |index| StoreTarget::Variant {
-                        enum_name: None,
-                        name: name.clone(),
-                        index,
-                    });
-                }
+            Expr::Call(call)
+                if self.bindings.get(&call.callee).is_none()
+                    && !self.type_params.contains(call.callee.as_str()) =>
+            {
+                self.record_args(&call.args, |index| StoreTarget::Call {
+                    name: call.callee.clone(),
+                    arity: call.args.len(),
+                    index,
+                });
             }
-            Expr::StaticCall(call) if is_variant_name(&call.method) => {
-                let (enum_name, name) = (call.class.clone(), call.method.clone());
-                self.record_args(&call.args, |index| StoreTarget::Variant {
-                    enum_name: Some(enum_name.clone()),
+            Expr::StaticCall(call) if !call.is_bare_member() => {
+                let name = QualifiedName::join(&call.class, &call.method);
+                self.record_args(&call.args, |index| StoreTarget::Call {
                     name: name.clone(),
+                    arity: call.args.len(),
                     index,
                 });
             }
@@ -612,6 +621,11 @@ pub(crate) struct SlotStats {
     pub(crate) nodes: usize,
     pub(crate) edges: usize,
     pub(crate) visits: usize,
+    pub(crate) variant_lookups: usize,
+    pub(crate) constructor_steps: usize,
+    pub(crate) constructor_arity_lookups: usize,
+    pub(crate) implicit_layout_steps: usize,
+    pub(crate) implicit_field_steps: usize,
 }
 
 /// Kind decisions of one build.
@@ -643,6 +657,13 @@ impl Graph {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ConstructorShape {
+    Declared(usize),
+    Implicit,
+    Cycle,
+}
+
 struct Index<'a> {
     classes: Vec<(&'a ClassDecl, FileId)>,
     class_names: DeclNames<'a>,
@@ -651,6 +672,7 @@ struct Index<'a> {
     function_names: DeclNames<'a>,
     enum_names: DeclNames<'a>,
     enums: Vec<&'a EnumDecl>,
+    enum_variants: Vec<HashMap<&'a str, Span>>,
     bases: Vec<Option<usize>>,
     fields: Vec<HashMap<&'a str, Span>>,
     slots: HashMap<SlotKey, usize>,
@@ -663,7 +685,9 @@ struct Index<'a> {
     by_name_sources: HashMap<String, usize>,
     by_variant: HashMap<(String, usize), usize>,
     field_memo: HashMap<(usize, String), Option<Span>>,
-    implicit_memo: HashMap<usize, Vec<Span>>,
+    implicit_memo: HashMap<usize, im::Vector<Span>>,
+    constructor_shapes: Vec<Option<ConstructorShape>>,
+    constructors_by_arity: Vec<HashMap<usize, usize>>,
     promised_spans: HashSet<Span>,
     graph: Graph,
 }
@@ -764,6 +788,15 @@ impl<'a> Index<'a> {
             function_names: names(programs, dependencies, &function_decls),
             enum_names: names(programs, dependencies, &enum_decls),
             enums: enums.iter().map(|(_, e)| *e).collect(),
+            enum_variants: enums
+                .iter()
+                .map(|(_, e)| {
+                    e.variants
+                        .iter()
+                        .map(|v| (v.name.as_str(), v.span))
+                        .collect()
+                })
+                .collect(),
             bases,
             fields,
             slots: HashMap::new(),
@@ -774,6 +807,17 @@ impl<'a> Index<'a> {
             by_variant: HashMap::new(),
             field_memo: HashMap::new(),
             implicit_memo: HashMap::new(),
+            constructor_shapes: vec![None; classes.len()],
+            constructors_by_arity: classes
+                .iter()
+                .map(|(_, class)| {
+                    let mut arities = HashMap::new();
+                    for (index, constructor) in class.constructors.iter().enumerate() {
+                        arities.entry(constructor.params.len()).or_insert(index);
+                    }
+                    arities
+                })
+                .collect(),
             promised_spans: HashSet::new(),
             graph: Graph {
                 edges: Vec::new(),
@@ -934,12 +978,13 @@ impl<'a> Index<'a> {
         let mut path = Vec::new();
         let mut current = Some(id);
         let mut found = None;
+        let mut seen = HashSet::new();
         while let Some(class) = current {
             if let Some(hit) = self.field_memo.get(&(class, field.to_owned())) {
                 found = *hit;
                 break;
             }
-            if path.contains(&class) {
+            if !seen.insert(class) {
                 break;
             }
             path.push(class);
@@ -955,50 +1000,80 @@ impl<'a> Index<'a> {
         found
     }
 
+    /// Every class on a queried base chain is resolved once, independently of
+    /// the number of construction sites and arguments that reuse it.
+    fn constructor_shape(&mut self, id: usize) -> ConstructorShape {
+        let mut current = Some(id);
+        let mut path = Vec::new();
+        let mut seen = HashSet::new();
+        let shape = loop {
+            let Some(class) = current else {
+                break ConstructorShape::Implicit;
+            };
+            if let Some(shape) = self.constructor_shapes[class] {
+                break shape;
+            }
+            if !seen.insert(class) {
+                break ConstructorShape::Cycle;
+            }
+            self.graph.stats.constructor_steps += 1;
+            path.push(class);
+            if !self.classes[class].0.constructors.is_empty() {
+                break ConstructorShape::Declared(class);
+            }
+            current = self.bases[class];
+        };
+        for class in path {
+            self.constructor_shapes[class] = Some(shape);
+        }
+        shape
+    }
+
     /// The slot for argument `index` of a `arity`-argument construction of
     /// class `id`: the first constructor on the chain with that arity, or the
     /// implicit constructor's fields (base first) when no class declares one.
     fn constructor_slot(&mut self, id: usize, arity: usize, index: usize) -> Option<usize> {
-        let mut current = Some(id);
-        let mut seen = HashSet::new();
-        while let Some(class) = current {
-            if !seen.insert(class) {
-                return None;
+        match self.constructor_shape(id) {
+            ConstructorShape::Cycle => return None,
+            ConstructorShape::Declared(class) => {
+                self.graph.stats.constructor_arity_lookups += 1;
+                let constructor = *self.constructors_by_arity[class].get(&arity)?;
+                let param = self.classes[class].0.constructors[constructor]
+                    .params
+                    .get(index)?;
+                return self.slots.get(&SlotKey::Decl(param.span)).copied();
             }
-            let (decl, _) = self.classes[class];
-            if !decl.constructors.is_empty() {
-                let constructor = decl.constructors.iter().find(|c| c.params.len() == arity)?;
-                return self
-                    .slots
-                    .get(&SlotKey::Decl(constructor.params.get(index)?.span))
-                    .copied();
-            }
-            current = self.bases[class];
+            ConstructorShape::Implicit => {}
         }
         if !self.implicit_memo.contains_key(&id) {
             let mut chain = Vec::new();
-            let mut seen = HashSet::new();
             let mut current = Some(id);
             while let Some(class) = current {
-                if !seen.insert(class) {
+                if self.implicit_memo.contains_key(&class) {
                     break;
                 }
+                self.graph.stats.implicit_layout_steps += 1;
                 chain.push(class);
                 current = self.bases[class];
             }
-            let fields = chain
-                .iter()
-                .rev()
-                .flat_map(|class| {
-                    self.classes[*class]
-                        .0
-                        .fields
-                        .iter()
-                        .filter(|f| !f.is_static())
-                        .map(|f| f.span)
-                })
-                .collect();
-            self.implicit_memo.insert(id, fields);
+            // Persistent vectors share inherited prefixes instead of copying
+            // the entire layout for every instantiated class on a deep chain.
+            let mut fields = current
+                .and_then(|class| self.implicit_memo.get(&class))
+                .cloned()
+                .unwrap_or_default();
+            for class in chain.into_iter().rev() {
+                for field in self.classes[class]
+                    .0
+                    .fields
+                    .iter()
+                    .filter(|field| !field.is_static())
+                {
+                    self.graph.stats.implicit_field_steps += 1;
+                    fields.push_back(field.span);
+                }
+                self.implicit_memo.insert(class, fields.clone());
+            }
         }
         let span = *self.implicit_memo[&id].get(index)?;
         self.slots.get(&SlotKey::Decl(span)).copied()
@@ -1032,11 +1107,11 @@ impl<'a> Index<'a> {
         self.class_names.lookup(file, name)
     }
 
-    fn field_node(&mut self, file: FileId, class: &Option<String>, field: &str) -> FieldNode {
+    fn field_node(&mut self, file: FileId, class: &Option<ReceiverName>, field: &str) -> FieldNode {
         let Some(class) = class else {
             return FieldNode::ByName;
         };
-        match self.class(file, class) {
+        match class.resolve(file, &self.class_names, &self.function_names) {
             None => FieldNode::ByName,
             Some(id) => match self.field(id, field) {
                 Some(span) => self
@@ -1072,22 +1147,22 @@ impl<'a> Index<'a> {
                 let base = self.bases[self.class(file, class)?]?;
                 self.constructor_slot(base, *arity, *index)
             }
-            StoreTarget::Variant {
-                enum_name: Some(enum_name),
-                name,
-                index,
-            } => {
-                let decl = self.enums[self.enum_names.lookup(file, enum_name)?];
-                let variant = decl.variants.iter().find(|v| &v.name == name)?;
-                self.slots
-                    .get(&SlotKey::Payload(variant.span, *index))
-                    .copied()
-            }
-            StoreTarget::Variant {
-                enum_name: None,
-                name,
-                index,
-            } => {
+            StoreTarget::Call { name, arity, index } => {
+                if self.function_names.lookup(file, name).is_some() {
+                    return None;
+                }
+                if let Some(class) = self.class(file, name) {
+                    return self.constructor_slot(class, *arity, *index);
+                }
+                if let Some((enum_name, name)) = QualifiedName::new(name).split_last() {
+                    let id = self.enum_names.lookup(file, enum_name)?;
+                    self.graph.stats.variant_lookups += 1;
+                    let span = self.enum_variants[id].get(name)?;
+                    return self.slots.get(&SlotKey::Payload(*span, *index)).copied();
+                }
+                if !is_variant_name(name) {
+                    return None;
+                }
                 let key = (name.clone(), *index);
                 if let Some(node) = self.by_variant.get(&key) {
                     return Some(*node);

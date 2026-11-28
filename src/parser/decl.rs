@@ -151,21 +151,8 @@ impl Parser {
         .with_help("list imported items explicitly, for example `::{Array, Map}`")
     }
 
-    /// Like [`expect_ident`], but also accepts builtin names that are lexed as
-    /// keywords (`print`, `println`) so they can appear as import-path segments,
-    /// e.g. `import std::io::println;`.
     pub(super) fn expect_path_segment(&mut self) -> Result<String, Diagnostic> {
-        match self.peek_kind() {
-            TokenKind::Print => {
-                self.advance();
-                Ok("print".to_string())
-            }
-            TokenKind::Println => {
-                self.advance();
-                Ok("println".to_string())
-            }
-            _ => self.expect_ident(),
-        }
+        self.expect_ident()
     }
 
     /// Resolve the closed set of built-in contract names at declaration time.
@@ -749,7 +736,7 @@ impl Parser {
             for param in &params {
                 self.default_import_usage.bind(&param.name);
             }
-            let body = self.parse_block_cont().await?;
+            let body = self.parse_callable_block_cont().await?;
             let end = self.previous_span();
             (Some(body), end)
         } else {
@@ -866,7 +853,7 @@ impl Parser {
         } else {
             None
         };
-        let body = self.parse_block()?;
+        let body = self.parse_callable_block()?;
         let span = start.to(body.span);
         let mut return_type = return_type;
         if modifiers.contains(Modifiers::ASYNC) {
@@ -990,7 +977,7 @@ impl Parser {
                 requires.push(expression);
             }
         }
-        let body = self.parse_block()?;
+        let body = self.parse_callable_block()?;
         let span = start.to(body.span);
         let mut return_type = return_type;
         if modifiers.contains(Modifiers::ASYNC) {

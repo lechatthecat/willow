@@ -41,7 +41,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "compilation failed");
-    assert_eq!(out.trim(), "4");
+    assert_eq!(out.trim(), "4.0");
 }
 
 #[test]

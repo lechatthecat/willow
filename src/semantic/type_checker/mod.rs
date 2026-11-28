@@ -140,6 +140,7 @@ pub struct ResolutionContext {
     /// Directly imported synchronous std::fs functions, keyed by their local
     /// alias. These block a native worker and therefore participate in E2604.
     imported_blocking_std_functions: ObservedMap<String, &'static str>,
+    imported_output_functions: ObservedMap<String, bool>,
     /// Enforce the Send/Sync async checks (E2402-E2405). Compiler entry points
     /// always enable these; direct checker tests can isolate individual rules.
     enforce_send_sync: bool,
@@ -270,6 +271,7 @@ pub struct TypeChecker {
     static_sync: HashMap<(TypeId, Span), bool>,
     static_markers: send_sync::MarkerCache,
     pub(crate) analysis_calls: HashMap<ExprId, Option<FunctionId>>,
+    pub(crate) constructor_calls: std::collections::HashSet<ExprId>,
     /// Constructor bodies whose call-agnostic flow reported a missing field;
     /// `finish_effect_analysis` decides their E0842 with panic facts.
     pending_constructor_flow: Vec<crate::parser::ast::BodyId>,
@@ -397,6 +399,7 @@ impl TypeChecker {
             imported_blocking_std_functions: ObservedMap::new(
                 "resolution.imported_blocking_std_functions",
             ),
+            imported_output_functions: ObservedMap::new("resolution.imported_output_functions"),
             enforce_send_sync: false,
             field_writes: None,
             nonpreemptible_methods: Default::default(),
@@ -471,6 +474,7 @@ impl TypeChecker {
             static_sync: HashMap::new(),
             static_markers: Default::default(),
             analysis_calls: HashMap::new(),
+            constructor_calls: Default::default(),
             pending_constructor_flow: Vec::new(),
             analysis_symbols: Default::default(),
             member_uses: HashMap::new(),
@@ -2962,3 +2966,8 @@ pub(super) fn bundled_storage_spelling(
 }
 
 mod native_handles;
+
+mod output;
+
+mod construction;
+use construction::Construction;

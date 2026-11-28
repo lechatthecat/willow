@@ -176,7 +176,7 @@ fn ctor_refs_04_a_mutable_f64() {
         \x20   pub init(self, v: &mut f64) { v = v * 2.0; self.factor = v; }\n\
          }\n\
          fn main() { let mut x = 1.5; let s = new Scale(&x); println(s.factor); println(x); }\n",
-        "3\n3\n",
+        "3.0\n3.0\n",
         &["main"],
     );
 }

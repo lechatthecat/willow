@@ -166,7 +166,10 @@ fn main() {
 "#,
     );
     assert!(ok, "exponent literals should compile: {out}");
-    assert_eq!(out, "1000\n2.5\ntrue\n2.001\n1\ntrue\ntrue\ntrue\n999\n");
+    assert_eq!(
+        out,
+        "1000.0\n2.5\ntrue\n2.001\n1.0\ntrue\ntrue\ntrue\n999.0\n"
+    );
 }
 
 // End-to-end: a missing exponent is a dedicated E0054, not E0101.

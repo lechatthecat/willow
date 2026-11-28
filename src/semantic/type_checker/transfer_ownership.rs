@@ -987,10 +987,16 @@ impl TypeChecker {
                 state.graph.alias(result, &ternary.then_expr);
                 state.graph.alias(result, &ternary.else_expr);
             }
-            Expr::New(new) => {
+            _ if matches!(expr, Expr::New(_)) || self.is_constructor_call(expr) => {
+                let (written, args) = match expr {
+                    Expr::New(c) => (c.class_name.as_str(), c.args.as_slice()),
+                    Expr::Call(c) => (c.callee.as_str(), c.args.as_slice()),
+                    Expr::StaticCall(c) => (c.class.as_str(), c.args.as_slice()),
+                    _ => unreachable!(),
+                };
                 let class = match self.expr_types.get(&expr.id()) {
-                    Some(Type::Named(class)) => class,
-                    _ => &new.class_name,
+                    Some(Type::Named(class)) => class.as_str(),
+                    _ => written,
                 };
                 let implicit = self
                     .symbols
@@ -1000,7 +1006,7 @@ impl TypeChecker {
                     let root = state.graph.root(id);
                     state.graph.borrowed[root] = true;
                 }
-                for arg in &new.args {
+                for arg in args {
                     state.graph.alias(result, &arg.expr);
                     if !implicit {
                         state.graph.escape(&arg.expr);

@@ -81,7 +81,7 @@ async fn main() {
         assert!(ok, "{out}");
         assert_eq!(
             out,
-            "integer overflow: i64::abs\ninvalid bounds: i64::clamp\ninvalid bounds: f64::clamp\ninvalid bounds: f64::clamp\ninvalid bounds: f64::clamp\n1\n0\n2\n1\n7\n3\n"
+            "integer overflow: i64::abs\ninvalid bounds: i64::clamp\ninvalid bounds: f64::clamp\ninvalid bounds: f64::clamp\ninvalid bounds: f64::clamp\n1\n0\n2\n1\n7\n3.0\n"
         );
     }
 }

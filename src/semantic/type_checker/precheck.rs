@@ -469,6 +469,9 @@ impl TypeChecker {
                 self.imported_collection_aliases.validate_key(key)
             }
             "resolution.imported_std_modules" => self.imported_std_modules.validate_key(key),
+            "resolution.imported_output_functions" => {
+                self.imported_output_functions.validate_key(key)
+            }
             "resolution.imported_blocking_std_functions" => {
                 self.imported_blocking_std_functions.validate_key(key)
             }
@@ -600,6 +603,13 @@ impl TypeChecker {
                 self.imported_std_modules.output_value(key)
             } else {
                 self.imported_std_modules.read_value(key)
+            };
+        }
+        if key.field == "resolution.imported_output_functions" {
+            return if raw {
+                self.imported_output_functions.output_value(key)
+            } else {
+                self.imported_output_functions.read_value(key)
             };
         }
         if key.field == "resolution.imported_blocking_std_functions" {

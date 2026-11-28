@@ -329,7 +329,7 @@ async fn main() {
     println(await ratio(Mutex::new(1.5)));
 }
 "#,
-        "3\n",
+        "3.0\n",
         &["ratio", "main"],
     );
 }

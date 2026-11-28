@@ -323,3 +323,33 @@ fn contextual_static_signature_finalization_keeps_one_reference_per_call() {
         }
     }
 }
+
+#[test]
+fn output_alias_tokens_report_concrete_signatures() {
+    let source = r#"
+import std::io::println as line;
+import std::io as output;
+fn println(value: i64) -> i64 { value }
+fn main() { line(println(1)); output::println(2.0); }
+"#;
+    for snapshot in both(snapshot(&[("main.wi", source)], "output-aliases")) {
+        let revision = snapshot.revision.clone();
+        let mut session = QuerySession::new(snapshot).unwrap();
+        for (needle, token, expected) in [
+            ("line(println(1))", "line", "fn(i64) -> void"),
+            ("println(1)", "println", "fn(i64) -> i64"),
+            ("output::println(2.0)", "println", "fn(f64) -> void"),
+        ] {
+            let result = type_at(
+                &mut session,
+                &revision,
+                "main.wi",
+                byte(source, needle, 0, token),
+            );
+            assert_eq!(
+                result["result"]["type_display"], expected,
+                "{needle}: {result}"
+            );
+        }
+    }
+}

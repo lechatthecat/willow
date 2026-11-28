@@ -943,6 +943,10 @@ impl TypeChecker {
                     let local = import.alias.as_deref().unwrap_or(item);
                     self.imported_names
                         .insert(local.to_string(), Some(import.span));
+                    if *module == "io" && matches!(*item, "print" | "println") {
+                        self.imported_output_functions
+                            .insert(local.to_string(), *item == "println");
+                    }
                     if *module == "fs" {
                         let operation = match *item {
                             "read_to_string" => Some("fs::read_to_string"),

@@ -238,6 +238,7 @@ impl Graph {
 
 struct Analysis<'a> {
     types: &'a HashMap<ExprId, Type>,
+    resolved_calls: &'a HashMap<ExprId, Option<FunctionId>>,
     /// Declaration identity of a type, independent of import spelling.
     identity: &'a dyn Fn(&str) -> String,
     /// Lock class node to value-type key, for every class with a concrete type.
@@ -333,6 +334,11 @@ impl Analysis<'_> {
     fn call_node(&mut self, expr: &Expr, locals: &HashMap<String, Identity>) -> Option<usize> {
         if let Some(&node) = self.value_calls.get(&expr.span()) {
             return Some(node);
+        }
+        if matches!(expr, Expr::Call(_) | Expr::StaticCall(_) | Expr::New(_))
+            && let Some(Some(target)) = self.resolved_calls.get(&expr.id())
+        {
+            return self.target_node(*target);
         }
         match expr {
             Expr::Call(call) if locals.contains_key(&call.callee) => Some(self.opaque),
@@ -553,11 +559,13 @@ pub(crate) fn collect(
     types: &HashMap<ExprId, Type>,
     identity: &dyn Fn(&str) -> String,
     calls: &CallGraph,
+    resolved_calls: &HashMap<ExprId, Option<FunctionId>>,
 ) -> Inputs {
     let mut graph = Graph::default();
     let opaque = graph.node(false);
     let mut analysis = Analysis {
         types,
+        resolved_calls,
         identity,
         lock_types: HashMap::new(),
         graph,
@@ -817,11 +825,12 @@ pub(super) fn analyze(
     types: &HashMap<ExprId, Type>,
     identity: &dyn Fn(&str) -> String,
     calls: &CallGraph,
+    resolved_calls: &HashMap<ExprId, Option<FunctionId>>,
 ) -> Vec<Diagnostic> {
     analyze_all(
         vec![(
             crate::module::UnitId::ENTRY,
-            collect(program, types, identity, calls),
+            collect(program, types, identity, calls, resolved_calls),
         )],
         |_, _| None,
     )
@@ -836,7 +845,13 @@ mod tests {
         let (program, errors) = crate::parser::Parser::new(tokens).parse();
         assert!(errors.is_empty(), "{errors:?}");
         let calls = super::super::TypeChecker::resolved_effect_graph(&program);
-        analyze(&program, &HashMap::new(), &str::to_owned, &calls)
+        analyze(
+            &program,
+            &HashMap::new(),
+            &str::to_owned,
+            &calls,
+            &HashMap::new(),
+        )
     }
 
     fn local(body: &str) -> Vec<Diagnostic> {

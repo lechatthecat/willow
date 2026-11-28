@@ -1441,5 +1441,5 @@ fn main() {
     }
     let (stdout, ok) = compile_and_run_release(source);
     assert!(ok, "{stdout}");
-    assert_eq!(stdout, "Infinity\nNaN\n8\n8\n2\n1\n9\n8\nNaN\n8\n");
+    assert_eq!(stdout, "Infinity\nNaN\n8\n8\n2\n1\n9.0\n8\nNaN\n8\n");
 }

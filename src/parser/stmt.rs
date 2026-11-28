@@ -5,6 +5,66 @@ use crate::lexer::token::TokenKind;
 
 #[willow_continuations::parser]
 impl Parser {
+    /// Callable tails lower to the existing return/cleanup path. Only terminal
+    /// conditionals propagate tail position; loop/defer bodies cannot return it.
+    pub(super) fn parse_callable_block(&mut self) -> Result<Block, Diagnostic> {
+        let saved = self.tail_expressions.replace(Default::default());
+        let mut result = self.parse_block();
+        let mut tails = self.tail_expressions.take().unwrap();
+        self.tail_expressions = saved;
+        if let Ok(body) = &mut result {
+            let mut pending = vec![body];
+            while let Some(block) = pending.pop() {
+                let Some(last) = block.stmts.last_mut() else {
+                    continue;
+                };
+                match last {
+                    Stmt::Expr(stmt) if tails.remove(&stmt.expr.id()).is_some() => {
+                        *last = Stmt::Return(ReturnStmt {
+                            value: Some(stmt.expr.take()),
+                            span: stmt.span,
+                        });
+                    }
+                    Stmt::If(stmt) => {
+                        pending.push(&mut stmt.then_block);
+                        if let Some(other) = &mut stmt.else_block {
+                            pending.push(other);
+                        }
+                    }
+                    Stmt::Expr(ExprStmt {
+                        expr: Expr::Match(m),
+                        ..
+                    }) if matches!(
+                        m.source,
+                        MatchSource::TupleLet | MatchSource::LetElse | MatchSource::IfLet
+                    ) =>
+                    {
+                        for arm in &mut m.arms {
+                            if let MatchBody::Block(block) = &mut arm.body {
+                                pending.push(block);
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (_, span) in tails {
+                let Some(span) = span else { continue };
+                self.recovered_errors.push(
+                    self.err_at(
+                        ErrorCode::E0102,
+                        "a value without `;` must be in the callable's tail position",
+                        span,
+                    )
+                    .with_help(
+                        "add `;` to discard the value, or write `return value;` to return early",
+                    ),
+                );
+            }
+        }
+        result
+    }
+
     pub(super) fn parse_block(&mut self) -> Result<Block, Diagnostic> {
         let scope = self.default_import_usage.scope();
         let result = self.parse_block_inner();
@@ -319,6 +379,15 @@ impl Parser {
                     && let Expr::Match(m) = &mut expr
                 {
                     m.block_arm_tail = true;
+                }
+                if self.check(TokenKind::RBrace)
+                    && let Expr::Match(m) = &expr
+                    && m.arms
+                        .iter()
+                        .any(|arm| matches!(arm.body, MatchBody::Expr(_)))
+                    && let Some(tails) = &mut self.tail_expressions
+                {
+                    tails.insert(expr.id(), None);
                 }
                 if self.check(TokenKind::Semicolon) {
                     self.advance();
@@ -1078,7 +1147,13 @@ impl Parser {
                 .err_at(ErrorCode::E0101, "block arms cannot yield a value", span.to(self.previous_span()))
                 .with_help("move the block arm logic into a helper function and call it as an expression arm; add `;` if this is only a statement"));
         }
-        self.expect(TokenKind::Semicolon)?;
+        if self.check(TokenKind::RBrace)
+            && let Some(tails) = &mut self.tail_expressions
+        {
+            tails.insert(expr.id(), Some(span));
+        } else {
+            self.expect(TokenKind::Semicolon)?;
+        }
         Ok(Stmt::Expr(ExprStmt { expr, span }))
     }
 
@@ -1222,4 +1297,46 @@ struct PatternBinding {
     init: Expr,
     else_block: Option<Block>,
     span: Span,
+}
+
+#[cfg(test)]
+mod tail_tests {
+    use super::*;
+    use crate::parser::iter::{AstEvent, AstWalk};
+
+    #[test]
+    fn callable_tail_token_and_node_work_is_linear() {
+        for nested in [false, true] {
+            let mut previous = None;
+            for count in [16, 32, 64, 128] {
+                let body = if nested {
+                    format!(
+                        "{}0{}",
+                        "if true { ".repeat(count),
+                        " } else { 1 }".repeat(count)
+                    )
+                } else {
+                    format!("{}{{ 0 }}", "if true { 1 } else ".repeat(count))
+                };
+                let source = format!("fn f() -> i64 {{ {body} }}");
+                super::super::PARSER_TOKEN_READS.with(|n| n.set(0));
+                let (program, errors) =
+                    Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap()).parse();
+                assert!(errors.is_empty(), "{errors:?}");
+                let reads = super::super::PARSER_TOKEN_READS.with(|n| n.get());
+                let Item::Function(f) = &program.items[0] else {
+                    panic!()
+                };
+                let returns = AstWalk::new(AstEvent::Block(&f.body))
+                    .filter(|event| matches!(event, AstEvent::Stmt(Stmt::Return(_))))
+                    .count();
+                assert_eq!(returns, count + 1);
+                if let Some((old_count, old_reads)) = previous {
+                    assert!(reads <= old_reads * count / old_count);
+                }
+                eprintln!("nested={nested} branches={count} reads={reads} returns={returns}");
+                previous = Some((count, reads));
+            }
+        }
+    }
 }

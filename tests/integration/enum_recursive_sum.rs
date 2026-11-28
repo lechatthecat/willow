@@ -241,7 +241,7 @@ fn main() {{
         };
         assert_eq!(
             String::from_utf8_lossy(&output.stdout),
-            format!("{first}\nexit\n5\nexit\n3\nexit\n8\n0\n15\n")
+            format!("{first}\nexit\n5\nexit\n3\nexit\n8\n0.0\n15\n")
         );
         cleanup(&path, &binary);
     }

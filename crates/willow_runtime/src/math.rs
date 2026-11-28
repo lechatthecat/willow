@@ -11,10 +11,11 @@ const PARSE_INVALID_TAG: i64 = 0;
 ///
 /// - Digits are the shortest decimal that parses back to the same bits.
 /// - Magnitudes in `1e-6 <= |x| < 1e21` print in fixed notation (`0.000001`,
-///   `123.5`, `100000000000000000000`); smaller or larger values print as
+///   `123.5`, `100000000000000000000.0`); smaller or larger values print as
 ///   `d.ddde<exp>` (`5.3622168208462125e-20`, `1e21`, `5e-324`). The exponent
 ///   has no `+`, so every finite output is also a valid Willow `f64` literal.
-/// - Integral values omit `.0`, including signed zeros (`0` and `-0`).
+/// - Integral fixed-notation values retain `.0`, including signed zeros (`0.0`
+///   and `-0.0`); exponent notation already distinguishes floating-point values.
 /// - Non-finite values print as `NaN`, `Infinity` and `-Infinity`.
 ///
 /// `f64::parse` accepts every output, preserving the sign bit. Explicit
@@ -59,6 +60,7 @@ pub fn format_f64_shortest(value: f64) -> String {
         if rest.len() <= point {
             out.push_str(rest);
             out.extend(std::iter::repeat_n('0', point - rest.len()));
+            out.push_str(".0");
         } else {
             out.push_str(&rest[..point]);
             out.push('.');
@@ -346,11 +348,11 @@ mod tests {
                 "{text}"
             );
             if value.fract() == 0.0 && value.abs() < 1e21 {
-                assert!(!text.contains('.'), "integral value {value:?}: {text}");
+                assert!(text.ends_with(".0"), "integral value {value:?}: {text}");
             }
         }
-        assert_eq!(format_f64_shortest(0.0), "0");
-        assert_eq!(format_f64_shortest(-0.0), "-0");
+        assert_eq!(format_f64_shortest(0.0), "0.0");
+        assert_eq!(format_f64_shortest(-0.0), "-0.0");
     }
 
     #[test]
@@ -368,9 +370,9 @@ mod tests {
             (9.99e-7, "9.99e-7"),
             (1.0e-7, "1e-7"),
             // Upper fixed boundary: below 1e21 stays fixed.
-            (1.0e20, "100000000000000000000"),
-            (1.5e20, "150000000000000000000"),
-            (123456789012345680000.0, "123456789012345680000"),
+            (1.0e20, "100000000000000000000.0"),
+            (1.5e20, "150000000000000000000.0"),
+            (123456789012345680000.0, "123456789012345680000.0"),
             (1.0e21, "1e21"),
             (1.5e21, "1.5e21"),
             // Subnormal and extreme finite values.
@@ -388,10 +390,10 @@ mod tests {
             (0.001, "0.001"),
             (123.456, "123.456"),
             (-2.5, "-2.5"),
-            (9007199254740993.0, "9007199254740992"),
-            (2.0, "2"),
-            (0.0, "0"),
-            (-0.0, "-0"),
+            (9007199254740993.0, "9007199254740992.0"),
+            (2.0, "2.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
             (f64::NAN, "NaN"),
             (f64::INFINITY, "Infinity"),
             (f64::NEG_INFINITY, "-Infinity"),
@@ -457,8 +459,8 @@ mod tests {
     }
 
     #[test]
-    fn math_unit_02_shortest_trims_trailing_dot_zero() {
-        assert_eq!(format_f64_shortest(10.0), "10");
+    fn math_unit_02_shortest_preserves_trailing_dot_zero() {
+        assert_eq!(format_f64_shortest(10.0), "10.0");
     }
 
     #[test]
@@ -494,7 +496,16 @@ mod tests {
         // SAFETY: The test controls its isolated runtime at this reset boundary; no other
         // mutator or subsequent access relies on the discarded heap.
         unsafe { willow_gc_init() };
-        assert_eq!(ws_text(willow_f64_to_string(3.14)), "3.14");
+        for (value, expected) in [
+            (3.14, "3.14"),
+            (2.0, "2.0"),
+            (-2.0, "-2.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1e21, "1e21"),
+        ] {
+            assert_eq!(ws_text(willow_f64_to_string(value)), expected);
+        }
     }
 
     #[test]

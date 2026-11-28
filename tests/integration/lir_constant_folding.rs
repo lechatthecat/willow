@@ -92,7 +92,7 @@ fn main() {
     assert!(ok, "{out}");
     assert_eq!(
         out,
-        "0\n0\n12\n123\n1234\n12345678\n0\n0.6875\n0.6640625\n1\n"
+        "0\n0\n12\n123\n1234\n12345678\n0.0\n0.6875\n0.6640625\n1.0\n"
     );
 }
 
@@ -138,7 +138,10 @@ fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "500000500000\n72\n3628800\n55\n1500001\n0\n1\n2\n0\n");
+    assert_eq!(
+        out,
+        "500000500000\n72\n3628800\n55\n1500001.0\n0\n1\n2\n0\n"
+    );
 }
 
 #[test]
@@ -168,5 +171,5 @@ fn main() {
 "#,
     );
     assert!(ok, "{out}");
-    assert_eq!(out, "-2\n0\n1\n1\n2\n3\n5\n6765\n42\n37\n1\n-2\n");
+    assert_eq!(out, "-2\n0\n1\n1\n2\n3\n5\n6765\n42\n37\n1.0\n-2\n");
 }

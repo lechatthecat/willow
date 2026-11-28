@@ -403,8 +403,8 @@ Willow provides. See [method_naming.wi](method_naming.wi).
 ### Default floating-point display
 
 `println(value)`, `value.to_string()`, `format("{}", value)`, and
-`f64::to_string(value)` omit the fractional suffix for integral `f64` values:
-`2.0` displays as `2`, `0.0` as `0`, and negative zero as `-0`.
+`f64::to_string(value)` retain the fractional suffix for integral `f64` values
+in fixed notation: `2.0`, `0.0`, and negative zero `-0.0`.
 `f64::parse` round-trips these strings, preserving negative zero's sign.
 Fractional values retain their round-tripping decimal representation;
 `NaN`, `Infinity`, and `-Infinity` keep those spellings. Explicit precision
@@ -412,9 +412,10 @@ placeholders such as `{:.6f}` retain their requested decimal places.
 Collections use the same default formatting for floating-point elements.
 See [f64_integral_display.wi](f64_integral_display.wi) for all four entry points.
 
-Digits are always the shortest decimal that parses back to the same `f64`.
+Significant digits use the shortest decimal that parses back to the same `f64`;
+integral values in fixed notation also retain `.0`.
 Magnitudes in `1e-6 <= |x| < 1e21` print in fixed notation (`0.000001`,
-`100000000000000000000`); smaller or larger values switch to exponent form,
+`100000000000000000000.0`); smaller or larger values switch to exponent form,
 so `5.3622168208462125e-20`, `1e30`, `1e21`, and the smallest subnormal
 `5e-324` stay compact. The exponent has no `+` sign: every printed finite
 value is also a valid Willow `f64` literal and parses back with `f64::parse`

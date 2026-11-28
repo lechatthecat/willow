@@ -19,6 +19,7 @@ fn analyze(source: &str) -> Analysis {
         &checker.expr_types,
         &checker.static_call_classes,
         &checker.builtin_calls,
+        &checker.analysis_calls,
     );
     assert_eq!(
         checker
@@ -439,3 +440,64 @@ case!(
     "fn main() { let out = Channel<i64>::new(); let input = Channel<i64>::new(); out.send(1); out.send(2); out.send(input.recv()); }",
     1
 );
+
+#[test]
+fn resolved_output_preserves_wait_arguments_and_shadowing() {
+    for (imports, output) in [
+        ("", "print"),
+        ("", "println"),
+        ("", "std::io::print"),
+        ("", "std::io::println"),
+        ("import std::io as out;", "out::print"),
+        ("import std::io as out;", "out::println"),
+        ("import std::io::print as write;", "write"),
+        ("import std::io::println as line;", "line"),
+    ] {
+        for (prefix, expected) in [("", 1), ("ch.send(1);", 0), ("ch.close();", 0)] {
+            let source = format!(
+                "{imports} fn main() {{ let ch = Channel<i64>::new(); {prefix} {output}(ch.recv()); }}"
+            );
+            assert_eq!(analyze(&source).diagnostics.len(), expected, "{source}");
+        }
+    }
+    for name in ["print", "println"] {
+        let source = format!(
+            "fn {name}(ch: Channel<i64>) {{ ch.send(1); }} fn main() {{ let ch = Channel<i64>::new(); {name}(ch); ch.recv(); }}"
+        );
+        let result = analyze(&source);
+        assert!(result.diagnostics.is_empty(), "{source}");
+        assert_eq!(
+            result.counts.send_checks, 1,
+            "the shadowing function must execute"
+        );
+        let source = format!(
+            "fn producer(ch: Channel<i64>) {{ ch.send(1); }} fn main() {{ let ch = Channel<i64>::new(); let {name} = producer; {name}(ch); ch.recv(); }}"
+        );
+        assert!(analyze(&source).diagnostics.is_empty(), "{source}");
+    }
+    let source = "import std::io::println as line; fn producer(ch: Channel<i64>) { ch.send(1); } fn main() { let ch = Channel<i64>::new(); let line = producer; line(ch); ch.recv(); }";
+    assert!(analyze(source).diagnostics.is_empty());
+    let source = "import std::io::println as line; fn receive(ch: Channel<i64>) -> i64 { ch.recv() } fn main() { let ch = Channel<i64>::new(); line(receive(ch)); }";
+    assert_eq!(analyze(source).diagnostics.len(), 1);
+}
+
+#[test]
+fn resolved_output_summary_work_is_linear() {
+    for count in [8, 32, 128] {
+        let source = format!(
+            "import std::io::println as line; fn emit() {{ {} }} fn main() {{ {} let ch = Channel<i64>::new(); std::io::println(ch.recv()); }}",
+            "line(1);".repeat(count),
+            "emit();".repeat(count)
+        );
+        let result = analyze(&source);
+        assert_eq!(result.diagnostics.len(), 1);
+        assert_eq!(result.counts.operations, count + 2);
+        assert_eq!(result.counts.waits, 1);
+        assert_eq!(result.counts.channels, 1);
+        assert!(result.counts.syntax < 50 * count + 100);
+        eprintln!(
+            "output sites={count}, helper calls={count}: {:?}",
+            result.counts
+        );
+    }
+}

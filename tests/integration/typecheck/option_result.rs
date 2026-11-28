@@ -170,7 +170,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "Option<f64> payload should compile and run");
-    assert_eq!(out, "3\n-1\n");
+    assert_eq!(out, "3.0\n-1.0\n");
 }
 
 // ── ? operator ────────────────────────────────────────────────────────────────
@@ -325,7 +325,7 @@ fn main() {
 "#;
     let (out, ok) = compile_and_run(src);
     assert!(ok, "Option ? should preserve f64 payloads");
-    assert_eq!(out, "3\n");
+    assert_eq!(out, "3.0\n");
 }
 
 #[test]

@@ -85,7 +85,7 @@ fn static_init_02_scalar_initializers_run() {
     assert_output(&one_static("n: i64 = 40 + 2;", "Cfg::n"), "42\n");
     assert_output(&one_static("n: i64 = -5;", "Cfg::n"), "-5\n");
     assert_output(&one_static("b: bool = 1 < 2;", "Cfg::b"), "true\n");
-    assert_output(&one_static("x: f64 = 1.5 * 2.0;", "Cfg::x"), "3\n");
+    assert_output(&one_static("x: f64 = 1.5 * 2.0;", "Cfg::x"), "3.0\n");
 }
 
 /// Perspectives 7-8: a String initializer allocates before the global store,
@@ -315,7 +315,7 @@ fn static_init_15_example_compiles_from_lowered_ir_and_runs() {
     assert!(ok, "run failed: {out}");
     assert_eq!(
         out,
-        "42\n-5\ntrue\n3\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n"
+        "42\n-5\ntrue\n3.0\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n"
     );
 
     let (ok, log) = compile_with_compiler_env(&src, &LIR_LOG);

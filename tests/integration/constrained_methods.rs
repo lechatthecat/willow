@@ -66,7 +66,7 @@ fn main() {
     ] {
         let (out, ok) = run(source);
         assert!(ok, "{out}");
-        assert_eq!(out, "2\n4\n1\n[true, false]\n[1.5, 2]\n");
+        assert_eq!(out, "2\n4\n1\n[true, false]\n[1.5, 2.0]\n");
     }
     for source in [
         "fn main() { let xs: Array<i64> = [1]; }",

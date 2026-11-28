@@ -129,10 +129,14 @@ impl TypeChecker {
         if self.enum_variant_resolutions.contains_key(&expr.id()) {
             return;
         }
-        if let Expr::New(call) = expr
+        if (matches!(expr, Expr::New(_)) || self.is_constructor_call(expr))
             && self
-                .symbols
-                .lookup_class(&call.class_name)
+                .expr_types
+                .get(&expr.id())
+                .and_then(|ty| match ty {
+                    Type::Named(name) => self.symbols.lookup_class(name),
+                    _ => None,
+                })
                 .is_some_and(|class| class.constructor.is_none())
         {
             return;

@@ -893,7 +893,12 @@ impl TypeChecker {
     /// Type-check `new Class(args...)` (constructor support §10): resolve the class, pick
     /// the explicit `init` or the implicit memberwise constructor, check
     /// visibility and arguments, and yield `Class`.
-    pub(super) fn check_new(&mut self, n: &NewExpr, class_name: &str, checked: bool) -> Type {
+    pub(super) fn check_new(
+        &mut self,
+        n: &Construction<'_>,
+        class_name: &str,
+        checked: bool,
+    ) -> Type {
         let resolved = self
             .resolve_static_call_class_name(class_name, n.span)
             .unwrap_or_else(|| class_name.to_owned());
@@ -901,7 +906,7 @@ impl TypeChecker {
         // Generic expansion already reported the invalid constructor type.
         // Keep independent argument errors, but do not look up the recovery marker.
         if Self::is_error_name(&resolved) {
-            for arg in &n.args {
+            for arg in n.args {
                 self.check_or_reuse_expr(&arg.expr, checked);
             }
             return Self::error_type();
@@ -910,7 +915,7 @@ impl TypeChecker {
         let Some(class) = self.symbols.lookup_class(&resolved).cloned() else {
             // No signature exists to provide argument context, but still check
             // every argument so its independent diagnostics are preserved.
-            for arg in &n.args {
+            for arg in n.args {
                 self.check_or_reuse_expr(&arg.expr, checked);
             }
             if self.symbols.lookup_interface(&resolved).is_some() {
@@ -942,14 +947,14 @@ impl TypeChecker {
         // cycle, so only the arguments' own diagnostics are kept and the call
         // still yields the class type for the code around it.
         if self.class_extends_cycle(&resolved).is_some() {
-            for arg in &n.args {
+            for arg in n.args {
                 self.check_or_reuse_expr(&arg.expr, checked);
             }
             return Type::Named(resolved);
         }
 
         if resolved == "PanicInfo" {
-            for arg in &n.args {
+            for arg in n.args {
                 self.check_or_reuse_expr(&arg.expr, checked);
             }
             self.push(
@@ -995,7 +1000,7 @@ impl TypeChecker {
             }
             None => {
                 let Some(fields) = self.implicit_constructor_field_infos(&resolved) else {
-                    for arg in &n.args {
+                    for arg in n.args {
                         self.check_or_reuse_expr(&arg.expr, checked);
                     }
                     return Type::Named(resolved);
@@ -1004,7 +1009,7 @@ impl TypeChecker {
                     n.span,
                     fields.iter().map(|(_, name, _)| name.clone()).collect(),
                 ));
-                self.check_implicit_constructor_field_visibility(&fields, &n.args, n.span);
+                self.check_implicit_constructor_field_visibility(&fields, n.args, n.span);
                 // A memberwise constructor stores every field by value: there is
                 // no declaration that could mark one `&`/`&mut`.
                 let field_types: Vec<Type> = fields
@@ -1091,7 +1096,7 @@ impl TypeChecker {
                     }
                 }
             }
-            self.check_mut_reference_aliases(&param_infos, &n.args);
+            self.check_mut_reference_aliases(&param_infos, n.args);
         }
 
         Type::Named(resolved)

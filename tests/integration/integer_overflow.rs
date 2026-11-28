@@ -711,7 +711,7 @@ fn main() {
         assert_eq!(
             out,
             format!(
-                "div zero\ndiv overflow\nrem zero\nrem overflow\nnegative exponent\nbounds\n{shifts}-4611686018427387904\n3\ntrue\n"
+                "div zero\ndiv overflow\nrem zero\nrem overflow\nnegative exponent\nbounds\n{shifts}-4611686018427387904\n3.0\ntrue\n"
             )
         );
     }

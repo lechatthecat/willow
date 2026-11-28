@@ -23,6 +23,7 @@ pub struct Parser {
     /// Payload nesting of the pattern being parsed; bounded by
     /// `pattern::MAX_PATTERN_DEPTH` so every pattern walk has a bounded depth.
     pattern_depth: usize,
+    tail_expressions: Option<std::collections::HashMap<ExprId, Option<Span>>>,
     /// Parsing one operand of an `if let ... && ...` chain: `&&` ends the
     /// operand instead of combining it. Nested delimiters reset it.
     in_let_chain: bool,
@@ -110,6 +111,7 @@ impl Parser {
             default_import_usage: Default::default(),
             tuple_arities: Default::default(),
             pattern_depth: 0,
+            tail_expressions: None,
             in_let_chain: false,
             type_uses: Vec::new(),
             tokens,
@@ -352,8 +354,6 @@ impl Parser {
                         | TokenKind::Match
                         | TokenKind::Await
                         | TokenKind::Select
-                        | TokenKind::Print
-                        | TokenKind::Println
                         | TokenKind::I8
                         | TokenKind::I16
                         | TokenKind::I32
@@ -486,19 +486,8 @@ impl Parser {
         }
     }
 
-    // Retain the surrounding declaration after a reserved builtin method name.
-    // The recorded diagnostic still rejects the program, but parsing its signature
-    // here prevents the next receiver from being parsed as a free-function parameter.
     fn expect_method_name(&mut self) -> Result<String, Diagnostic> {
-        if matches!(self.peek_kind(), TokenKind::Print | TokenKind::Println) {
-            let error = self.err(ErrorCode::E0102, "expected identifier");
-            self.recovered_errors.push(error);
-            let name = self.peek_kind().keyword_name().unwrap().to_string();
-            self.advance();
-            Ok(name)
-        } else {
-            self.expect_ident()
-        }
+        self.expect_ident()
     }
 
     fn err(&self, code: ErrorCode, msg: impl Into<String>) -> Diagnostic {
@@ -512,9 +501,6 @@ impl Parser {
             diagnostic
                 .message
                 .push_str(&format!("; '{keyword}' is a reserved keyword"));
-            if matches!(self.peek_kind(), TokenKind::Print | TokenKind::Println) {
-                diagnostic.message.push_str(" (builtin function name)");
-            }
             diagnostic.helps.push(format!(
                 "if you intended '{keyword}' as a name, rename it to a non-keyword identifier"
             ));

@@ -172,7 +172,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("tests/regressions/async_dead_locals.wi", "42\n42\n2\n3\n"),
         (
             "tests/regressions/closed_world_dispatch.wi",
-            "12\n2\nitem!\n7\n",
+            "12\n2.0\nitem!\n7\n",
         ),
         (
             "tests/regressions/diagnostic_recovery_if.wi",
@@ -216,7 +216,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("tests/regressions/atomic_inline.wi", "20000\n20000\n42\n"),
         (
             "tests/regressions/guarded_fn_values.wi",
-            "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n",
+            "4\n1\n6\n2\nrecovered\n-1\n1\n-3.0\nfalse\n",
         ),
         (
             "tests/regressions/imported_constructor_effects.wi",
@@ -420,7 +420,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/arithmetic.wi",
-            "27\n15\n126\n3\n3\n54\n3\ntrue\n1024\n1\n",
+            "27\n15\n126\n3\n3\n54\n3.0\ntrue\n1024\n1\n",
         ),
         (
             "tests/regressions/array_fast_paths.wi",
@@ -529,7 +529,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/map_float_keys.wi",
-            "true\n1\n20\n20\n{0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
+            "true\n1\n20\n20\n{0.0: 20}\ntrue\nfalse\nNaN cannot be used as a Map key\n1\n",
         ),
         ("example/constructor_visibility.wi", "pub\n42\n7\n"),
         ("example/constructors.wi", "John\n20\n7\n"),
@@ -549,16 +549,16 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/f64_parse.wi", "3.5\ntrue\nNaN\nparse failed\n"),
         (
             "example/f64_integral_display.wi",
-            "0\n0\n0\n0\ntrue\n-0\n-0\n-0\n-0\ntrue\n2\n2\n2\n2\ntrue\n-2\n-2\n-2\n-2\ntrue\n1\n1\n1\n1\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n",
+            "0.0\n0.0\n0.0\n0.0\ntrue\n-0.0\n-0.0\n-0.0\n-0.0\ntrue\n2.0\n2.0\n2.0\n2.0\ntrue\n-2.0\n-2.0\n-2.0\n-2.0\ntrue\n1.0\n1.0\n1.0\n1.0\ntrue\n1.25\n1.25\n1.25\n1.25\ntrue\n-Infinity\n",
         ),
         (
             "example/f64_exponent_display.wi",
-            "5.3622168208462125e-20\n1e30\n-1.5e-7\n0.000001 true\n9.99e-7 true\n100000000000000000000 true\n1e21 true\n5e-324 true\n1.7976931348623157e308 true\n0.30000000000000004 true\n2 true\n[1e-9, 0.5, 2.5e22]\nloss=3.2e-12\ntrue\n",
+            "5.3622168208462125e-20\n1e30\n-1.5e-7\n0.000001 true\n9.99e-7 true\n100000000000000000000.0 true\n1e21 true\n5e-324 true\n1.7976931348623157e308 true\n0.30000000000000004 true\n2.0 true\n[1e-9, 0.5, 2.5e22]\nloss=3.2e-12\ntrue\n",
         ),
-        ("example/floats.wi", "4\ntrue\n-4\n"),
+        ("example/floats.wi", "4.0\ntrue\n-4.0\n"),
         (
             "example/float_exponents.wi",
-            "1\n6.02214076\ntrue\n250\ntrue\n",
+            "1.0\n6.02214076\ntrue\n250.0\ntrue\n",
         ),
         ("example/contextual_ctor_args.wi", "9\n2\n0\n1\n2\n1\n"),
         ("example/fn_values.wi", "20\n25\n30\n107\n104\n"),
@@ -595,7 +595,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/enum_match.wi",
-            "north\nwest\n78.53975\n12\n0\nzero\nnonzero\nyes\nno\n",
+            "north\nwest\n78.53975\n12.0\n0.0\nzero\nnonzero\nyes\nno\n",
         ),
         ("tests/regressions/generic_enum_empty/main.wi", "1\n2\n"),
         ("example/unqualified_enum_pair.wi", "42\n"),
@@ -911,7 +911,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "example/constants/main.wi",
-            "hello from willow-demo\n99\n199\n299\n5\nquiet\n",
+            "hello from willow-demo\n99\n199\n299\n5.0\nquiet\n",
         ),
         ("example/native_stack_overflow.wi", "8\n"),
         ("example/task_stack_overflow.wi", "8\n"),
@@ -920,7 +920,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ("example/range_value.wi", "2\n6\n4\n14\n0\n1\n2\n"),
         (
             "tests/regressions/reference_args_control_flow.wi",
-            "10\n15\n12\n14\n3\n9\n",
+            "10\n15\n12\n14\n3.0\n9\n",
         ),
         (
             "example/references.wi",
@@ -928,7 +928,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "tests/regressions/rust_runtime_smoke.wi",
-            "rust runtime\n42\n10\n21\n0\n",
+            "rust runtime\n42\n10.0\n21\n0\n",
         ),
         ("example/channel_producer.wi", "10\n20\n30\n"),
         (
@@ -971,8 +971,8 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         (
             "example/exponentiation.wi",
             "1024\n64\n512\n64\n18\n-4\n4\n1\n1\n32\n64\n0\ntrue\n\
-             recovered: negative exponent in integer `**`: -3\ndone\n1024\n0.125\n\
-             1.414213562373095\n3\n4\n",
+             recovered: negative exponent in integer `**`: -3\ndone\n1024.0\n0.125\n\
+             1.414213562373095\n3.0\n4.0\n",
         ),
         (
             "example/integer_overflow.wi",
@@ -1002,7 +1002,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         ("example/task_sharing.wi", "6\n1\n2\n"),
         ("example/ternary.wi", "1\n-1\n0\n20\n99\n15\n8\n1\n"),
-        ("example/types.wi", "10\n2.5\n10\n78.53975\ntrue\n"),
+        ("example/types.wi", "10\n2.5\n10.0\n78.53975\ntrue\n"),
         ("example/super_class.wi", "3 cats:\nann\njohn\nben\n"),
         (
             "example/super_method_calls.wi",
@@ -1075,7 +1075,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         (
             "tests/regressions/lir_enum_match.wi",
             "north\neast\nsouth\nwest\nnorth\n0\n48\n15\n0\n\
-             nothing\ncircle\nrect\nlabeled plate/plate\n3\n-1\n2.5\n1\n\
+             nothing\ncircle\nrect\nlabeled plate/plate\n3\n-1\n2.5\n1.0\n\
              100\n200\n21\nyes\nno\nnorth star\nuntagged\n\
              going north\ngoing elsewhere\n63\neast:rect\n",
         ),
@@ -1103,7 +1103,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "tests/regressions/lir_closures.wi",
-            "8\n15\n5\n18\n9\narea=12\n11.25\n0\n1\n42\n42\n25\n14\n63\n20\n",
+            "8\n15\n5\n18\n9\narea=12\n11.25\n0.0\n1\n42\n42\n25\n14\n63\n20\n",
         ),
         (
             "tests/regressions/lir_interface_boxing.wi",
@@ -1129,7 +1129,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "tests/regressions/lir_static_initializers.wi",
-            "42\n-5\ntrue\n3\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n",
+            "42\n-5\ntrue\n3.0\nwillow\n42\n4\n0\n3\n7\n1\n8\n43\n1\n10\n3\n5\np8\n84\n11\n",
         ),
         (
             "tests/regressions/lir_static_property_bodies.wi",
@@ -1378,7 +1378,7 @@ fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
         ),
         (
             "tests/regressions/effect_precision.wi",
-            "3\n1\neffect precision\n1\n",
+            "3.0\n1\neffect precision\n1\n",
         ),
         ("tests/regressions/preemption_complete.wi", "[41, 42]\n"),
         (
@@ -2458,9 +2458,23 @@ fn test_integral_float_display_examples() {
         if matches!(
             path,
             "example/f64_integral_display.wi"
+                | "tests/regressions/closed_world_dispatch.wi"
+                | "tests/regressions/guarded_fn_values.wi"
+                | "example/arithmetic.wi"
                 | "example/map_float_keys.wi"
+                | "example/f64_exponent_display.wi"
+                | "example/floats.wi"
+                | "example/float_exponents.wi"
                 | "example/enum_match.wi"
+                | "example/constants/main.wi"
+                | "tests/regressions/reference_args_control_flow.wi"
+                | "tests/regressions/rust_runtime_smoke.wi"
+                | "example/types.wi"
                 | "tests/regressions/lir_closures.wi"
+                | "tests/regressions/lir_static_initializers.wi"
+                | "tests/regressions/effect_precision.wi"
+                | "example/exponentiation.wi"
+                | "tests/regressions/lir_enum_match.wi"
         ) {
             let (out, ok) = compile_file_and_run(path);
             assert!(ok, "{path}: {out}");

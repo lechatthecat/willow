@@ -931,7 +931,7 @@ fn main() {
 "#,
     );
     assert!(ok, "pow builtins should compile and run");
-    assert_eq!(out, "256\n3\n");
+    assert_eq!(out, "256.0\n3.0\n");
 }
 
 #[test]
@@ -962,7 +962,7 @@ fn main() {
 "#,
     );
     assert!(ok, "f64::to_string should compile and run");
-    assert_eq!(out, "3.14\n10\n");
+    assert_eq!(out, "3.14\n10.0\n");
 }
 
 #[test]

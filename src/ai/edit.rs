@@ -1402,9 +1402,15 @@ fn structured_changes(
         }
     }
     let index = StructuredIndex::new(snapshot, root, &tokens, &operations, &mut state.work)?;
-    let mut semantic_renames = index
-        .has_member_rename
-        .then(|| super::rename::Index::new(snapshot, root, &index.identifiers, &index.qualifiers));
+    let mut semantic_renames = index.has_member_rename.then(|| {
+        super::rename::Index::new(
+            snapshot,
+            root,
+            &index.identifiers,
+            &index.qualifiers,
+            &index.member_tokens,
+        )
+    });
     for operation in operations {
         let id = match &operation {
             Operation::Rename { function, .. } | Operation::ReplaceBody { function, .. } => {
@@ -1461,6 +1467,7 @@ struct TokenIndex<'a> {
     identifiers: BTreeMap<&'a str, Vec<(&'a str, &'a crate::diagnostics::Span)>>,
     call_names: BTreeMap<(&'a str, usize), (&'a str, usize)>,
     qualifiers: std::collections::HashSet<(&'a str, usize, usize)>,
+    member_tokens: std::collections::HashSet<(&'a str, usize, usize)>,
     alias_tokens: std::collections::HashSet<(&'a Path, usize, usize)>,
 }
 
@@ -1474,11 +1481,18 @@ impl<'a> TokenIndex<'a> {
             BTreeMap::new();
         let mut call_names = BTreeMap::new();
         let mut qualifiers = std::collections::HashSet::new();
+        let mut member_tokens = std::collections::HashSet::new();
         let mut alias_tokens = std::collections::HashSet::new();
         for (path, ts) in tokens {
             for (i, token) in ts.iter().enumerate() {
                 work.tokens_indexed += 1;
                 if let TokenKind::Ident(name) = &token.kind {
+                    // A value binding cannot capture the member in `x.name`
+                    // or `module::name`. Keep their heads in the collision
+                    // index; only the member tokens have fixed qualification.
+                    if i > 0 && matches!(ts[i - 1].kind, TokenKind::ColonColon | TokenKind::Dot) {
+                        member_tokens.insert((path.as_str(), token.span.start, token.span.end));
+                    }
                     if i > 0 && ts[i - 1].kind == TokenKind::As {
                         alias_tokens.insert((Path::new(path), token.span.start, token.span.end));
                     }
@@ -1516,6 +1530,7 @@ impl<'a> TokenIndex<'a> {
             identifiers,
             call_names,
             qualifiers,
+            member_tokens,
             alias_tokens,
         }
     }
@@ -1529,6 +1544,7 @@ struct StructuredIndex<'a> {
     identifiers: BTreeMap<&'a str, Vec<(&'a str, &'a crate::diagnostics::Span)>>,
     call_names: BTreeMap<(&'a str, usize), (&'a str, usize)>,
     qualifiers: std::collections::HashSet<(&'a str, usize, usize)>,
+    member_tokens: std::collections::HashSet<(&'a str, usize, usize)>,
     references: BTreeMap<&'a str, Vec<&'a super::semantic::Expression>>,
     dispatch: BTreeMap<&'a str, Vec<&'a str>>,
     local_ids: std::collections::HashSet<&'a str>,
@@ -1555,6 +1571,7 @@ impl<'a> StructuredIndex<'a> {
             identifiers,
             call_names,
             qualifiers,
+            member_tokens,
             alias_tokens,
         } = TokenIndex::new(tokens, work);
         let mut references: BTreeMap<&str, Vec<_>> = BTreeMap::new();
@@ -1681,6 +1698,7 @@ impl<'a> StructuredIndex<'a> {
             identifiers,
             call_names,
             qualifiers,
+            member_tokens,
             references,
             dispatch,
             local_ids,
@@ -2082,3 +2100,35 @@ mod tests;
 #[cfg(test)]
 #[path = "edit_visibility_tests.rs"]
 mod visibility_tests;
+
+#[cfg(test)]
+mod member_token_tests {
+    use super::*;
+
+    #[test]
+    fn qualified_members_are_excluded_from_local_capture_candidates() {
+        for count in [1, 8, 64, 256] {
+            let source = "println(value); std::io::println(value); p./* member */println(value); "
+                .repeat(count);
+            let tokens = BTreeMap::from([(
+                "main.wi".to_owned(),
+                crate::lexer::Lexer::new(&source).tokenize().unwrap(),
+            )]);
+            let mut work = EditWork::default();
+            let index = TokenIndex::new(&tokens, &mut work);
+            let occurrences = &index.identifiers["println"];
+            let qualified = occurrences
+                .iter()
+                .filter(|(path, span)| index.member_tokens.contains(&(*path, span.start, span.end)))
+                .count();
+            assert_eq!(qualified, 2 * count);
+            assert_eq!(occurrences.len() - qualified, count);
+            for head in ["std", "p"] {
+                assert!(index.identifiers[head].iter().all(|(path, span)| {
+                    !index.member_tokens.contains(&(*path, span.start, span.end))
+                }));
+            }
+            assert_eq!(work.tokens_indexed, tokens["main.wi"].len());
+        }
+    }
+}

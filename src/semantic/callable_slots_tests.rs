@@ -338,3 +338,182 @@ fn resolution_work_is_linear() {
     let program = parse(&deep(50));
     assert!(!shareable(&class(&program, "C0").fields[0].ty));
 }
+
+#[test]
+fn concise_constructor_scan_preserves_capture_slots() {
+    for prefix in ["", "new "] {
+        for declaration in [
+            "class Holder { pub callback: fn(i64) -> i64; }",
+            "class Holder { pub callback: fn(i64) -> i64; pub init(self, f: fn(i64) -> i64) { self.callback = f; } }",
+        ] {
+            let source = format!(
+                "{declaration} fn main() {{ let xs = [1]; let h = {prefix}Holder(|x: i64| x + xs[0]); let callback = h.callback; println(callback(2)); }}"
+            );
+            let program = parse(&source);
+            assert!(
+                !shareable(&class(&program, "Holder").fields[0].ty),
+                "{source}"
+            );
+            let mut checker = crate::semantic::TypeChecker::new();
+            checker.check_program(&program);
+            assert!(checker.errors.is_empty(), "{source}: {:?}", checker.errors);
+        }
+        let source = format!(
+            "class Box<T> {{ pub f: fn(T) -> T; pub value: T; }} fn main() {{ let xs = [1]; let b = {prefix}Box<i64>(|x: i64| x + xs[0], 1); }}"
+        );
+        assert!(!field(&source, "Box", "f"));
+        let source = format!(
+            "{STAGE} class Other {{ pub run: fn(i64) -> i64; }} fn main() {{ let s = {prefix}Stage(inc); let alias = s; let xs = [1]; alias.run = |x: i64| x + xs[0]; }}"
+        );
+        assert!(!field(&source, "Stage", "run"));
+        assert!(field(&source, "Other", "run"));
+    }
+}
+
+#[test]
+fn concise_constructor_scan_respects_function_and_local_shadowing() {
+    for (declaration, binding) in [
+        ("fn Stage(f: fn(i64) -> i64) -> i64 { 0 }", ""),
+        ("", "let Stage = |f: fn(i64) -> i64| 0;"),
+    ] {
+        let source = format!(
+            "{STAGE} {declaration} fn main() {{ {binding} let xs = [1]; Stage(|x: i64| x + xs[0]); }}"
+        );
+        assert!(field(&source, "Stage", "run"), "{source}");
+    }
+}
+
+#[test]
+fn concise_constructor_scan_resolves_imports_and_scales() {
+    for prefix in ["", "new "] {
+        for call in ["model::Holder", "m::Holder", "Container"] {
+            let mut model = parse("pub class Holder { pub callback: fn(i64) -> i64; }");
+            let source = format!(
+                "import model; import model as m; import model::Holder as Container; fn main() {{ let xs = [1]; let h = {prefix}{call}(|x: i64| x + xs[0]); }}"
+            );
+            let (mut main, errors) = crate::parser::Parser::new(
+                crate::lexer::Lexer::with_file_id(&source, FileId(1))
+                    .tokenize()
+                    .unwrap(),
+            )
+            .parse();
+            assert!(errors.is_empty(), "{errors:?}");
+            let mut stores = program_stores(&model);
+            stores.extend(program_stores(&main));
+            apply_build(
+                &mut [("model", &mut model), ("main", &mut main)],
+                None,
+                &stores,
+            );
+            assert!(
+                !shareable(&class(&model, "Holder").fields[0].ty),
+                "{source}"
+            );
+        }
+    }
+    for count in [8, 32, 128] {
+        let declarations = (0..count)
+            .map(|i| format!("class Holder{i} {{ pub f: fn(i64) -> i64; }}"))
+            .collect::<String>();
+        let calls = (0..count)
+            .map(|i| format!("Holder{i}(|x: i64| x + xs[0]);"))
+            .collect::<String>();
+        let mut program = parse(&format!(
+            "{declarations} fn main() {{ let xs = [1]; {calls} }}"
+        ));
+        let stores = program_stores(&program);
+        assert_eq!(stores.len(), count);
+        let stats = apply_build(&mut [("", &mut program)], None, &stores);
+        assert_eq!(stats.stores, count);
+        assert_eq!(stats.visits, count);
+        eprintln!(
+            "concise constructor classes={count} stores={} visits={}",
+            stats.stores, stats.visits
+        );
+    }
+}
+
+#[test]
+fn concise_constructor_scan_indexes_qualified_variants_once() {
+    for count in [8, 32, 128] {
+        let variants = (0..count)
+            .map(|i| format!("V{i}(fn(i64) -> i64),"))
+            .collect::<String>();
+        let calls = (0..count)
+            .map(|i| format!("Op::V{i}(|x: i64| x + xs[0]);"))
+            .collect::<String>();
+        let mut program = parse(&format!(
+            "enum Op {{ {variants} }} fn main() {{ let xs = [1]; {calls} }}"
+        ));
+        let stores = program_stores(&program);
+        let stats = apply_build(&mut [("", &mut program)], None, &stores);
+        assert_eq!(stats.variant_lookups, count);
+        assert_eq!(stats.stores, count);
+        assert_eq!(stats.visits, count);
+        eprintln!(
+            "qualified variants={count} lookups={} stores={} visits={}",
+            stats.variant_lookups, stats.stores, stats.visits
+        );
+    }
+}
+
+#[test]
+fn concise_constructor_scan_indexes_arity_and_shared_inherited_layouts() {
+    for count in [8, 32, 128] {
+        let chain = (1..=count)
+            .map(|i| {
+                format!(
+                    "open class C{i} extends C{} {{ pub value{i}: i64; }}",
+                    i - 1
+                )
+            })
+            .collect::<String>();
+        let program = parse(&format!(
+            "open class C0 {{ pub f: fn(i64) -> i64; }} {chain} fn main() {{}}"
+        ));
+        let mut index = Index::new(&[("", &program)], None);
+        let expected = index.constructor_slot(0, 1, 0).unwrap();
+        for _ in 0..4 {
+            for class in (0..=count).rev() {
+                assert_eq!(index.constructor_slot(class, class + 1, 0), Some(expected));
+            }
+        }
+        assert_eq!(index.graph.stats.constructor_steps, count + 1);
+        assert_eq!(index.graph.stats.implicit_layout_steps, count + 1);
+        assert_eq!(index.graph.stats.implicit_field_steps, count + 1);
+        eprintln!(
+            "implicit chain={count} calls={} owner_steps={} layouts={} fields={}",
+            4 * (count + 1),
+            index.graph.stats.constructor_steps,
+            index.graph.stats.implicit_layout_steps,
+            index.graph.stats.implicit_field_steps
+        );
+
+        let constructors = (0..count)
+            .map(|arity| {
+                let extras = (0..arity)
+                    .map(|i| format!(", p{i}: i64"))
+                    .collect::<String>();
+                format!("pub init(self, f: fn(i64) -> i64{extras}) {{}}")
+            })
+            .collect::<String>();
+        let program = parse(&format!(
+            "open class C0 {{ {constructors} }} {chain} fn main() {{}}"
+        ));
+        let mut index = Index::new(&[("", &program)], None);
+        for _ in 0..4 {
+            for arity in (1..=count).rev() {
+                assert!(index.constructor_slot(count, arity, 0).is_some());
+            }
+        }
+        assert_eq!(index.graph.stats.constructor_steps, count + 1);
+        assert_eq!(index.graph.stats.constructor_arity_lookups, 4 * count);
+        assert_eq!(index.graph.stats.implicit_layout_steps, 0);
+        eprintln!(
+            "explicit chain={count} arities={count} calls={} owner_steps={} arity_lookups={}",
+            4 * count,
+            index.graph.stats.constructor_steps,
+            index.graph.stats.constructor_arity_lookups
+        );
+    }
+}

@@ -1257,7 +1257,11 @@ pub(crate) fn intrinsic_effects(target: &FunctionId) -> Option<RuntimeEffects> {
 /// builtins include filesystem/network operations and callback dispatch; keep
 /// them IO-capable unless a separate IO proof is available.
 fn intrinsic_may_io(target: &FunctionId) -> bool {
-    crate::semantic::intrinsics::builtin_target_effects(target).is_none()
+    // Scalar output has a known, non-panicking runtime mask, but still
+    // performs IO. Use its resolved identity so user shadows stay ordinary
+    // graph nodes and aliases share this classification.
+    (target.is_method_of("$output") && matches!(target.name().as_ref(), "print" | "println"))
+        || crate::semantic::intrinsics::builtin_target_effects(target).is_none()
 }
 
 fn unknown_external_capabilities(target: &FunctionId) -> EffectCapabilities {

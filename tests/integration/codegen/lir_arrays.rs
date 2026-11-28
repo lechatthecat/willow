@@ -58,7 +58,7 @@ fn main() {
     println(bools());
 }
 "#,
-        "2\n4\ntrue\n",
+        "2\n4.0\ntrue\n",
     );
 }
 

@@ -13,11 +13,6 @@ pub(super) fn validate_name(name: &str) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("invalid identifier"))?;
     if tokens.len() == 2 {
         if let Some(keyword) = tokens[0].kind.keyword_name() {
-            if matches!(tokens[0].kind, TokenKind::Print | TokenKind::Println) {
-                anyhow::bail!(
-                    "rename requires an identifier; '{keyword}' is a reserved keyword (builtin function name)"
-                );
-            }
             anyhow::bail!("rename requires an identifier; '{keyword}' is a reserved keyword");
         }
         if matches!(&tokens[0].kind, TokenKind::Ident(s) if s == name) {
@@ -364,6 +359,7 @@ impl<'a> Index<'a> {
         root: &Path,
         identifiers: &BTreeMap<&'a str, Vec<(&str, &'a Span)>>,
         qualifiers: &HashSet<(&str, usize, usize)>,
+        member_tokens: &HashSet<(&str, usize, usize)>,
     ) -> Self {
         let mut result = Self {
             symbols: HashMap::new(),
@@ -514,11 +510,13 @@ impl<'a> Index<'a> {
                     result.indexed += 1;
                 }
                 if let Some(&absolute) = paths.get(path) {
-                    result
-                        .named_tokens
-                        .entry(name)
-                        .or_default()
-                        .push((absolute, span));
+                    if !member_tokens.contains(&(path, span.start, span.end)) {
+                        result
+                            .named_tokens
+                            .entry(name)
+                            .or_default()
+                            .push((absolute, span));
+                    }
                     result
                         .source_tokens
                         .insert((absolute, span.start, span.end), (name, span));
@@ -600,8 +598,9 @@ impl<'a> Index<'a> {
                 .local_ranges
                 .get(id)
                 .context("declaration has no editable lexical scope")?;
-            // Conservative capture prevention: any existing destination spelling
-            // in the enclosing function (including nested closures) is rejected.
+            // Conservative capture prevention: any unqualified destination
+            // spelling in the enclosing function (including nested closures)
+            // is rejected. Qualified members cannot be captured by a binding.
             // Indexed range lookup avoids a token scan for each local rename.
             if let Some(tokens) = self.named_tokens.get(name) {
                 let i = tokens.partition_point(|(path, span)| {
@@ -907,7 +906,13 @@ mod tests {
                         ..Default::default()
                     },
                 };
-                let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+                let mut index = Index::new(
+                    &snapshot,
+                    &root,
+                    &identifiers,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                );
                 let mut patches = BTreeMap::new();
                 let mut work = EditWork::default();
                 for i in 0..n {
@@ -1011,7 +1016,13 @@ mod tests {
                 };
                 let identifiers =
                     BTreeMap::from([("old", spans.iter().map(|&s| ("main.wi", s)).collect())]);
-                let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+                let mut index = Index::new(
+                    &snapshot,
+                    &root,
+                    &identifiers,
+                    &HashSet::new(),
+                    &HashSet::new(),
+                );
                 let mut work = EditWork::default();
                 let mut patches = BTreeMap::new();
                 for i in 0..if shape == "disjoint" { n } else { 1 } {
@@ -1122,7 +1133,13 @@ mod tests {
                 ),
             ]);
             let selected = n / 2;
-            let mut index = Index::new(&snapshot, &root, &identifiers, &HashSet::new());
+            let mut index = Index::new(
+                &snapshot,
+                &root,
+                &identifiers,
+                &HashSet::new(),
+                &HashSet::new(),
+            );
             let error = index
                 .plan(
                     &format!("s{selected}"),

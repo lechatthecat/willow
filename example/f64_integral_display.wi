@@ -1,4 +1,4 @@
-// Default integral f64 display omits .0, including signed zero.
+// Default integral f64 display retains .0, including signed zero.
 fn show(value: f64) {
     println(value);
     println(value.to_string());

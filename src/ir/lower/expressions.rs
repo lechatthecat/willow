@@ -51,6 +51,92 @@ pub(super) fn lower_expr(expr: &Expr, ctx: &mut LowerCtx) -> Result<HirExpr, Dia
     {
         return Err(missing_fact(expr.span(), "static target"));
     }
+    if matches!(expr, Expr::Call(_) | Expr::StaticCall(_))
+        && let Some(target) = ctx
+            .tables
+            .analysis_calls
+            .and_then(|calls| calls.get(&expr.id()))
+            .copied()
+            .flatten()
+        && target.is_method_of("$output")
+    {
+        let args = match expr {
+            Expr::Call(c) => &c.args,
+            Expr::StaticCall(c) => &c.args,
+            _ => unreachable!(),
+        };
+        return lower_print_expr(
+            &args[0].expr,
+            target.name().as_ref() == "println",
+            expr.span(),
+            checked_type,
+            ctx,
+        );
+    }
+    if matches!(expr, Expr::Call(_) | Expr::StaticCall(_))
+        && ctx
+            .tables
+            .constructor_calls
+            .is_some_and(|calls| calls.contains(&expr.id()))
+    {
+        let args = match expr {
+            Expr::Call(c) => &c.args,
+            Expr::StaticCall(c) => &c.args,
+            _ => unreachable!(),
+        };
+        let args = lower_value_args(args, ctx)?;
+        let Type::Named(name) = checked_type
+            .as_ref()
+            .ok_or_else(|| missing_fact(expr.span(), "constructor type"))?
+        else {
+            return Err(missing_fact(expr.span(), "nominal constructor type"));
+        };
+        let (class, ty) = allocation_type(name, checked_type.clone(), ctx);
+        return Ok(HirExpr {
+            kind: HirExprKind::New { class, args },
+            ty,
+            span: expr.span(),
+        });
+    }
+    // The public standalone lowering API has no checker facts. Respect its
+    // lexical/function scopes before recognizing prelude output or classes.
+    if !ctx.tables.checked {
+        let site = match expr {
+            Expr::Call(c)
+                if ctx.lookup(&c.callee).is_none() && !ctx.fn_returns.contains_key(&c.callee) =>
+            {
+                Some((c.callee.clone(), c.args.as_slice()))
+            }
+            Expr::StaticCall(c) => {
+                Some((QualifiedName::join(&c.class, &c.method), c.args.as_slice()))
+            }
+            _ => None,
+        };
+        if let Some((name, args)) = site {
+            if matches!(
+                name.as_str(),
+                "print" | "println" | "std::io::print" | "std::io::println"
+            ) && args.len() == 1
+            {
+                return lower_print_expr(
+                    &args[0].expr,
+                    name.ends_with("println"),
+                    expr.span(),
+                    checked_type,
+                    ctx,
+                );
+            }
+            if ctx.classes.map.contains_key(&name) {
+                let args = lower_value_args(args, ctx)?;
+                let (class, ty) = allocation_type(&name, checked_type, ctx);
+                return Ok(HirExpr {
+                    kind: HirExprKind::New { class, args },
+                    ty,
+                    span: expr.span(),
+                });
+            }
+        }
+    }
     lower_expr_inner(expr, checked_type, ctx)
 }
 

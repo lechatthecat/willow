@@ -595,7 +595,7 @@ fn promoted_function_values_keep_linear_generated_code() {
 fn promoted_function_values_guard_target_and_evaluate_operands_once() {
     for (out, ok) in both(include_str!("../../tests/regressions/guarded_fn_values.wi")) {
         assert!(ok, "{out}");
-        assert_eq!(out, "4\n1\n6\n2\nrecovered\n-1\n1\n-3\nfalse\n");
+        assert_eq!(out, "4\n1\n6\n2\nrecovered\n-1\n1\n-3.0\nfalse\n");
     }
 }
 

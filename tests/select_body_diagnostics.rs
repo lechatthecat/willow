@@ -66,7 +66,7 @@ fn select_block_diagnostic_preserves_neighboring_errors() {
             "async fn main() { select { default => {",
             "expected `}` to close block",
         ),
-        ("fn println() {}", "reserved keyword"),
+        ("fn while() {}", "reserved keyword"),
     ] {
         let (_, errors) = Parser::new(Lexer::new(source).tokenize().unwrap()).parse();
         assert!(

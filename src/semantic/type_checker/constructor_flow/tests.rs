@@ -476,8 +476,9 @@ interface Probe { fn ok(self) -> bool; }
         // 7-8: proven pure calls do not reach the recovery exit.
         ("RECOVER let ok = pure(1); self.x = 1; self.y = 2;", &[]),
         ("RECOVER let n = calm(1); self.x = 1; self.y = 2;", &[]),
-        // Helper display shares the solver's conservative Print summary.
-        ("RECOVER tidy(); self.x = 1; self.y = 2;", &["x", "y"]),
+        // Resolved scalar output keeps its IO capability but no longer adds
+        // the legacy Print summary's conservative panic to a helper.
+        ("RECOVER tidy(); self.x = 1; self.y = 2;", &[]),
         // 9-10: panicking helpers and checked arithmetic still do.
         ("RECOVER boom(); self.x = 1; self.y = 2;", &["x", "y"]),
         (
@@ -564,6 +565,26 @@ interface Probe { fn ok(self) -> bool; }
     ];
     for (body, expected) in cases {
         check_items(helpers, &body.replace("RECOVER", recovery), expected);
+    }
+    // Every output spelling has the same helper precision. Argument hazards
+    // still reach recovery before either field is assigned.
+    for (imports, output) in [
+        ("", "print"),
+        ("", "println"),
+        ("", "std::io::print"),
+        ("", "std::io::println"),
+        ("import std::io as out;", "out::print"),
+        ("import std::io as out;", "out::println"),
+        ("import std::io::print as write;", "write"),
+        ("import std::io::println as line;", "line"),
+    ] {
+        for (argument, expected) in [("n", &[][..]), ("1 / n", &["x", "y"][..])] {
+            check_items(
+                &format!("{imports} fn tidy(n: i64) {{ {output}({argument}); }}"),
+                &format!("{recovery} tidy(1); self.x = 1; self.y = 2;"),
+                expected,
+            );
+        }
     }
     // 30: interface dispatch stays conservative (its implementations are open).
     check_items(

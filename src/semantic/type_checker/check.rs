@@ -447,6 +447,7 @@ impl TypeChecker {
                 &self.expr_types,
                 &self.static_call_classes,
                 &self.builtin_calls,
+                &self.analysis_calls,
             );
             for diagnostic in result.diagnostics {
                 self.push(diagnostic);
@@ -843,18 +844,21 @@ impl TypeChecker {
     fn record_resolved_call(&mut self, expr: &Expr) {
         use crate::semantic::intrinsics::BuiltinMethod;
         let mut inline_callback = false;
-        let native = self
+        let resolved = self
             .analysis_calls
             .get(&expr.id())
             .copied()
             .flatten()
             .filter(|id| {
-                self.symbols
-                    .native_function(&id.to_string())
-                    .is_some_and(|info| info.native.is_some())
+                id.is_method_of("$output")
+                    || self.constructor_calls.contains(&expr.id())
+                    || self
+                        .symbols
+                        .native_function(&id.to_string())
+                        .is_some_and(|info| info.native.is_some())
             });
         let mut targets = match expr {
-            _ if native.is_some() => vec![native.unwrap()],
+            _ if resolved.is_some() => vec![resolved.unwrap()],
             // Constant reads inline their value. Keep a string constant's
             // resolved identity outside AI capture too, so allocation proofs
             // distinguish it from a shadowing local without resolving again.
@@ -867,8 +871,7 @@ impl TypeChecker {
                     .insert(*id, Some(FunctionId::free_from_source_name(name)));
                 return;
             }
-            // Printing is syntax rather than an ordinary Call expression, but
-            // contract proofs still need its trusted runtime ABI edge.
+            // Internally generated output nodes use the same trusted runtime edge.
             Expr::Print(_, newline, _, _) => vec![FunctionId::method(
                 TypeId::local("$output"),
                 if *newline { "println" } else { "print" },
@@ -1112,11 +1115,20 @@ impl TypeChecker {
 
     pub(super) fn check_new_with_effects(
         &mut self,
-        n: &NewExpr,
+        n: &Construction<'_>,
         class: &str,
         checked: bool,
     ) -> Type {
         let result = self.check_new(n, class, checked);
+        self.constructor_calls.insert(n.id);
+        if let Type::Named(owner) = &result {
+            self.static_call_classes
+                .insert(n.id, TypeId::from_source_name(owner));
+            self.analysis_calls.insert(
+                n.id,
+                Some(FunctionId::method(TypeId::from_source_name(owner), "init")),
+            );
+        }
         if self
             .symbols
             .lookup_class(class)
@@ -1131,6 +1143,9 @@ impl TypeChecker {
     }
 
     fn check_expr_inner(&mut self, expr: &Expr) -> Type {
+        if let Some(newline) = self.output_function(expr) {
+            return self.check_output_call(expr, newline);
+        }
         if let Expr::Var(name, span, _) = expr
             && self.symbols.lookup_var(name).is_none()
             && (self.generics.functions.contains_key(name)
@@ -1151,11 +1166,8 @@ impl TypeChecker {
             return self.check_object_literal(literal);
         }
 
-        if let Expr::New(n) = expr
-            && n.type_args.is_empty()
-            && let Some(ty) = self.check_inferred_generic_new(n)
-        {
-            return ty;
+        if let Some(construction) = self.construction(expr) {
+            return self.check_constructor_call(&construction);
         }
         let generic_class = self.generic_class_site(expr);
         if let Some((name, args)) = generic_class
@@ -1165,9 +1177,6 @@ impl TypeChecker {
                 return ty;
             };
             self.generics.objects.insert(expr.id(), name.clone());
-            if let Expr::New(n) = expr {
-                return self.check_new_with_effects(n, name, false);
-            }
 
             let mut concrete = expr.clone();
             match &mut concrete {
@@ -1211,7 +1220,7 @@ impl TypeChecker {
             }
             Expr::StaticCall(s) => self.check_static_call(s, CallContext::default()),
             Expr::StaticField(s) => self.resolve_static_field_read(&s.class, &s.field, s.span),
-            Expr::New(n) => self.check_new_with_effects(n, &n.class_name, false),
+            Expr::New(_) => unreachable!("construction handled above"),
             Expr::ObjectLiteral(o) => self.check_object_literal(o),
             Expr::Await(a) => self.check_await_expr(a),
             Expr::Select(s) => {
@@ -1394,6 +1403,21 @@ impl TypeChecker {
             return Self::error_type();
         }
         if self.report_contextless_variant(name, *span) {
+            return Self::error_type();
+        }
+        if matches!(name, "print" | "println") || self.imported_output_functions.contains_key(name)
+        {
+            self.push(
+                Diagnostic::new(
+                    Severity::Error,
+                    ErrorCode::E1012,
+                    "a polymorphic output function needs a concrete callback signature",
+                )
+                .with_label(Label::primary(*span, "argument type is not specified"))
+                .with_help(format!(
+                    "wrap the function in a typed lambda, for example `|value: i64| {name}(value)`"
+                )),
+            );
             return Self::error_type();
         }
         self.push(
@@ -1764,7 +1788,7 @@ impl TypeChecker {
         }
     }
 
-    fn check_print_expr(&mut self, arg: &Expr, newline: &bool) -> Type {
+    pub(super) fn check_print_expr(&mut self, arg: &Expr, newline: &bool) -> Type {
         let arg_ty = self.check_expr(arg);
         // Printable: i64/f64/bool/String and Never (a panicking
         // argument never reaches the print). Option values require

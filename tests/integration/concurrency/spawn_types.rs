@@ -60,7 +60,7 @@ async fn main() {
 "#,
     );
     assert!(ok, "f64-return task await should compile and run");
-    assert_eq!(out.trim(), "5");
+    assert_eq!(out.trim(), "5.0");
 }
 
 /// Function with three i64 parameters can be spawned; all args are forwarded.
