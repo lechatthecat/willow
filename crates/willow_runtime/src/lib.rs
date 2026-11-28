@@ -1,5 +1,12 @@
 //! Runtime functions linked with Cranelift-generated object files.
 //!
+//! # Runtime instances
+//!
+//! Supported programs use the process-default runtime. Non-default runtimes
+//! are internal test fixtures; concurrent fixture isolation is not a public
+//! embedding API. Host-managed creation, selection and destruction of multiple
+//! runtimes are unsupported. See `crates/willow_runtime/EMBEDDING.md`.
+//!
 //! # Failure policy
 //!
 //! RecoverableLanguageFault: set the current language panic context and return

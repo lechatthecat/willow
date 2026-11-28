@@ -1,5 +1,11 @@
 //! Ownership of GC storage and worker policy in the process-default ABI instance.
 //!
+//! Non-default instances are internal test fixtures, not a supported embedding
+//! API. Their constructors are test-only; TLS selection requires a static owner.
+//! Concurrent fixture isolation does not establish a host-managed lifecycle.
+//! See `crates/willow_runtime/EMBEDDING.md` for the support boundary and proposed
+//! requirements; exposing multiple runtimes remains a user decision.
+//!
 //! Worker configuration exists before lazy GC or scheduler initialization, so
 //! selecting a worker configuration cannot recursively initialize a scheduler.
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -181,9 +187,11 @@ impl Runtime {
         }
     }
 
-    // Non-default runtimes are test/private instances; keeping their lazy
-    // collector lookup out of line leaves the default gate a straight-line
-    // compare and address in every inlined barrier.
+    // Non-default runtimes are internal test fixtures, not embedding instances.
+    // Keep their lazy lookup out of line to preserve the default Rust barrier
+    // path. Generated barriers use gate pointers published in their context,
+    // so they do not call this lookup per store. See EMBEDDING.md for the
+    // performance decision and the requirements for any public lifecycle.
     #[cold]
     #[inline(never)]
     fn owned_mark_phase(&self) -> &std::sync::atomic::AtomicU8 {

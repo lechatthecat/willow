@@ -44,6 +44,13 @@ quiescence fails with a channel/await wait witness and exit status 1. This detec
 an observed whole-program stop, not partial deadlocks while other work or wake
 sources remain. See the [precise scope and exclusions](#runtime-channelawait-deadlock-detection).
 
+## Runtime instances
+
+Willow programs use the process-default runtime. Additional runtimes are internal
+test fixtures; concurrent fixture isolation is not public embedding support.
+Host-managed creation, selection and destruction of multiple runtimes are
+unsupported. See [runtime instances and proposed embedding requirements](crates/willow_runtime/EMBEDDING.md).
+
 ## Runtime channel/await deadlock detection
 
 Willow uses **runtime global-quiescence detection** for channel/await deadlocks.
