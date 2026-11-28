@@ -85,6 +85,15 @@ impl CompilerDb {
     ) -> Self {
         let dependencies = std::rc::Rc::new(dependencies);
         let overflow_checks = inputs.options.target.resolved_overflow_checks();
+        let effects = effects::EffectQueries::new(
+            modules,
+            std::rc::Rc::clone(&dependencies),
+            overflow_checks,
+        );
+        effects.proofs.borrow_mut().namespaces = modules
+            .iter()
+            .map(|m| (m.id, m.identity_path().to_owned()))
+            .collect();
         Self {
             source_imports_checked: false,
             prechecks: Default::default(),
@@ -108,11 +117,7 @@ impl CompilerDb {
             )),
             inputs,
             layouts: Default::default(),
-            effects: std::rc::Rc::new(effects::EffectQueries::new(
-                modules,
-                std::rc::Rc::clone(&dependencies),
-                overflow_checks,
-            )),
+            effects: std::rc::Rc::new(effects),
             bodies,
             dependencies,
             checked: QueryTable::named("checked_unit"),

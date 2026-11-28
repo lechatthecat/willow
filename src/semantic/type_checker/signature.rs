@@ -199,6 +199,10 @@ impl TypeChecker {
             f.return_type_span.as_deref().copied().unwrap_or(f.span),
         );
         let info = FuncInfo {
+            pure: f
+                .effect_contracts
+                .iter()
+                .any(|a| a.kind == crate::parser::ast::EffectContractKind::Pure),
             native: f
                 .rust_bridge
                 .as_deref()

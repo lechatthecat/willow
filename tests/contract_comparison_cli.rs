@@ -518,3 +518,180 @@ fn verify_edit_panic_allocation_contract_changes() {
         );
     }
 }
+
+#[test]
+fn modular_verification_cli_dependency_changes_and_unknown_exit() {
+    let root = std::env::temp_dir().join(format!(
+        "willow-modular-contract-cli-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    for file in ["main.wi", "bounds.wi", "arithmetic.wi"] {
+        fs::copy(
+            Path::new("example/modular_verification").join(file),
+            root.join(file),
+        )
+        .unwrap();
+    }
+    git(&root, &["add", "main.wi", "bounds.wi", "arithmetic.wi"]);
+    git(&root, &["commit", "-qm", "Modular example"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    let run = |expected| {
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["verify-edit", "--root"])
+            .arg(&root)
+            .args([
+                "--base",
+                &base,
+                "--protected-base",
+                &base,
+                "--schema",
+                "v4",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let same = run(0);
+    assert!(
+        same["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|r| r["verification"]["target"] == "PROVEN")
+            .count()
+            >= 2
+    );
+    let bounds = fs::read_to_string(root.join("bounds.wi")).unwrap();
+    fs::write(root.join("bounds.wi"), bounds.replace("x >= 0", "x > 0")).unwrap();
+    let changed = run(1);
+    assert!(
+        changed["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["symbol"] == "twice" && r["proof_dependencies_changed"] == true)
+    );
+    fs::write(
+        root.join("bounds.wi"),
+        "@pure pub fn small(x:i64)->bool {return small(x);}",
+    )
+    .unwrap();
+    let unknown = run(3);
+    assert_eq!(unknown["status"], "incomplete");
+    assert!(
+        unknown["summary"]["verification"]["target"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["status"] == "UNKNOWN")
+    );
+}
+
+#[test]
+fn modular_verification_cli_unchanged_opaque_helpers_preserve_contracts() {
+    let root =
+        std::env::temp_dir().join(format!("willow-opaque-helper-cli-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    let module = "@pure fn a(x:i64)->bool {return x>=0;} @pure fn b(x:i64)->bool {return x<=10;} @pure @verified pub fn helper(x:i64)->bool {return a(x) && b(x);} @pure @verified pub fn positive(x:i64)->bool {return x>=0;} @pure @verified pub fn bounded(x:i64)->i64 ensures result>=0 {return 1;}";
+    fs::write(root.join("math.wi"), module).unwrap();
+    fs::write(root.join("main.wi"), "import math; @pure @verified fn caller(x:i64)->i64 requires math::positive(x) ensures result==x {return x;} @pure @verified fn bounded(x:i64)->i64 requires math::bounded(x)>0 ensures result==x {return x;} @pure @verified fn reordered(x:i64)->i64 requires math::helper(x) ensures result==x {return x;} fn main() {}").unwrap();
+    git(&root, &["add", "main.wi", "math.wi"]);
+    git(&root, &["commit", "-qm", "Opaque helper contracts"]);
+    let base = git(&root, &["rev-parse", "HEAD"]);
+    let run = |expected| {
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["verify-edit", "--root"])
+            .arg(&root)
+            .args([
+                "--base",
+                &base,
+                "--protected-base",
+                &base,
+                "--schema",
+                "v4",
+                "--format",
+                "json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(expected),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let same = run(0);
+    for caller in ["caller", "bounded", "reordered"] {
+        let change = same["changes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["symbol"] == caller)
+            .unwrap();
+        assert_eq!(change["contract_preserved"], "PROVEN");
+        assert_eq!(change["implementation_verified"], true);
+        assert_eq!(change["proof_dependencies_changed"], false);
+    }
+    let swapped = module.replace(
+        "@pure fn a(x:i64)->bool {return x>=0;} @pure fn b(x:i64)->bool {return x<=10;}",
+        "@pure fn b(x:i64)->bool {return x<=10;} @pure fn a(x:i64)->bool {return x>=0;}",
+    );
+    fs::write(root.join("math.wi"), swapped).unwrap();
+    let reordered = run(0);
+    for change in reordered["changes"].as_array().unwrap() {
+        assert_eq!(change["contract_preserved"], "PROVEN", "{change}");
+        assert_eq!(change["proof_dependencies_changed"], false, "{change}");
+    }
+    assert_eq!(
+        reordered["summary"]["proof_cache"]["misses"],
+        same["summary"]["proof_cache"]["misses"]
+    );
+    assert_eq!(
+        reordered["summary"]["proof_cache"]["hits"],
+        same["summary"]["proof_cache"]["hits"]
+    );
+    // Same contracts cannot justify coupling different implementations.
+    fs::write(root.join("math.wi"), module.replace("x>=0", "x>0")).unwrap();
+    let changed = run(1);
+    let caller = changed["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["symbol"] == "caller")
+        .unwrap();
+    assert_eq!(caller["contract_preserved"], "NOT_PRESERVED");
+    assert_eq!(caller["proof_dependencies_changed"], true);
+}

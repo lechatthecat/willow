@@ -1,18 +1,16 @@
 //! Process-owned proof entries. Disk artifacts are never trusted as proofs.
 use super::*;
-use std::collections::BTreeMap;
-#[derive(Default)]
+#[derive(Debug, Default, Clone)]
 pub struct ProofCache {
-    entries: BTreeMap<String, Vec<Obligation>>,
+    entries: HashMap<String, (String, Vec<Obligation>)>,
     pub hits: usize,
     pub misses: usize,
 }
 impl ProofCache {
-    pub(super) fn invalidate(&mut self) {
-        self.entries.clear();
-    }
-    pub(super) fn get(&mut self, key: &str) -> Option<Vec<Obligation>> {
-        if let Some(value) = self.entries.get(key) {
+    pub(super) fn get(&mut self, owner: &str, key: &str) -> Option<Vec<Obligation>> {
+        if let Some((identity, value)) = self.entries.get(owner)
+            && identity == key
+        {
             self.hits += 1;
             Some(value.clone())
         } else {
@@ -20,18 +18,16 @@ impl ProofCache {
             None
         }
     }
-    pub(super) fn remove(&mut self, key: &str) {
-        self.entries.remove(key);
+    pub(super) fn remove(&mut self, owner: &str) {
+        self.entries.remove(owner);
     }
-    pub(super) fn insert(&mut self, key: String, value: Vec<Obligation>) {
-        if self.entries.len() >= 256 && !self.entries.contains_key(&key) {
-            self.entries.pop_first();
-        }
-        self.entries.insert(key, value);
+    pub(super) fn insert(&mut self, owner: String, key: String, value: Vec<Obligation>) {
+        self.entries.insert(owner, (key, value));
     }
 }
 pub(super) fn identity(
     summary: &Summary,
+    dependency_names: &[String],
     dependencies: &[String],
     f: &FunctionDecl,
     options: &Options,
@@ -39,8 +35,8 @@ pub(super) fn identity(
     digest(
         &serde_json::json!({
             "schema":"willow.proof-cache.v1", "typed_semantics":summary.definitions,
-            "contracts":summary.contract_definitions, "dependencies":dependencies,
-            "signature":comparison::signature(f), "model":"checked-i64", "vc_generator":"6", "data_model":summary.data_digest,
+            "contracts":summary.contract_definitions, "dependencies":dependencies, "dependency_names":dependency_names,
+            "signature":comparison::signature(f), "model":"checked-i64", "vc_generator":"8", "data_model":summary.data_digest,
             "compiler":crate::ai::compiler_identity(), "solver_version":solver::VERSION,
             "solver_executable":options.solver, "timeout_ms":options.timeout_ms,
             "resource_limit":options.resource_limit

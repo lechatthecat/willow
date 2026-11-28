@@ -309,7 +309,13 @@ fn contract_proof_cache_shared_graph_work_scales() {
         assert!(second.reports.iter().all(|r| r.status == Status::Proven));
         assert_eq!(cache.hits, n);
         assert_eq!(cache.misses, n);
-        assert_eq!(second.smt.matches("(define-fun f0_value ").count(), 1);
+        assert_eq!(
+            second
+                .smt
+                .matches(&format!("(define-fun f{}_value ", symbol_name("helper")))
+                .count(),
+            1
+        );
         eprintln!(
             "cache fanout n={n} misses={} hits={} bytes={}",
             cache.misses,
@@ -320,7 +326,7 @@ fn contract_proof_cache_shared_graph_work_scales() {
 }
 
 #[test]
-fn contract_comparison_invalid_budgets_and_unsupported_calls_fail_closed() {
+fn contract_comparison_invalid_budgets_and_impure_calls_fail_closed() {
     let a = snapshot(&function("", "", "x"));
     for o in [
         Options {
@@ -342,7 +348,7 @@ fn contract_comparison_invalid_budgets_and_unsupported_calls_fail_closed() {
         );
     }
     let a = snapshot(
-        "@pure fn g(x:i64)->i64 {return x;} @pure fn f(x:i64)->i64 ensures result==g(x) {return x;}",
+        "fn g(x:i64)->i64 {return x;} @pure fn f(x:i64)->i64 ensures result==g(x) {return x;}",
     );
     let c = compare(&a, &a, &options());
     assert_eq!(
@@ -365,4 +371,75 @@ fn contract_comparison_body_identity_is_separate_from_specification_dependencies
     assert_eq!(c["changes"][0]["contract_preserved"], "PROVEN");
     assert_eq!(c["changes"][0]["proof_dependencies_changed"], false);
     assert_eq!(c["changes"][0]["semantic_identity_changed"], true);
+}
+
+#[test]
+fn contract_comparison_opaque_helpers_share_only_unchanged_semantics() {
+    for (helper, contracts) in [
+        (
+            "@pure @verified fn helper(x:i64)->bool {return x>=0;}",
+            "requires helper(x) ensures result==x",
+        ),
+        (
+            "@pure @verified fn helper(x:i64)->i64 ensures result>=0 {return 1;}",
+            "requires helper(x)>0 ensures result==x",
+        ),
+        (
+            "@pure @verified fn helper()->bool {return true;}",
+            "requires helper() ensures result==x",
+        ),
+        (
+            "@pure @verified fn helper(x:i64,y:i64)->bool {return x>=y;}",
+            "requires helper(x,0) ensures result==x",
+        ),
+        (
+            "@pure @verified fn helper(x:i64)->bool {return x>=0;} @pure fn wrapper(x:i64)->bool {return helper(x);}",
+            "requires wrapper(x) ensures result==x",
+        ),
+        (
+            "@pure @verified fn helper(x:i64)->bool {return x>=0;}",
+            "requires helper(x) ensures helper(result) && result==x",
+        ),
+    ] {
+        let source =
+            format!("{helper} @pure @verified fn caller(x:i64)->i64 {contracts} {{return x;}}");
+        let a = snapshot(&format!("{source} fn removed()->i64 {{return 0;}}"));
+        let b = snapshot(&format!(
+            "fn added()->i64 {{return 0;}} {source} fn zadded()->i64 {{return 0;}}"
+        ));
+        let same = compare_typed(&a, &b, &options());
+        assert!(same.uncertainty.is_empty(), "{source}: {same:?}");
+        assert!(
+            same.changes
+                .iter()
+                .all(|c| c.contract_preserved == Preservation::Proven),
+            "{source}: {same:?}"
+        );
+    }
+    for (helper, changed) in [
+        (
+            "@pure @verified fn helper(x:i64)->bool {return x>=0;}",
+            "@pure @verified fn helper(x:i64)->bool {return x>0;}",
+        ),
+        (
+            "@pure fn leaf(x:i64)->bool {return x>=0;} @pure @verified fn helper(x:i64)->bool {return leaf(x);}",
+            "@pure fn leaf(x:i64)->bool {return x>0;} @pure @verified fn helper(x:i64)->bool {return leaf(x);}",
+        ),
+    ] {
+        let caller = "@pure @verified fn caller(x:i64)->i64 requires helper(x) ensures result==x {return x;}";
+        let a = snapshot(&format!("{helper} {caller}"));
+        let b = snapshot(&format!("{changed} {caller}"));
+        let report = compare_typed(&a, &b, &options());
+        let caller = report
+            .changes
+            .iter()
+            .find(|c| c.symbol == "caller")
+            .unwrap();
+        assert_eq!(
+            caller.contract_preserved,
+            Preservation::NotPreserved,
+            "{report:?}"
+        );
+        assert!(caller.proof_dependencies_changed, "{report:?}");
+    }
 }

@@ -1,0 +1,4 @@
+// Shared, pure predicate used by contracts in other modules.
+@pure pub fn small(x: i64) -> bool {
+    return x >= 0 && x < 100;
+}

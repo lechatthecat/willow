@@ -1,0 +1,9 @@
+import bounds;
+
+// Callers use this contract without expanding the implementation.
+@pure @verified pub fn advance(x: i64) -> i64
+    requires bounds::small(x)
+    ensures result == x + 1
+{
+    return x + 1;
+}

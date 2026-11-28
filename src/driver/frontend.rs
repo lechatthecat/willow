@@ -773,10 +773,14 @@ fn expand_templates(
         source_imports_checked,
     })
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "database preparation transfers one revision ownership graph into its shared query tables"
+)]
 fn prepare_database(
     expanded: ExpandedTemplates,
     mut graph: module::ModuleGraph,
-    inputs: compiler_db::inputs::CompilerInputs,
+    mut inputs: compiler_db::inputs::CompilerInputs,
     desugar_dependencies: ModuleDependencies,
     reuse: RevisionReuse<'_>,
     root: &Path,
@@ -834,6 +838,7 @@ fn prepare_database(
     artifacts.previous_parsed = None;
     artifacts.previous_expanded = None;
     let syntax_queries = artifacts.syntax_queries.take();
+    let proof_cache = inputs.proof_cache.take();
     let mut db = compiler_db::CompilerDb::with_dependencies(
         inputs,
         &graph.files,
@@ -841,6 +846,11 @@ fn prepare_database(
         std::rc::Rc::clone(&artifacts.store),
         desugar_dependencies,
     );
+    if let Some(cache) = proof_cache {
+        db.effects.proofs.borrow_mut().cache = cache;
+    } else if let Some(previous) = previous {
+        db.effects.proofs.borrow_mut().cache = previous.db.effects.proofs.borrow().cache.clone();
+    }
     db.generic_sources = generic_sources;
     db.runtime_names = runtime_names;
     db.prechecks = prechecks;

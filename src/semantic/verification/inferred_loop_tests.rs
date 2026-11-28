@@ -157,7 +157,7 @@ fn inferred_loop_constant_obligations_and_scaling() {
             let safe = summary
                 .definitions
                 .lines()
-                .find(|s| s.starts_with("(define-fun f0_safe "))
+                .find(|s| s.starts_with(&format!("(define-fun f{}_safe ", symbol(f))))
                 .unwrap();
             // Entry/preservation, rank bounds twice, nonnegativity, increment
             // safety and strict decrease: seven guards, independent of trip
@@ -204,7 +204,7 @@ fn inferred_loop_array_and_exit_obligation_counts() {
             let safe = summary
                 .definitions
                 .lines()
-                .find(|s| s.starts_with("(define-fun f0_safe "))
+                .find(|s| s.starts_with(&format!("(define-fun f{}_safe ", symbol(f))))
                 .unwrap();
             let loops = if shape == "arrays" { count } else { 1 };
             let guards = safe.matches("(=> ").count();

@@ -1211,6 +1211,47 @@ impl TypeChecker {
         proven.into_keys().collect()
     }
 
+    fn report_static_verification(&mut self, program: &Program) {
+        let options = self.verification_options.clone().unwrap_or_default();
+        let writes = self.field_writes.clone().expect("field write analysis");
+        let (diagnostics, verification) = if let Some((queries, unit)) = &self.effect_queries {
+            let mut world = queries.proofs.borrow_mut();
+            let targets = self
+                .analysis_calls
+                .iter()
+                .filter_map(|(&expr, target)| {
+                    let target = (*target)?;
+                    let (owner, target) = queries
+                        .external_target(*unit, &target, &self.effect_index.imports)
+                        .unwrap_or((*unit, target));
+                    (target.owner().is_none()).then(|| (expr, world.name(owner, &target.name())))
+                })
+                .collect();
+            world.check(
+                *unit,
+                program,
+                &self.errors,
+                &self.builtin_calls,
+                &targets,
+                &writes,
+                &options,
+            )
+        } else {
+            crate::semantic::verification::check(
+                program,
+                &self.errors,
+                &self.builtin_calls,
+                &writes,
+                &options,
+                &mut self.verification_cache,
+            )
+        };
+        self.verification = verification;
+        for diagnostic in diagnostics {
+            self.push(diagnostic);
+        }
+    }
+
     pub(super) fn report_effect_contracts(
         &mut self,
         program: &Program,
@@ -1221,20 +1262,7 @@ impl TypeChecker {
         let mut declarations = self.contract_obligations(program, templates);
         self.report_purity(program, graph, &declarations, templates);
         if !templates && !self.template_precheck {
-            let options = self.verification_options.clone().unwrap_or_default();
-            let writes = self.field_writes.clone().expect("field write analysis");
-            let (diagnostics, verification) = crate::semantic::verification::check(
-                program,
-                &self.errors,
-                &self.builtin_calls,
-                &writes,
-                &options,
-                &mut self.verification_cache,
-            );
-            self.verification = verification;
-            for diagnostic in diagnostics {
-                self.push(diagnostic);
-            }
+            self.report_static_verification(program);
         }
 
         declarations.retain(|(_, c)| {

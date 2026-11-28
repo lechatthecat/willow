@@ -30,6 +30,12 @@ fn byte_string(value: &str) -> String {
     out.push('"');
     out
 }
+pub(super) fn symbol(f: &FunctionDecl) -> String {
+    symbol_name(&f.name)
+}
+pub(super) fn symbol_name(name: &str) -> String {
+    format!("{:x}", crate::hex::Hex(name.as_bytes()))
+}
 pub(super) fn integer(n: impl Into<i128>) -> String {
     let n = n.into();
     if n < 0 {
@@ -54,6 +60,7 @@ pub(super) fn has(f: &FunctionDecl, k: EffectContractKind) -> bool {
 pub(super) struct Summary {
     #[cfg(test)]
     pub assembly_bytes: usize,
+    pub contract_dependencies: BTreeSet<usize>,
     pub data_digest: String,
     pub definitions: String,
     pub contract_definitions: String,
@@ -94,7 +101,7 @@ struct Encoder<'a> {
     dependencies: BTreeSet<usize>,
     depth: usize,
     expected: Option<Type>,
-    function_id: usize,
+    function_id: String,
     havoc: Vec<Value>,
     loop_symbols: std::collections::BTreeMap<String, String>,
     loop_writes: HashMap<BodyId, BTreeSet<String>>,
@@ -122,7 +129,11 @@ impl<'a> Encoder<'a> {
             dependencies: BTreeSet::new(),
             depth: 0,
             expected: None,
-            function_id,
+            function_id: format!(
+                "{}{}",
+                data.symbol_namespace,
+                symbol(functions[function_id])
+            ),
             havoc: Vec::new(),
             loop_symbols: std::collections::BTreeMap::new(),
             loop_writes: HashMap::new(),
@@ -303,14 +314,20 @@ impl<'a> Encoder<'a> {
                 if let Some(v) = state.env.get(n) {
                     return Ok(v.clone());
                 }
+                let resolved = self
+                    .data
+                    .targets
+                    .and_then(|t| t.get(&expr.id()))
+                    .map(String::as_str)
+                    .unwrap_or(n);
                 match self
                     .names
-                    .get(n.as_str())
+                    .get(resolved)
                     .and_then(|i| self.functions[*i].constant.as_ref())
                 {
                     Some(ConstValue::Integer(number)) => {
                         let mut value = Value::literal(integer(*number), false);
-                        value.ty = self.functions[self.names[n.as_str()]].return_type.clone();
+                        value.ty = self.functions[self.names[resolved]].return_type.clone();
                         Ok(value)
                     }
                     Some(ConstValue::Char(c)) => Ok(Value {
@@ -414,70 +431,102 @@ impl<'a> Encoder<'a> {
                 }
                 self.typed_node(format!("(ite {} {} {})", c.text, a.text, b.text), &a.ty)
             }
-            Expr::Call(c) => {
-                if !c.type_args.is_empty() || state.env.contains_key(&c.callee) {
-                    return Err(Unsupported.error("generic or indirect call"));
-                }
-                let &id = self
-                    .names
-                    .get(c.callee.as_str())
-                    .ok_or_else(|| Unsupported.error("callee body unavailable"))?;
-                let f = self.functions[id];
-                if !has(f, EffectContractKind::Pure) {
-                    return Err(Unsupported.error("callee is not @pure"));
-                }
-                if c.args.len() != f.params.len() {
-                    return Err(Unsupported.error("call arity mismatch"));
-                }
-                let mut args = Vec::new();
-                for (a, p) in c.args.iter().zip(&f.params) {
-                    if a.mode != CallArgMode::Value {
-                        return Err(Unsupported.error("reference argument"));
-                    }
-                    let v = self.expr_expecting(a, state, gate, Some(&p.ty))?;
-                    if v.ty != p.ty {
-                        return Err(Unsupported.error("argument type mismatch"));
-                    }
-                    args.push(v.text);
-                }
-                self.dependencies.insert(id);
-                let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
-                self.guard(gate, call("pre_safe"))?;
-                self.guard(gate, call("pre"))?;
-                if !has(f, EffectContractKind::Verified) {
-                    self.guard(gate, call("safe"))?;
-                    self.guard(gate, call("post_safe"))?;
-                    // A runtime ensures clause is executed even for an unverified helper.
-                    // It is an obligation, never an assumed axiom.
-                    self.guard(gate, call("post"))?;
-                }
-                let result = self.typed_node(
-                    call(if has(f, EffectContractKind::Verified) {
-                        "contract"
-                    } else {
-                        "value"
-                    }),
-                    &f.return_type,
-                )?;
-                let assumption = if has(f, EffectContractKind::Verified) {
-                    let mut domain = vec![gate.text.clone(), call("pre_safe"), call("pre")];
-                    for (a, p) in args.iter().zip(&f.params) {
-                        domain.push(data::domain(&p.ty, a));
-                    }
-                    let mut post_args = args.clone();
-                    post_args.push(result.text.clone());
-                    let post = application(&format!("f{id}_ensures"), &post_args);
-                    let range = data::domain(&result.ty, &result.text);
-                    format!("(=> (and {}) (and {range} {post}))", domain.join(" "))
-                } else {
-                    format!("(=> {} {})", gate.text, call("assume"))
-                };
-                let assumption = self.node(assumption, true)?;
-                self.assumptions.push(assumption.text);
-                Ok(result)
-            }
+            Expr::Call(c) => self.call(c.id, &c.callee, &c.type_args, &c.args, state, gate),
+            Expr::StaticCall(c) if self.data.targets.is_some_and(|t| t.contains_key(&c.id)) => self
+                .call(
+                    c.id,
+                    &format!("{}::{}", c.class, c.method),
+                    &c.type_args,
+                    &c.args,
+                    state,
+                    gate,
+                ),
             _ => Err(Unsupported.error("unsupported expression in i64/bool V1")),
         }
+    }
+    fn call(
+        &mut self,
+        expr_id: ExprId,
+        callee: &str,
+        type_args: &[Type],
+        arguments: &[CallArg],
+        state: &State,
+        gate: &Value,
+    ) -> VerificationResult<Value> {
+        if !type_args.is_empty() || state.env.contains_key(callee) {
+            return Err(Unsupported.error("generic or indirect call"));
+        }
+        let name = self
+            .data
+            .targets
+            .and_then(|targets| targets.get(&expr_id))
+            .map(String::as_str)
+            .unwrap_or(callee);
+        let &id = self
+            .names
+            .get(name)
+            .ok_or_else(|| Unsupported.error("callee body unavailable"))?;
+        let f = self.functions[id];
+        if !has(f, EffectContractKind::Pure) {
+            return Err(Unsupported.error("callee is not @pure"));
+        }
+        if arguments.len() != f.params.len() {
+            return Err(Unsupported.error("call arity mismatch"));
+        }
+        let mut args = Vec::new();
+        for (a, p) in arguments.iter().zip(&f.params) {
+            if a.mode != CallArgMode::Value {
+                return Err(Unsupported.error("reference argument"));
+            }
+            let v = self.expr_expecting(a, state, gate, Some(&p.ty))?;
+            if v.ty != p.ty {
+                return Err(Unsupported.error("argument type mismatch"));
+            }
+            args.push(v.text);
+        }
+        self.dependencies.insert(id);
+        let id = format!("{}{}", self.data.symbol_namespace, symbol(f));
+        let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
+        self.guard(gate, call("pre_safe"))?;
+        self.guard(gate, call("pre"))?;
+        if !has(f, EffectContractKind::Verified) {
+            self.guard(gate, call("safe"))?;
+            self.guard(gate, call("post_safe"))?;
+            // A runtime ensures clause is executed even for an unverified helper.
+            // It is an obligation, never an assumed axiom.
+            self.guard(gate, call("post"))?;
+        }
+        let result = self.typed_node(
+            call(if has(f, EffectContractKind::Verified) {
+                "contract"
+            } else {
+                "value"
+            }),
+            &f.return_type,
+        )?;
+        let assumption = if has(f, EffectContractKind::Verified) {
+            let mut domain = vec![gate.text.clone(), call("pre_safe"), call("pre")];
+            for (a, p) in args.iter().zip(&f.params) {
+                domain.push(data::domain(&p.ty, a));
+            }
+            let mut post_args = args.clone();
+            post_args.push(result.text.clone());
+            let post = application(&format!("f{id}_ensures"), &post_args);
+            let range = data::domain(&result.ty, &result.text);
+            format!("(=> (and {}) (and {range} {post}))", domain.join(" "))
+        } else {
+            format!("(=> {} {})", gate.text, call("assume"))
+        };
+        let assumption = self.node(
+            format!(
+                "(and (=> {} {}) {assumption})",
+                gate.text,
+                call("pre_assume")
+            ),
+            true,
+        )?;
+        self.assumptions.push(assumption.text);
+        Ok(result)
     }
     fn quantifier(
         &mut self,
@@ -1324,6 +1373,7 @@ pub(super) fn encode(
     };
     let initial = state.clone();
     let mut e = Encoder::new(id, functions, names, data);
+    let id = format!("{}{}", data.symbol_namespace, symbol(f));
     let pre = e.clauses(&f.requires, &state)?;
     let pre_safe = e.safety();
     let mut definitions = e.definition(&format!("f{id}_pre"), &params.join(" "), "Bool", &pre.text);
@@ -1333,7 +1383,14 @@ pub(super) fn encode(
         "Bool",
         &pre_safe,
     );
+    definitions += &e.definition(
+        &format!("f{id}_pre_assume"),
+        &params.join(" "),
+        "Bool",
+        &format!("(and true {})", e.assumptions.join(" ")),
+    );
     let mut contract_definitions = definitions.clone();
+    let mut contract_dependencies = e.dependencies.clone();
     index_loop_writes(&f.body, &mut e.loop_writes, 0)?;
     e.block(&f.body, &mut state, 0)?;
     for h in &e.havoc {
@@ -1344,17 +1401,7 @@ pub(super) fn encode(
         format!("(not {})", state.alive.text),
     )?;
     let safety = e.safety();
-    let assumptions = if e.assumptions.is_empty() {
-        "true".into()
-    } else {
-        format!("(and {})", e.assumptions.join(" "))
-    };
-    definitions += &e.definition(
-        &format!("f{id}_assume"),
-        &params.join(" "),
-        "Bool",
-        &assumptions,
-    );
+
     definitions += &e.definition(
         &format!("f{id}_value"),
         &params.join(" "),
@@ -1376,6 +1423,13 @@ pub(super) fn encode(
     }
     let post = e.node(format!("(=> {} {})", state.returned.text, post.text), true)?;
     let post_safe = e.safety();
+    let assumptions = format!("(and true {})", e.assumptions.join(" "));
+    definitions += &e.definition(
+        &format!("f{id}_assume"),
+        &params.join(" "),
+        "Bool",
+        &assumptions,
+    );
     definitions += &e.definition(
         &format!("f{id}_post"),
         &params.join(" "),
@@ -1389,7 +1443,7 @@ pub(super) fn encode(
         &post_safe,
     );
     // Separate contract predicate, with an arbitrary return, for callers.
-    let mut c = Encoder::new(id, functions, names, data);
+    let mut c = Encoder::new(names[f.name.as_str()], functions, names, data);
     let mut cs = initial;
     cs.env.insert(
         "result".into(),
@@ -1406,15 +1460,17 @@ pub(super) fn encode(
         &format!("f{id}_ensures"),
         &params.join(" "),
         "Bool",
-        &format!("(and {safe} {})", cp.text),
+        &format!("(and {safe} {} {})", cp.text, c.assumptions.join(" ")),
     );
     contract_definitions += &c.definition(
         &format!("f{id}_ensures"),
         &params.join(" "),
         "Bool",
-        &format!("(and {safe} {})", cp.text),
+        &format!("(and {safe} {} {})", cp.text, c.assumptions.join(" ")),
     );
+    contract_dependencies.extend(&c.dependencies);
     Ok(Summary {
+        contract_dependencies,
         #[cfg(test)]
         assembly_bytes: e
             .fragments
@@ -1495,9 +1551,27 @@ fn index_loop_writes(
 }
 
 // Scan call edges once, including unreachable statements: recursion is not V1.
-pub(super) fn edges(f: &FunctionDecl, names: &HashMap<&str, usize>) -> BTreeSet<usize> {
+pub(super) fn resolved_edges(
+    f: &FunctionDecl,
+    names: &HashMap<&str, usize>,
+    targets: Option<&HashMap<ExprId, String>>,
+) -> BTreeSet<usize> {
     AstWalk::new(AstEvent::Block(&f.body))
+        .chain(
+            f.requires
+                .iter()
+                .chain(&f.ensures)
+                .flat_map(|e| AstWalk::new(AstEvent::Expr(e))),
+        )
         .filter_map(|event| match event {
+            AstEvent::Expr(e @ (Expr::Call(_) | Expr::StaticCall(_)))
+                if targets.is_some_and(|t| t.contains_key(&e.id())) =>
+            {
+                targets
+                    .and_then(|t| t.get(&e.id()))
+                    .and_then(|n| names.get(n.as_str()))
+                    .copied()
+            }
             AstEvent::Expr(Expr::Call(c)) => names.get(c.callee.as_str()).copied(),
             _ => None,
         })
@@ -1548,6 +1622,7 @@ pub(super) fn contract_predicates(
     let mut e = Encoder::new(id, functions, names, data);
     let pre = e.clauses(&f.requires, &state)?;
     let safety = e.safety();
+    let assumptions = format!("(and true {})", e.assumptions.join(" "));
     let mut out = e.definition(&format!("c{id}_pre"), &params.join(" "), "Bool", &pre.text);
     out += &e.definition(
         &format!("c{id}_pre_safe"),
@@ -1555,7 +1630,14 @@ pub(super) fn contract_predicates(
         "Bool",
         &safety,
     );
+    out += &e.definition(
+        &format!("c{id}_pre_assume"),
+        &params.join(" "),
+        "Bool",
+        &assumptions,
+    );
     e.nodes.clear();
+    e.assumptions.clear();
     state.env.insert("result".into(), state.result.clone());
     params.push(format!("(returned {ret})"));
     let post = e.clauses(&f.ensures, &state)?;
@@ -1572,9 +1654,12 @@ pub(super) fn contract_predicates(
         "Bool",
         &safety,
     );
-    if !e.dependencies.is_empty() {
-        return Err(Unsupported.error("contract calls require additional comparison summaries"));
-    }
+    out += &e.definition(
+        &format!("c{id}_post_assume"),
+        &params.join(" "),
+        "Bool",
+        &format!("(and true {})", e.assumptions.join(" ")),
+    );
     Ok(out)
 }
 

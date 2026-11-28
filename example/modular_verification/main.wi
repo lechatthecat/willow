@@ -1,0 +1,15 @@
+import arithmetic::advance as next;
+import bounds;
+
+@pure @verified fn twice(x: i64) -> i64
+    requires x >= 0 && x < 98
+    ensures result == x + 2
+    ensures bounds::small(result)
+{
+    return next(next(x));
+}
+
+fn main() {
+    println(twice(40));
+    println(bounds::small(42));
+}

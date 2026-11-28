@@ -30,6 +30,7 @@ impl TargetCapabilities {
 
 #[derive(Debug, Clone)]
 pub struct CompilerInputs {
+    pub(crate) proof_cache: Option<crate::semantic::verification::ProofCache>,
     pub(crate) capture_analysis: bool,
     /// Retain reusable body/reference facts without query-only source views.
     pub(crate) cache_analysis: bool,
@@ -86,6 +87,7 @@ impl CompilerInputs {
 
     pub fn native(options: crate::CompilerOptions, project_root: PathBuf) -> Self {
         Self {
+            proof_cache: None,
             capture_analysis: false,
             cache_analysis: false,
             verification: false,

@@ -1,5 +1,7 @@
 //! Versioned scalar and immutable-data contract comparison. Unknown evidence is never preservation.
 use super::*;
+#[path = "comparison_calls.rs"]
+mod calls;
 use crate::parser::iter::{AstEvent, AstWalk};
 use crate::semantic::field_writes::FieldWrites;
 use serde_json::{Value as Json, json};
@@ -111,6 +113,7 @@ fn relevant(f: &FunctionDecl) -> bool {
         || has(f, EffectContractKind::Verified)
 }
 pub struct Snapshot {
+    pub(crate) targets: HashMap<ExprId, String>,
     pub program: Program,
     pub lock: Lock,
     pub verification: Verification,
@@ -189,6 +192,26 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
         )
     };
     *cache = std::mem::take(&mut checker.verification_cache);
+    from_checked(
+        program,
+        HashMap::new(),
+        verification,
+        errors,
+        purity_losses,
+        &checker.panic_evidence,
+    )
+}
+pub(crate) fn from_checked(
+    program: Program,
+    targets: HashMap<ExprId, String>,
+    verification: Verification,
+    mut errors: Vec<String>,
+    purity_losses: BTreeSet<String>,
+    panic_evidence: &HashMap<
+        crate::semantic::ids::FunctionId,
+        crate::semantic::type_checker::PanicEvidence,
+    >,
+) -> Snapshot {
     let fs: Vec<_> = program
         .items
         .iter()
@@ -220,15 +243,15 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
             contract_digest(f),
             data_digest.as_deref(),
         ));
-        let mut deps = encode::edges(f, &names);
+        let mut deps = encode::resolved_edges(f, &names, Some(&targets));
         for event in AstWalk::new(AstEvent::Block(&f.body)).chain(
             f.requires
                 .iter()
                 .chain(&f.ensures)
                 .flat_map(|e| AstWalk::new(AstEvent::Expr(e))),
         ) {
-            if let AstEvent::Expr(Expr::Var(n, ..)) = event
-                && let Some(&id) = names.get(n.as_str())
+            if let AstEvent::Expr(expr @ Expr::Var(n, ..)) = event
+                && let Some(&id) = names.get(targets.get(&expr.id()).unwrap_or(n).as_str())
                 && fs[id].constant.is_some()
             {
                 deps.insert(id);
@@ -246,10 +269,12 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
         let mut stack = vec![(root, false)];
         while let Some((id, exit)) = stack.pop() {
             if exit {
-                let deps: Vec<_> = edges[id]
+                let mut deps: Vec<_> = edges[id]
                     .iter()
                     .map(|&d| (&fs[d].name, &semantic[d]))
                     .collect();
+                // Source declaration positions are not semantic identities.
+                deps.sort_unstable_by(|a, b| a.0.cmp(b.0));
                 dependency_digests[id] =
                     with_data_identity(digest(&json!(deps).to_string()), data_digest.as_deref());
                 semantic[id] = digest(
@@ -287,8 +312,7 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
                     contract: contracts[i].clone(),
                     semantics: dependency_digests[i].clone(),
                     no_panic: has(f, EffectContractKind::NoPanic).then(|| {
-                        checker
-                            .panic_evidence
+                        panic_evidence
                             .get(&crate::semantic::ids::FunctionId::free(&f.name))
                             .cloned()
                     }),
@@ -302,6 +326,7 @@ pub fn capture(program: Program, options: &Options, cache: &mut ProofCache) -> S
         .map(|(i, f)| (f.name.clone(), semantic[i].clone()))
         .collect();
     Snapshot {
+        targets,
         semantic_identities,
         program,
         purity_losses,
@@ -490,8 +515,16 @@ pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Compariso
         .enumerate()
         .map(|(i, f)| (f.name.as_str(), i + split))
         .collect();
-    let data_a = DataTypes::new(&a.program, &FieldWrites::from_program(&a.program));
-    let data_b = DataTypes::new(&b.program, &FieldWrites::from_program(&b.program));
+    let data_a = DataTypes {
+        symbol_namespace: "old",
+        targets: Some(&a.targets),
+        ..DataTypes::new(&a.program, &FieldWrites::from_program(&a.program))
+    };
+    let data_b = DataTypes {
+        symbol_namespace: "new",
+        targets: Some(&b.targets),
+        ..DataTypes::new(&b.program, &FieldWrites::from_program(&b.program))
+    };
     // An identical spelling with a different representation cannot share solver sorts.
     // Conservatively require unchanged data declarations and immutable type domains.
     let data_changed = a.data_digest != b.data_digest || data_a.definitions != data_b.definitions;
@@ -522,6 +555,7 @@ pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Compariso
         .iter()
         .map(|r| (r.function.as_str(), r))
         .collect();
+    let mut declarations = calls::Declarations::new(a, b);
     let mut changes = Vec::new();
     let mut unknown = Vec::new();
     let mut violations = 0;
@@ -557,6 +591,24 @@ pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Compariso
                     let i = names_a[key];
                     let j = names_b[key];
                     let s = engine.as_mut().map_err(|e| e.clone())?;
+                    calls::declare(
+                        fa,
+                        &functions,
+                        &names_a,
+                        &data_a,
+                        &reports_a,
+                        &mut declarations,
+                        s,
+                    )?;
+                    calls::declare(
+                        fb,
+                        &functions,
+                        &names_b,
+                        &data_b,
+                        &reports_b,
+                        &mut declarations,
+                        s,
+                    )?;
                     let ca = contract_predicates(i, &functions, &names_a, &data_a)?;
                     let cb = contract_predicates(j, &functions, &names_b, &data_b)?;
                     predicate_bytes += ca.len() + cb.len();
@@ -582,6 +634,8 @@ pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Compariso
                     domain.push(super::data::domain(&fa.return_type, &ret));
                     let pre_a = application(&format!("c{i}_pre"), &args);
                     let pre_b = application(&format!("c{j}_pre"), &args);
+                    let pa_a = application(&format!("c{i}_pre_assume"), &args);
+                    let pa_b = application(&format!("c{j}_pre_assume"), &args);
                     let ps_a = application(&format!("c{i}_pre_safe"), &args);
                     let ps_b = application(&format!("c{j}_pre_safe"), &args);
                     input_symbols.insert(ret.clone(), "result".to_owned());
@@ -590,7 +644,12 @@ pub fn compare_typed(a: &Snapshot, b: &Snapshot, options: &Options) -> Compariso
                     let post_b = application(&format!("c{j}_post"), &args);
                     let ss_a = application(&format!("c{i}_post_safe"), &args);
                     let ss_b = application(&format!("c{j}_post_safe"), &args);
-                    let domain = format!("(and {})", domain.join(" "));
+                    let post_assume_a = application(&format!("c{i}_post_assume"), &args);
+                    let post_assume_b = application(&format!("c{j}_post_assume"), &args);
+                    let domain = format!(
+                        "(and {} {pa_a} {pa_b} {post_assume_a} {post_assume_b})",
+                        domain.join(" ")
+                    );
                     let mut preserved = true;
                     for (kind, formula) in [
                         (

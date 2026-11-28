@@ -29,6 +29,19 @@ Interactive or intentionally non-terminating examples should contain:
 
 Manual examples remain runnable, but the automated example catalog does not execute them.
 
+## Contracts across modules
+
+`willow run example/modular_verification/main.wi` proves and runs a caller of an
+imported `@pure @verified` function. Its `requires` clause is a caller obligation;
+its `ensures` clause supplies the caller's result guarantee. Contracts can call
+`@pure` helpers, including imported helpers. Helper safety and runtime contracts
+remain proof obligations. Recursive call graphs are currently UNKNOWN; recursion
+is never accepted without a termination proof. Runtime guards remain enabled.
+
+`willow verify-edit --schema v4 --base <revision> --protected-base <revision>`
+reports changed proof dependencies across module boundaries. Unknown proofs or
+unsupported comparisons exit with code 3.
+
 ## Constructors and partially built objects
 
 Inside `init`, a field may be read only after it is assigned on every path

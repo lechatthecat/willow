@@ -349,14 +349,34 @@ fn contract_policy_closed_stdout_still_obeys_verifier_timeout() {
 
 #[test]
 fn contract_policy_project_scope_cannot_silently_omit_sources() {
-    let (dir, mut o, p) = fixture();
-    fs::write(dir.0.join("extra.wi"), "@pure fn other()->i64 {return 1;}").unwrap();
+    let (dir, mut o, mut p) = fixture();
+    fs::create_dir(dir.0.join("src")).unwrap();
+    fs::rename(dir.0.join("main.wi"), dir.0.join("src/main.wi")).unwrap();
+    fs::write(
+        dir.0.join("project.toml"),
+        "[project]\nname=\"comparison\"\nversion=\"0.1.0\"\n",
+    )
+    .unwrap();
+    git(&dir.0, &["add", "main.wi", "src/main.wi", "project.toml"]);
+    git(&dir.0, &["commit", "-qm", "Project scope fixture"]);
+    o.base = resolve_base(&dir.0, "HEAD").unwrap();
+    p.protected_base = Some(git(&dir.0, &["rev-parse", "HEAD"]));
     o.project = true;
+    let same = verify(&o, &p).unwrap();
+    assert_eq!(same.exit_code(), 0, "{same:?}");
+    fs::write(
+        dir.0.join("src/extra.wi"),
+        "@pure fn other()->i64 {return 1;}",
+    )
+    .unwrap();
+    let changed = verify(&o, &p).unwrap();
+    assert_eq!(changed.exit_code(), 1, "{changed:?}");
     assert!(
-        verify(&o, &p)
-            .unwrap_err()
-            .to_string()
-            .contains("multi-source")
+        changed
+            .changes
+            .iter()
+            .any(|c| c.symbol.ends_with("extra::other") && c.base.is_none()),
+        "{changed:?}"
     );
 }
 
@@ -483,5 +503,187 @@ fn proof_no_panic_verify_edit_dependency_and_output_bounds() {
             .values()
             .any(|e| e["status"] == "UNPROVEN"),
         "{report:?}"
+    );
+}
+
+#[test]
+fn modular_contract_verify_edit_dependency_digests_and_cache() {
+    let mut tree = tree::Tree::new();
+    let module =
+        "@pure @verified pub fn id(x:i64)->i64 requires x>=0 ensures result==x {return x;}";
+    tree.insert("math.wi".into(), module.as_bytes().to_vec());
+    tree.insert("main.wi".into(),b"import math; @pure @verified fn caller(x:i64)->i64 requires x>=1 ensures result==x {return math::id(x);} @pure @verified fn unrelated(x:i64)->i64 ensures result==x {return x;} fn main() {}".to_vec());
+    let mut cache = ProofCache::default();
+    let a = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    assert!(a.errors.is_empty(), "{:?}", a.errors);
+    assert!(
+        a.verification
+            .reports
+            .iter()
+            .all(|r| r.status == verification::Status::Proven),
+        "{:?}",
+        a.verification.reports
+    );
+    assert_eq!(cache.misses, 3);
+    tree.insert(
+        "math.wi".into(),
+        module.replace("x>=0", "x>=1").into_bytes(),
+    );
+    let b = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    assert_eq!(cache.hits, 1);
+    assert_eq!(cache.misses, 5);
+    let report = comparison::compare_typed(
+        &a,
+        &b,
+        &verification::Options {
+            artifacts: None,
+            ..Default::default()
+        },
+    );
+    let caller = report
+        .changes
+        .iter()
+        .find(|c| c.symbol == "caller")
+        .unwrap();
+    assert!(caller.proof_dependencies_changed, "{report:?}");
+    assert_eq!(
+        caller.proof_dependencies.base.as_ref().unwrap().functions,
+        ["$local::math::id"]
+    );
+    assert!(caller.implementation_verified, "{report:?}");
+    assert_eq!(
+        caller.contract_preserved,
+        comparison::Preservation::Proven,
+        "{report:?}"
+    );
+}
+
+#[test]
+fn modular_contract_verify_edit_reports_and_unknown_exit() {
+    let (dir, mut o, mut p) = fixture();
+    fs::write(
+        dir.0.join("math.wi"),
+        "@pure @verified pub fn id(x:i64)->i64 requires x>=0 ensures result==x {return x;}",
+    )
+    .unwrap();
+    fs::write(dir.0.join("main.wi"),"import math; @pure @verified fn caller(x:i64)->i64 requires x>=1 ensures result==x {return math::id(x);} fn main() {}").unwrap();
+    git(&dir.0, &["add", "main.wi", "math.wi"]);
+    git(&dir.0, &["commit", "-qm", "Modular contracts"]);
+    o.base = resolve_base(&dir.0, "HEAD").unwrap();
+    p.protected_base = Some(git(&dir.0, &["rev-parse", "HEAD"]));
+    let same = verify(&o, &p).unwrap();
+    assert_eq!(same.exit_code(), 0, "{same:?}");
+    fs::write(
+        dir.0.join("math.wi"),
+        "@pure @verified pub fn id(x:i64)->i64 requires x>=1 ensures result==x {return x;}",
+    )
+    .unwrap();
+    let changed = verify(&o, &p).unwrap();
+    assert_eq!(changed.exit_code(), 1, "{changed:?}");
+    assert!(
+        changed
+            .changes
+            .iter()
+            .any(|c| c.symbol == "caller" && c.proof_dependencies_changed),
+        "{changed:?}"
+    );
+    fs::write(
+        dir.0.join("math.wi"),
+        "@pure @verified pub fn id(x:i64)->i64 {return id(x);}",
+    )
+    .unwrap();
+    let unknown = verify(&o, &p).unwrap();
+    assert_eq!(unknown.exit_code(), 3, "{unknown:?}");
+}
+
+#[test]
+fn modular_contract_pure_helper_changes_are_compared_with_isolated_definitions() {
+    let mut tree = tree::Tree::new();
+    tree.insert(
+        "math.wi".into(),
+        b"@pure pub fn positive(x:i64)->bool {return x>=0;}".to_vec(),
+    );
+    tree.insert("main.wi".into(),b"import math; @pure @verified fn caller(x:i64)->i64 requires math::positive(x) ensures math::positive(result) {return x;} fn main() {}".to_vec());
+    let mut cache = ProofCache::default();
+    let a = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    let same = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    let options = verification::Options {
+        artifacts: None,
+        ..Default::default()
+    };
+    let unchanged = comparison::compare_typed(&a, &same, &options);
+    assert!(unchanged.uncertainty.is_empty(), "{unchanged:?}");
+    assert!(
+        unchanged
+            .changes
+            .iter()
+            .all(|c| c.contract_preserved == comparison::Preservation::Proven),
+        "{unchanged:?}"
+    );
+    tree.insert(
+        "math.wi".into(),
+        b"@pure pub fn positive(x:i64)->bool {return x>0;}".to_vec(),
+    );
+    let b = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    let changed = comparison::compare_typed(&a, &b, &options);
+    let caller = changed
+        .changes
+        .iter()
+        .find(|c| c.symbol == "caller")
+        .unwrap();
+    assert!(caller.proof_dependencies_changed, "{changed:?}");
+    assert_eq!(
+        caller.contract_preserved,
+        comparison::Preservation::NotPreserved,
+        "{changed:?}"
+    );
+    assert!(caller.implementation_verified, "{changed:?}");
+}
+
+#[test]
+fn modular_contract_constants_keep_module_identity_and_dependencies() {
+    let mut tree = tree::Tree::new();
+    let left = "const LIMIT:i64=100; @pure @verified pub fn id(x:i64)->i64 requires x<LIMIT ensures result==x {return x;}";
+    tree.insert("left.wi".into(), left.as_bytes().to_vec());
+    tree.insert("right.wi".into(), left.replace("100", "200").into_bytes());
+    tree.insert("main.wi".into(), b"import left; import right; @pure @verified fn caller(x:i64)->i64 requires x<90 ensures result==x {return left::id(right::id(x));} fn main() {}".to_vec());
+    let mut cache = ProofCache::default();
+    let a = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    let options = verification::Options {
+        artifacts: None,
+        ..Default::default()
+    };
+    let same = comparison::compare_typed(&a, &a, &options);
+    assert!(same.uncertainty.is_empty(), "{same:?}");
+    assert!(
+        same.changes
+            .iter()
+            .all(|c| c.contract_preserved == comparison::Preservation::Proven),
+        "{same:?}"
+    );
+    tree.insert("left.wi".into(), left.replace("100", "99").into_bytes());
+    let b = capture(&tree, Path::new("main.wi"), &mut cache).unwrap();
+    let changed = comparison::compare_typed(&a, &b, &options);
+    let left = changed
+        .changes
+        .iter()
+        .find(|c| c.symbol == "$local::left::id")
+        .unwrap();
+    assert!(left.proof_dependencies_changed, "{changed:?}");
+    assert_eq!(
+        left.contract_preserved,
+        comparison::Preservation::NotPreserved,
+        "{changed:?}"
+    );
+    let right = changed
+        .changes
+        .iter()
+        .find(|c| c.symbol == "$local::right::id")
+        .unwrap();
+    assert!(!right.proof_dependencies_changed, "{changed:?}");
+    assert_eq!(
+        right.contract_preserved,
+        comparison::Preservation::Proven,
+        "{changed:?}"
     );
 }

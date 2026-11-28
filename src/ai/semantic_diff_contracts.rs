@@ -1,4 +1,6 @@
 //! Opt-in v2 policy layer; all v1 callers retain their original report and codes.
+#[path = "semantic_diff_modular.rs"]
+mod modular_capture;
 use super::*;
 use crate::semantic::verification::{self, ProofCache, comparison};
 use std::path::PathBuf;
@@ -139,6 +141,9 @@ fn capture(
         .map_err(|e| anyhow::anyhow!("lex failed: {e:?}"))?;
     let (program, errors) = crate::parser::Parser::new(tokens).parse();
     ensure!(errors.is_empty(), "contract input parsing failed");
+    if !program.imports.is_empty() || inputs.contains_key("project.toml") {
+        return modular_capture::capture(inputs, entry, cache);
+    }
     Ok(comparison::capture(
         program,
         &verification::Options {
@@ -244,14 +249,6 @@ pub fn verify(options: &Options, policy: &Policy) -> Result<Report> {
     let target = tree::target_inputs(&root, true)?;
     let before_digest = hash_serialized(&before)?;
     let target_digest = hash_serialized(&target)?;
-    ensure!(
-        !(options.project
-            || before.contains_key("project.toml")
-            || target.contains_key("project.toml"))
-            || (before.keys().filter(|p| p.ends_with(".wi")).count() <= 1
-                && target.keys().filter(|p| p.ends_with(".wi")).count() <= 1),
-        "contract comparison does not support multi-source project discovery"
-    );
     let entry = resolve_entry(options, &before)?;
     ensure!(
         entry == resolve_entry(options, &target)?,

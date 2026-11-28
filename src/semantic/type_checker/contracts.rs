@@ -80,6 +80,20 @@ impl TypeChecker {
                                 .is_some_and(|ty| self.verification_immutable_type(ty, immutable))
                         }
                         Expr::Call(c) if matches!(c.callee.as_str(), "forall" | "exists") => true,
+                        Expr::Call(c) => {
+                            c.type_args.is_empty()
+                                && self.symbols.lookup_var(&c.callee).is_none()
+                                && self.symbols.lookup_func(&c.callee).is_some_and(|f| f.pure)
+                                && c.args.iter().all(|a| a.mode == CallArgMode::Value)
+                        }
+                        Expr::StaticCall(c) if !c.is_bare_member() => {
+                            c.type_args.is_empty()
+                                && self
+                                    .symbols
+                                    .lookup_module_func(&c.class, &c.method)
+                                    .is_some_and(|f| f.pure)
+                                && c.args.iter().all(|a| a.mode == CallArgMode::Value)
+                        }
                         Expr::Var(name, ..) => {
                             if bindings.get(name).copied().unwrap_or(false) {
                                 true

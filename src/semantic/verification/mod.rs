@@ -2,6 +2,7 @@
 //! Mathematical integers model values; every finite-width operation has a
 //! separate safety obligation. Summaries share helper bodies across call sites.
 mod cache;
+pub(crate) mod modular;
 #[cfg(test)]
 mod panic_effect_tests;
 #[cfg(test)]
@@ -45,7 +46,7 @@ pub struct Obligation {
     pub expected_solver_result: String,
     pub counterexample_candidate: Option<String>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InferredLoopAnnotations {
     pub location: Span,
     pub kind: &'static str,
@@ -58,7 +59,7 @@ pub struct InferredLoopAnnotations {
     /// None means the user's variant is used instead. Arithmetic is checked i64.
     pub variant: Option<&'static str>,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Report {
     #[serde(skip)]
     failure_kind: Option<FailureKind>,
@@ -198,6 +199,26 @@ pub(crate) fn check(
     options: &Options,
     cache: &mut ProofCache,
 ) -> (Vec<Diagnostic>, Verification) {
+    check_with_data(
+        program,
+        previous,
+        options,
+        cache,
+        &DataTypes {
+            calls: Some(calls),
+            ..DataTypes::new(program, writes)
+        },
+        None,
+    )
+}
+fn check_with_data(
+    program: &Program,
+    previous: &[Diagnostic],
+    options: &Options,
+    cache: &mut ProofCache,
+    data: &DataTypes,
+    world: Option<&mut modular::World>,
+) -> (Vec<Diagnostic>, Verification) {
     let mut diagnostics = Vec::new();
     // Methods are outside V1, including interface declarations without bodies.
     for item in &program.items {
@@ -217,24 +238,16 @@ pub(crate) fn check(
             ));
         }
     }
-    if !program
-        .items
-        .iter()
-        .any(|i| matches!(i, Item::Function(f) if has(f,EffectContractKind::Verified)))
+    if world.is_none()
+        && !program
+            .items
+            .iter()
+            .any(|i| matches!(i, Item::Function(f) if has(f,EffectContractKind::Verified)))
     {
         return (diagnostics, Verification::default());
     }
     let prior_error = previous.iter().any(|d| d.severity == Severity::Error);
-    let verification = verify_with_data(
-        program,
-        options,
-        prior_error,
-        cache,
-        &DataTypes {
-            calls: Some(calls),
-            ..DataTypes::new(program, writes)
-        },
-    );
+    let verification = verify_with_data(program, options, prior_error, cache, data, world);
     for r in &verification.reports {
         if let Some(failure) = r.failure_kind {
             let detail = r.unknown_reasons.first().cloned().unwrap_or_else(|| {
@@ -308,40 +321,76 @@ pub fn verify_cached(
         prior_error,
         cache,
         &DataTypes::new(program, &writes),
+        None,
     )
     .with_artifacts(options, |_| {})
 }
+#[expect(
+    clippy::too_many_lines,
+    reason = "topological proof scheduling keeps failure provenance, imported declarations and cache admission in one state transition"
+)]
 fn verify_with_data(
     program: &Program,
     options: &Options,
     prior_error: bool,
     cache: &mut ProofCache,
     data: &DataTypes,
+    mut world: Option<&mut modular::World>,
 ) -> Verification {
-    let functions: Vec<_> = program
-        .items
+    let imported = world
+        .as_ref()
+        .map(|w| w.imports(program, data.targets))
+        .unwrap_or_default();
+    let imported_len = imported.len();
+    let functions: Vec<_> = imported
         .iter()
-        .filter_map(|i| {
+        .map(|e| &e.function)
+        .chain(program.items.iter().filter_map(|i| {
             if let Item::Function(f) = i {
                 Some(f)
             } else {
                 None
             }
-        })
+        }))
         .collect();
-    let names: HashMap<_, _> = functions
+    let mut names: HashMap<_, _> = functions
         .iter()
         .enumerate()
         .map(|(i, f)| (f.name.as_str(), i))
         .collect();
-    let edges: Vec<_> = functions.iter().map(|f| encode::edges(f, &names)).collect();
+    // Source-local constants and direct calls retain their lexical spelling;
+    // imported stubs never contribute unqualified aliases.
+    if world.is_some() {
+        for (i, f) in functions.iter().enumerate().skip(imported_len) {
+            if let Some((_, local)) = f.name.rsplit_once("::") {
+                names.insert(local, i);
+            }
+        }
+    }
+    let edges: Vec<_> = functions
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            if i < imported_len {
+                BTreeSet::new()
+            } else {
+                encode::resolved_edges(f, &names, data.targets)
+            }
+        })
+        .collect();
     let roots: Vec<_> = functions
         .iter()
         .enumerate()
-        .filter_map(|(i, f)| has(f, EffectContractKind::Verified).then_some(i))
+        .filter_map(|(i, f)| {
+            (i >= imported_len
+                && (has(f, EffectContractKind::Verified)
+                    || (world.is_some() && has(f, EffectContractKind::Pure))))
+            .then_some(i)
+        })
         .collect();
     // Iterative DFS gives one shared topological ordering and rejects cycles.
     let mut colors = vec![0; functions.len()];
+    colors[..imported_len].fill(2);
     let mut order = Vec::new();
     let mut cyclic = BTreeSet::new();
     for &root in &roots {
@@ -386,7 +435,11 @@ fn verify_with_data(
     let mut failures = Vec::new();
     let mut engine = if !valid_budget(options) {
         Err(FailureKind::Infrastructure.error("invalid verification timeout/resource budget"))
-    } else if roots.is_empty() || prior_error {
+    } else if !roots
+        .iter()
+        .any(|i| has(functions[*i], EffectContractKind::Verified))
+        || prior_error
+    {
         Err(FailureKind::Unsupported.error("type or purity checking failed"))
     } else {
         #[cfg(test)]
@@ -406,6 +459,23 @@ fn verify_with_data(
     {
         engine = Err(error);
     }
+    for (id, export) in imported.iter().enumerate() {
+        semantic_digests[id] = export.digest.clone();
+        match &export.error {
+            Some(error) => {
+                states[id] = FunctionState::Failed(failures.len());
+                failures.push(FunctionFailure::Direct(error.clone()));
+            }
+            None => {
+                if let Ok(s) = &mut engine
+                    && let Err(e) = s.exchange(&export.definitions)
+                {
+                    engine = Err(e);
+                }
+                states[id] = FunctionState::Valid;
+            }
+        }
+    }
     let proof = ProofContext {
         functions: &functions,
         names: &names,
@@ -424,6 +494,8 @@ fn verify_with_data(
             .iter()
             .map(|i| functions[*i].name.clone())
             .collect();
+        // Reuse this canonical ordering for reports, cache keys and exports.
+        r.dependencies.sort_unstable();
         let result = if prior_error {
             Err(FailureKind::Unsupported
                 .error("type or purity checking failed")
@@ -455,18 +527,20 @@ fn verify_with_data(
             proof
                 .verify_function(
                     id,
-                    verified,
                     &mut r,
                     &mut engine,
                     cache,
                     &mut semantic_digests,
+                    world.as_deref_mut(),
                 )
                 .map_err(FunctionFailure::Direct)
         };
         match result {
             Ok(()) => states[id] = FunctionState::Valid,
             Err(error) => {
-                cache.invalidate();
+                if let Some(world) = world.as_deref_mut() {
+                    world.fail(f, error.message(&failures));
+                }
                 if verified {
                     let kind = error.kind();
                     r.failure_kind = Some(kind);
@@ -483,7 +557,7 @@ fn verify_with_data(
             reports.push(r);
         }
     }
-    for f in &functions {
+    for f in &functions[imported_len..] {
         if !has(f, EffectContractKind::Verified)
             && (!f.requires.is_empty() || !f.ensures.is_empty())
         {
@@ -525,11 +599,11 @@ impl ProofContext<'_> {
     fn verify_function(
         &self,
         id: usize,
-        verified: bool,
         r: &mut Report,
         engine: &mut VerificationResult<solver::Solver>,
         cache: &mut ProofCache,
         semantic_digests: &mut [String],
+        world: Option<&mut modular::World>,
     ) -> VerificationResult<()> {
         let Self {
             functions,
@@ -539,32 +613,68 @@ impl ProofContext<'_> {
             edges,
         } = *self;
         let f = functions[id];
+        let verified = has(f, EffectContractKind::Verified);
         let summary = encode(id, functions, names, data)?;
         r.vc_nodes = summary.nodes;
-        r.dependency_digests = edges[id]
+        r.dependency_digests = r
+            .dependencies
             .iter()
-            .map(|i| semantic_digests[*i].clone())
+            .map(|name| semantic_digests[names[name.as_str()]].clone())
             .collect();
-        semantic_digests[id] =
-            digest(&(summary.definitions.clone() + &r.dependency_digests.join("\n")));
+        let exported_edges = if verified {
+            &summary.contract_dependencies
+        } else {
+            &summary.dependencies
+        };
+        let exported_dependencies: Vec<_> = r
+            .dependencies
+            .iter()
+            .filter(|name| exported_edges.contains(&names[name.as_str()]))
+            .map(|name| {
+                (
+                    name.as_str(),
+                    semantic_digests[names[name.as_str()]].as_str(),
+                )
+            })
+            .collect();
+        let exported_digest = digest(&serde_json::json!({
+            "definitions": if verified { &summary.contract_definitions } else { &summary.definitions },
+            "dependencies": exported_dependencies,
+        }).to_string());
+        let export = modular::Export::new(
+            f,
+            &summary,
+            exported_digest.clone(),
+            exported_dependencies
+                .iter()
+                .map(|(name, _)| (*name).to_owned())
+                .collect(),
+        );
+        semantic_digests[id] = exported_digest;
         if summary.dependencies != edges[id] {
             return Err(FailureKind::Infrastructure.error("unresolved call dependency"));
         }
-        let s = engine.as_mut().map_err(|e| e.clone())?;
-        s.exchange(&summary.definitions)?;
         if !verified {
+            if let Ok(s) = engine {
+                s.exchange(&summary.definitions)?;
+            }
+            if let Some(world) = world {
+                world.insert(export);
+            }
             return Ok(());
         }
-        #[cfg(test)]
-        PROOF_RUNS.with(|n| n.set(n.get() + 1));
-        let cache_key = cache::identity(&summary, &r.dependency_digests, f, options);
+        let s = engine.as_mut().map_err(|e| e.clone())?;
+        s.exchange(&summary.definitions)?;
+        let symbol = symbol(f);
+        let cache_key =
+            cache::identity(&summary, &r.dependencies, &r.dependency_digests, f, options);
         r.inferred_loop_annotations = summary.inferred_loop_annotations;
-        let cached = cache.get(&cache_key);
+        let cached = cache.get(&f.name, &cache_key);
         let cache_hit = cached.is_some();
         let mut args = Vec::new();
         let mut domain = vec!["true".to_string()];
         for (i, p) in f.params.iter().enumerate() {
-            let name = format!("a{id}_{i}");
+            let name = format!("a{symbol}_{i}");
             let ty = sort(&p.ty)?;
             s.exchange(&format!("(declare-const {name} {ty})\n"))?;
             domain.push(data::domain(&p.ty, &name));
@@ -575,27 +685,33 @@ impl ProofContext<'_> {
         model_symbols.extend(summary.loop_symbols.keys().cloned());
         r.input_symbols.extend(summary.loop_symbols.clone());
         let domain = format!("(and {})", domain.join(" "));
-        let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
+        let call = |suffix: &str| application(&format!("f{symbol}_{suffix}"), &args);
         if let Some(obligations) = cached {
             // Probe the live solver before reuse: missing, poisoned or exhausted
             // sessions cannot be turned into a successful old result.
             if s.query("false", &[])?.0 != Answer::Unsat {
-                cache.remove(&cache_key);
+                cache.remove(&f.name);
                 return Err(
                     FailureKind::Infrastructure.error("solver unavailable for cached proof")
                 );
             }
             r.obligations = obligations;
         } else {
+            #[cfg(test)]
+            PROOF_RUNS.with(|n| n.set(n.get() + 1));
             for (kind, formula, want) in [
                 (
                     "requires safety",
-                    format!("(and {domain} (not {}))", call("pre_safe")),
+                    format!(
+                        "(and {domain} {} (not {}))",
+                        call("pre_assume"),
+                        call("pre_safe")
+                    ),
                     Answer::Unsat,
                 ),
                 (
                     "requires satisfiability",
-                    format!("(and {domain} {})", call("pre")),
+                    format!("(and {domain} {} {})", call("pre_assume"), call("pre")),
                     Answer::Sat,
                 ),
                 (
@@ -664,12 +780,15 @@ impl ProofContext<'_> {
             .collect::<Result<Vec<_>, _>>()?
             .join(" ");
         s.exchange(&format!(
-            "(declare-fun f{id}_contract ({sorts}) {})\n",
+            "(declare-fun f{symbol}_contract ({sorts}) {})\n",
             sort(&f.return_type)?
         ))?;
+        if let Some(world) = world {
+            world.insert(export);
+        }
         r.status = Status::Proven;
         if !cache_hit {
-            cache.insert(cache_key, r.obligations.clone());
+            cache.insert(f.name.clone(), cache_key, r.obligations.clone());
         }
         Ok(())
     }

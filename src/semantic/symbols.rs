@@ -178,6 +178,9 @@ impl NativeFunction {
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct FuncInfo {
+    /// Declared purity; implementations are checked before proof use.
+    #[serde(default)]
+    pub pure: bool,
     #[serde(default)]
     pub native: Option<NativeFunction>,
     #[serde(default)]
@@ -1096,6 +1099,7 @@ mod tests {
     }
     fn function_info(ty: Type) -> FuncInfo {
         FuncInfo {
+            pure: false,
             native: None,
             foreign: false,
             sending: false,

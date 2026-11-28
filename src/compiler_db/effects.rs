@@ -260,6 +260,7 @@ impl EffectRootLocation {
 }
 
 pub(crate) struct EffectQueries {
+    pub(crate) proofs: std::cell::RefCell<crate::semantic::verification::modular::World>,
     /// Body-derived purity for this checking session; external declarations and
     /// persistent runtime-effect summaries cannot supply these proofs.
     pub(crate) purity_facts: std::cell::RefCell<
@@ -310,6 +311,7 @@ pub(crate) struct EffectQueries {
 impl Default for EffectQueries {
     fn default() -> Self {
         Self {
+            proofs: Default::default(),
             purity_facts: Default::default(),
             contract_facts: Default::default(),
             static_initializers: Default::default(),

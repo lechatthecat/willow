@@ -1,11 +1,11 @@
 use super::*;
-fn parse(source: &str) -> Program {
+pub(super) fn parse(source: &str) -> Program {
     let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
     let (p, errors) = crate::parser::Parser::new(tokens).parse();
     assert!(errors.is_empty(), "{errors:?}");
     p
 }
-fn options() -> Options {
+pub(super) fn options() -> Options {
     Options {
         artifacts: None,
         ..Options::default()
@@ -288,7 +288,12 @@ fn verification_shared_helper_scaling() {
         source.push_str("return y;}");
         let v = verify_source(&source);
         assert_eq!(v.reports[0].status, Status::Proven);
-        assert_eq!(v.smt.matches("(define-fun f0_value ").count(), 1);
+        assert_eq!(
+            v.smt
+                .matches(&format!("(define-fun f{}_value ", symbol_name("g")))
+                .count(),
+            1
+        );
         assert!(v.reports[0].vc_nodes < n * 12 + 20);
         eprintln!(
             "calls={n} nodes={} bytes={}",
@@ -570,9 +575,9 @@ fn verification_repair_evidence_distinguishes_obligations() {
                 failed
                     .counterexample_candidate
                     .as_ref()
-                    .is_some_and(|s| s.contains("a0_0"))
+                    .is_some_and(|s| s.contains(&format!("a{}_0", symbol_name("f"))))
             );
-            assert_eq!(r.input_symbols["a0_0"], "x");
+            assert_eq!(r.input_symbols[&format!("a{}_0", symbol_name("f"))], "x");
         } else {
             assert!(failed.counterexample_candidate.is_none());
         }

@@ -43,6 +43,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "recover".to_string(),
             FuncInfo {
+                pure: false,
                 native: None,
                 foreign: false,
                 sending: false,
@@ -64,6 +65,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    pure: false,
                     native: None,
                     foreign: false,
                     sending: false,
@@ -81,6 +83,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "gc_collect".to_string(),
             FuncInfo {
+                pure: false,
                 native: None,
                 foreign: false,
                 sending: false,
@@ -98,6 +101,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    pure: false,
                     native: None,
                     foreign: false,
                     sending: false,
@@ -159,6 +163,7 @@ impl TypeChecker {
             self.symbols.define_func(
                 name.to_string(),
                 FuncInfo {
+                    pure: false,
                     native: None,
                     foreign: false,
                     sending: false,
@@ -178,6 +183,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "panic".to_string(),
             FuncInfo {
+                pure: false,
                 native: None,
                 foreign: false,
                 sending: false,
@@ -195,6 +201,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "sleep".to_string(),
             FuncInfo {
+                pure: false,
                 native: None,
                 foreign: false,
                 sending: false,
@@ -211,6 +218,7 @@ impl TypeChecker {
         self.symbols.define_func(
             "yield".to_string(),
             FuncInfo {
+                pure: false,
                 native: None,
                 foreign: false,
                 sending: false,
@@ -257,6 +265,7 @@ impl TypeChecker {
                 Some((
                     item.name.to_string(),
                     FuncInfo {
+                        pure: false,
                         native: None,
                         foreign: false,
                         sending: false,
@@ -676,6 +685,10 @@ impl TypeChecker {
                     functions.insert(
                         f.name.clone(),
                         FuncInfo {
+                            pure: f
+                                .effect_contracts
+                                .iter()
+                                .any(|a| a.kind == EffectContractKind::Pure),
                             native: f
                                 .rust_bridge
                                 .as_deref()

@@ -1907,6 +1907,10 @@ impl TypeChecker {
                 self.symbols.define_func(
                     f.name.clone(),
                     FuncInfo {
+                        pure: f
+                            .effect_contracts
+                            .iter()
+                            .any(|a| a.kind == EffectContractKind::Pure),
                         native: None,
                         foreign: false,
                         sending: false,

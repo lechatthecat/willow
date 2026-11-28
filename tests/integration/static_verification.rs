@@ -397,3 +397,10 @@ fn verified_string_cli_rejects_counterexamples_and_unknown() {
         assert_compile_error_contains(&format!("{source} fn main(){{}}"), &[reason]);
     }
 }
+
+#[test]
+fn modular_verification_example_runs() {
+    let (output, ok) = compile_file_and_run("example/modular_verification/main.wi");
+    assert!(ok, "{output}");
+    assert_eq!(output, "42\ntrue\n");
+}

@@ -463,7 +463,13 @@ fn verified_loop_counterexample_names_arbitrary_head() {
             .counterexample_candidate
             .as_ref()
             .unwrap()
-            .contains("h0_0")
+            .contains(
+                r.input_symbols
+                    .iter()
+                    .find(|(_, name)| name.starts_with("loop@"))
+                    .unwrap()
+                    .0
+            )
     );
 }
 

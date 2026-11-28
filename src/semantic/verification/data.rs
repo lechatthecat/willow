@@ -12,6 +12,8 @@ pub(super) struct Constructor {
 }
 #[derive(Default)]
 pub(super) struct DataTypes<'a> {
+    pub symbol_namespace: &'a str,
+    pub targets: Option<&'a HashMap<ExprId, String>>,
     pub calls: Option<&'a crate::semantic::intrinsics::BuiltinCalls>,
     pub constructors: HashMap<Type, Vec<Constructor>>,
     pub definitions: String,

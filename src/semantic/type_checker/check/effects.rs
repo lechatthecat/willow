@@ -31,6 +31,9 @@ impl TypeChecker {
     /// Reset and index the named callables consumed by the semantic
     /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604.
     pub(super) fn prepare_lock_effect_analysis(&mut self, program: &Program) {
+        if program.items.iter().any(|item| matches!(item, Item::Function(f) if f.effect_contracts.iter().any(|a| matches!(a.kind, EffectContractKind::Pure | EffectContractKind::Verified)))) {
+            self.capture_call_sites = true;
+        }
         self.local.current_effect_callable = None;
         self.effect_index.callables.clear();
         self.effect_index.local_methods.clear();

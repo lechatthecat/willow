@@ -8,6 +8,7 @@ use super::*;
 )]
 fn runnable_example_cases() -> &'static [(&'static str, &'static str)] {
     &[
+        ("example/modular_verification/main.wi", "42\ntrue\n"),
         (
             "example/channel_closed_send.wi",
             "send on closed channel\nsend on closed channel\naccepted\ntrue\n",
@@ -1600,6 +1601,11 @@ fn runnable_project_example_cases() -> &'static [ProjectExampleCase] {
 // use their existing path dependencies without pretending to test crates.io.
 fn runnable_rust_project_example_cases() -> &'static [(&'static str, &'static str, &'static str)] {
     &[
+        (
+            "example/rust_handles",
+            "example/rust_handles/src/main.wi",
+            "42\n42\n1\n7\n2\n",
+        ),
         (
             "example/rust_blocking_pool",
             "example/rust_blocking_pool/src/main.wi",
