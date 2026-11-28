@@ -1,6 +1,5 @@
 // Runtime guards remain; these failure paths are excluded by static proof.
 @effects(no_panic)
-@pure
 @verified
 fn inc(x: i64) -> i64
     requires x >= 0 && x < 100
@@ -10,7 +9,6 @@ fn inc(x: i64) -> i64
 }
 
 @effects(no_panic)
-@pure
 @verified
 fn at(xs: FrozenArray<i64>, i: i64) -> i64
     requires i >= 0 && i < xs.len()
@@ -19,7 +17,6 @@ fn at(xs: FrozenArray<i64>, i: i64) -> i64
 }
 
 @effects(no_panic)
-@pure
 @verified
 fn next(x: i64) -> i64
     requires x >= 0 && x < 100

@@ -262,6 +262,21 @@ fn source_span_index(program: &Program) -> HashMap<(u32, usize, usize), Span> {
     index
 }
 
+// Purity is a body constraint, not a RuntimeEffects bit. Testing containment
+// of its empty forbidden mask would silently accept an explicitly weaker list.
+fn preserves_contract(declared: &[EffectContract], inherited: EffectContractKind) -> bool {
+    if inherited == EffectContractKind::Pure {
+        declared.iter().any(|c| c.kind == EffectContractKind::Pure)
+    } else {
+        declared
+            .iter()
+            .fold(RuntimeEffects::NONE, |bits, c| {
+                bits.union(c.kind.forbidden())
+            })
+            .contains(inherited.forbidden())
+    }
+}
+
 impl TypeChecker {
     /// Whether evaluating the lambda builds a fresh function-value object.
     pub(super) fn lambda_allocates_environment(&self, lambda: ExprId) -> bool {
@@ -1071,13 +1086,7 @@ impl TypeChecker {
                         for contract in contracts.iter().flatten() {
                             if let Some(m) = explicit
                                 && !m.effect_contracts.is_empty()
-                                && !m
-                                    .effect_contracts
-                                    .iter()
-                                    .fold(RuntimeEffects::NONE, |bits, c| {
-                                        bits.union(c.kind.forbidden())
-                                    })
-                                    .contains(contract.kind.forbidden())
+                                && !preserves_contract(&m.effect_contracts, contract.kind)
                             {
                                 diagnostics.push(Diagnostic::new(Severity::Error, ErrorCode::E2611, format!("override `{id}` weakens inherited effect contract `{}`", contract.kind.name()))
                                         .with_label(Label::primary(m.span, "override must preserve all inherited prohibitions"))
@@ -1093,13 +1102,7 @@ impl TypeChecker {
                         let inherited = obligations.get(&owner).and_then(|m| m.get(&method.name));
                         for contract in inherited.into_iter().flatten().flatten() {
                             if !method.effect_contracts.is_empty()
-                                && !method
-                                    .effect_contracts
-                                    .iter()
-                                    .fold(RuntimeEffects::NONE, |bits, c| {
-                                        bits.union(c.kind.forbidden())
-                                    })
-                                    .contains(contract.kind.forbidden())
+                                && !preserves_contract(&method.effect_contracts, contract.kind)
                             {
                                 diagnostics.push(Diagnostic::new(Severity::Error, ErrorCode::E2611, format!("interface method `{}::{}` weakens an inherited effect contract", interface.name, method.name))
                                     .with_label(Label::primary(method.span, "weakened contract"))
@@ -2268,6 +2271,28 @@ mod tests {
     }
 
     #[test]
+    fn purity_spelling_inherited_work_is_linear() {
+        for n in [8, 32, 128] {
+            for shape in ["chain", "fanout"] {
+                let mut source = String::from("open class C0 { @pure pub open fn f(self) {} }\n");
+                for i in 1..n {
+                    let parent = if shape == "chain" { i - 1 } else { 0 };
+                    source.push_str(&format!("open class C{i} extends C{parent} {{ @effects(pure, pure) pub open override fn f(self) {{}} }}\n"));
+                }
+                OBLIGATION_WORK.with(|v| v.set(0));
+                let errors = check_source(&source);
+                assert!(
+                    errors.iter().all(|d| d.severity != Severity::Error),
+                    "{errors:?}"
+                );
+                let work = OBLIGATION_WORK.with(|v| v.get());
+                assert_eq!(work, 2 * n - 1, "{shape} {n}");
+                println!("purity-obligations shape={shape} classes={n} visits={work}");
+            }
+        }
+    }
+
+    #[test]
     fn effect_contract_obligation_and_arity_work_bounds() {
         for n in [8, 32, 128] {
             for shape in ["chain", "fanout"] {
@@ -2406,22 +2431,22 @@ mod tests {
             (
                 "waiting named function value",
                 "fn wait(c: BlockingCell<i64>) { c.get(); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = wait; f(c); }",
-                Some(ErrorCode::E2612),
+                Some(ErrorCode::E2610),
             ),
             (
                 "waiting value through argument",
                 "fn wait(c: BlockingCell<i64>) { c.get(); } fn relay(f: fn(BlockingCell<i64>), c: BlockingCell<i64>) { f(c); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { relay(wait, c); }",
-                Some(ErrorCode::E2612),
+                Some(ErrorCode::E2610),
             ),
             (
                 "waiting captured closure",
                 "@effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = || { c.get(); }; f(); }",
-                Some(ErrorCode::E2612),
+                Some(ErrorCode::E2610),
             ),
             (
                 "closure captures waiting value",
                 "fn wait(c: BlockingCell<i64>) { c.get(); } @effects(no_wait) fn guard(c: BlockingCell<i64>) { let f = wait; let g = || { f(c); }; g(); }",
-                Some(ErrorCode::E2612),
+                Some(ErrorCode::E2610),
             ),
             (
                 "unverified ffi",

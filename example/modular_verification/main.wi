@@ -1,7 +1,7 @@
 import arithmetic::advance as next;
 import bounds;
 
-@pure @verified fn twice(x: i64) -> i64
+@verified fn twice(x: i64) -> i64
     requires x >= 0 && x < 98
     ensures result == x + 2
     ensures bounds::small(result)

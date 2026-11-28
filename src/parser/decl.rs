@@ -3,13 +3,14 @@ use super::{Parser, modifiers::MemberHead};
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
 use crate::lexer::token::TokenKind;
 
-const EFFECT_CONTRACT_NAMES: [&str; 6] = [
+const EFFECT_CONTRACT_NAMES: [&str; 7] = [
     "no_wait",
     "no_block",
     "no_suspend",
     "no_io",
     "no_panic",
     "no_alloc",
+    "pure",
 ];
 
 // Candidates are fixed ASCII names, so the DP row is bounded independently of
@@ -157,7 +158,18 @@ impl Parser {
 
     /// Resolve the closed set of built-in contract names at declaration time.
     pub(super) fn parse_effect_contracts(&mut self) -> Result<Vec<EffectContract>, Diagnostic> {
-        let mut contracts = Vec::new();
+        let mut contracts = Vec::<EffectContract>::new();
+        // Contracts form a set. The closed vocabulary bounds this scan to nine
+        // entries, including under arbitrarily repeated attributes.
+        let mut push = |contract: EffectContract| {
+            if !contracts.iter().any(|c| {
+                #[cfg(test)]
+                effect_contract_diagnostic_tests::CONTRACT_COMPARISONS.with(|n| n.set(n.get() + 1));
+                c.kind == contract.kind
+            }) {
+                contracts.push(contract);
+            }
+        };
         while self.eat(TokenKind::At) {
             let start = self.previous_span();
             let attribute = self.expect_ident()?;
@@ -168,7 +180,7 @@ impl Parser {
                 _ => None,
             };
             if let Some(kind) = simple {
-                contracts.push(EffectContract {
+                push(EffectContract {
                     kind,
                     span: start.to(self.previous_span()),
                 });
@@ -184,6 +196,7 @@ impl Parser {
             loop {
                 let name = self.expect_ident()?;
                 let kind = match name.as_str() {
+                    "pure" => EffectContractKind::Pure,
                     "no_wait" => EffectContractKind::NoWait,
                     "no_block" => EffectContractKind::NoBlock,
                     "no_suspend" => EffectContractKind::NoSuspend,
@@ -204,7 +217,7 @@ impl Parser {
                             )));
                     }
                 };
-                contracts.push(EffectContract {
+                push(EffectContract {
                     kind,
                     span: start.to(self.previous_span()),
                 });
@@ -213,6 +226,23 @@ impl Parser {
                 }
             }
             self.expect(TokenKind::RParen)?;
+        }
+        // Normalize the implication once, before registration, checking, query
+        // capture and proof generation. An explicit purity span takes precedence.
+        if !contracts.iter().any(|c| c.kind == EffectContractKind::Pure)
+            && let Some(index) = contracts
+                .iter()
+                .position(|c| c.kind == EffectContractKind::Verified)
+        {
+            // Match the established `@pure @verified` order so adding the
+            // implication does not change protected contract digests.
+            contracts.insert(
+                index,
+                EffectContract {
+                    kind: EffectContractKind::Pure,
+                    span: contracts[index].span,
+                },
+            );
         }
         Ok(contracts)
     }
@@ -1547,13 +1577,61 @@ mod effect_contract_diagnostic_tests {
     use crate::lexer::Lexer;
 
     thread_local! {
+        pub(super) static CONTRACT_COMPARISONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         pub(super) static EDIT_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[test]
+    fn purity_spelling_normalization_and_bounded_work() {
+        for (attributes, expected) in [
+            ("@pure", 1),
+            ("@effects(pure)", 1),
+            ("@verified", 2),
+            ("@pure @verified", 2),
+            ("@verified @pure", 2),
+            ("@effects(pure) @pure", 1),
+            ("@pure @effects(pure)", 1),
+            ("@effects(pure, pure)", 1),
+            ("@effects(pure, no_panic)", 2),
+            ("@verified @effects(pure, no_panic)", 3),
+            (
+                "@effects(no_wait, no_block, no_suspend, no_io, no_panic, no_alloc, pure) @verified @sending",
+                9,
+            ),
+        ] {
+            for count in [1, 16, 256, 4096] {
+                let source = format!("{} fn f() {{}}", attributes.repeat(count));
+                let tokens = Lexer::new(&source).tokenize().unwrap();
+                CONTRACT_COMPARISONS.with(|n| n.set(0));
+                let (program, errors) = Parser::new(tokens).parse();
+                assert!(errors.is_empty(), "{attributes}: {errors:?}");
+                let Item::Function(f) = &program.items[0] else {
+                    panic!("function")
+                };
+                assert_eq!(f.effect_contracts.len(), expected);
+                let pure = f
+                    .effect_contracts
+                    .iter()
+                    .find(|c| c.kind == EffectContractKind::Pure)
+                    .unwrap();
+                assert!(pure.span.end <= attributes.len());
+                // At most nine bounded set comparisons per written contract.
+                assert!(CONTRACT_COMPARISONS.with(|n| n.get()) <= 81 * count);
+                let restored: Program =
+                    serde_json::from_str(&serde_json::to_string(&program).unwrap()).unwrap();
+                let Item::Function(restored) = &restored.items[0] else {
+                    panic!("function")
+                };
+                assert_eq!(f.effect_contracts, restored.effect_contracts);
+            }
+        }
     }
 
     #[test]
     fn effect_contract_unknown_names_have_precise_spans_and_help() {
         // Substitution, deletion, insertion, case, distant name and stable tie.
         for (name, closest) in [
+            ("pur", "pure"),
             ("no_wai", "no_wait"),
             ("no_waitt", "no_wait"),
             ("no_wxit", "no_wait"),
@@ -1589,7 +1667,7 @@ mod effect_contract_diagnostic_tests {
                 assert_eq!(
                     error.helps,
                     [format!(
-                        "valid effect contracts: no_wait, no_block, no_suspend, no_io, no_panic, no_alloc; did you mean `{closest}`?"
+                        "valid effect contracts: no_wait, no_block, no_suspend, no_io, no_panic, no_alloc, pure; did you mean `{closest}`?"
                     )]
                 );
             }
@@ -1635,7 +1713,7 @@ mod effect_contract_diagnostic_tests {
         for length in [16, 256, 4096] {
             EDIT_CELLS.with(|n| n.set(0));
             closest_effect_contract(&"x".repeat(length));
-            EDIT_CELLS.with(|n| assert_eq!(n.get(), 46 * length));
+            EDIT_CELLS.with(|n| assert_eq!(n.get(), 50 * length));
         }
     }
 }

@@ -709,3 +709,76 @@ fn modular_verification_cli_unchanged_opaque_helpers_preserve_contracts() {
     assert_eq!(caller["contract_preserved"], "NOT_PRESERVED");
     assert_eq!(caller["proof_dependencies_changed"], true);
 }
+
+#[test]
+fn purity_spelling_verify_edit_and_protected_lock_are_equivalent() {
+    let root = std::env::temp_dir().join(format!("willow-purity-spelling-{}", std::process::id()));
+    fs::create_dir(&root).unwrap();
+    struct Cleanup(std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(root.clone());
+    git(&root, &["init", "-q"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.invalid"]);
+    let source = "@pure fn helper(x:i64)->i64 ensures result==x {return x;} @pure @verified fn f(x:i64)->i64 ensures result==x {return helper(x);} fn main() {}";
+    fs::write(root.join("main.wi"), source).unwrap();
+    git(&root, &["add", "main.wi"]);
+    git(&root, &["commit", "-qm", "Initial fixture"]);
+    let initial = git(&root, &["rev-parse", "HEAD"]);
+    let run = |base: &str, write: bool| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_willow"));
+        cmd.args(["verify-edit", "--root"]).arg(&root).args([
+            "--base",
+            base,
+            "--protected-base",
+            base,
+            "--schema",
+            "v4",
+            "--format",
+            "json",
+        ]);
+        if write {
+            cmd.arg("--write-contracts-lock");
+        }
+        let output = cmd.output().unwrap();
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    run(&initial, true);
+    let lock = fs::read(root.join("contracts.lock")).unwrap();
+    git(&root, &["add", "contracts.lock"]);
+    git(&root, &["commit", "-qm", "Protect contracts"]);
+    let protected = git(&root, &["rev-parse", "HEAD"]);
+    for spelling in ["@effects(pure)", "@pure @effects(pure, pure)"] {
+        for implied in [false, true] {
+            let candidate = if implied {
+                source.replace("@pure @verified", "@verified")
+            } else {
+                source.into()
+            };
+            fs::write(root.join("main.wi"), candidate.replace("@pure", spelling)).unwrap();
+            let report = run(&protected, true);
+            assert_eq!(
+                report["summary"]["lock_manifest"]["change"], "unchanged",
+                "{report}"
+            );
+            assert_eq!(
+                report["summary"]["approval"]["contract_status"], "contract_digest_unchanged",
+                "{report}"
+            );
+            for change in report["changes"].as_array().unwrap() {
+                assert_eq!(change["contract_preserved"], "PROVEN", "{change}");
+            }
+            assert_eq!(fs::read(root.join("contracts.lock")).unwrap(), lock);
+        }
+    }
+}

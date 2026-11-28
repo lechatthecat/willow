@@ -2,7 +2,6 @@
 class Threshold { pub minimum: i64; }
 enum Reading { Value(i64), Missing }
 
-@pure
 @verified
 fn first(values: FrozenArray<i64>, threshold: Threshold) -> i64
     requires values.len() > 0
@@ -12,7 +11,6 @@ fn first(values: FrozenArray<i64>, threshold: Threshold) -> i64
     return values[0];
 }
 
-@pure
 @verified
 fn reading_value(reading: Reading) -> i64
     ensures result == match reading {
@@ -26,7 +24,6 @@ fn reading_value(reading: Reading) -> i64
     };
 }
 
-@pure
 @verified
 fn count(values: FrozenArray<i64>) -> i64
     ensures result == values.len()
@@ -41,7 +38,6 @@ fn count(values: FrozenArray<i64>) -> i64
     return total;
 }
 
-@pure
 @verified
 fn stop_at_three(n: i64) -> i64
     requires n >= 0

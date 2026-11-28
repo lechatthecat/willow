@@ -125,7 +125,7 @@ fn verification_acceptance_cases() {
         (
             "verified alone",
             "@verified fn f()->i64 {return 1;}",
-            Unknown,
+            Proven,
         ),
         (
             "requires safety",
@@ -204,7 +204,12 @@ fn verification_acceptance_cases() {
         ),
     ] {
         eprintln!("perspective: {name}");
-        status(source, want);
+        status(source, want.clone());
+        status(
+            &source.replace("@pure @verified", "@verified"),
+            want.clone(),
+        );
+        status(&source.replace("@pure", "@effects(pure)"), want);
     }
 }
 #[test]

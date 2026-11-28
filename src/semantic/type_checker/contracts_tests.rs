@@ -160,3 +160,128 @@ fn contracts_immutable_string_values_are_allowed() {
     );
     assert!(errors.is_empty(), "{errors:?}");
 }
+
+#[test]
+fn purity_spelling_inheritance_and_combinations() {
+    use super::ErrorCode;
+    for parent in ["@pure", "@effects(pure)"] {
+        for child in [
+            "@pure",
+            "@effects(pure)",
+            "@effects(pure, no_io)",
+            "",
+            "@effects(no_io)",
+        ] {
+            for declaration in [
+                format!(
+                    "open class B {{ {parent} pub open fn f(self)->i64 {{return 1;}} }} class C extends B {{ {child} pub override fn f(self)->i64 {{return 1;}} }}"
+                ),
+                format!(
+                    "interface I {{ {parent} fn f(self)->i64; }} class C implements I {{ {child} pub fn f(self)->i64 {{return 1;}} }}"
+                ),
+                format!(
+                    "interface I {{ {parent} fn f(self)->i64; }} interface J extends I {{ {child} fn f(self)->i64; }}"
+                ),
+            ] {
+                let errors = check_source(&format!("{declaration} fn main() {{}}"));
+                if child == "@effects(no_io)" {
+                    assert!(
+                        errors.iter().any(|d| d.code == ErrorCode::E2611),
+                        "{declaration}: {errors:?}"
+                    );
+                    assert!(
+                        errors.iter().all(|d| d.code == ErrorCode::E2611),
+                        "{errors:?}"
+                    );
+                } else {
+                    assert!(errors.is_empty(), "{declaration}: {errors:?}");
+                }
+            }
+        }
+        for body in ["println(1); return 1;", "return 1;"] {
+            let source = format!(
+                "interface I {{ {parent} fn f(self)->i64; }} class C implements I {{ pub fn f(self)->i64 {{{body}}} }} fn main() {{}}"
+            );
+            let errors = check_source(&source);
+            assert_eq!(
+                errors.iter().any(|d| d.code == ErrorCode::E2620),
+                body.contains("println"),
+                "{source}: {errors:?}"
+            );
+        }
+    }
+    for attribute in ["@pure", "@effects(pure)", "@pure @effects(pure, pure)"] {
+        for effect in [
+            "no_wait",
+            "no_block",
+            "no_suspend",
+            "no_io",
+            "no_panic",
+            "no_alloc",
+        ] {
+            let source = format!(
+                "{attribute} @effects({effect}) fn f(x:i64)->i64 {{return x;}} fn main() {{}}"
+            );
+            assert!(check_source(&source).is_empty(), "{source}");
+        }
+        let source = format!("{attribute} fn f() {{println(1);}} fn main() {{}}");
+        let errors = check_source(&source);
+        assert_eq!(
+            errors.iter().filter(|d| d.code == ErrorCode::E2620).count(),
+            1,
+            "{errors:?}"
+        );
+        let source = format!(
+            "{attribute} @effects(no_panic) fn f(x:i64)->i64 {{return 1/x;}} fn main() {{}}"
+        );
+        let errors = check_source(&source);
+        assert!(
+            errors.iter().any(|d| d.code == ErrorCode::E2610),
+            "{errors:?}"
+        );
+    }
+}
+
+#[test]
+fn purity_spelling_verified_body_gate() {
+    use super::ErrorCode;
+    for attribute in [
+        "@verified",
+        "@pure @verified",
+        "@effects(pure) @verified",
+        "@verified @pure @effects(pure)",
+    ] {
+        for (body, expected) in [
+            ("return x;", None),
+            ("println(x); return x;", Some(ErrorCode::E2620)),
+            ("return x+1;", Some(ErrorCode::E2630)),
+        ] {
+            let source =
+                format!("{attribute} fn f(x:i64)->i64 ensures result==x {{{body}}} fn main() {{}}");
+            let errors = check_source(&source);
+            if let Some(code) = expected {
+                assert!(
+                    errors.iter().any(|d| d.code == code),
+                    "{source}: {errors:?}"
+                );
+                assert!(
+                    errors.iter().all(|d| d.code == code),
+                    "{source}: {errors:?}"
+                );
+            } else {
+                assert!(errors.is_empty(), "{source}: {errors:?}");
+            }
+        }
+    }
+}
+
+#[test]
+fn purity_spelling_generics() {
+    for attribute in ["@pure", "@effects(pure)"] {
+        let source = format!(
+            "{attribute} fn identity<T>(x:T)->T {{return x;}} fn main() {{println(identity(1));}}"
+        );
+        let errors = check_source(&source);
+        assert!(errors.is_empty(), "{source}: {errors:?}");
+    }
+}

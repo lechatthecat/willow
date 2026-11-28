@@ -301,7 +301,7 @@ out of memory. See [contract examples](example/effect_contracts.wi),
 
 <a id="verified-prove-a-contract-with-z3"></a>
 
-**`@pure @verified`** proves a function's contracts with Z3. It
+**`@verified`** implies purity and proves a function's contracts with Z3. It
 supports integers, bool, char, String equality and byte length, frozen arrays
 and immutable data. Other String methods aren't supported yet. Unsupported code
 and failed proofs are compile errors. Install Z3 4.15.4 and put `z3` on PATH,
@@ -334,8 +334,13 @@ presentation versions you don't recognize.
 
 <a id="pure-and-run-time-contracts"></a>
 
-**`@pure`** forbids any interaction beyond arguments and results, including
-reads of mutable heap data and calls to unknown functions.
+**`@effects(pure)`** forbids any interaction beyond arguments and results,
+including reads of mutable heap data and calls to unknown functions. It
+combines with other effects, as in `@effects(pure, no_panic)`. Purity alone
+allows panics and allocation. Impure bodies are rejected with E2620, also under
+`@verified` alone. `@pure` is an alias, and repeating a contract has no extra
+effect. An override that lists its effects must keep inherited purity (E2611);
+an override without a list inherits it.
 
 **`requires` / `ensures`** are checked at run time in debug and release builds
 and raise recoverable panics. See [pure functions](example/pure_functions.wi)

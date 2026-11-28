@@ -1,7 +1,7 @@
 // Run this valid program with `willow run example/verification_diagnostics.wi`.
 // To see a source-level counterexample, replace the body of non_negative with
 // `return x;` and run `willow check` on the edited copy.
-@pure @verified
+@verified
 fn non_negative(x: i64) -> i64
     ensures result >= 0
 {

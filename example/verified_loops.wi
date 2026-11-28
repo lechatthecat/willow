@@ -1,5 +1,5 @@
 // Loop annotations are proof-only; check/build reject a failed proof.
-@pure @verified
+@verified
 fn countdown(n: i64) -> i64
     requires n >= 0
     ensures result == 0
@@ -15,7 +15,7 @@ fn countdown(n: i64) -> i64
     return remaining;
 }
 
-@pure @verified
+@verified
 fn count_to(limit: i64) -> i64
     requires limit >= 0
     ensures result == limit

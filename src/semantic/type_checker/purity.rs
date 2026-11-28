@@ -159,20 +159,25 @@ mod tests {
             ),
         ];
         for (name, source, rejected) in cases {
-            let diagnostics = check_source(&format!("{source} fn main() {{}}"));
-            let errors: Vec<_> = diagnostics
-                .iter()
-                .filter(|d| d.severity == Severity::Error)
-                .collect();
-            assert_eq!(
-                errors.iter().any(|d| d.code == ErrorCode::E2620),
-                rejected,
-                "{name}: {errors:?}"
-            );
-            assert!(
-                errors.iter().all(|d| d.code == ErrorCode::E2620),
-                "{name}: unexpected errors {errors:?}"
-            );
+            for source in [
+                source.to_string(),
+                source.replace("@pure", "@effects(pure)"),
+            ] {
+                let diagnostics = check_source(&format!("{source} fn main() {{}}"));
+                let errors: Vec<_> = diagnostics
+                    .iter()
+                    .filter(|d| d.severity == Severity::Error)
+                    .collect();
+                assert_eq!(
+                    errors.iter().any(|d| d.code == ErrorCode::E2620),
+                    rejected,
+                    "{name}: {errors:?}"
+                );
+                assert!(
+                    errors.iter().all(|d| d.code == ErrorCode::E2620),
+                    "{name}: unexpected errors {errors:?}"
+                );
+            }
         }
     }
 
@@ -527,11 +532,7 @@ mod tests {
 
     #[test]
     fn purity_attribute_syntax_and_storage() {
-        for source in [
-            "@pure() fn f() {}",
-            "@pure class C {}",
-            "@effects(pure) fn f() {}",
-        ] {
+        for source in ["@pure() fn f() {}", "@pure class C {}"] {
             let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
             let (_, errors) = crate::parser::Parser::new(tokens).parse();
             assert!(!errors.is_empty(), "{source}");

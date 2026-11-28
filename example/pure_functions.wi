@@ -1,9 +1,9 @@
-@pure
+@effects(pure, no_io)
 fn square(x: i64) -> i64 {
     return x * x;
 }
 
-@pure
+@effects(pure)
 fn sum_squares(n: i64) -> i64 {
     let mut total = 0;
     let mut i = 0;

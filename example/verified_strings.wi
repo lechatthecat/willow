@@ -1,7 +1,7 @@
 // Request-label routing: immutable text, byte lengths and value contracts.
 class Request { pub label: String; }
 
-@pure @verified
+@verified
 fn label_or_default(label: String) -> String
     ensures result.len() > 0
     ensures result == (label == "" ? "unknown" : label)
@@ -9,14 +9,14 @@ fn label_or_default(label: String) -> String
     return label == "" ? "unknown" : label;
 }
 
-@pure @verified
+@verified
 fn is_health_route(path: String) -> bool
     ensures result == (path == "/health")
 {
     return path == "/health";
 }
 
-@pure @verified
+@verified
 fn payload_bytes(payload: String) -> i64
     ensures result >= 0
     ensures result == payload.len()
@@ -24,14 +24,14 @@ fn payload_bytes(payload: String) -> i64
     return payload.len();
 }
 
-@pure @verified
+@verified
 fn request_label(request: Request) -> String
     ensures result == request.label
 {
     return request.label;
 }
 
-@pure @verified
+@verified
 fn first_label(labels: FrozenArray<String>) -> String
     requires labels.len() > 0
     ensures result == labels[0]

@@ -34,7 +34,7 @@ fn verified_example_and_signed_boundaries_both_modes() {
 #[test]
 fn verified_rejections_reach_build_gate() {
     for (source, reason) in [
-        ("@verified fn f()->i64 {return 1;}", "@pure"),
+        ("@verified fn f()->i64 {println(1); return 1;}", "E2620"),
         (
             "@pure @verified fn f(x:i64)->i64 ensures result>x {return x;}",
             "COUNTEREXAMPLE",
@@ -461,5 +461,20 @@ fn verified_source_diagnostics_preserve_names_values_and_construction_limits() {
         assert_eq!(stderr.lines().next(), Some(expected), "{stderr}");
         fs::remove_file(path).unwrap();
         fs::remove_dir_all(artifacts).unwrap();
+    }
+}
+
+#[test]
+fn purity_spelling_interface_defaults_run_after_expansion() {
+    // The direct type-checker helper does not perform default expansion.
+    // Exercise the production frontend and generated inherited method instead.
+    for attribute in ["@pure", "@effects(pure)"] {
+        let source = format!(
+            "interface I {{ {attribute} fn f(self)->i64 {{return 1;}} }} class C implements I {{}} fn main() {{println(new C().f());}}"
+        );
+        for (output, ok) in [compile_and_run(&source), compile_and_run_release(&source)] {
+            assert!(ok, "{attribute}: {output}");
+            assert_eq!(output, "1\n");
+        }
     }
 }

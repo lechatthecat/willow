@@ -566,3 +566,50 @@ fn closure_effects_foreign_sync_wrapper_tracks_async_transition() {
         }
     }
 }
+
+#[test]
+fn purity_spelling_queries_share_contracts_and_effects() {
+    let mut baseline = None;
+    for (index, attribute) in ["@pure", "@effects(pure)", "@pure @effects(pure, pure)"]
+        .iter()
+        .enumerate()
+    {
+        let source = format!(
+            "{attribute} fn helper(x:i64)->i64 {{return x;}} @verified fn f(x:i64)->i64 ensures result==x {{return helper(x);}} fn main() {{}}"
+        );
+        let snapshot = snapshot(&source, &format!("purity-spelling-{index}"));
+        let symbol = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .find(|s| s.name == "helper")
+            .unwrap();
+        assert_eq!(symbol.details.effect_contracts, ["pure"]);
+        let verified = snapshot
+            .semantic
+            .symbols
+            .iter()
+            .find(|s| s.name == "f")
+            .unwrap();
+        let mut contracts = verified.details.effect_contracts.clone();
+        contracts.sort();
+        assert_eq!(contracts, ["pure", "verified"]);
+        let result = effects(snapshot.clone(), "helper");
+        let mut direct = willow_compiler::ai::direct::DirectSession::new(snapshot).unwrap();
+        let direct_result = direct
+            .query("effects", "helper", &Default::default(), true)
+            .unwrap();
+        assert_eq!(result["status"], "ok", "{result}");
+        assert_eq!(direct_result["status"], "ok", "{direct_result}");
+        let observed = (
+            result["bounds"].clone(),
+            result["effects"].clone(),
+            direct_result["bounds"].clone(),
+        );
+        if let Some(expected) = &baseline {
+            assert_eq!(&observed, expected);
+        } else {
+            baseline = Some(observed);
+        }
+    }
+}
