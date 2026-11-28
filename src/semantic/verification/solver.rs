@@ -178,6 +178,15 @@ impl Solver {
         formula: &str,
         inputs: &[String],
     ) -> VerificationResult<(Answer, Option<String>)> {
+        let (answer, model, ()) = self.query_detailed(formula, inputs, |_| Ok(()))?;
+        Ok((answer, model))
+    }
+    pub fn query_detailed<T: Default>(
+        &mut self,
+        formula: &str,
+        inputs: &[String],
+        details: impl FnOnce(&mut Self) -> VerificationResult<T>,
+    ) -> VerificationResult<(Answer, Option<String>, T)> {
         let answer = self.exchange(&format!("(push 1)\n(assert {formula})\n(check-sat)\n"))?;
         let answer = Answer::parse(&answer).inspect_err(|_| self.poisoned = true)?;
         let model = if answer == Answer::Sat && !inputs.is_empty() {
@@ -189,8 +198,13 @@ impl Solver {
         } else {
             None
         };
+        let details = if answer == Answer::Sat {
+            details(self)?
+        } else {
+            T::default()
+        };
         self.exchange("(pop 1)\n")?;
-        Ok((answer, model))
+        Ok((answer, model, details))
     }
 }
 

@@ -404,3 +404,62 @@ fn modular_verification_example_runs() {
     assert!(ok, "{output}");
     assert_eq!(output, "42\ntrue\n");
 }
+
+#[test]
+fn verified_source_diagnostics_readme_and_example() {
+    let source = include_str!("../../example/verification_diagnostics.wi");
+    let (output, ok) = compile_and_run(source);
+    assert!(ok, "{output}");
+    assert_eq!(output, "0\n5\n");
+    let broken = source.replace("    if x < 0 { return 0; }\n", "");
+    let id = unique_test_id();
+    let path = temp_path(format!("source_diagnostics_{id}.wi"));
+    let artifacts = temp_path(format!("source_diagnostics_{id}"));
+    fs::write(&path, broken).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+        .args(["check", &path])
+        .env("WILLOW_VERIFICATION_DIR", &artifacts)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let line = "error[E2630]: @verified `non_negative`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs x = -1; result = -1";
+    assert!(stderr.contains(line), "{stderr}");
+    assert!(include_str!("../../README.md").contains(line));
+    assert!(stderr.contains("ensures result >= 0"), "{stderr}");
+    fs::remove_file(path).unwrap();
+    fs::remove_dir_all(artifacts).unwrap();
+}
+
+#[test]
+fn verified_source_diagnostics_preserve_names_values_and_construction_limits() {
+    for (source, expected) in [
+        (
+            r#"@pure @verified fn Unknown(Counterexample:String)->String requires Counterexample == "Unknown Counterexample VacuousPrecondition" ensures false {return Counterexample;} fn main(){}"#,
+            r#"error[E2630]: @verified `Unknown`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs Counterexample = "Unknown Counterexample VacuousPrecondition"; result = "Unknown Counterexample VacuousPrecondition""#,
+        ),
+        (
+            r#"@pure @verified fn f(s:String)->String requires s == "\e" ensures false {return s;} fn main(){}"#,
+            r#"error[E2630]: @verified `f`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs s = "\e"; result = "\e""#,
+        ),
+        (
+            "class Point {pub x:i64; pub init(self,b:bool) {self.x=-4;}} @pure @verified fn f(p:Point)->i64 requires p.x == -4 ensures result>=0 {return p.x;} fn main(){}",
+            "error[E2630]: @verified `f`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs p = Point { x: -4 }; result = -4; display incomplete: Point: construction unavailable (explicit constructor has not been evaluated)",
+        ),
+    ] {
+        let id = unique_test_id();
+        let path = temp_path(format!("source_values_{id}.wi"));
+        let artifacts = temp_path(format!("source_values_{id}"));
+        fs::write(&path, source).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_willow"))
+            .args(["check", &path])
+            .env("WILLOW_VERIFICATION_DIR", &artifacts)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(stderr.lines().next(), Some(expected), "{stderr}");
+        fs::remove_file(path).unwrap();
+        fs::remove_dir_all(artifacts).unwrap();
+    }
+}

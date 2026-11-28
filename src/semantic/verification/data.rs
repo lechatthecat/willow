@@ -9,6 +9,8 @@ use std::collections::BTreeMap;
 pub(super) struct Constructor {
     pub name: String,
     pub fields: Vec<(String, Type)>,
+    /// Only an implicit record constructor directly accepts these field values.
+    pub memberwise: bool,
 }
 #[derive(Default)]
 pub(super) struct DataTypes<'a> {
@@ -193,6 +195,7 @@ impl DataTypes<'_> {
                         }
                         vec![Constructor {
                             name: c.name.clone(),
+                            memberwise: c.constructors.is_empty(),
                             fields: c
                                 .fields
                                 .iter()
@@ -206,6 +209,7 @@ impl DataTypes<'_> {
                         .iter()
                         .map(|v| Constructor {
                             name: v.name.clone(),
+                            memberwise: false,
                             fields: v
                                 .payload
                                 .iter()
@@ -250,6 +254,20 @@ impl DataTypes<'_> {
                     forms.join(" "),
                     valid.join(" ")
                 );
+                // Share one constructor discriminator per enum across every
+                // displayed value. Model projection must not rebuild a V-way
+                // selector for each of P values (O(P*V) emitted text).
+                if let Some(Item::Enum(_)) = declarations.get(n.as_str()) {
+                    use std::fmt::Write;
+                    write!(self.definitions, "(define-fun tag_{key} ((x {name})) Int ").unwrap();
+                    for i in 0..ctors.len() {
+                        write!(self.definitions, "(ite ((_ is make_{key}_{i}) x) {i} ").unwrap();
+                    }
+                    self.definitions.push_str("(- 1)");
+                    self.definitions
+                        .extend(std::iter::repeat_n(')', ctors.len() + 1));
+                    self.definitions.push('\n');
+                }
                 self.variants.insert(
                     ty.clone(),
                     ctors

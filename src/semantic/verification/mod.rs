@@ -16,7 +16,9 @@ mod encode;
 mod error;
 pub use cache::ProofCache;
 use data::*;
+mod presentation;
 mod solver;
+pub use presentation::{DisplayInput, Presentation};
 #[cfg(test)]
 mod tests;
 use crate::diagnostics::{Diagnostic, ErrorCode, Label, Severity, Span};
@@ -39,12 +41,24 @@ pub enum Status {
     Unknown,
     RuntimeChecked,
 }
+impl Status {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Proven => "PROVEN",
+            Self::Counterexample => "COUNTEREXAMPLE",
+            Self::VacuousPrecondition => "VACUOUS_PRECONDITION",
+            Self::Unknown => "UNKNOWN",
+            Self::RuntimeChecked => "RUNTIME_CHECKED",
+        }
+    }
+}
 #[derive(Debug, Clone, Serialize)]
 pub struct Obligation {
     pub kind: String,
     pub solver_result: String,
     pub expected_solver_result: String,
     pub counterexample_candidate: Option<String>,
+    pub presentation: Option<Presentation>,
 }
 #[derive(Debug, Clone, Serialize)]
 pub struct InferredLoopAnnotations {
@@ -220,6 +234,7 @@ fn check_with_data(
     world: Option<&mut modular::World>,
 ) -> (Vec<Diagnostic>, Verification) {
     let mut diagnostics = Vec::new();
+    let prior_error = previous.iter().any(|d| d.severity == Severity::Error);
     // Methods are outside V1, including interface declarations without bodies.
     for item in &program.items {
         let attrs: Vec<_> = match item {
@@ -229,7 +244,7 @@ fn check_with_data(
         };
         for a in attrs
             .into_iter()
-            .filter(|a| a.kind == EffectContractKind::Verified)
+            .filter(|a| !prior_error && a.kind == EffectContractKind::Verified)
         {
             diagnostics.push(diagnostic(
                 FailureKind::Unsupported.code(),
@@ -246,10 +261,11 @@ fn check_with_data(
     {
         return (diagnostics, Verification::default());
     }
-    let prior_error = previous.iter().any(|d| d.severity == Severity::Error);
     let verification = verify_with_data(program, options, prior_error, cache, data, world);
     for r in &verification.reports {
-        if let Some(failure) = r.failure_kind {
+        if let Some(failure) = r.failure_kind
+            && !prior_error
+        {
             let detail = r.unknown_reasons.first().cloned().unwrap_or_else(|| {
                 r.obligations
                     .last()
@@ -258,22 +274,37 @@ fn check_with_data(
                             "{}: {}{}",
                             o.kind,
                             o.solver_result,
-                            o.counterexample_candidate
+                            o.presentation
                                 .as_ref()
-                                .map(|m| format!("; candidate inputs {m}"))
+                                .filter(|m| m.evidence == "CANDIDATE")
+                                .map(|m| format!("; candidate inputs {}", m.text()))
                                 .unwrap_or_default()
                         )
                     })
                     .unwrap_or_default()
             });
-            diagnostics.push(diagnostic(
+            let mut error = diagnostic(
                 failure.code(),
-                r.location,
-                &format!("@verified `{}`: {:?}: {detail}", r.function, r.status)
-                    .replace("Counterexample", "COUNTEREXAMPLE")
-                    .replace("VacuousPrecondition", "VACUOUS_PRECONDITION")
-                    .replace("Unknown", "UNKNOWN"),
-            ));
+                r.obligations
+                    .last()
+                    .and_then(|o| o.presentation.as_ref())
+                    .and_then(|p| p.location)
+                    .unwrap_or(r.location),
+                &format!(
+                    "@verified `{}`: {}: {detail}",
+                    r.function,
+                    r.status.as_str()
+                ),
+            );
+            if let Some(kind) = r
+                .obligations
+                .last()
+                .and_then(|o| o.presentation.as_ref())
+                .and_then(|p| p.obligation.as_ref())
+            {
+                error.labels[0].message = format!("failed {kind}");
+            }
+            diagnostics.push(error);
         }
     }
     let verification = verification.with_artifacts(options, |error| {
@@ -289,7 +320,7 @@ fn check_with_data(
                         None
                     }
                 })
-                .unwrap(),
+                .unwrap_or_else(Span::dummy),
             &format!(
                 "UNKNOWN: cannot save verification artifacts: {}",
                 error.message
@@ -745,12 +776,23 @@ impl ProofContext<'_> {
                     Answer::Unsat,
                 ),
             ] {
-                let (answer, model) = s.query(
+                let phase = match kind {
+                    "requires safety" => "pre_safe",
+                    "body safety and termination" => "safe",
+                    "ensures safety" => "post_safe",
+                    _ => "post",
+                };
+                let (answer, model, presentation) = s.query_detailed(
                     &formula,
                     if want == Answer::Unsat {
                         &model_symbols
                     } else {
                         &[]
+                    },
+                    |solver| {
+                        Ok((want == Answer::Unsat).then(|| {
+                            presentation::capture(solver, data, f, &args, &summary.sites, phase)
+                        }))
                     },
                 )?;
                 r.obligations.push(Obligation {
@@ -758,6 +800,11 @@ impl ProofContext<'_> {
                     solver_result: answer.as_str().into(),
                     expected_solver_result: want.as_str().into(),
                     counterexample_candidate: if answer != want { model } else { None },
+                    presentation: if answer == Answer::Unsat && want == Answer::Sat {
+                        Some(Presentation::vacuous(summary.precondition_location))
+                    } else {
+                        presentation
+                    },
                 });
                 if answer != want {
                     return Err(match answer {
@@ -919,3 +966,6 @@ mod inferred_loop_tests;
 
 #[cfg(test)]
 mod string_tests;
+
+#[cfg(test)]
+mod diagnostic_tests;

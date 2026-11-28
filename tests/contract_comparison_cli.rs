@@ -255,15 +255,29 @@ fn contract_repair_cli_exposes_evidence_and_rechecks_fixed_source() {
     assert_eq!(evidence["status"], "COUNTEREXAMPLE");
     assert_eq!(evidence["declaration_id"], base["declaration_id"]);
     assert_eq!(evidence["contract_digest"], base["contract_digest"]);
-    assert_eq!(evidence["input_symbols"]["a0_0"], "x");
+    let symbol = evidence["input_symbols"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, name)| *name == "x")
+        .unwrap()
+        .0;
     let obligation = evidence["obligations"].as_array().unwrap().last().unwrap();
     assert_eq!(obligation["kind"], "ensures truth");
     assert!(
         obligation["counterexample_candidate"]
             .as_str()
             .unwrap()
-            .contains("a0_0")
+            .contains(symbol)
     );
+    assert_eq!(
+        obligation["presentation"]["schema"],
+        "willow.verification.presentation.v1"
+    );
+    assert_eq!(obligation["presentation"]["evidence"], "CANDIDATE");
+    assert_eq!(obligation["presentation"]["inputs"][0]["name"], "x");
+    assert_eq!(obligation["presentation"]["inputs"][0]["value"], "-1");
+    assert!(!obligation["presentation"]["location"].is_null());
     assert_eq!(
         evidence["specification_provenance"]["approval_status"],
         "UNVERIFIED"

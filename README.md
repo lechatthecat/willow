@@ -383,6 +383,36 @@ and keep `z3` on PATH, or set `WILLOW_Z3`. See the [proof example](example/stati
 [strings](example/verified_strings.wi), [immutable data](example/verified_data.wi), [loops](example/verified_loops.wi) and
 [solver-backed no-panic](example/proven_no_panic.wi).
 
+A failed proof points to the failing clause or safety expression. For example,
+replacing `non_negative`'s body in [this runnable example](example/verification_diagnostics.wi)
+with `return x;` makes `willow check` report:
+
+```text
+error[E2630]: @verified `non_negative`: COUNTEREXAMPLE: ensures truth: sat; candidate inputs x = -1; result = -1
+```
+
+The primary label points to `result >= 0`, rather than the whole function.
+Inputs use source parameter names and Willow values, including `[-3]`,
+`new Point(-4)` and `Choice::Yes(-6)`. Explicit record constructors are not
+replayed: their values use field summaries such as `Point { x: -4 }`, with a
+`construction unavailable` limitation, instead of invented constructor arguments.
+String values use Willow escapes such as `"\e"` for ESC. A candidate is a solver witness, **not a
+replayed runtime violation**; loop induction states and abstract calls can make
+it impossible to reproduce from the displayed inputs alone. Large values are
+explicitly abbreviated. `UNKNOWN` remains a failed proof; an earlier type,
+purity or effect error suppresses only the redundant skipped-proof diagnostic.
+
+Verification JSON and the AI report retain `willow.verification.v1` and all
+existing fields, including raw `counterexample_candidate` and `input_symbols`.
+Each failed SAT obligation adds `presentation` with its own
+`willow.verification.presentation.v1` schema: `evidence: "CANDIDATE"`, the failing
+`location`/`obligation`, source-named `inputs`, an optional `result`, and an
+`incomplete` reason when display extraction is unavailable. Consumers should
+ignore unknown presentation versions and continue using the original fields.
+Unsatisfiable preconditions identify the combined `requires` range and use
+`evidence: "VACUOUS_PRECONDITION"` without candidate values. Display extraction
+never promotes a candidate to a confirmed violation.
+
 <a id="pure-and-run-time-contracts"></a>
 
 **`@pure`** rejects observable interaction outside arguments and results, including

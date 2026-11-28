@@ -57,7 +57,15 @@ pub(super) fn integer_bounds(v: &str, layout: crate::parser::ast::IntegerLayout)
 pub(super) fn has(f: &FunctionDecl, k: EffectContractKind) -> bool {
     f.effect_contracts.iter().any(|c| c.kind == k)
 }
+pub(super) struct ProofSite {
+    pub location: Span,
+    pub kind: &'static str,
+    phase: &'static str,
+    term: String,
+}
 pub(super) struct Summary {
+    pub sites: Vec<ProofSite>,
+    pub precondition_location: Option<Span>,
     #[cfg(test)]
     pub assembly_bytes: usize,
     pub contract_dependencies: BTreeSet<usize>,
@@ -97,6 +105,10 @@ struct Encoder<'a> {
     names: &'a HashMap<&'a str, usize>,
     nodes: Vec<(Value, String)>,
     safety: Vec<String>,
+    sites: Vec<ProofSite>,
+    phase: &'static str,
+    location: Span,
+    locations: HashMap<ExprId, Span>,
     assumptions: Vec<String>,
     dependencies: BTreeSet<usize>,
     depth: usize,
@@ -125,6 +137,10 @@ impl<'a> Encoder<'a> {
             names,
             nodes: Vec::new(),
             safety: Vec::new(),
+            sites: Vec::new(),
+            phase: "pre_safe",
+            location: functions[function_id].span,
+            locations: source_locations(functions[function_id]),
             assumptions: Vec::new(),
             dependencies: BTreeSet::new(),
             depth: 0,
@@ -167,8 +183,56 @@ impl<'a> Encoder<'a> {
     }
     fn guard(&mut self, gate: &Value, condition: String) -> VerificationResult<()> {
         let v = self.node(format!("(=> {} {condition})", gate.text), true)?;
+        self.site(v.text.clone(), "safety", self.location);
         self.safety.push(v.text);
         Ok(())
+    }
+    fn site(&mut self, term: String, kind: &'static str, location: Span) {
+        self.sites.push(ProofSite {
+            term,
+            kind,
+            location,
+            phase: self.phase,
+        });
+    }
+    fn guard_at(
+        &mut self,
+        gate: &Value,
+        condition: String,
+        kind: &'static str,
+        location: Span,
+    ) -> VerificationResult<()> {
+        self.guard(gate, condition)?;
+        let site = self.sites.last_mut().unwrap();
+        site.kind = kind;
+        site.location = location;
+        Ok(())
+    }
+    // One selector per proof phase shares the existing DAG. Emitting one full
+    // definition per obligation would multiply DAG size by obligation count.
+    fn failure_definition(&self, name: &str, params: &str, phase: &str) -> String {
+        if !self.verified {
+            return String::new();
+        }
+        let mut result = String::new();
+        let mut count = 0;
+        for (index, site) in self
+            .sites
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.phase == phase)
+        {
+            use std::fmt::Write;
+            write!(result, "(ite (not {}) {index} ", site.term).unwrap();
+            count += 1;
+        }
+        result.push_str("(- 1)");
+        result.extend(std::iter::repeat_n(')', count));
+        if count == 0 {
+            format!("(define-fun {name} ({params}) Int (- 1))\n")
+        } else {
+            self.definition(name, params, "Int", &result)
+        }
     }
     fn expr(&mut self, expr: &Expr, state: &State, gate: &Value) -> VerificationResult<Value> {
         self.depth += 1;
@@ -176,7 +240,15 @@ impl<'a> Encoder<'a> {
             return Err(Unsupported.error("expression depth budget exceeded"));
         }
         let expected = self.expected.take();
+        let previous_location = std::mem::replace(
+            &mut self.location,
+            self.locations
+                .get(&expr.id())
+                .copied()
+                .unwrap_or_else(|| expr.span()),
+        );
         let result = self.expr_inner(expr, state, gate, expected.as_ref());
+        self.location = previous_location;
         self.depth -= 1;
         result
     }
@@ -279,12 +351,17 @@ impl<'a> Encoder<'a> {
             } else {
                 format!("(distinct {} 0)", r.text)
             };
-            self.guard(gate, safe)?;
+            self.guard_at(gate, safe, "division safety", self.location)?;
         }
         let result_ty = if boolean { Type::Bool } else { l.ty.clone() };
         let value = self.typed_node(format!("({op} {} {})", l.text, r.text), &result_ty)?;
         if !boolean {
-            self.guard(gate, data::domain(&value.ty, &value.text))?;
+            self.guard_at(
+                gate,
+                data::domain(&value.ty, &value.text),
+                "overflow safety",
+                self.location,
+            )?;
         }
         Ok(value)
     }
@@ -488,7 +565,7 @@ impl<'a> Encoder<'a> {
         let id = format!("{}{}", self.data.symbol_namespace, symbol(f));
         let call = |suffix: &str| application(&format!("f{id}_{suffix}"), &args);
         self.guard(gate, call("pre_safe"))?;
-        self.guard(gate, call("pre"))?;
+        self.guard_at(gate, call("pre"), "requires", self.location)?;
         if !has(f, EffectContractKind::Verified) {
             self.guard(gate, call("safe"))?;
             self.guard(gate, call("post_safe"))?;
@@ -561,6 +638,7 @@ impl<'a> Encoder<'a> {
         };
         let first = self.nodes.len();
         let safe_first = self.safety.len();
+        let site_first = self.sites.len();
         let assumption_first = self.assumptions.len();
         let symbol = format!("q{}", self.next_quantifier);
         self.next_quantifier += 1;
@@ -578,6 +656,7 @@ impl<'a> Encoder<'a> {
             return Err(Unsupported.error("unsupported quantified predicate"));
         }
         let safety = self.safety.split_off(safe_first);
+        self.sites.truncate(site_first);
         let nodes = self.nodes.split_off(first);
         self.scoped_nodes += nodes.len();
         let wrap = |result: String| scoped_lets(&nodes, &result);
@@ -928,6 +1007,7 @@ impl<'a> Encoder<'a> {
         gate: &Value,
         index: Option<&str>,
         automatic: Option<(&str, &Value, &Value)>,
+        assert: bool,
     ) -> VerificationResult<Value> {
         let mut result = gate.clone();
         if let Some((counter, start, upper)) = automatic {
@@ -939,12 +1019,31 @@ impl<'a> Encoder<'a> {
                 ),
                 true,
             )?;
+            if assert {
+                self.guard_at(
+                    &result,
+                    value.text.clone(),
+                    "inferred invariant",
+                    self.location,
+                )?;
+            }
             result = self.and(&result, &value)?;
         }
         for expr in invariants {
             let value = self.loop_annotation(expr, state, &result, index)?;
             if !value.boolean {
                 return Err(Unsupported.error("loop invariant must have type bool"));
+            }
+            if assert {
+                self.guard_at(
+                    &result,
+                    value.text.clone(),
+                    "invariant",
+                    self.locations
+                        .get(&expr.id())
+                        .copied()
+                        .unwrap_or_else(|| expr.span()),
+                )?;
             }
             result = self.and(&result, &value)?;
         }
@@ -979,9 +1078,15 @@ impl<'a> Encoder<'a> {
         let annotation_index = element.and(step);
         let automatic =
             automatic_bounds.map(|(start, upper)| (step.expect("for counter"), start, upper));
-        let entry =
-            self.loop_invariant(invariants, state, &incoming, annotation_index, automatic)?;
-        self.guard(&incoming, entry.text)?;
+        self.location = span;
+        self.loop_invariant(
+            invariants,
+            state,
+            &incoming,
+            annotation_index,
+            automatic,
+            true,
+        )?;
 
         // One arbitrary loop head represents every iteration. Only writes to
         // bindings visible at the head are forgotten; lexical locals stay local.
@@ -1030,6 +1135,7 @@ impl<'a> Encoder<'a> {
             &head.alive.clone(),
             annotation_index,
             automatic,
+            false,
         )?;
         let condition = self.expr(cond, &head, &head.alive.clone())?;
         if !condition.boolean {
@@ -1041,7 +1147,15 @@ impl<'a> Encoder<'a> {
         if rank.ty != Type::I64 {
             return Err(Unsupported.error("loop variant must have type i64"));
         }
-        self.guard(&body.alive, format!("(<= 0 {})", rank.text))?;
+        self.guard_at(
+            &body.alive,
+            format!("(<= 0 {})", rank.text),
+            "variant nonnegative",
+            self.locations
+                .get(&variant.id())
+                .copied()
+                .unwrap_or_else(|| variant.span()),
+        )?;
         if let Some((binding, array)) = element {
             let index = &head.env[step.expect("array iteration index")];
             let ty = frozen_element(&array.ty).expect("frozen element");
@@ -1059,6 +1173,7 @@ impl<'a> Encoder<'a> {
         self.jumps
             .push((Value::literal("false", true), Value::literal("false", true)));
         self.block(body_block, &mut body, depth)?;
+        self.location = span;
         let (broken, continued) = self.jumps.pop().unwrap();
         body.alive = self.node(format!("(or {} {})", body.alive.text, continued.text), true)?;
         if let Some(name) = step {
@@ -1071,19 +1186,27 @@ impl<'a> Encoder<'a> {
             )?;
             body.env.insert(name.to_owned(), next);
         }
-        let preserved = self.loop_invariant(
+        self.loop_invariant(
             invariants,
             &body,
             &body.alive.clone(),
             annotation_index,
             automatic,
+            true,
         )?;
-        self.guard(&body.alive, preserved.text)?;
         let next = self.loop_annotation(variant, &body, &body.alive.clone(), annotation_index)?;
         if next.ty != Type::I64 {
             return Err(Unsupported.error("loop variant must have type i64"));
         }
-        self.guard(&body.alive, format!("(< {} {})", next.text, rank.text))?;
+        self.guard_at(
+            &body.alive,
+            format!("(< {} {})", next.text, rank.text),
+            "variant decrease",
+            self.locations
+                .get(&variant.id())
+                .copied()
+                .unwrap_or_else(|| variant.span()),
+        )?;
 
         // Backedges end the induction step, not the function. Only the false
         // condition continues after the loop; returns in the body remain exits.
@@ -1389,16 +1512,24 @@ pub(super) fn encode(
         "Bool",
         &format!("(and true {})", e.assumptions.join(" ")),
     );
+    definitions += &e.failure_definition(
+        &format!("f{id}_failure_pre_safe"),
+        &params.join(" "),
+        "pre_safe",
+    );
     let mut contract_definitions = definitions.clone();
+    e.phase = "safe";
     let mut contract_dependencies = e.dependencies.clone();
     index_loop_writes(&f.body, &mut e.loop_writes, 0)?;
     e.block(&f.body, &mut state, 0)?;
     for h in &e.havoc {
         definitions += &format!("(declare-const {} {})\n", h.text, sort(&h.ty)?);
     }
-    e.guard(
+    e.guard_at(
         &Value::literal("true", true),
         format!("(not {})", state.alive.text),
+        "return coverage",
+        f.span,
     )?;
     let safety = e.safety();
 
@@ -1409,6 +1540,8 @@ pub(super) fn encode(
         &state.result.text,
     );
     definitions += &e.definition(&format!("f{id}_safe"), &params.join(" "), "Bool", &safety);
+    definitions += &e.failure_definition(&format!("f{id}_failure_safe"), &params.join(" "), "safe");
+    e.phase = "post_safe";
     let mut post_state = initial.clone();
     post_state.env.insert("result".into(), state.result);
     // Arbitrary heads outside an invariant describe no execution. Check the
@@ -1419,6 +1552,13 @@ pub(super) fn encode(
         if !value.boolean {
             return Err(Unsupported.error("non-boolean contract"));
         }
+        let truth = e.node(format!("(=> {} {})", post.text, value.text), true)?;
+        e.sites.push(ProofSite {
+            term: truth.text,
+            kind: "ensures",
+            location: e.locations[&clause.id()],
+            phase: "post",
+        });
         post = e.and(&post, &value)?;
     }
     let post = e.node(format!("(=> {} {})", state.returned.text, post.text), true)?;
@@ -1442,6 +1582,10 @@ pub(super) fn encode(
         "Bool",
         &post_safe,
     );
+    for phase in ["post_safe", "post"] {
+        definitions +=
+            &e.failure_definition(&format!("f{id}_failure_{phase}"), &params.join(" "), phase);
+    }
     // Separate contract predicate, with an arbitrary return, for callers.
     let mut c = Encoder::new(names[f.name.as_str()], functions, names, data);
     let mut cs = initial;
@@ -1470,6 +1614,12 @@ pub(super) fn encode(
     );
     contract_dependencies.extend(&c.dependencies);
     Ok(Summary {
+        precondition_location: f
+            .requires
+            .first()
+            .zip(f.requires.last())
+            .map(|(first, last)| e.locations[&first.id()].to(e.locations[&last.id()])),
+        sites: e.sites,
         contract_dependencies,
         #[cfg(test)]
         assembly_bytes: e
@@ -1492,6 +1642,37 @@ pub(super) fn encode(
         inferred_loop_annotations: e.inferred_loop_annotations,
     })
 }
+// Some parser spans identify only an operator. Fold descendant token ranges
+// once, bottom-up, instead of rescanning the expression at every safety check.
+fn source_locations(function: &FunctionDecl) -> HashMap<ExprId, Span> {
+    let mut locations = HashMap::new();
+    let mut stack: Vec<Span> = Vec::new();
+    for event in AstWalk::new(AstEvent::Block(&function.body)).chain(
+        function
+            .requires
+            .iter()
+            .chain(&function.ensures)
+            .flat_map(|e| AstWalk::new(AstEvent::Expr(e))),
+    ) {
+        match event {
+            AstEvent::Expr(expr) => stack.push(expr.span()),
+            AstEvent::ExitExpr(expr) => {
+                let span = stack.pop().expect("expression entry");
+                locations.insert(expr.id(), span);
+                if let Some(parent) = stack.last_mut() {
+                    let end = parent.end.max(span.end);
+                    if span.start < parent.start {
+                        *parent = span;
+                    }
+                    parent.end = end;
+                }
+            }
+            _ => {}
+        }
+    }
+    locations
+}
+
 // Summarize lexical writes once, bottom-up. Nested loops reuse their summary;
 // no enclosing loop rescans a nested body. Set merging is small-to-large.
 fn index_loop_writes(
