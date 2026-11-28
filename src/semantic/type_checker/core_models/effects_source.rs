@@ -54,27 +54,20 @@ impl Model {
         }
     }
 
-    // An indirect edge expands to all address-taken functions of its arity.
-    // Share a hub per arity instead of materializing the Cartesian product of
-    // calls and candidates. Virtual's pure base contributes no wait; its sole
-    // override and Interface's sole implementation forward to `to`.
+    // Each generated indirect call loads exactly the named target into its
+    // local. The oracle follows that value, independently of compiler flow
+    // constraints. Unused function values cannot introduce edges. Virtual's
+    // pure base contributes no wait; its override forwards to `to`.
     fn reachable_wait(&self) -> (bool, usize) {
         let n = self.edges.len();
         let mut expanded = vec![Vec::new(); n + 2];
-        let mut addressed = vec![false; n];
         let mut work = 0;
         for (from, row) in self.edges.iter().enumerate() {
             work += 1;
             for edge in row {
                 work += 1;
                 match edge.kind {
-                    Kind::Indirect => {
-                        let hub = n + self.arity[edge.to] - 1;
-                        expanded[from].push(hub);
-                        if !std::mem::replace(&mut addressed[edge.to], true) {
-                            expanded[hub].push(edge.to);
-                        }
-                    }
+                    Kind::Indirect => expanded[from].push(edge.to),
                     Kind::Virtual if self.async_virtual => {}
                     Kind::Direct | Kind::Virtual | Kind::Interface | Kind::Imported => {
                         expanded[from].push(edge.to);
@@ -87,7 +80,7 @@ impl Model {
         seen[0] = true;
         while let Some(node) = pending.pop() {
             work += 1;
-            if (node < n && self.waits[node]) || (node >= n && self.lambda == Some(node - n + 1)) {
+            if node < n && self.waits[node] {
                 return (true, work);
             }
             for &to in &expanded[node] {
@@ -340,8 +333,8 @@ fn core_model_effects_source_masks_and_arity() {
             }
         }
     }
-    // f2 is disconnected but address-taken by f3; only arity can exclude it.
-    // A waiting lambda is also checked both matching and mismatching f1.
+    // f2 and the lambda are disconnected. Matching arity must not create a
+    // path from the entry after function-value flow refinement.
     for value_arity in [1, 2] {
         for lambda in [None, Some(1), Some(2)] {
             let mut model = Model::empty(4);
@@ -357,10 +350,7 @@ fn core_model_effects_source_masks_and_arity() {
             model.waits[2] = true;
             model.lambda = lambda;
             let label = format!("arity value={value_arity} lambda={lambda:?}");
-            assert_eq!(
-                model.compare(&label, true),
-                value_arity == 1 || lambda == Some(1)
-            );
+            assert!(!model.compare(&label, true));
             assert!(!model.compare(&label, false));
             cases += 1;
         }

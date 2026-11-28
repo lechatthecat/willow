@@ -23,4 +23,5 @@ pub(crate) mod generic_inference;
 
 pub mod verification;
 
+pub(crate) mod function_flow;
 pub(crate) mod permanent_wait;

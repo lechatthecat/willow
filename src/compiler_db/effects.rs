@@ -2793,6 +2793,11 @@ impl Ord for LockEffectWitness {
 pub(crate) struct IndirectLockSession {
     /// Per unit and callable: the arity bits of the indirect calls it can
     /// make synchronously, through any non-async call path.
+    pub(crate) types:
+        HashMap<UnitId, HashMap<FunctionId, crate::semantic::indirect_lock::TypeReach>>,
+    pub(crate) type_locks: crate::semantic::indirect_lock::TypeReach,
+    pub(crate) type_values: crate::semantic::indirect_lock::TypeValues,
+    pub(crate) value_witnesses: crate::semantic::indirect_lock::TypeWitnesses,
     pub(crate) reach: HashMap<UnitId, HashMap<FunctionId, u64>>,
     pub(crate) values: crate::semantic::indirect_lock::ValueMasks,
     /// Arity bits of the indirect calls made while holding a lock.

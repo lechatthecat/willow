@@ -264,18 +264,21 @@ fn closure_effects_shared_candidates_scale_linearly() {
             .iter()
             .filter(|f| f.id.starts_with("$indirect-arity:"))
             .collect();
-        assert_eq!(buckets.len(), 1);
-        assert_eq!(buckets[0].callees.len(), n);
+        assert_eq!(buckets.len(), n);
+        assert!(buckets.iter().all(|bucket| bucket.callees.len() == 1));
+        let bucket_ids: std::collections::HashSet<_> = buckets.iter().map(|b| &b.id).collect();
         let uses = snapshot
             .functions
             .iter()
             .flat_map(|f| &f.callees)
-            .filter(|id| *id == &buckets[0].id)
+            .filter(|id| bucket_ids.contains(id))
             .count();
         assert_eq!(uses, n);
         let result = effects(snapshot, "main");
         assert_eq!(result["status"], "ok", "{result}");
-        println!("indirect scale n={n} shared_buckets=1 candidate_edges={n} caller_edges={uses}");
+        println!(
+            "indirect scale n={n} precise_buckets={n} candidate_edges={n} caller_edges={uses}"
+        );
     }
 }
 

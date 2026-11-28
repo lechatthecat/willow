@@ -31,6 +31,8 @@ impl TypeChecker {
     /// Reset and index the named callables consumed by the semantic
     /// `MAY_BLOCK | MAY_SUSPEND` analysis for E2604.
     pub(super) fn prepare_lock_effect_analysis(&mut self, program: &Program) {
+        // Value-flow argument/return edges consume checked call identities.
+        self.capture_call_sites = true;
         if program.items.iter().any(|item| matches!(item, Item::Function(f) if f.effect_contracts.iter().any(|a| matches!(a.kind, EffectContractKind::Pure | EffectContractKind::Verified)))) {
             self.capture_call_sites = true;
         }
@@ -763,6 +765,9 @@ impl TypeChecker {
                 },
             );
         }
+        let mut capture_graph = graph.clone();
+        self.refine_function_flow(program, &mut graph);
+        capture_graph.flow_sensitive = graph.flow_sensitive;
         if self.effect_graph_only.is_some() {
             self.effect_graph_only = Some(graph);
             return;
@@ -870,7 +875,7 @@ impl TypeChecker {
                         queries,
                     },
                     program,
-                    &graph,
+                    &capture_graph,
                     crate::ai::CaptureInputs {
                         indirect: &self.indirect_lock,
                         types: &self.expr_types,
@@ -985,7 +990,18 @@ impl TypeChecker {
         }
         // Lambdas are never imported; any other callable outside this unit's
         // index is imported, even when the unit's graph has a node for it.
-        let local = self.effect_index.callables.contains_key(callee) || callee.is_lambda();
+        let local = self.effect_index.callables.contains_key(callee)
+            || callee.is_lambda()
+            || matches!(
+                callee.synthetic_kind(),
+                crate::qualified_name::SyntheticKind::Indirect { .. }
+            );
+        if !local
+            && crate::compiler_db::effects::intrinsic_effects(callee)
+                .is_some_and(|effects| !effects.intersects(LOCK_EFFECT_WAIT))
+        {
+            return None;
+        }
         let evidence = self.effect_queries.as_ref().and_then(|(queries, unit)| {
             if local {
                 queries.effect_evidence(*unit, *callee)

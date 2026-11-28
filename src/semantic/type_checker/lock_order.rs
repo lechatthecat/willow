@@ -245,6 +245,7 @@ struct Analysis<'a> {
     graph: Graph,
     functions: HashMap<FunctionId, (usize, bool)>,
     dispatch: HashMap<FunctionId, usize>,
+    value_calls: HashMap<Span, usize>,
     classes: HashMap<Class, usize>,
     globals: HashMap<(String, String), Identity>,
     opaque: usize,
@@ -330,6 +331,9 @@ impl Analysis<'_> {
     }
 
     fn call_node(&mut self, expr: &Expr, locals: &HashMap<String, Identity>) -> Option<usize> {
+        if let Some(&node) = self.value_calls.get(&expr.span()) {
+            return Some(node);
+        }
         match expr {
             Expr::Call(call) if locals.contains_key(&call.callee) => Some(self.opaque),
             Expr::Call(call) => self.target_node(FunctionId::free_from_source_name(&call.callee)),
@@ -559,6 +563,7 @@ pub(crate) fn collect(
         graph,
         functions: HashMap::new(),
         dispatch: HashMap::new(),
+        value_calls: HashMap::new(),
         classes: HashMap::new(),
         globals: HashMap::new(),
         opaque,
@@ -610,6 +615,28 @@ pub(crate) fn collect(
             .functions
             .entry(id)
             .or_insert_with(|| (analysis.graph.node(false), asynchronous));
+    }
+    for &id in calls.ids() {
+        if id.is_lambda()
+            || matches!(
+                id.synthetic_kind(),
+                crate::qualified_name::SyntheticKind::Indirect { .. }
+            )
+        {
+            analysis
+                .functions
+                .entry(id)
+                .or_insert_with(|| (analysis.graph.node(false), false));
+        }
+    }
+    for (&span, targets) in &calls.value_calls {
+        let node = analysis.graph.node(false);
+        analysis.value_calls.insert(span, node);
+        for &target in targets {
+            if let Some(target) = analysis.target_node(target) {
+                analysis.graph.edge(node, target, span);
+            }
+        }
     }
     let hierarchy = ClassHierarchy::from_program(program);
     for (_, sites) in calls.iter() {
@@ -1096,5 +1123,18 @@ mod tests {
             assert!(graph.diagnostics(&TypeClasses::default()).is_empty());
             assert!(graph.operations <= 3 * n + 4 * (2 * (n - 1)));
         }
+    }
+    #[test]
+    fn function_flow_lock_order_uses_per_site_targets() {
+        let source = "class L { static a:Mutex<i64>=Mutex::new(1); } fn take() { lock L::a as x {} } async fn main() { let f=take; f(); lock L::a as x { f(); } }";
+        let errors = check(source);
+        assert!(
+            errors.iter().any(|d| d.code == ErrorCode::E2605),
+            "{errors:?}"
+        );
+        // A function value that only creates a Task cannot acquire a lock on
+        // its caller's stack. Keep the async boundary in the shared graph.
+        let source = source.replace("fn take()", "async fn take()");
+        assert!(check(&source).is_empty());
     }
 }

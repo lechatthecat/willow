@@ -1,0 +1,48 @@
+// Unrelated waiting values do not taint these critical-section calls.
+fn identity(x: i64) -> i64 { return x; }
+fn wait(x: i64) -> i64 {
+    let channel = Channel<i64>::new();
+    return channel.recv();
+}
+fn apply(f: fn(i64) -> i64, x: i64) -> i64 { return f(x); }
+fn make() -> fn(i64) -> i64 { return identity; }
+class Handler { pub callback: fn(i64) -> i64; }
+fn replace(callback: &mut fn(i64) -> i64) { callback = identity; }
+open class BaseHandler {
+    pub callback: fn(i64) -> i64;
+    pub init(self, callback: fn(i64) -> i64) { self.callback = callback; }
+}
+class ChildHandler extends BaseHandler {
+    pub init(self, callback: fn(i64) -> i64) { super.init(callback); }
+}
+open class StoredBase { pub inherited: fn(i64) -> i64; }
+class StoredChild extends StoredBase { pub count: i64; }
+async fn main() {
+    let mutex = Mutex::new(42);
+    lock mutex as value {
+        let unused = wait;
+        let local = identity;
+        let handler = new Handler(identity);
+        let stored = handler.callback;
+        let callbacks = [identity];
+        let element = callbacks[0];
+        let returned = make();
+        println(local(value));
+        println(apply(identity, value));
+        println(returned(value));
+        println(stored(value));
+        println(element(value));
+        replace(&callbacks[0]);
+        callbacks.push(identity);
+        let written = callbacks[0];
+        let appended = callbacks[1];
+        let child = new ChildHandler(identity);
+        let inherited = child.callback;
+        println(written(value));
+        println(appended(value));
+        println(inherited(value));
+        let memberwise = new StoredChild(identity, value);
+        let from_base = memberwise.inherited;
+        println(from_base(memberwise.count));
+    }
+}

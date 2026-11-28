@@ -349,3 +349,69 @@ fn indirect_lock_23_single_report_per_site() {
     );
     assert_eq!(out.matches("error[E2604]").count(), 1, "{out}");
 }
+
+#[test]
+fn indirect_lock_cross_module_full_signature_fallback() {
+    for (label, slow_type, accepted) in
+        [("type_distinct", "bool", true), ("type_wait", "i64", false)]
+    {
+        let main = format!(
+            "import worker; fn safe(x:i64)->i64 {{ return x; }} fn slow(x:{slow_type})->i64 {{ let c=Channel<i64>::new(); return c.recv(); }} async fn main() {{ let unused=slow; println(await worker::run(safe)); }}"
+        );
+        let (out, ok) = check(
+            label,
+            &[
+                (
+                    "worker.wi",
+                    "pub async fn run(f:fn(i64)->i64)->i64 { let m=Mutex::new(0); lock m as v { return f(1); } }",
+                ),
+                ("main.wi", &main),
+            ],
+        );
+        assert_eq!(ok, accepted, "{out}");
+        if !accepted {
+            assert!(out.contains("E2604"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn indirect_lock_cross_module_conditional_signature_chain() {
+    for (label, slow_type, accepted) in [
+        ("conditional_type_distinct", "bool", true),
+        ("conditional_type_wait", "i64", false),
+    ] {
+        let main = format!(
+            "import worker; fn safe(x:i64)->i64 {{ return x; }} fn slow(x:{slow_type})->i64 {{ let c=Channel<i64>::new(); return c.recv(); }} fn bridge(f:fn(i64)->i64)->i64 {{ return worker::apply(f); }} async fn main() {{ let unused=slow; let m=Mutex::new(0); lock m as v {{ println(worker::invoke(bridge,safe)); }} }}"
+        );
+        let (out, ok) = check(
+            label,
+            &[
+                (
+                    "worker.wi",
+                    "pub fn apply(f:fn(i64)->i64)->i64 { return f(1); } pub fn invoke(f:fn(fn(i64)->i64)->i64,g:fn(i64)->i64)->i64 { return f(g); }",
+                ),
+                ("main.wi", &main),
+            ],
+        );
+        assert_eq!(ok, accepted, "{out}");
+        if !accepted {
+            assert!(out.contains("E2604"), "{out}");
+        }
+    }
+}
+
+#[test]
+fn indirect_lock_imported_callback_storage_cannot_reuse_local_field_candidates() {
+    let library = "pub class Holder { pub f:fn(i64)->i64; } fn slow(x:i64)->i64 { let c=Channel<i64>::new(); return c.recv(); } pub fn make()->Holder { return new Holder(slow); }";
+    let entry = "import lib; class Local { pub f:fn(i64)->i64; } fn safe(x:i64)->i64 { return x; } async fn main() { let a=new Local(safe); let b=lib::make(); let m=Mutex::new(0); lock m as v { let f=b.f; f(1); } }";
+    let (diagnostics, ok) = check(
+        "indirect_imported_storage",
+        &[("main.wi", entry), ("lib.wi", library)],
+    );
+    assert!(!ok && diagnostics.contains("E2604"), "{diagnostics}");
+    assert!(
+        diagnostics.contains("may wait") || diagnostics.contains("causes this transitive effect"),
+        "{diagnostics}"
+    );
+}

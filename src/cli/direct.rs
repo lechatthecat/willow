@@ -797,6 +797,13 @@ fn effect_state_lines(
                 UnknownReasonCode::ExternalInterop => "external-interop",
                 UnknownReasonCode::MissingWitness => "missing-witness",
                 UnknownReasonCode::MissingSource => "missing-source",
+                UnknownReasonCode::FunctionFlowExternalEscape => "function-flow-external-escape",
+                UnknownReasonCode::FunctionFlowUnknownStorage => "function-flow-unknown-storage",
+                UnknownReasonCode::FunctionFlowCandidateLimit => "function-flow-candidate-limit",
+                UnknownReasonCode::FunctionFlowDepthLimit => "function-flow-depth-limit",
+                UnknownReasonCode::FunctionFlowUnresolvedSource => {
+                    "function-flow-unresolved-source"
+                }
             };
             let mut detail = format!("  Unknown: {code}");
             if let Some(callee) = &reason.callee {

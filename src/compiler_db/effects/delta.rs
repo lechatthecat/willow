@@ -18,6 +18,12 @@ pub(super) fn solve_unit_delta<N: std::fmt::Display>(
     direct: &HashMap<FunctionId, DirectLockEffects>,
     external: &impl Fn(&FunctionId) -> RuntimeEffects,
 ) -> Option<UnitEffects> {
+    // An unchanged caller can acquire new targets when another body changes
+    // an argument, return or heap write. Rebuild this unit's equations from
+    // the shared flow result; retained body checking still remains available.
+    if graph.flow_sensitive {
+        return None;
+    }
     let DeltaOrigin {
         index,
         queries,

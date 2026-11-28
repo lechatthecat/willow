@@ -10,7 +10,7 @@ use std::collections::VecDeque;
 pub const SCHEMA: &str = "willow.effects.v3";
 const COUNT: usize = RuntimeEffects::BIT_COUNT as usize;
 const MISSING_WITNESS: usize = 5;
-const REASONS: [UnknownReasonCode; 7] = [
+const REASONS: [UnknownReasonCode; 12] = [
     UnknownReasonCode::IndirectCall,
     UnknownReasonCode::UnresolvedCallee,
     UnknownReasonCode::IncompleteFlow,
@@ -18,6 +18,11 @@ const REASONS: [UnknownReasonCode; 7] = [
     UnknownReasonCode::ExternalInterop,
     UnknownReasonCode::MissingWitness,
     UnknownReasonCode::MissingSource,
+    UnknownReasonCode::FunctionFlowExternalEscape,
+    UnknownReasonCode::FunctionFlowUnknownStorage,
+    UnknownReasonCode::FunctionFlowCandidateLimit,
+    UnknownReasonCode::FunctionFlowDepthLimit,
+    UnknownReasonCode::FunctionFlowUnresolvedSource,
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -30,6 +35,11 @@ pub enum UnknownReasonCode {
     ExternalInterop,
     MissingWitness,
     MissingSource,
+    FunctionFlowExternalEscape,
+    FunctionFlowUnknownStorage,
+    FunctionFlowCandidateLimit,
+    FunctionFlowDepthLimit,
+    FunctionFlowUnresolvedSource,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -85,7 +95,7 @@ impl EffectView<'_> {
 #[derive(Clone, Default)]
 struct Fact {
     witness: Option<usize>,
-    reasons: [Option<usize>; 7],
+    reasons: [Option<usize>; REASONS.len()],
 }
 impl Fact {
     fn get(&self, slot: usize) -> Option<usize> {
@@ -150,6 +160,19 @@ impl Analysis {
             }
         }
         for (i, f) in snapshot.functions.iter().enumerate() {
+            for unresolved in &f.unresolved {
+                let slot = match unresolved.as_str() {
+                    "function-flow-external-escape" => Some(7),
+                    "function-flow-unknown-storage" => Some(8),
+                    "function-flow-candidate-limit" => Some(9),
+                    "function-flow-depth-limit" => Some(10),
+                    "function-flow-unresolved-source" => Some(11),
+                    _ => None,
+                };
+                if let Some(slot) = slot {
+                    result.reason(i, RuntimeEffects::ALL.bits(), slot, f.locations.first());
+                }
+            }
             if !bodies[i] && !f.synthetic {
                 let unknown = RuntimeEffects::ALL.difference(declared_absent[i]);
                 result.reason(i, unknown.bits(), 3, f.locations.first());
@@ -202,8 +225,15 @@ impl Analysis {
             let ranges = super::semantic::local_ranges(&f.locations);
             if let Some(facts) = snapshot.semantic.witnesses.get(&f.id) {
                 for fact in facts {
-                    let bits = fact.effect;
                     let w = &fact.witness;
+                    // A resolved pure value has no panic obligation. Keep the
+                    // source-bearing indirect witness for foreign provenance,
+                    // but do not turn an absent capability into uncertainty.
+                    let bits = if w.operation() == Some(&CapabilityOperation::IndirectCall) {
+                        fact.effect & f.runtime_effects
+                    } else {
+                        fact.effect
+                    };
                     let location = w.location().cloned();
                     let reason = if w.kind == WitnessKind::ExternalBoundary
                         || w.operation() == Some(&CapabilityOperation::ExternRust)

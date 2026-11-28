@@ -745,6 +745,7 @@ impl TypeChecker {
                 TypeId::from_source_name(&base.name),
                 "init",
             ));
+            self.indirect_lock.super_calls.push((s.span, target));
             self.resolved_calls
                 .entry(caller)
                 .or_default()
@@ -786,6 +787,10 @@ impl TypeChecker {
                     }
                     return;
                 };
+                self.indirect_lock.memberwise.push((
+                    s.span,
+                    fields.iter().map(|(_, name, _)| name.clone()).collect(),
+                ));
                 self.check_implicit_constructor_field_visibility(&fields, &s.args, s.span);
                 let params = fields
                     .iter()
@@ -995,6 +1000,10 @@ impl TypeChecker {
                     }
                     return Type::Named(resolved);
                 };
+                self.indirect_lock.memberwise.push((
+                    n.span,
+                    fields.iter().map(|(_, name, _)| name.clone()).collect(),
+                ));
                 self.check_implicit_constructor_field_visibility(&fields, &n.args, n.span);
                 // A memberwise constructor stores every field by value: there is
                 // no declaration that could mark one `&`/`&mut`.

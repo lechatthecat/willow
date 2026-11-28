@@ -373,6 +373,9 @@ pub struct CallSites {
 #[derive(Debug, Default, Clone)]
 pub struct CallGraph {
     nodes: BTreeMap<FunctionId, CallSites>,
+    pub(crate) flow_sensitive: bool,
+    /// Per-site value dispatch, including repeated calls of the same target.
+    pub(crate) value_calls: HashMap<crate::diagnostics::Span, Vec<FunctionId>>,
 }
 
 impl CallGraph {
@@ -668,15 +671,24 @@ mod tests {
     #[test]
     fn p03_a_call_through_a_parameter_is_indirect() {
         let source = "fn caller(f: fn(i64) -> i64) -> i64 { return f(1); }";
-        assert!(free_targets(source, "caller").is_empty());
+        let (graph, _) = graph_of(source);
+        let targets = &graph.get(&FunctionId::free("caller")).unwrap().targets;
+        assert_eq!(targets.len(), 1);
+        assert!(matches!(
+            targets.iter().next().unwrap().synthetic_kind(),
+            crate::qualified_name::SyntheticKind::Indirect { .. }
+        ));
         assert!(has_unknown(source, "caller"));
     }
 
     #[test]
     fn p04_a_call_through_a_local_function_value_is_indirect() {
         let source = "fn caller() -> i64 { let f = |x: i64| -> i64 { return x; }; return f(1); }";
-        assert!(free_targets(source, "caller").is_empty());
-        assert!(has_unknown(source, "caller"));
+        let (graph, _) = graph_of(source);
+        let targets = &graph.get(&FunctionId::free("caller")).unwrap().targets;
+        assert_eq!(targets.iter().filter(|id| id.is_lambda()).count(), 1);
+        assert_eq!(targets.len(), 1);
+        assert!(!has_unknown(source, "caller"));
     }
 
     #[test]
@@ -686,8 +698,11 @@ mod tests {
                         let helper = |x: i64| -> i64 { return x + 1; };\n\
                         return helper(1);\n\
                       }";
-        assert!(free_targets(source, "caller").is_empty());
-        assert!(has_unknown(source, "caller"));
+        let (graph, _) = graph_of(source);
+        let targets = &graph.get(&FunctionId::free("caller")).unwrap().targets;
+        assert_eq!(targets.iter().filter(|id| id.is_lambda()).count(), 1);
+        assert_eq!(targets.len(), 1);
+        assert!(!has_unknown(source, "caller"));
     }
 
     #[test]
@@ -959,11 +974,12 @@ mod tests {
                         }\n\
                         return helper();\n\
                       }";
-        // The inner call is still indirect, so `has_unknown` stays set — but the
-        // call after the block reaches the real helper. The flat pre-pass lost
-        // that edge for the whole body.
-        assert_eq!(free_targets(source, "caller"), vec!["helper"]);
-        assert!(has_unknown(source, "caller"));
+        let (graph, _) = graph_of(source);
+        let targets = &graph.get(&FunctionId::free("caller")).unwrap().targets;
+        assert_eq!(targets.iter().filter(|id| id.is_lambda()).count(), 1);
+        assert!(targets.contains(&FunctionId::free("helper")));
+        assert_eq!(targets.len(), 2);
+        assert!(!has_unknown(source, "caller"));
     }
 
     #[test]
@@ -1067,7 +1083,13 @@ mod tests {
                         }\n\
                         return 0;\n\
                       }";
-        assert!(free_targets(source, "caller").is_empty());
+        let (graph, _) = graph_of(source);
+        let targets = &graph.get(&FunctionId::free("caller")).unwrap().targets;
+        assert_eq!(targets.len(), 1);
+        assert!(matches!(
+            targets.iter().next().unwrap().synthetic_kind(),
+            crate::qualified_name::SyntheticKind::Indirect { .. }
+        ));
         assert!(has_unknown(source, "caller"));
     }
 }

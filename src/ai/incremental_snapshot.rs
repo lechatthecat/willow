@@ -818,6 +818,20 @@ pub(crate) fn capture_incremental(
             &local_effects,
         );
     };
+    if graph.flow_sensitive {
+        // Value-flow constraints span typed owners; a body-only patch cannot
+        // retain consumers whose source value changed in another owner.
+        plan.borrow_mut().request_retry(SnapshotRetry::FullCapture);
+        return capture(
+            program,
+            graph,
+            inputs,
+            facts,
+            symbols,
+            index,
+            &local_effects,
+        );
+    }
     let Some(bodies) = bodies else {
         plan.borrow_mut().request_retry(SnapshotRetry::FullCapture);
         return capture(

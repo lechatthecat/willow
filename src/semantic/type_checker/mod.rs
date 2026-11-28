@@ -48,6 +48,8 @@ mod check_ops;
 mod class_cycle_tests;
 mod constructor_flow;
 mod diagnostics;
+#[cfg(test)]
+mod function_flow_tests;
 mod indirect_lock;
 #[cfg(test)]
 mod match_guard_tests;

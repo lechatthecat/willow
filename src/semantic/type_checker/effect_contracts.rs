@@ -591,8 +591,7 @@ impl TypeChecker {
 
     /// Contract proofs are deliberately separate from the runtime/lock lattice:
     /// an unknown callback must fail a declaration proof even outside a lock.
-    /// Arity hub nodes reuse the existing address-taken analysis without a
-    /// call-sites × candidate-values expansion.
+    /// Reuse the bounded candidate and full-signature fallback graph.
     fn solve_contracts(
         &self,
         program: &Program,
@@ -604,66 +603,23 @@ impl TypeChecker {
         let mut graph = graph.clone();
         let allocations = self.contract_allocations(program, &mut graph);
         for call in &self.indirect_lock.calls {
-            #[cfg(test)]
-            CONTRACT_GRAPH_WORK.with(|n| n.set(n.get() + 1));
-            graph.merge(
-                call.caller,
-                CallSites {
-                    targets: [FunctionId::synthetic_free(
-                        format!("$contract$arity{}", call.bit.trailing_zeros()),
-                        crate::qualified_name::SyntheticKind::ContractArity,
-                    )]
-                    .into(),
-                    // The arity set is conservative, not a proof that an arbitrary
-                    // parameter cannot receive an unseen value.
-                    has_unknown: true,
-                    ..Default::default()
-                },
-            );
+            if call.targets.is_none() {
+                // A fallback is a workspace bound, never a proof about values
+                // supplied by future callers. Reuse its full-signature graph.
+                graph.merge(
+                    call.caller,
+                    CallSites {
+                        has_unknown: true,
+                        ..Default::default()
+                    },
+                );
+            }
         }
-        for value in &self.indirect_lock.values {
-            #[cfg(test)]
-            CONTRACT_GRAPH_WORK.with(|n| n.set(n.get() + 1));
-            graph.merge(
-                FunctionId::synthetic_free(
-                    format!("$contract$arity{}", value.bit.trailing_zeros()),
-                    crate::qualified_name::SyntheticKind::ContractArity,
-                ),
-                CallSites {
-                    has_unknown: value.target.is_none(),
-                    ..Default::default()
-                },
-            );
-        }
-        let mut problem = EffectProblem::new()
+        let problem = EffectProblem::new()
             .external_callee(CONTRACT_EFFECTS)
             .unknown_callee(CONTRACT_EFFECTS)
             .missing_body(CONTRACT_EFFECTS)
             .default_transmit(CONTRACT_EFFECTS);
-        // A matching arity identifies a possible target, not an exact dynamic
-        // target. External witnesses sort after proven Lock witnesses, so an
-        // uncertain candidate cannot hide an independently proven violation.
-        for value in &self.indirect_lock.values {
-            let Some(target) = value.target else {
-                continue;
-            };
-            let target = self.effect_index.local_target(target);
-            if self.lock_callee_is_async(&target) == Some(true) {
-                continue;
-            }
-            let Some(summary) = facts.get(&target) else {
-                continue;
-            };
-            let hub = FunctionId::synthetic_free(
-                format!("$contract$arity{}", value.bit.trailing_zeros()),
-                crate::qualified_name::SyntheticKind::ContractArity,
-            );
-            for bit in CONTRACT_BITS {
-                if summary.intersects(bit) {
-                    problem = problem.seed(hub, bit, Some(EffectWitness::External(hub)));
-                }
-            }
-        }
         let mut nodes: HashSet<_> = graph.ids().copied().chain(roots).collect();
         for (_, sites) in graph.iter() {
             nodes.extend(&sites.targets);

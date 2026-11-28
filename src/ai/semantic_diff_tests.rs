@@ -2802,3 +2802,52 @@ fn semantic_diff_panic_allocation_helper_violations() {
         );
     }
 }
+
+#[test]
+fn function_flow_edits_match_cold_analysis() {
+    let prelude = "fn safe(x:i64)->i64 { return x; } fn slow(x:i64)->i64 { let c=Channel<i64>::new(); return c.recv(); }";
+    for body in [
+        "fn make()->fn(i64)->i64 { return safe; } fn apply()->i64 { let f=make(); return f(1); } fn main() { apply(); }",
+        "fn apply(f:fn(i64)->i64)->i64 { return f(1); } fn main() { apply(safe); }",
+        "class Holder { pub f:fn(i64)->i64; } fn apply()->i64 { let h=new Holder(safe); let f=h.f; return f(1); } fn main() { apply(); }",
+        "pub fn apply(f:fn(i64)->i64)->i64 { return f(1); } fn main() { apply(safe); }",
+        "fn replace(f:&mut fn(i64)->i64) { f=safe; } fn apply()->i64 { let a=[safe]; replace(&a[0]); let f=a[0]; return f(1); } fn main() { apply(); }",
+        "open class Base { pub f:fn(i64)->i64; pub init(self,f:fn(i64)->i64) { self.f=f; } } class Child extends Base { pub init(self,f:fn(i64)->i64) { super.init(f); } } fn apply()->i64 { let a=new Child(safe); let f=a.f; return f(1); } fn main() { apply(); }",
+        "fn apply()->i64 { let a=[safe]; a.push(safe); let f=a[1]; return f(1); } fn main() { apply(); }",
+        "open class Base { pub f:fn(i64)->i64; } class Child extends Base { pub n:i64; } fn apply()->i64 { let a=new Base(safe); let b=new Child(safe,1); let f=b.f; return f(1); } fn main() { apply(); }",
+    ] {
+        let pure = format!("{prelude} {body}");
+        let waiting = format!("{prelude} {}", body.replace("safe", "slow"));
+        for (before, after) in [(&pure, &waiting), (&waiting, &pure)] {
+            let (old, clean) = captures_mode(before, after, false);
+            let expected = compare(&old, &clean, false).unwrap();
+            let (old, retained) = captures(before, after);
+            assert_eq!(
+                wire(&compare(&old, &retained, false).unwrap()),
+                wire(&expected),
+                "{before} -> {after}"
+            );
+        }
+    }
+}
+
+#[test]
+fn function_flow_memberwise_layout_edits_match_cold_analysis() {
+    let source = |fields: &str| {
+        format!(
+            "fn safe(x:i64)->i64 {{ return x; }} fn slow(x:i64)->i64 {{ let c=Channel<i64>::new(); return c.recv(); }} open class Base {{ {fields} }} class Child extends Base {{ pub n:i64; }} fn apply()->i64 {{ let child=new Child(safe,slow,1); let f=child.f; return f(1); }} fn main() {{ apply(); }}"
+        )
+    };
+    let first = source("pub f:fn(i64)->i64; pub g:fn(i64)->i64;");
+    let second = source("pub g:fn(i64)->i64; pub f:fn(i64)->i64;");
+    for (before, after) in [(&first, &second), (&second, &first)] {
+        let (old, clean) = captures_mode(before, after, false);
+        let expected = compare(&old, &clean, false).unwrap();
+        let (old, retained) = captures(before, after);
+        assert_eq!(
+            wire(&compare(&old, &retained, false).unwrap()),
+            wire(&expected)
+        );
+        assert!(!expected.changes.is_empty());
+    }
+}

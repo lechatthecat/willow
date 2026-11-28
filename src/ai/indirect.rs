@@ -34,6 +34,7 @@ pub(super) fn infer(
     let mut typed: [HashMap<&str, Candidates>; 64] = std::array::from_fn(|_| HashMap::new());
     let mut wild: [Candidates; 64] = std::array::from_fn(|_| Candidates::default());
     let mut calls: Calls = HashMap::new();
+    let mut precise = HashMap::new();
     let mut untyped_calls = [false; 64];
     let mut typed_calls: [BTreeSet<&str>; 64] = std::array::from_fn(|_| BTreeSet::new());
     for (&unit, capture) in captures {
@@ -50,6 +51,33 @@ pub(super) fn infer(
             }
         }
         for call in &capture.indirect.calls {
+            if let Some(targets) = &call.targets {
+                let caller = calls.entry(resolve(unit, call.caller)).or_default();
+                if targets.is_empty() {
+                    continue;
+                }
+                let mut opaque = false;
+                let mut callees = Vec::new();
+                for target in targets {
+                    if let Some(node) = nodes.get(&resolve(unit, *target)) {
+                        callees.push(node.id.clone());
+                    } else {
+                        opaque = true;
+                    }
+                }
+                callees.sort_unstable();
+                callees.dedup();
+                let slot = call.bit.trailing_zeros() as usize;
+                let id = format!(
+                    "$indirect-arity:{slot}:flow:{}",
+                    hash(format!("{opaque}:{callees:?}"))
+                );
+                caller.insert(id.clone());
+                precise
+                    .entry(id.clone())
+                    .or_insert_with(|| bucket(id, slot, call.key.as_deref(), callees, opaque));
+                continue;
+            }
             let slot = call.bit.trailing_zeros() as usize;
             let bucket = match &call.key {
                 Some(key) => {
@@ -67,7 +95,7 @@ pub(super) fn infer(
                 .insert(bucket);
         }
     }
-    let mut functions = Vec::new();
+    let mut functions: Vec<_> = precise.into_values().collect();
     for slot in 0..64 {
         let has_wild = !wild[slot].targets.is_empty() || wild[slot].opaque;
         if untyped_calls[slot] {

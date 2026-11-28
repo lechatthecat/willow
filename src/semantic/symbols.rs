@@ -494,9 +494,10 @@ impl SymbolTable {
     /// considers the types the same (see [`Self::type_key`]); `None` for a
     /// non-function type or a function type without a full key.
     pub(crate) fn function_type_key(&self, ty: &Type) -> Option<String> {
-        matches!(ty, Type::Fn(..) | Type::Closure(..))
-            .then(|| self.type_key(ty))
-            .flatten()
+        if !matches!(ty, Type::Fn(..) | Type::Closure(..)) {
+            return None;
+        }
+        crate::semantic::function_flow::type_key(self, ty)
     }
 
     /// A key of `ty` that equal types share: nominal types are keyed by

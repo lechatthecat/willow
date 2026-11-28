@@ -87,7 +87,7 @@ impl StaticInitQueries {
     }
 
     /// Resolve deferred module obligations using shared dispatch unions and
-    /// 64 shared arity nodes. No caller copies its transitive target set.
+    /// shared full-signature candidate nodes. No caller copies its transitive target set.
     #[allow(
         clippy::too_many_lines,
         reason = "the build-wide proof shares body, dispatch and arity nodes across reachability and propagation phases; keeping their construction and witness lookup together exposes the graph invariants"
@@ -195,6 +195,10 @@ impl StaticInitQueries {
                     }
                 }
                 if !inputs.effects.preemption_bodies.contains(&id)
+                    && !matches!(
+                        id.synthetic_kind(),
+                        crate::qualified_name::SyntheticKind::Indirect { .. }
+                    )
                     && !id.is_lambda()
                     && calls.targets.is_empty()
                     && calls.virtual_calls.is_empty()
@@ -228,18 +232,58 @@ impl StaticInitQueries {
         for &node in &dispatch.unresolved {
             unknown[node] = true;
         }
-        let arities = edges.len();
-        edges.resize_with(arities + 64, Vec::new);
+        let bucket_start = edges.len();
+        let mut bucket_ids = HashMap::new();
+        let mut bucket_keys = Vec::new();
+        for &unit in order {
+            if let Some(inputs) = units.get(&unit).and_then(|u| u.preemption.as_ref()) {
+                for (bit, key) in inputs
+                    .indirect
+                    .values
+                    .iter()
+                    .map(|v| (v.bit, v.key.clone()))
+                    .chain(
+                        inputs
+                            .indirect
+                            .calls
+                            .iter()
+                            .filter(|c| c.targets.is_none())
+                            .map(|c| (c.bit, c.key.clone())),
+                    )
+                {
+                    let next = bucket_start + bucket_keys.len();
+                    bucket_ids.entry((bit, key.clone())).or_insert_with(|| {
+                        bucket_keys.push((bit, key));
+                        next
+                    });
+                }
+            }
+        }
+        // Each typed value has one shared bucket. Typed calls reach their own
+        // bucket and an optional wildcard; untyped calls share one arity union.
+        let all_start = bucket_start + bucket_keys.len();
+        edges.resize_with(all_start + 64, Vec::new);
         unknown.resize(edges.len(), false);
         loops.resize(edges.len(), false);
-        let mut has_value = 0u64;
+        let mut populated = HashSet::new();
+        let mut value_arities = 0u64;
+        let mut obligations: HashMap<_, Vec<_>> = HashMap::new();
+        for (&(bit, ref key), &node) in &bucket_ids {
+            edges[all_start + bit.trailing_zeros() as usize].push(node);
+            if key.is_some()
+                && let Some(&wild) = bucket_ids.get(&(bit, None))
+            {
+                edges[node].push(wild);
+            }
+        }
         for &unit in order {
             let Some(inputs) = units.get(&unit).and_then(|u| u.preemption.as_ref()) else {
                 continue;
             };
             for value in &inputs.indirect.values {
-                has_value |= value.bit;
-                let node = arities + value.bit.trailing_zeros() as usize;
+                value_arities |= value.bit;
+                let node = bucket_ids[&(value.bit, value.key.clone())];
+                populated.insert(node);
                 match value.target {
                     Some(target) => {
                         if let Some(target_node) = resolve(unit, &target) {
@@ -252,18 +296,41 @@ impl StaticInitQueries {
                 }
             }
             for call in &inputs.indirect.calls {
-                let mask = call.bit;
-                if let Some(&caller) = positions.get(&(unit, call.caller)) {
-                    for bit in 0..64 {
-                        if mask & (1 << bit) != 0 {
-                            edges[caller].push(arities + bit);
+                let Some(&caller) = positions.get(&(unit, call.caller)) else {
+                    continue;
+                };
+                if let Some(targets) = &call.targets {
+                    for target in targets {
+                        if let Some(node) = resolve(unit, target) {
+                            edges[caller].push(node);
+                        } else if !leaf(unit, target) {
+                            unknown[caller] = true;
                         }
                     }
+                } else {
+                    let node = if call.key.is_some() {
+                        bucket_ids[&(call.bit, call.key.clone())]
+                    } else {
+                        all_start + call.bit.trailing_zeros() as usize
+                    };
+                    edges[caller].push(node);
+                    obligations
+                        .entry((unit, call.caller))
+                        .or_default()
+                        .push((node, call.span));
                 }
             }
         }
+        for (&(bit, ref key), &node) in &bucket_ids {
+            if key.is_some() {
+                unknown[node] |= !populated.contains(&node)
+                    && !bucket_ids
+                        .get(&(bit, None))
+                        .is_some_and(|n| populated.contains(n));
+            }
+        }
         for bit in 0..64 {
-            unknown[arities + bit] |= has_value & (1 << bit) == 0;
+            unknown[all_start + bit] |= value_arities & (1 << bit) == 0;
         }
         // Creating a Task never executes its body synchronously. Check task
         // bodies as roots, but remove incoming edges to those roots.
@@ -313,13 +380,6 @@ impl StaticInitQueries {
         } else {
             propagate(&edges, loops).0
         };
-        let failed_arities = (0..64).fold(0u64, |mask, bit| {
-            if unknown[arities + bit] || blocked[arities + bit] {
-                mask | (1 << bit)
-            } else {
-                mask
-            }
-        });
         tasks
             .into_iter()
             .filter_map(|(node, span)| {
@@ -336,7 +396,10 @@ impl StaticInitQueries {
                         .cloned()
                         .or_else(|| keys.get(origins[node]).map(|(_, id)| id.to_string()))
                         .unwrap_or_else(|| {
-                            format!("function value with arity {}", origins[node] - arities)
+                            format!(
+                                "function-value candidate bucket {}",
+                                origins[node] - bucket_start
+                            )
                         })
                 } else {
                     keys[node].1.to_string()
@@ -366,10 +429,13 @@ impl StaticInitQueries {
                         failed.then_some(*span)
                     }))
                     .chain(
-                        sites
-                            .indirect_spans
-                            .iter()
-                            .filter_map(|(bit, span)| (failed_arities & bit != 0).then_some(*span)),
+                        obligations
+                            .get(&(unit, id))
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|&(node, span)| {
+                                (unknown[node] || blocked[node]).then_some(span)
+                            }),
                     )
                     .chain(sites.unknown_span)
                     .min_by_key(|s| (s.file_id, s.start));
@@ -510,6 +576,9 @@ mod tests {
     }
 
     fn errors(source: &str, native: bool) -> Vec<Diagnostic> {
+        errors_with_keys(source, native, false)
+    }
+    fn errors_with_keys(source: &str, native: bool, erase_keys: bool) -> Vec<Diagnostic> {
         let tokens = crate::lexer::Lexer::new(source).tokenize().unwrap();
         let (mut program, diagnostics) = crate::parser::Parser::new(tokens).parse();
         for item in &mut program.items {
@@ -528,6 +597,15 @@ mod tests {
         let queries = std::rc::Rc::new(EffectQueries::default());
         checker.set_effect_queries(std::rc::Rc::clone(&queries), UnitId::ENTRY);
         checker.check_program(&program);
+        if erase_keys {
+            for facts in queries.static_initializers.units.borrow_mut().values_mut() {
+                if let Some(inputs) = &mut facts.preemption {
+                    for call in &mut inputs.indirect.calls {
+                        call.key = None;
+                    }
+                }
+            }
+        }
         if checker.errors.is_empty() {
             checker
                 .errors
@@ -660,5 +738,16 @@ mod tests {
         let source = "pub fn foreign(x:i64,y:i64)->i64 {return x+y;} fn keep()->fn(i64,i64)->i64{return foreign;} fn add(x:i64)->i64{return x+1;} fn apply(f:fn(i64)->i64)->i64{return f(41);} async fn main(){println(apply(add));}";
         let errors = errors(source, true);
         assert!(errors.is_empty(), "{errors:?}");
+    }
+    #[test]
+    fn function_flow_untyped_empty_candidates_fail_preemption() {
+        let source = "async fn run(f:fn(i64)->i64)->i64 { return f(1); } fn main() {}";
+        for native in [false, true] {
+            let errors = errors_with_keys(source, native, true);
+            assert!(
+                errors.iter().any(|d| d.code == ErrorCode::E0810),
+                "native={native}: {errors:?}"
+            );
+        }
     }
 }

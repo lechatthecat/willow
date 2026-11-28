@@ -360,6 +360,19 @@ pub(super) fn finish(
     let mut units: Vec<_> = captures.keys().copied().collect();
     units.sort();
     for unit in units {
+        let resolved_values: std::collections::HashSet<_> = captures[&unit]
+            .indirect
+            .calls
+            .iter()
+            .filter(|call| {
+                call.targets.as_ref().is_some_and(|targets| {
+                    targets.iter().all(|target| {
+                        functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
+                    })
+                })
+            })
+            .map(|call| (call.caller, call.span.file_id, call.span.start))
+            .collect();
         for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
             // Prefer the checked implementation (which may belong to a base
             // class). A receiver-qualified name need not have its own body.
@@ -396,7 +409,8 @@ pub(super) fn finish(
                         location: site,
                     });
             }
-            if resolved_dispatch
+            if resolved_values.contains(&(*caller, span.file_id, span.start))
+                || resolved_dispatch
                 || effect_target.is_some_and(|target| {
                     functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
                 })

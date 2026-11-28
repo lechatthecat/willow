@@ -261,6 +261,9 @@ impl State {
                         caller: caller.1,
                         bit: *bit,
                         key: key.clone(),
+                        span: Span::dummy(),
+                        targets: None,
+                        unknown_reasons: Vec::new(),
                     },
                 );
                 requested.insert((*bit, key.clone()));
@@ -328,6 +331,9 @@ mod tests {
                 caller,
                 bit: 1,
                 key: Some("fn()->void".into()),
+                span: Span::dummy(),
+                targets: None,
+                unknown_reasons: Vec::new(),
             }],
             ..Default::default()
         };
@@ -390,6 +396,9 @@ mod tests {
                             caller: FunctionId::free(format!("caller_{i}")),
                             bit: 1,
                             key: Some("fn()->void".into()),
+                            span: Span::dummy(),
+                            targets: None,
+                            unknown_reasons: Vec::new(),
                         }],
                         ..Default::default()
                     }),

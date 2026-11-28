@@ -1784,6 +1784,13 @@ where
         edges: &mut HashMap<CallKey, BTreeSet<String>>,
     ) {
         let (unit, capture) = (self.unit, self.capture);
+        let mut flow_reasons: HashMap<FunctionId, BTreeSet<String>> = HashMap::new();
+        for call in &capture.indirect.calls {
+            flow_reasons
+                .entry(call.caller)
+                .or_default()
+                .extend(call.unknown_reasons.iter().cloned());
+        }
         for (&id, sites) in capture.graph.iter() {
             let key = (self.resolve)(unit, id);
             let indirect_targets = self.indirect_calls.get(&key);
@@ -1808,6 +1815,7 @@ where
             }
             let mut unknown = sites.has_unknown && !inferred;
             let mut unresolved = BTreeSet::new();
+            unresolved.extend(flow_reasons.remove(&id).unwrap_or_default());
             if unknown {
                 unresolved.insert(if capture.templates.contains(&id) {
                     generics::UNINSTANTIATED.to_string()
@@ -1817,6 +1825,12 @@ where
             }
             let mut bits = 0;
             for target in &sites.targets {
+                if matches!(
+                    target.synthetic_kind(),
+                    crate::qualified_name::SyntheticKind::Indirect { .. }
+                ) {
+                    continue;
+                }
                 let key_target = (self.resolve)(unit, *target);
                 if let Some(node) = nodes.get(&key_target) {
                     edges.entry(key).or_default().insert(node.id.clone());
