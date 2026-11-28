@@ -517,10 +517,11 @@ fn unresolved_call_evidence_scales_with_sites_and_reachable_edges() {
         assert_eq!(
             snapshot
                 .semantic
-                .unresolved_calls
+                .effect_calls
                 .values()
-                .map(Vec::len)
-                .sum::<usize>(),
+                .flatten()
+                .filter(|site| site.indirect.is_some())
+                .count(),
             n
         );
         let function = snapshot
@@ -683,5 +684,49 @@ fn builtin_path_display_preserves_bits_and_scales_after_roundtrip() {
             session.effect_edge_visits
         );
     }
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
+fn function_field_effects_header_reflects_remaining_unresolved_site() {
+    let directory =
+        std::env::temp_dir().join(format!("willow-field-header-{}", std::process::id()));
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = directory.join("main.wi");
+    std::fs::write(&path, "fn clean() {} fn main() { clean(); }").unwrap();
+    let mut snapshot = crate::CompilerSession::new(
+        path.to_str().unwrap(),
+        "",
+        &crate::CompilerOptions::debug(),
+        None,
+    )
+    .analysis_with_emitter(&mut crate::diagnostics::HumanEmitter)
+    .unwrap();
+    let function = snapshot
+        .functions
+        .iter()
+        .find(|f| f.name == "clean")
+        .unwrap();
+    assert!(!function.unknown);
+    snapshot.semantic.unresolved_calls.insert(
+        function.id.clone(),
+        vec![UnresolvedCall {
+            operation: "receiver.work".into(),
+            location: function.locations[0].clone(),
+        }],
+    );
+    snapshot.revision = snapshot.digest().unwrap();
+    let function = snapshot
+        .functions
+        .iter()
+        .find(|f| f.name == "main")
+        .unwrap()
+        .id
+        .clone();
+    let revision = snapshot.revision.clone();
+    let result = QuerySession::new(snapshot)
+        .unwrap()
+        .query(QueryRequest::Effects { revision, function });
+    assert_eq!(result["result"]["status"], "unknown", "{result}");
     std::fs::remove_dir_all(directory).unwrap();
 }

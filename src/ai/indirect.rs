@@ -14,6 +14,12 @@ pub(super) struct Inputs {
 
 type Key = (UnitId, FunctionId);
 type Calls = HashMap<Key, BTreeSet<String>>;
+pub(super) type Sites = HashMap<(UnitId, FunctionId, Span), String>;
+pub(super) struct Inferred {
+    pub functions: Vec<Function>,
+    pub calls: Calls,
+    pub sites: Sites,
+}
 
 /// Candidate values of one key, or of no key (`None`).
 #[derive(Default)]
@@ -30,11 +36,12 @@ pub(super) fn infer(
     captures: &HashMap<UnitId, CapturedUnit>,
     nodes: &HashMap<Key, Function>,
     resolve: &impl Fn(UnitId, FunctionId) -> Key,
-) -> (Vec<Function>, Calls) {
+) -> Inferred {
     let mut typed: [HashMap<&str, Candidates>; 64] = std::array::from_fn(|_| HashMap::new());
     let mut wild: [Candidates; 64] = std::array::from_fn(|_| Candidates::default());
     let mut calls: Calls = HashMap::new();
     let mut precise = HashMap::new();
+    let mut sites = Sites::new();
     let mut untyped_calls = [false; 64];
     let mut typed_calls: [BTreeSet<&str>; 64] = std::array::from_fn(|_| BTreeSet::new());
     for (&unit, capture) in captures {
@@ -73,6 +80,7 @@ pub(super) fn infer(
                     hash(format!("{opaque}:{callees:?}"))
                 );
                 caller.insert(id.clone());
+                sites.insert((unit, call.caller, call.span), id.clone());
                 precise
                     .entry(id.clone())
                     .or_insert_with(|| bucket(id, slot, call.key.as_deref(), callees, opaque));
@@ -89,6 +97,7 @@ pub(super) fn infer(
                     bucket_id(slot)
                 }
             };
+            sites.insert((unit, call.caller, call.span), bucket.clone());
             calls
                 .entry(resolve(unit, call.caller))
                 .or_default()
@@ -128,11 +137,15 @@ pub(super) fn infer(
                 slot,
                 Some(key),
                 callees,
-                own.opaque,
+                own.opaque || wild[slot].opaque,
             ));
         }
     }
-    (functions, calls)
+    Inferred {
+        functions,
+        calls,
+        sites,
+    }
 }
 
 fn bucket(

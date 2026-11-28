@@ -183,45 +183,7 @@ impl Analysis {
             ) {
                 result.reason(i, f.runtime_effects, 0, None);
             }
-            if let Some(sites) = snapshot.semantic.unresolved_calls.get(&f.id) {
-                for site in sites {
-                    result.named_reason(
-                        i,
-                        RuntimeEffects::ALL.bits(),
-                        if matches!(site.operation, super::operation::Operation::IndirectCall) {
-                            0
-                        } else {
-                            1
-                        },
-                        Some(&site.location),
-                        Some(&site.operation),
-                    );
-                }
-            }
-            if !f.unresolved.is_empty() || (f.synthetic && f.unknown && index.callees[i].is_empty())
-            {
-                result.named_reason(
-                    i,
-                    RuntimeEffects::ALL.bits(),
-                    1,
-                    f.locations.first(),
-                    Some(f.unresolved.first().unwrap_or(&f.name)),
-                );
-            }
-            if let Some(callee) = f
-                .callees
-                .iter()
-                .find(|id| !index.by_id.contains_key(id.as_str()))
-            {
-                let location = snapshot
-                    .semantic
-                    .effect_calls
-                    .get(&f.id)
-                    .and_then(|sites| sites.iter().find(|site| &site.target == callee))
-                    .map(|site| &site.location)
-                    .or_else(|| f.locations.first());
-                result.named_reason(i, RuntimeEffects::ALL.bits(), 1, location, Some(callee));
-            }
+            result.call_reasons(snapshot, &index, i);
             let ranges = super::semantic::local_ranges(&f.locations);
             if let Some(facts) = snapshot.semantic.witnesses.get(&f.id) {
                 for fact in facts {
@@ -333,6 +295,87 @@ impl Analysis {
         // bounds, including a cycle beside an independently witnessed path.
         result.propagate(snapshot, &index, missing);
         result
+    }
+    /// Seed source-bearing call reasons before graph propagation. Candidate
+    /// buckets supply bounds; only unresolved direct targets use callee errors.
+    fn call_reasons(&mut self, snapshot: &Snapshot, index: &graph::Index<'_>, i: usize) {
+        let f = &snapshot.functions[i];
+        if let Some(sites) = snapshot.semantic.effect_calls.get(&f.id) {
+            // Prefer the genuinely incomplete call when a body also has a
+            // checked bound for the same effect. Two linear passes retain
+            // bounded evidence without hiding the unknown's source.
+            for unknown in [true, false] {
+                for site in sites {
+                    if let Some(callee) = &site.indirect {
+                        let target = index
+                            .by_id
+                            .get(site.target.as_str())
+                            .map(|&target| &snapshot.functions[target]);
+                        if target.is_none_or(|target| target.unknown) != unknown {
+                            continue;
+                        }
+                        let bits = target
+                            .map_or(RuntimeEffects::ALL.bits(), |target| target.runtime_effects);
+                        self.named_reason(i, bits, 0, Some(&site.location), Some(callee));
+                    }
+                }
+            }
+        }
+        if let Some(sites) = snapshot.semantic.unresolved_calls.get(&f.id) {
+            for site in sites {
+                self.named_reason(
+                    i,
+                    RuntimeEffects::ALL.bits(),
+                    if matches!(site.operation, super::operation::Operation::IndirectCall) {
+                        0
+                    } else {
+                        1
+                    },
+                    Some(&site.location),
+                    Some(&site.operation),
+                );
+            }
+        }
+        // Flow widening is explained by its own reason and the named
+        // indirect site, not by inventing an unresolved direct callee.
+        let indirect = matches!(
+            f.synthetic_kind,
+            crate::qualified_name::SyntheticKind::Indirect { .. }
+        );
+        let named_indirect = snapshot
+            .semantic
+            .effect_calls
+            .get(&f.id)
+            .is_some_and(|sites| sites.iter().any(|site| site.indirect.is_some()));
+        let unresolved = f.unresolved.iter().find(|reason| {
+            !(reason.starts_with("function-flow-")
+                || named_indirect && reason.as_str() == "indirect-or-unresolved")
+        });
+        if !indirect
+            && (unresolved.is_some() || (f.synthetic && f.unknown && index.callees[i].is_empty()))
+        {
+            self.named_reason(
+                i,
+                RuntimeEffects::ALL.bits(),
+                1,
+                f.locations.first(),
+                Some(unresolved.unwrap_or(&f.name)),
+            );
+        }
+        if let Some(callee) = f
+            .callees
+            .iter()
+            .find(|id| !index.by_id.contains_key(id.as_str()))
+        {
+            let location = snapshot
+                .semantic
+                .effect_calls
+                .get(&f.id)
+                .and_then(|sites| sites.iter().find(|site| &site.target == callee))
+                .map(|site| &site.location)
+                .or_else(|| f.locations.first());
+            self.named_reason(i, RuntimeEffects::ALL.bits(), 1, location, Some(callee));
+        }
     }
     fn propagate(
         &mut self,
@@ -639,6 +682,7 @@ mod tests {
         s.semantic.effect_calls.insert(
             "f0".into(),
             vec![semantic::EffectCall {
+                indirect: None,
                 target: "absent::method".into(),
                 location: Location {
                     display: None,

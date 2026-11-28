@@ -1485,3 +1485,50 @@ fn nested_lambda_hazards_belong_to_the_lambda_and_constructors_union() {
     assert!(facts[&lambda_id]);
     assert!(facts[&FunctionId::method(TypeId::local("C"), "init")]);
 }
+
+#[test]
+fn function_field_expression_lambda_inventory_is_linear_and_owned() {
+    use crate::query_stats::{Counter, Session, count};
+    for nested in [false, true] {
+        let mut previous = None;
+        for size in [8, 32, 128, 512] {
+            let body = if nested {
+                format!("let f = {} 1;", "|| ".repeat(size))
+            } else {
+                (0..size)
+                    .map(|i| format!("let callback_{i} = |x: i64| x / x;"))
+                    .collect()
+            };
+            let program = program(&format!("fn root() {{ {body} }}"));
+            let mut index = crate::compiler_db::ids::BodyIndex::default();
+            index.register_program(&program);
+            let Item::Function(root) = &program.items[0] else {
+                panic!()
+            };
+            let _session = Session::start(true, false);
+            let direct = scan_direct_effects(
+                FunctionId::free("root"),
+                root.body.id,
+                &root.body,
+                &HashMap::<ExprId, Type>::new(),
+                Some(&index),
+                true.into(),
+            );
+            assert_eq!(direct.len(), size + 1);
+            assert!(!direct[0].panics);
+            assert_eq!(
+                direct.iter().filter(|body| body.panics).count(),
+                if nested { 0 } else { size }
+            );
+            let visits = count(Counter::EffectInventory);
+            if let Some((previous_size, previous_visits)) = previous {
+                assert!(visits <= previous_visits * (size / previous_size));
+            }
+            previous = Some((size, visits));
+            println!(
+                "expression lambda nested={nested} count={size} direct_bodies={} ast_events={visits}",
+                direct.len()
+            );
+        }
+    }
+}

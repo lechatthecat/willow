@@ -758,9 +758,28 @@ impl CaptureExpressionContext<'_> {
             symbols,
             builtin_aliases,
         } = *self;
+        if let Expr::Match(m) = e
+            && let Expr::FieldAccess(_, name, ..) = m.scrutinee.as_ref()
+        {
+            let label = crate::semantic::type_checker::expr_text::simple_expr_text(&m.scrutinee)
+                .unwrap_or_else(|| format!("(...).{name}"));
+            result
+                .semantic
+                .field_call_names
+                .insert(m.scrutinee.span(), label);
+        }
         if let Some(target) = calls.get(&e.id()) {
             let operation = match e {
-                Expr::Call(c) => Some(c.callee.clone()),
+                Expr::Call(c) => Some(if c.callee == "$field_callable" {
+                    result
+                        .semantic
+                        .field_call_names
+                        .get(&c.span)
+                        .cloned()
+                        .unwrap_or_else(|| c.callee.clone())
+                } else {
+                    c.callee.clone()
+                }),
                 Expr::MethodCall(c) => Some(c.method.as_str().to_owned()),
                 Expr::StaticCall(c) => Some(QualifiedName::join(&c.class, &c.method)),
                 _ => None,
@@ -1020,7 +1039,11 @@ fn snapshot_with_boundary(
     if let Some(retained) = retained {
         retain_indirect_targets(&captured, &resolve, &mut nodes, retained);
     }
-    let (indirect_functions, indirect_calls) = indirect::infer(&captured, &nodes, &resolve);
+    let indirect::Inferred {
+        functions: indirect_functions,
+        calls: indirect_calls,
+        sites: indirect_sites,
+    } = indirect::infer(&captured, &nodes, &resolve);
     let incomplete_indirect: std::collections::HashSet<_> = indirect_functions
         .iter()
         .filter(|f| f.unknown)
@@ -1088,7 +1111,10 @@ fn snapshot_with_boundary(
         &resolve,
         &|unit, target| bodyless_target_effects(unit, target).is_some(),
         &fingerprints,
-        &dispatch_sites,
+        &semantic::CallSiteBounds {
+            dispatch: &dispatch_sites,
+            indirect: &indirect_sites,
+        },
     )?;
     attach_dispatch_targets(&mut semantic, &dispatch_sites);
     attach_interface_calls(&mut semantic, interface_routing.calls, &paths);
@@ -1800,11 +1826,13 @@ where
             let indirect_targets = self.indirect_calls.get(&key);
             // Only replace genuinely indirect obligations, never unresolved
             // methods, virtual dispatch, or unchecked generic templates.
-            let inferred = indirect_targets.is_some_and(|targets| {
+            let bounded = indirect_targets.is_some_and(|targets| {
                 targets
                     .iter()
                     .all(|target| !self.incomplete_indirect.contains(target.as_str()))
-            }) && sites.unknown_span.is_none()
+            });
+            let inferred = bounded
+                && sites.unknown_span.is_none()
                 && sites.unsupported_initialization.iter().all(|reason| {
                     matches!(
                         reason,
@@ -1819,7 +1847,9 @@ where
             }
             let mut unknown = sites.has_unknown && !inferred;
             let mut unresolved = BTreeSet::new();
-            unresolved.extend(flow_reasons.remove(&id).unwrap_or_default());
+            if !bounded {
+                unresolved.extend(flow_reasons.remove(&id).unwrap_or_default());
+            }
             if unknown {
                 unresolved.insert(if capture.templates.contains(&id) {
                     generics::UNINSTANTIATED.to_string()
@@ -2017,6 +2047,7 @@ fn attach_interface_calls(
                 .entry(caller)
                 .or_default()
                 .push(semantic::EffectCall {
+                    indirect: None,
                     target,
                     location: Location {
                         display: None,

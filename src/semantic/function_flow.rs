@@ -175,6 +175,23 @@ impl Builder<'_> {
                             self.solver.unknown(node, UNRESOLVED);
                         }
                     }
+                    // A direct `(receiver.field)(args)` is a match binding in
+                    // the parser. Preserve the scrutinee's value identity, just
+                    // as for a source-written `match value { binding => ... }`.
+                    if let Expr::Match(m) = e {
+                        let source = self.expr(&m.scrutinee);
+                        for arm in &m.arms {
+                            if let Pattern::Binding { name, .. } = &arm.pattern {
+                                bindings.insert(name.as_ptr() as usize, source);
+                            }
+                            for guard in &arm.guard {
+                                if let Some(Pattern::Binding { name, .. }) = guard.pattern() {
+                                    let source = self.expr(guard.expr());
+                                    bindings.insert(name.as_ptr() as usize, source);
+                                }
+                            }
+                        }
+                    }
                     if let Expr::Var(name, ..) = e {
                         if let Some(source) = env.get(name) {
                             self.solver.edge(source, node);
@@ -227,6 +244,17 @@ impl Builder<'_> {
                                 self.solver.edge(source, self.solver.signatures[&id].result);
                             }
                             env.exit();
+                        }
+                        Expr::Match(m) => {
+                            for arm in &m.arms {
+                                match &arm.body {
+                                    MatchBody::Expr(value) => {
+                                        let source = self.expr(value);
+                                        self.solver.edge(source, out);
+                                    }
+                                    MatchBody::Block(_) => self.solver.unknown(out, STORAGE),
+                                }
+                            }
                         }
                         Expr::Ternary(t) => {
                             for e in [&t.then_expr, &t.else_expr] {

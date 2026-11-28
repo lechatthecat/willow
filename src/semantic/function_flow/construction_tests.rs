@@ -103,3 +103,76 @@ fn function_flow_storage_constraint_construction_is_linear() {
         );
     }
 }
+
+#[test]
+fn function_flow_field_binding_construction_is_linear() {
+    for count in [8, 32, 128, 512] {
+        let source = format!("fn run() {{ {} }}", "(object.callback)(1);".repeat(count));
+        let (program, errors) =
+            crate::parser::Parser::new(crate::lexer::Lexer::new(&source).tokenize().unwrap())
+                .parse();
+        assert!(errors.is_empty());
+        let Item::Function(function) = &program.items[0] else {
+            panic!()
+        };
+        let callback = Type::Fn(vec![Type::I64], Box::new(Type::I64));
+        let types = AstWalk::new(AstEvent::Block(&function.body))
+            .filter_map(|event| {
+                if let AstEvent::Expr(e @ Expr::FieldAccess(..)) = event {
+                    Some((e.id(), callback.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let resolved = HashMap::new();
+        let mut builder = Builder {
+            solver: Solver::default(),
+            exprs: HashMap::new(),
+            origins: HashMap::new(),
+            calls: HashMap::new(),
+            fields: HashMap::new(),
+            memberwise: HashMap::new(),
+            classes: HashSet::new(),
+            open_methods: HashSet::new(),
+            storage_escape: false,
+            forwarded: HashMap::new(),
+            types: &types,
+            resolved: &resolved,
+            super_calls: HashMap::new(),
+            escape: 0,
+        };
+        builder.escape = builder.solver.node();
+        let target = FunctionId::free("pure");
+        builder.signature(target, 1);
+        let field = builder.field("callback");
+        builder.solver.target(field, target, 0);
+        builder.root(
+            FunctionId::free("run"),
+            &[],
+            AstEvent::Block(&function.body),
+            false,
+        );
+        builder.solver.solve();
+        assert_eq!(
+            builder
+                .calls
+                .values()
+                .filter(|&&node| builder.solver.nodes[node].unknown == 0
+                    && builder.solver.nodes[node].targets.contains_key(&target))
+                .count(),
+            count
+        );
+        assert_eq!(builder.calls.len(), count * 2);
+        assert!(builder.solver.nodes.len() <= 8 * count + 8);
+        assert!(builder.solver.edge_attempts <= 8 * count + 8);
+        assert!(builder.solver.operations <= 8 * count + 8);
+        println!(
+            "field flow sites={count} nodes={} edges={} edge_attempts={} operations={}",
+            builder.solver.nodes.len(),
+            builder.solver.edges,
+            builder.solver.edge_attempts,
+            builder.solver.operations
+        );
+    }
+}

@@ -30,7 +30,7 @@ mod capture_flow;
 mod check_decls;
 mod check_lambda_match;
 mod exhaustiveness;
-mod expr_text;
+pub(crate) mod expr_text;
 pub(crate) mod generics;
 pub(crate) mod precheck;
 pub(crate) mod precheck_journal;

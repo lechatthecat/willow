@@ -1182,27 +1182,31 @@ fn main() { println(safe_wrapper()); }
 
 #[test]
 fn pe_34_nested_lambda_facts_use_contextual_body_identities() {
-    let source = r#"
-fn nested() {
-    let outer = || { let inner = |x: i64| { return x + 1; }; return inner(1); };
-}
-fn main() { nested(); println(1); }
-"#;
-    let (ok, stderr) =
-        compile_release_with_compiler_env(source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
-    assert!(ok, "{stderr}");
-    assert!(
-        stderr.contains("[panic-effects] $lambda.0: no-panic"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("[panic-effects] $lambda.1: may-panic"),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("[panic-effects] nested: no-panic"),
-        "{stderr}"
-    );
+    for (expression, effect) in [("x + 1", "no-panic"), ("1 / x", "may-panic")] {
+        let source = format!(
+            r#"
+fn nested() {{
+    let outer = || {{ let inner = |x: i64| {{ return {expression}; }}; return inner(1); }};
+}}
+fn main() {{ nested(); println(1); }}
+"#
+        );
+        let (ok, stderr) =
+            compile_release_with_compiler_env(&source, &[("WILLOW_PANIC_EFFECTS_LOG", "1")]);
+        assert!(ok, "{stderr}");
+        // Both nested identities have checked bodies: the outer reaches the
+        // inner's actual bound. Constructing them does not execute either.
+        for lambda in ["$lambda.0", "$lambda.1"] {
+            assert!(
+                stderr.contains(&format!("[panic-effects] {lambda}: {effect}")),
+                "{stderr}"
+            );
+        }
+        assert!(
+            stderr.contains("[panic-effects] nested: no-panic"),
+            "{stderr}"
+        );
+    }
 }
 
 #[test]

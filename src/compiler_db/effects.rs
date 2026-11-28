@@ -1781,7 +1781,7 @@ impl<'a> ColdUnitSolve<'a> {
         false
     }
 
-    /// Scans one declaration body and its block lambdas, then records and
+    /// Scans one declaration body and its nested lambdas, then records and
     /// seeds each scanned part.
     fn scan_direct_body<N: std::fmt::Display>(
         &mut self,
@@ -1815,13 +1815,7 @@ impl<'a> ColdUnitSolve<'a> {
         };
         self.plan.roots.insert(
             body_id,
-            Arc::new(
-                direct_bodies
-                    .iter()
-                    .map(|d| d.id)
-                    .chain(graph_lambdas(body_id, body, index))
-                    .collect(),
-            ),
+            Arc::new(direct_bodies.iter().map(|d| d.id).collect()),
         );
         if let Some((_, queries)) = origins
             && let Some(tracking) = queries.tracking.borrow().upgrade()
@@ -2231,33 +2225,6 @@ struct DirectBodyEffects {
     may_io: bool,
 }
 
-// Graph-only expression lambdas have no block contribution but still own an
-// equation, including when they are not called directly from their enclosing body.
-fn graph_lambdas(
-    root: BodyId,
-    body: &Block,
-    index: Option<&super::ids::BodyIndex>,
-) -> Vec<FunctionId> {
-    let mut result = Vec::new();
-    let mut pending = vec![(root, AstEvent::Block(body))];
-    while let Some((parent, body)) = pending.pop() {
-        let mut walk = AstWalk::new(body);
-        while let Some(event) = walk.next() {
-            if let AstEvent::Lambda(lambda) = event {
-                if let Some(id) = index.and_then(|i| i.lambda_in(parent, lambda.id)) {
-                    result.push(FunctionId::lambda(id));
-                    match &lambda.body {
-                        LambdaBody::Block(block) => pending.push((id, AstEvent::Block(block))),
-                        LambdaBody::Expr(expr) => pending.push((id, AstEvent::Expr(expr))),
-                    }
-                }
-                walk.skip_children();
-            }
-        }
-    }
-    result
-}
-
 fn scan_direct_effects<N: std::fmt::Display>(
     id: FunctionId,
     body_id: BodyId,
@@ -2266,7 +2233,7 @@ fn scan_direct_effects<N: std::fmt::Display>(
     index: Option<&super::ids::BodyIndex>,
     overflow_checks: OverflowChecks,
 ) -> Vec<DirectBodyEffects> {
-    let mut pending = vec![(id, body_id, body)];
+    let mut pending = vec![(id, body_id, AstEvent::Block(body))];
     let mut result = Vec::new();
     let mut visits = 0;
     while let Some((id, body_id, body)) = pending.pop() {
@@ -2287,17 +2254,24 @@ fn scan_direct_effects<N: std::fmt::Display>(
         // Loop invariants and variants are verifier-only: no backend evaluates
         // them, so their operations are not runtime effects of the body.
         let mut ghosts = HashSet::new();
-        let mut walk = AstWalk::new(AstEvent::Block(body));
+        let mut walk = AstWalk::new(body);
         while let Some(event) = walk.next() {
             visits += 1;
             match event {
                 AstEvent::Expr(expr) if ghosts.contains(&expr.id()) => walk.skip_children(),
                 AstEvent::Lambda(lambda) => {
-                    if let LambdaBody::Block(child) = &lambda.body {
-                        let child_id = index
-                            .and_then(|i| i.lambda_in(body_id, lambda.id))
-                            .unwrap_or(child.id);
-                        pending.push((FunctionId::lambda(child_id), child_id, child));
+                    let child = index.and_then(|i| i.lambda_in(body_id, lambda.id)).or(
+                        match &lambda.body {
+                            LambdaBody::Block(block) => Some(block.id),
+                            LambdaBody::Expr(_) => None,
+                        },
+                    );
+                    if let Some(child) = child {
+                        let root = match &lambda.body {
+                            LambdaBody::Block(block) => AstEvent::Block(block),
+                            LambdaBody::Expr(expr) => AstEvent::Expr(expr),
+                        };
+                        pending.push((FunctionId::lambda(child), child, root));
                     }
                     walk.skip_children();
                 }

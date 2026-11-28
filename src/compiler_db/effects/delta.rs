@@ -434,15 +434,10 @@ impl DeltaSolve<'_> {
                 .expect("changed direct effect dependencies have completed"),
             None => scan().expect("direct effect scan is infallible"),
         };
-        result.plan.roots.insert(
-            root,
-            Arc::new(
-                scan.iter()
-                    .map(|d| d.id)
-                    .chain(graph_lambdas(root, body, Some(index)))
-                    .collect(),
-            ),
-        );
+        result
+            .plan
+            .roots
+            .insert(root, Arc::new(scan.iter().map(|d| d.id).collect()));
         changed.extend(result.plan.roots[&root].iter().copied());
         if result.plan.helpers.contains_key(&id) {
             result.plan.helpers.insert(id, location.span(program)?);

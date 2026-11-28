@@ -48,6 +48,9 @@ pub struct SemanticFacts {
 #[serde(deny_unknown_fields)]
 pub struct EffectCall {
     pub target: String,
+    /// Source callee of a function-value call into a shared candidate bucket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub indirect: Option<String>,
     pub location: Location,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -102,6 +105,7 @@ pub(super) struct Captured {
     pub async_functions: std::collections::HashSet<FunctionId>,
     bodies: Vec<Body>,
     pub call_sites: Vec<(FunctionId, Span, Option<FunctionId>, String)>,
+    pub field_call_names: HashMap<Span, String>,
     // Builtin calls stay out of `call_sites`, but their compiler boundary
     // witnesses still need the owning call span.
     pub builtin_calls: Vec<(FunctionId, Span, FunctionId)>,
@@ -287,6 +291,11 @@ impl Captured {
         self.bodies.push(Body::build(function, root, types));
     }
 }
+pub(super) struct CallSiteBounds<'a> {
+    pub dispatch: &'a HashMap<(&'a str, usize, usize), String>,
+    pub indirect: &'a super::indirect::Sites,
+}
+
 /// Status of one effect witness: a witness without a source location is
 /// `missing-source`; runtime capabilities are conservative bounds.
 #[allow(
@@ -300,7 +309,7 @@ pub(super) fn finish(
     resolve: &impl Fn(UnitId, FunctionId) -> (UnitId, FunctionId),
     bodyless: &impl Fn(UnitId, &FunctionId) -> bool,
     fingerprints: &HashMap<Span, String>,
-    dispatch_sites: &HashMap<(&str, usize, usize), String>,
+    call_sites: &CallSiteBounds<'_>,
 ) -> Result<SemanticFacts> {
     let location = |span: Span| -> Result<Location> {
         Ok(Location {
@@ -363,25 +372,28 @@ pub(super) fn finish(
     let mut units: Vec<_> = captures.keys().copied().collect();
     units.sort();
     for unit in units {
-        let resolved_values: std::collections::HashSet<_> = captures[&unit]
-            .indirect
-            .calls
-            .iter()
-            .filter(|call| {
-                call.targets.as_ref().is_some_and(|targets| {
-                    targets.iter().all(|target| {
-                        functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
-                    })
-                })
-            })
-            .map(|call| (call.caller, call.span.file_id, call.span.start))
-            .collect();
         for (caller, span, target, operation) in &captures[&unit].semantic.call_sites {
             // Prefer the checked implementation (which may belong to a base
             // class). A receiver-qualified name need not have its own body.
+            if let Some(target) = call_sites.indirect.get(&(unit, *caller, *span))
+                && let Some(caller) = functions.get(&resolve(unit, *caller))
+            {
+                result
+                    .effect_calls
+                    .entry(caller.id.clone())
+                    .or_default()
+                    .push(EffectCall {
+                        target: target.clone(),
+                        indirect: Some(operation.clone()),
+                        location: location(*span)?,
+                    });
+                continue;
+            }
             let effect_target = target.as_ref();
             let site = location(*span)?;
-            let dispatch = dispatch_sites.get(&(site.path.as_str(), site.start, site.end));
+            let dispatch = call_sites
+                .dispatch
+                .get(&(site.path.as_str(), site.start, site.end));
             if let Some(target) = effect_target
                 && let (Some(caller), Some(target)) = (
                     functions.get(&resolve(unit, *caller)),
@@ -393,6 +405,7 @@ pub(super) fn finish(
                     .entry(caller.id.clone())
                     .or_default()
                     .push(EffectCall {
+                        indirect: None,
                         target: target.id.clone(),
                         location: location(*span)?,
                     });
@@ -408,12 +421,12 @@ pub(super) fn finish(
                     .entry(caller.id.clone())
                     .or_default()
                     .push(EffectCall {
+                        indirect: None,
                         target: dispatch.clone(),
                         location: site,
                     });
             }
-            if resolved_values.contains(&(*caller, span.file_id, span.start))
-                || resolved_dispatch
+            if resolved_dispatch
                 || effect_target.is_some_and(|target| {
                     functions.contains_key(&resolve(unit, *target)) || bodyless(unit, target)
                 })
@@ -1515,11 +1528,33 @@ impl QuerySession {
         self.present_lock_types(&mut evidence);
         self.attach_call_chains(&witness, &mut evidence);
         let compiler_witnesses = self.local_compiler_witnesses(f);
+        // A checked candidate union is a complete conservative bound. Other
+        // unknown facts must not be hidden by an otherwise complete graph.
+        let unresolved = states.iter().any(|state| {
+            state.unknown_reasons.iter().any(|reason| {
+                !matches!(
+                    reason.code,
+                    effect_states::UnknownReasonCode::IndirectCall
+                        | effect_states::UnknownReasonCode::MissingWitness
+                        | effect_states::UnknownReasonCode::MissingSource
+                )
+            })
+        });
+        let missing = missing
+            || states.iter().any(|state| {
+                state.unknown_reasons.iter().any(|reason| {
+                    matches!(
+                        reason.code,
+                        effect_states::UnknownReasonCode::MissingWitness
+                            | effect_states::UnknownReasonCode::MissingSource
+                    )
+                })
+            });
         QueryResult {
-            status: if f.unknown { Status::Unknown } else if missing { Status::Incomplete } else { Status::Ok },
+            status: if f.unknown || unresolved { Status::Unknown } else if missing { Status::Incomplete } else { Status::Ok },
             data: QueryData::Effects(EffectResult {
                 schema: effect_states::SCHEMA, effects: states, assumptions: Some(assumptions),
-                reason: f.unknown_reason().or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }).map(str::to_owned),
+                reason: f.unknown_reason().or(if unresolved { Some("Effect facts remain unknown: see the named callee, source location, and unknown reasons below.") } else { None }).or(if missing { Some("Effect evidence is incomplete: see the named capability and missing-witness or missing-source reason below.") } else { None }).map(str::to_owned),
                 unknown_causes: Some(unknown_causes), bounds: Some(EffectBounds { runtime: f.runtime_effects, compiler: self.snapshot.semantic.compiler_effects.get(&f.id).copied() }),
                 effect_evidence: Some(evidence), no_panic: Some(self.snapshot.semantic.panic_evidence.get(&f.id).cloned()),
                 witness: Some(witness), compiler_witnesses: Some(compiler_witnesses),
@@ -1804,18 +1839,43 @@ impl<'a> EffectWalk<'a> {
         if cause.unknown
             && (!cause.unresolved.is_empty() || (cause.synthetic && session.callees[j].is_empty()))
         {
+            let mut call_sites = session
+                .snapshot
+                .semantic
+                .unresolved_calls
+                .get(&cause.id)
+                .cloned()
+                .unwrap_or_default();
+            call_sites.extend(
+                session
+                    .snapshot
+                    .semantic
+                    .effect_calls
+                    .get(&cause.id)
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|site| {
+                        let callee = site.indirect.as_ref()?;
+                        if session
+                            .functions
+                            .get(&site.target)
+                            .is_some_and(|&target| !session.snapshot.functions[target].unknown)
+                        {
+                            return None;
+                        }
+                        Some(UnresolvedCall {
+                            operation: callee.clone().into(),
+                            location: site.location.clone(),
+                        })
+                    }),
+            );
             self.unknown_causes.push(UnknownCause {
                 function: cause.id.clone(),
                 name: cause.name.clone(),
                 module: cause.module.clone(),
                 locations: cause.locations.clone(),
                 unresolved: cause.unresolved.clone(),
-                call_sites: session
-                    .snapshot
-                    .semantic
-                    .unresolved_calls
-                    .get(&cause.id)
-                    .cloned(),
+                call_sites: (!call_sites.is_empty()).then_some(call_sites),
                 caller_location: if cause.locations.is_empty() {
                     via.and_then(|v| session.snapshot.functions[v].locations.first())
                         .cloned()

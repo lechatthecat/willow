@@ -90,6 +90,7 @@ fn fixture(n: usize, start: usize, end: usize) -> Snapshot {
         "f".into(),
         vec![
             semantic::EffectCall {
+                indirect: None,
                 target: "f".into(),
                 location: location.clone()
             };

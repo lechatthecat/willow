@@ -7,7 +7,7 @@ use crate::parser::ast::{CallArg, CallArgMode, Expr};
 /// Longest rendering a help message quotes.
 const MAX_LEN: usize = 60;
 
-pub(super) fn simple_expr_text(expr: &Expr) -> Option<String> {
+pub(crate) fn simple_expr_text(expr: &Expr) -> Option<String> {
     let mut out = String::new();
     write_expr(expr, 0, &mut out).then_some(out)
 }
