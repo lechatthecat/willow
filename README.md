@@ -404,12 +404,9 @@ owner. See the [type parameter example](example/semantic_type_parameters.wi).
 
 <a id="runtime-performance-strengths-and-gaps"></a>
 
-Latest Willow, Go and Java comparison, measured on 2026-11-28 at commit
-`e0e602a7`: AMD Ryzen 7 7800X3D, Linux x86_64, release builds, Go 1.27.0,
-OpenJDK 26.0.2, 8 workers in every runtime, median of 5 trials. Scheduler
-cases time marked phases; synchronous cases time the whole process (Java rows
-include JVM startup and JIT warm-up) except `*_only` and the GC, map, dispatch,
-closure and string cases, which time a marked phase. Results vary by workload.
+Measured on 2026-11-28 (commit `e0e602a7`): Ryzen 7 7800X3D, Linux, release
+builds, Go 1.27.0, OpenJDK 26.0.2, 8 workers, median of 5 runs. Some cases time
+the whole process, so their Java numbers include JVM startup.
 
 | Case | Work | Willow (ms) | Go (ms) | Java (ms) | vs Go | vs Java |
 |---|---|---:|---:|---:|---|---|
@@ -434,14 +431,9 @@ closure and string cases, which time a marked phase. Results vary by workload.
 | closure_call | 20,480,000 closure calls | 52.6 | 25.9 | 16.7 | Go 2.03x | Java 3.15x |
 | string_build | 2,000,000 built strings | 61.2 | 80.3 | 85.2 | Willow 1.31x | Willow 1.39x |
 
-Willow's 100,000 parked tasks take 757 bytes of RSS each (Go 2,743, Java
-1,348). Willow's scheduler CPU time includes a busy-spinning driver thread.
-Compared with the previous measurement on the same machine, Willow array index
-reads became 13 to 19% faster and writes 9 to 14% faster; no Willow case
-regressed. The [benchmark harness](benches/go_vs_willow/README.md) runs every
-case and explains how to reproduce the numbers; the
-[2026-10-25 report](benches/go_vs_willow/MEASUREMENT_2026-10-25.md) shows the
-full report format with raw data.
+100,000 parked tasks use 757 bytes of memory each in Willow (Go 2,743, Java
+1,348). Willow's CPU time includes a driver thread that busy-spins. See the
+[benchmark harness](benches/go_vs_willow/README.md) to run the cases yourself.
 
 <a id="current-boundaries"></a>
 
